@@ -624,6 +624,9 @@ impl PtyDriver for AlacrittyDriver {
 
 #[cfg(test)]
 const PREVIEW_FRAME_RESERVE: usize = 1;
+// Retry coalesced compositor state while still allowing input, events, and
+// encoder completions to acquire the session lock between attempts.
+const COMPOSITOR_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
 /// Relay workers feed the ordinary tracked outbox through this bounded lane.
@@ -1401,6 +1404,14 @@ struct SharedCompositor {
     /// reconciliation. Keeps unchanged delivery ticks out of the client ×
     /// subscription scan.
     frame_clocks_dirty: bool,
+    // Coalesced state updates waiting for compositor queue capacity. Never
+    // wait for that capacity while holding the session lock: the compositor
+    // can itself be blocked publishing an event that only the tick can drain.
+    pending_refresh_mhz: Option<u32>,
+    pending_touch_enabled: Option<bool>,
+    pending_recomposites: HashSet<u16>,
+    pending_focus: Option<u16>,
+    pending_closes: HashSet<u16>,
     #[cfg(target_os = "linux")]
     created_at: Instant,
     /// Monotonically increasing counter for pixel generations.
@@ -1934,7 +1945,50 @@ impl SharedCompositor {
         )
     }
 
-    /// Hand a resize to the compositor and open a fresh settle window.
+    /// Submit replaceable state without blocking the session. A full command
+    /// queue keeps only the latest value until a later delivery tick.
+    fn flush_state_updates(&mut self) -> bool {
+        if self.pending_refresh_mhz.is_none()
+            && self.pending_touch_enabled.is_none()
+            && self.pending_recomposites.is_empty()
+            && self.pending_focus.is_none()
+            && self.pending_closes.is_empty()
+        {
+            return false;
+        }
+        use std::sync::mpsc::TrySendError;
+        let sender = &self.handle.command_tx;
+        self.handle.wake();
+        let admitted = |command| !matches!(sender.try_send(command), Err(TrySendError::Full(_)));
+        if let Some(mhz) = self.pending_refresh_mhz
+            && admitted(CompositorCommand::SetRefreshRate { mhz })
+        {
+            self.pending_refresh_mhz = None;
+        }
+        if let Some(enabled) = self.pending_touch_enabled
+            && admitted(CompositorCommand::SetTouchEnabled { enabled })
+        {
+            self.pending_touch_enabled = None;
+        }
+        if let Some(surface_id) = self.pending_focus
+            && admitted(CompositorCommand::SurfaceFocus { surface_id })
+        {
+            self.pending_focus = None;
+        }
+        self.pending_closes
+            .retain(|&surface_id| !admitted(CompositorCommand::SurfaceClose { surface_id }));
+        self.pending_recomposites
+            .retain(|&surface_id| !admitted(CompositorCommand::Recomposite { surface_id }));
+        self.handle.wake();
+        self.pending_refresh_mhz.is_some()
+            || self.pending_touch_enabled.is_some()
+            || !self.pending_recomposites.is_empty()
+            || self.pending_focus.is_some()
+            || !self.pending_closes.is_empty()
+    }
+
+    /// Hand a resize to the compositor and open a fresh settle window only
+    /// after it is admitted. Queue pressure retains the latest requested size.
     fn dispatch_resize(
         &mut self,
         surface_id: u16,
@@ -1942,30 +1996,38 @@ impl SharedCompositor {
         height: u16,
         scale_120: u16,
         now: Instant,
-    ) {
-        self.pending_resize.remove(&surface_id);
-        self.last_configured_size
-            .insert(surface_id, (width, height, scale_120));
-        self.last_resize_at.insert(surface_id, now);
-        self.resize_inflight.insert(surface_id, now);
-        let _ = self
+    ) -> bool {
+        use std::sync::mpsc::TrySendError;
+        self.handle.wake();
+        let result = self
             .handle
             .command_tx
-            .send(CompositorCommand::SurfaceResize {
+            .try_send(CompositorCommand::SurfaceResize {
                 surface_id,
                 width,
                 height,
                 scale_120,
             });
-        // Commands are only drained at the top of the compositor's event
-        // loop, which is otherwise parked in `dispatch()` for up to a
-        // second.  Every other command site wakes it; this one did not, so
-        // a configure sat in the queue until something unrelated ran the
-        // loop — a Wayland event, the next blanket `RequestFrame`, or a
-        // pointer/key event from the very surface being resized.  That last
-        // one is why a resize looked like it only took effect once you
-        // interacted with the window.
         self.handle.wake();
+        match result {
+            Ok(()) => {
+                self.pending_resize.remove(&surface_id);
+                self.last_configured_size
+                    .insert(surface_id, (width, height, scale_120));
+                self.last_resize_at.insert(surface_id, now);
+                self.resize_inflight.insert(surface_id, now);
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                self.pending_resize
+                    .insert(surface_id, (width, height, scale_120));
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.pending_resize.remove(&surface_id);
+                false
+            }
+        }
     }
 
     /// Where a size already decided on is taking this surface, while that is
@@ -1979,11 +2041,10 @@ impl SharedCompositor {
     /// its configure must not be able to hold its viewers on a frozen
     /// picture.
     fn resize_destination(&self, surface_id: u16, now: Instant) -> Option<(u16, u16, u16)> {
-        // Both cases follow a dispatch — a held resize is one that arrived
-        // inside another's window — so the window's opening is the clock for
-        // both.
-        let opened = *self.last_resize_at.get(&surface_id)?;
-        if now.duration_since(opened) >= RESIZE_ENCODER_GRACE {
+        // A settle-window hold follows a dispatch; queue pressure may also
+        // defer the first configure, before there is any dispatched timestamp.
+        let opened = self.last_resize_at.get(&surface_id).copied();
+        if opened.is_some_and(|opened| now.duration_since(opened) >= RESIZE_ENCODER_GRACE) {
             return None;
         }
         if let Some(&held) = self.pending_resize.get(&surface_id) {
@@ -2016,6 +2077,10 @@ impl SharedCompositor {
                 _ => {
                     if let Some(&(w, h, s)) = self.pending_resize.get(&sid) {
                         self.dispatch_resize(sid, w, h, s, now);
+                        if self.pending_resize.contains_key(&sid) {
+                            let retry = now + COMPOSITOR_RETRY_INTERVAL;
+                            next = Some(next.map_or(retry, |known| known.min(retry)));
+                        }
                     }
                 }
             }
@@ -2626,9 +2691,13 @@ struct SurfaceSubState {
     /// the session-wide timing counters used for diagnostics, this survives
     /// log intervals and lets an app-limited local link distinguish "the
     /// encoder cannot produce frames" from "the transport cannot carry
-    /// frames". 0 = no completed encode measured yet (Vulkan Video never
+    /// frames". Excludes the first encode after creation, which can include
+    /// driver warmup. 0 = no warm encode measured yet (Vulkan Video never
     /// enters the server-side encode path and therefore stays at 0).
     encode_work_us: f32,
+    /// This encoder has completed its first, potentially cold encode. Reset
+    /// on recreation so driver warmup cannot shrink a fast stream.
+    encode_warmed_up: bool,
     /// Quantizer the adaptive controller is currently asking for.  `None`
     /// = run at the ceiling (`bandwidth_override` / server default).
     adaptive_quantizer: Option<u8>,
@@ -2853,10 +2922,9 @@ struct VulkanVideoSurfaceState {
 }
 
 struct ClientState {
-    /// Microseconds the writer task has spent blocked inside a socket
-    /// write, accumulated.  A blocked write is the earliest and cheapest
-    /// congestion signal available; the bandwidth controller samples the
-    /// delta between its steps rather than the absolute value.
+    /// Accumulated write time beyond the per-write serialization allowance.
+    /// The controller samples the delta between steps; normal short writes
+    /// must not turn high throughput into a congestion signal.
     write_blocked_us: Arc<AtomicU64>,
     /// `write_blocked_us` as of the controller's last step, so it can read a
     /// delta out of a monotonically growing counter.
@@ -3902,7 +3970,11 @@ fn accept_completed_encode(
 /// a later surface resize happens to break that deadlock by recompositing.
 fn accept_completed_creation(state: &mut SurfaceSubState) -> bool {
     state.creation_in_flight = false;
-    !std::mem::replace(&mut state.encoder_invalidated, false)
+    if std::mem::replace(&mut state.encoder_invalidated, false) {
+        return false;
+    }
+    state.encode_warmed_up = false;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -3977,9 +4049,8 @@ const ADAPTIVE_ENCODER_PRESSURE_RATIO: f32 = 1.25;
 /// otherwise a software encoder alternates forever between one sustainable
 /// extent and the next unsustainable one.
 const ADAPTIVE_ENCODER_RECOVERY_RATIO: f32 = 0.75;
-/// Blocked-write time within one step interval that counts as congestion.
-/// A write that blocks for a tenth of the interval means the socket, not the
-/// encoder, is setting the pace.
+/// Write time beyond the serialization allowance within one step interval
+/// that counts as congestion. Normal short writes do not contribute.
 const WRITE_BLOCKED_CONGESTED_US: u64 = 25_000;
 /// Gap between refinement steps on a surface that has stopped changing.
 /// Longer than `ADAPTIVE_STEP_INTERVAL` because each step costs a keyframe
@@ -4150,6 +4221,22 @@ fn surface_encode_budget_us(client: &ClientState, surface_id: u16) -> f32 {
 
 fn encoder_scale_recovery_has_headroom(encode_work_us: f32, budget_us: f32) -> bool {
     encode_work_us <= 0.0 || encode_work_us * 4.0 <= budget_us * ADAPTIVE_ENCODER_RECOVERY_RATIO
+}
+
+fn record_surface_encode_work(state: &mut SurfaceSubState, work_us: u64) {
+    // First-use driver work can take hundreds of milliseconds while normal
+    // frames cost only a few. Exclude exactly one completion per encoder;
+    // a slow CPU fallback is still detected after its second frame. Keep
+    // every later sample, including alternating expensive and cheap frames.
+    if !std::mem::replace(&mut state.encode_warmed_up, true) {
+        return;
+    }
+    let sample = work_us as f32;
+    state.encode_work_us = if state.encode_work_us <= 0.0 {
+        sample
+    } else {
+        ewma_with_direction(state.encode_work_us, sample, 0.5, 0.25)
+    };
 }
 
 /// Apply transport adaptation to an already aspect-preserving encode target.
@@ -6112,6 +6199,11 @@ impl Session {
                 last_encoded: HashMap::new(),
                 frame_clock_intervals: FxHashMap::default(),
                 frame_clocks_dirty: true,
+                pending_refresh_mhz: None,
+                pending_touch_enabled: None,
+                pending_recomposites: HashSet::new(),
+                pending_focus: None,
+                pending_closes: HashSet::new(),
                 #[cfg(target_os = "linux")]
                 created_at,
                 pixel_generation: 0,
@@ -6654,11 +6746,8 @@ impl Session {
     fn sync_touch_capability(&mut self) {
         let enabled = self.wants_direct_touch();
         if let Some(compositor) = self.compositor.as_mut() {
-            let _ = compositor
-                .handle
-                .command_tx
-                .send(CompositorCommand::SetTouchEnabled { enabled });
-            compositor.handle.wake();
+            compositor.pending_touch_enabled = Some(enabled);
+            compositor.flush_state_updates();
         }
     }
 
@@ -7152,17 +7241,13 @@ impl Session {
         (fps * 1000.0).round() as u32
     }
 
-    fn sync_compositor_refresh_rate(&self) {
-        let Some(cs) = self.compositor.as_ref() else {
+    fn sync_compositor_refresh_rate(&mut self) {
+        let mhz = self.compositor_refresh_mhz();
+        let Some(cs) = self.compositor.as_mut() else {
             return;
         };
-        let _ = cs
-            .handle
-            .command_tx
-            .send(CompositorCommand::SetRefreshRate {
-                mhz: self.compositor_refresh_mhz(),
-            });
-        cs.handle.wake();
+        cs.pending_refresh_mhz = Some(mhz);
+        cs.flush_state_updates();
     }
 
     /// Every surface whose logical size participates in mediation.  A global
@@ -7265,10 +7350,7 @@ impl Session {
                     .insert(surface_id, (width, height, scale_120));
                 false
             }
-            ResizeAction::Dispatch => {
-                cs.dispatch_resize(surface_id, width, height, scale_120, now);
-                true
-            }
+            ResizeAction::Dispatch => cs.dispatch_resize(surface_id, width, height, scale_120, now),
         }
     }
 
@@ -8445,9 +8527,14 @@ fn take_snapshot(pty: &mut Pty) -> FrameState {
 
 /// How much one in-process session may buffer per direction.
 ///
-/// One wire frame's worth: the reader takes a frame at a time, so a writer that
-/// is a frame ahead has said everything the reader can act on.
-const LOCAL_SESSION_BUFFER: usize = yas_wire::schema::transport::RECOMMENDED_WIRE_FRAME as usize;
+/// Keep this independent of the recommended one-MiB wire-frame size. Bytes in
+/// this FIFO have already left the priority scheduler, so a Ping cannot
+/// overtake them. A one-MiB local queue adds seconds on a constrained path
+/// even when encoding and request dispatch are fast. WebTransport separately
+/// admits its observed network flight plus a small waiting queue, so a fast
+/// long path is not throttled to this pipe's capacity per RTT. Readers consume
+/// frames incrementally, so large valid frames need no matching pipe capacity.
+const LOCAL_SESSION_BUFFER: usize = 16 * 1024;
 
 /// A door into this server for a service the server is hosting itself.
 ///
@@ -9131,6 +9218,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.last_configured_size.remove(&surface_id);
                     cs.last_resize_at.remove(&surface_id);
                     cs.pending_resize.remove(&surface_id);
+                    cs.pending_recomposites.remove(&surface_id);
+                    cs.pending_closes.remove(&surface_id);
+                    if cs.pending_focus == Some(surface_id) {
+                        cs.pending_focus = None;
+                    }
                     cs.resize_inflight.remove(&surface_id);
                     cs.native_sizes.remove(&surface_id);
                     cs.frame_clock_intervals.remove(&surface_id);
@@ -11543,17 +11635,11 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                     // Keep encode pressure per subscription. Session-wide
                     // counters below are reset after each diagnostics line,
-                    // and therefore cannot drive adaptation. Rise quickly
-                    // when a CPU encoder falls behind, then require several
-                    // cheaper frames before trusting a recovery.
+                    // and therefore cannot drive adaptation. Exclude the
+                    // first encode's driver warmup from steady-state work.
                     if let Some(client) = sess.clients.get_mut(&result.cid) {
                         let state = client.surface_subs.entry(result.sid).or_default();
-                        let sample = work_us as f32;
-                        state.encode_work_us = if state.encode_work_us <= 0.0 {
-                            sample
-                        } else {
-                            ewma_with_direction(state.encode_work_us, sample, 0.5, 0.25)
-                        };
+                        record_surface_encode_work(state, work_us);
                     }
 
                     let Some((nal_data, is_keyframe)) = result.nal_data else {
@@ -12442,7 +12528,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     if cs
                         .handle
                         .command_tx
-                        .send(CompositorCommand::RequestFrame {
+                        .try_send(CompositorCommand::RequestFrame {
                             surface_id: sid,
                             presentation_at: now,
                         })
@@ -12974,6 +13060,13 @@ async fn tick(state: &AppState) -> TickOutcome {
         && let Some(due) = cs.flush_due_resizes(now)
     {
         next_deadline = Some(next_deadline.map_or(due, |d: Instant| d.min(due)));
+    }
+
+    if let Some(cs) = sess.compositor.as_mut()
+        && cs.flush_state_updates()
+    {
+        let retry = now + COMPOSITOR_RETRY_INTERVAL;
+        next_deadline = Some(next_deadline.map_or(retry, |due| due.min(retry)));
     }
 
     // Guarantee the tick loop wakes up at least every blanket interval
@@ -14111,6 +14204,129 @@ mod tests {
         );
         assert_eq!(cs.last_configured_size.get(&1), Some(&(850, 600, 120)));
         assert!(cs.pending_resize.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn surface_resize_queue_pressure_does_not_hold_the_session_lock() {
+        let state = process_transport::test_state(process::Server::new(false, true));
+        let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+        commands.try_send(CompositorCommand::DragLeave).unwrap();
+        let original = {
+            let mut session = state.session.lock().await;
+            session.ensure_compositor(false, Arc::new(|| {}), "");
+            std::mem::replace(
+                &mut session.compositor.as_mut().unwrap().handle.command_tx,
+                commands,
+            )
+        };
+        // A real compositor may be waiting to publish an event while its
+        // command queue is full. Keep the queue full until the assertion,
+        // but provide a watchdog so a regression fails instead of hanging.
+        let (release, released) = std::sync::mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(2));
+            while receiver.recv().is_ok() {}
+        });
+        let resizing = tokio::spawn({
+            let state = state.clone();
+            async move { state.session.lock().await.resize_surface(1, 800, 600, 120) }
+        });
+        let responsive = tokio::time::timeout(Duration::from_millis(250), async {
+            let sent = resizing.await.unwrap();
+            let session = state.session.lock().await;
+            (
+                sent,
+                session
+                    .compositor
+                    .as_ref()
+                    .unwrap()
+                    .pending_resize
+                    .get(&1)
+                    .copied(),
+            )
+        })
+        .await;
+        release.send(()).unwrap();
+        state
+            .session
+            .lock()
+            .await
+            .compositor
+            .as_mut()
+            .unwrap()
+            .handle
+            .command_tx = original;
+        drain.join().unwrap();
+        assert_eq!(
+            responsive.expect("resize must not wait for compositor queue capacity"),
+            (false, Some((800, 600, 120)))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn surface_state_retries_coalesce_and_only_mark_admitted_resizes() {
+        let mut session = Session::new();
+        session.ensure_compositor(false, Arc::new(|| {}), "");
+        let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+        commands.try_send(CompositorCommand::DragLeave).unwrap();
+        let cs = session.compositor.as_mut().unwrap();
+        let original = std::mem::replace(&mut cs.handle.command_tx, commands);
+        let now = Instant::now();
+        assert!(!cs.dispatch_resize(1, 800, 600, 120, now));
+        assert!(!cs.dispatch_resize(1, 960, 720, 240, now));
+        assert_eq!(cs.pending_resize.len(), 1);
+        assert!(cs.last_configured_size.is_empty());
+        assert!(cs.last_resize_at.is_empty());
+        assert!(cs.resize_inflight.is_empty());
+        assert_eq!(cs.resize_destination(1, now), Some((960, 720, 240)));
+        assert_eq!(
+            cs.flush_due_resizes(now),
+            Some(now + COMPOSITOR_RETRY_INTERVAL)
+        );
+        receiver.try_recv().unwrap();
+        assert_eq!(cs.flush_due_resizes(now + COMPOSITOR_RETRY_INTERVAL), None);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CompositorCommand::SurfaceResize {
+                surface_id: 1,
+                width: 960,
+                height: 720,
+                scale_120: 240,
+            }
+        ));
+        assert_eq!(cs.last_configured_size[&1], (960, 720, 240));
+        assert!(cs.pending_resize.is_empty());
+
+        cs.handle
+            .command_tx
+            .try_send(CompositorCommand::DragLeave)
+            .unwrap();
+        cs.pending_refresh_mhz = Some(60_000);
+        cs.pending_touch_enabled = Some(true);
+        cs.pending_recomposites.insert(1);
+        assert!(cs.flush_state_updates());
+        cs.pending_refresh_mhz = Some(120_000);
+        cs.pending_touch_enabled = Some(false);
+        cs.pending_recomposites.insert(1);
+        assert!(cs.flush_state_updates());
+        receiver.try_recv().unwrap();
+        assert!(cs.flush_state_updates());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CompositorCommand::SetRefreshRate { mhz: 120_000 }
+        ));
+        assert!(cs.flush_state_updates());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CompositorCommand::SetTouchEnabled { enabled: false }
+        ));
+        assert!(!cs.flush_state_updates());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CompositorCommand::Recomposite { surface_id: 1 }
+        ));
+        assert!(receiver.try_recv().is_err());
+        cs.handle.command_tx = original;
     }
 
     #[cfg(target_os = "linux")]
@@ -16347,6 +16563,144 @@ mod tests {
         assert!(step.target_changed);
         assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 2);
         assert!(client.surface_subs[&sid].encode_work_us < 20_000.0);
+    }
+
+    #[test]
+    fn cold_encoder_start_does_not_blur_a_fast_surface() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        let sid = 1;
+        let started = Instant::now();
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.scaled_target = Some((1918, 2108));
+        sub.allow_adaptive_scale = true;
+
+        for (i, work_us) in [450_000, 3_000, 2_000, 4_000].into_iter().enumerate() {
+            record_surface_encode_work(client.surface_subs.get_mut(&sid).unwrap(), work_us);
+            let step = step_adaptive_bandwidth(
+                &mut client,
+                SurfaceBandwidth::Ultra,
+                sid,
+                started + ADAPTIVE_STEP_INTERVAL * i as u32,
+                false,
+            );
+            assert!(
+                !step.target_changed,
+                "startup sample {i} reduced resolution"
+            );
+            assert!(
+                step.quantizer.is_none(),
+                "startup sample {i} reduced quality"
+            );
+            assert!(client.surface_subs[&sid].congested_at.is_none());
+        }
+        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
+    }
+
+    #[test]
+    fn a_recreated_encoder_does_not_inherit_a_cold_work_sample() {
+        let mut sub = SurfaceSubState::default();
+        record_surface_encode_work(&mut sub, 450_000);
+        assert!(accept_completed_creation(&mut sub));
+        record_surface_encode_work(&mut sub, 450_000);
+        assert_eq!(sub.encode_work_us, 0.0);
+        record_surface_encode_work(&mut sub, 3_000);
+        assert_eq!(sub.encode_work_us, 3_000.0);
+    }
+
+    #[test]
+    fn alternating_slow_encodes_after_warmup_still_reduce_resolution() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        let sid = 1;
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.scaled_target = Some((1918, 2108));
+        sub.allow_adaptive_scale = true;
+        for work_us in [450_000, 3_000, 240_000, 3_000, 240_000, 3_000] {
+            record_surface_encode_work(sub, work_us);
+        }
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Ultra,
+            sid,
+            Instant::now(),
+            false,
+        );
+        assert!(step.target_changed);
+        assert!(client.surface_subs[&sid].adaptive_scale_shift > 0);
+    }
+
+    #[test]
+    fn sustained_slow_encoding_still_reduces_resolution_promptly() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        let sid = 1;
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.scaled_target = Some((1918, 2108));
+        sub.allow_adaptive_scale = true;
+        record_surface_encode_work(sub, 240_000);
+        record_surface_encode_work(sub, 240_000);
+
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Ultra,
+            sid,
+            Instant::now(),
+            false,
+        );
+        assert!(step.target_changed);
+        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 2);
+        assert_eq!(
+            step.quantizer,
+            Some(SurfaceBandwidth::Ultra.av1_quantizer() as u8)
+        );
+        assert!(client.surface_subs[&sid].adaptive_quantizer.is_none());
+    }
+
+    #[test]
+    fn healthy_fragment_writes_do_not_reduce_surface_quality() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        let sid = 1;
+        client.surface_subs.entry(sid).or_default();
+        let started = Instant::now();
+        for i in 0..12 {
+            // 16 KiB per 2 ms carries 65 Mbit/s continuously. Summing normal
+            // serialization time must not label every interval congested.
+            for _ in 0..125 {
+                yas::accumulate_write_duration(&client.write_blocked_us, Duration::from_millis(2));
+            }
+            let step = step_adaptive_bandwidth(
+                &mut client,
+                SurfaceBandwidth::Ultra,
+                sid,
+                started + ADAPTIVE_STEP_INTERVAL * i,
+                false,
+            );
+            assert!(
+                step.quantizer.is_none(),
+                "healthy interval {i} reduced quality"
+            );
+            assert!(client.surface_subs[&sid].congested_at.is_none());
+        }
+    }
+
+    #[test]
+    fn a_stalled_fragment_write_still_reduces_surface_quality() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        let sid = 1;
+        client.surface_subs.entry(sid).or_default();
+        yas::accumulate_write_duration(&client.write_blocked_us, Duration::from_millis(70));
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Ultra,
+            sid,
+            Instant::now(),
+            false,
+        );
+        assert!(step.quantizer.is_some());
+        assert!(client.surface_subs[&sid].congested_at.is_some());
+        assert!(!step.target_changed);
     }
 
     #[test]

@@ -299,8 +299,37 @@ permanently would multiply a large high-resolution delta into seconds of
 reliable queueing on a constrained WAN. Negotiated decoder slots still bound
 admission, and an ACK wakes delivery as soon as it returns credit. Native
 Surface viewers also share the real connection writer's blocked-time counter
-with their encoder controller, so socket pressure backs off quality and
-resolution instead of being hidden by the in-process Surface event sink.
+with their encoder controller, so socket pressure backs off quality instead
+of being hidden by the in-process Surface event sink. Each write gets a 5 ms
+serialization allowance; only excess time accumulates as pressure. Otherwise
+continuous short fragment writes on a healthy fast link would lower quality
+merely because the writer was busy. Transport pressure preserves resolution.
+
+The hosted edge and share use a 16 KiB in-process byte buffer per direction,
+independent of the recommended 1 MiB wire-frame size. Large frames stream through
+that buffer incrementally. Bytes already in this FIFO cannot be overtaken by
+Ping replies, so sizing it to the frame limit would hide seconds of video in
+front of control traffic on a constrained connection.
+
+WebTransport's reliable send allowance follows the observed QUIC flight plus
+64 KiB of queue headroom, capped at 64 MiB of unacknowledged reliable data per
+connection. Quinn's send window includes unacknowledged bytes already
+traversing the network:
+holding that entire window at 64 KiB would cap a 200 ms connection at about
+2.6 Mbit/s, regardless of link capacity. The edge observes the existing CUBIC
+controller's send, ACK, and loss callbacks and adjusts admission before each
+write; it does not bypass congestion control. Packet overhead makes the flight
+estimate conservative, and each ACK batch corrects it. An idle writer resets
+its estimate, and blocked writers refresh it after connection path changes.
+
+Surface registration, focus, close, refresh-rate changes, touch capability,
+and resize requests never wait for compositor command-queue space while
+holding the shared session lock. Under queue pressure, the server retains the
+latest state and retries from the delivery tick; repeated resizes and focus
+changes coalesce. Resize timestamps and encoder rebuild state advance only
+when the configure is admitted. Unwatched frame callbacks skip a full queue
+and resume on their next clock tick. This lets delivery continue draining the
+compositor's bounded event queue while new windows are opening.
 
 ### Preview budgeting
 
@@ -491,7 +520,11 @@ Encode time also participates in adaptive resolution. A transport can be
 completely idle while a CPU fallback spends hundreds of milliseconds encoding
 each native-resolution frame; link and decoder backlog alone cannot detect
 that case. The server tracks encode work per surface and downsizes a moving
-stream until the encoder can sustain an interactive cadence. A still surface
+stream until the encoder can sustain an interactive cadence. The first encode
+after creation is excluded from that estimate because driver warmup can cost
+hundreds of milliseconds on an otherwise fast encoder. Every subsequent work
+sample counts, so sustained or alternating slow frames still trigger adaptation.
+A still surface
 continues to refine back to full resolution, and a moving stream only probes a
 larger extent when the measured encoder work has enough headroom for the
 roughly fourfold pixel cost.

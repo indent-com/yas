@@ -7,6 +7,7 @@ async fn backpressured_surface_session(
     FrameCodec,
     yas_surface::ViewResult,
     tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<FrameHeader>,
 ) {
     let state = super::super::tests::process_transport::test_state(
         super::super::process::Server::new(false, true),
@@ -21,6 +22,8 @@ async fn backpressured_surface_session(
     let registration = state.connections.register(cancellation.clone()).unwrap();
     let mut services = Services::from_state(&state);
     services.receive_max_buffered_override = Some(TEST_PEER_MAX_BUFFERED);
+    let (queued_tx, queued_rx) = mpsc::unbounded_channel();
+    services.result_queued_probe = Some(queued_tx);
     let task = tokio::spawn(serve_registered(
         server,
         services,
@@ -58,7 +61,7 @@ async fn backpressured_surface_session(
     .await;
     assert_eq!(opened.status, Status::Ok);
     let view = yas_surface::ViewResult::decode(&opened.body).unwrap();
-    (state, client, codec, view, task)
+    (state, client, codec, view, task, queued_rx)
 }
 
 #[cfg(unix)]
@@ -79,7 +82,7 @@ async fn surface_test_ping(client: &mut DuplexStream, codec: &FrameCodec, id: u3
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn surface_eos_waits_for_decoder_credit_without_blocking_ping() {
-    let (state, mut client, codec, view, task) = backpressured_surface_session(1).await;
+    let (state, mut client, codec, view, task, _) = backpressured_surface_session(1).await;
     send_hidden_surface_frame(&state, 7, (320, 180), 1, 0, true, large_h264_test_frame(16)).await;
     let data = next_frame(&mut client, &codec).await;
     assert_eq!(
@@ -185,7 +188,8 @@ async fn surface_bulk_and_lifetime_barriers_do_not_queue_megabytes_ahead_of_ping
         yas_wire::schema::surface::request::RESET_VIEW,
         yas_wire::schema::surface::request::CLOSE_VIEW,
     ] {
-        let (state, mut client, codec, view, task) = backpressured_surface_session(4).await;
+        let (state, mut client, codec, view, task, mut queued) =
+            backpressured_surface_session(4).await;
         send_hidden_surface_frame(
             &state,
             7,
@@ -196,26 +200,10 @@ async fn surface_bulk_and_lifetime_barriers_do_not_queue_megabytes_ahead_of_ping
             large_h264_test_frame(3 * 1024 * 1024),
         )
         .await;
-        timeout(TEST_TIMEOUT, async {
-            loop {
-                let bytes = state
-                    .session
-                    .lock()
-                    .await
-                    .native_yas_clients
-                    .values()
-                    .next()
-                    .unwrap()
-                    .outbound_bytes
-                    .load(Ordering::Relaxed);
-                if bytes >= 48 * 1024 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // Allow the producer to reach transport backpressure before probing.
+        // The queue bound below is deliberately independent of its configured
+        // capacity: using LOCAL_SESSION_BUFFER there hid a one-MiB FIFO.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         match operation {
             yas_wire::schema::surface::request::CONFIGURE_VIEW => {
                 write_request(
@@ -265,6 +253,17 @@ async fn surface_bulk_and_lifetime_barriers_do_not_queue_megabytes_ahead_of_ping
             _ => {}
         }
         surface_test_ping(&mut client, &codec, 12).await;
+        // Keep the transport blocked until Ping reaches the control lane.
+        // Draining immediately races request dispatch and measures scheduling
+        // rather than bytes buffered downstream of the priority writer.
+        timeout(TEST_TIMEOUT, async {
+            while queued.recv().await.unwrap()
+                != FrameHeader::result(family::CORE, yas_wire::core::request_kind::PING, 12)
+            {
+            }
+        })
+        .await
+        .expect("Ping must be queued while the transport is blocked");
         let mut bytes_before_ping = 0usize;
         let mut fragments = 0u16;
         let mut fragment_count = 0u16;
@@ -284,9 +283,9 @@ async fn surface_bulk_and_lifetime_barriers_do_not_queue_megabytes_ahead_of_ping
             fragment_count = fragment.fragment_count;
             bytes_before_ping += frame.payload.len();
         }
+        eprintln!("surface operation {operation}: {bytes_before_ping} bytes precede Ping");
         assert!(
-            bytes_before_ping
-                <= super::super::LOCAL_SESSION_BUFFER + 3 * (SURFACE_RELIABLE_FRAGMENT_BYTES + 64),
+            bytes_before_ping <= 96 * 1024,
             "{bytes_before_ping} bytes ahead of ping for operation {operation}"
         );
         // Complete the frame and verify that asynchronous retirement/configure
@@ -308,4 +307,111 @@ async fn surface_bulk_and_lifetime_barriers_do_not_queue_megabytes_ahead_of_ping
         drop(client);
         timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_open_queue_pressure_does_not_block_ping() {
+    let (state, mut client, codec, _view, task, _) = backpressured_surface_session(4).await;
+    let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+    commands
+        .try_send(yas_compositor::CompositorCommand::DragLeave)
+        .unwrap();
+    let (original, surface_handle) = {
+        let mut session = state.session.lock().await;
+        let handle = session.surface_handles.get_or_insert(7).unwrap();
+        let original = std::mem::replace(
+            &mut session.compositor.as_mut().unwrap().handle.command_tx,
+            commands,
+        );
+        (original, handle)
+    };
+    let (release, released) = std::sync::mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        let _ = released.recv_timeout(Duration::from_secs(2));
+        while receiver.recv().is_ok() {}
+    });
+    let responsive = timeout(Duration::from_millis(250), async {
+        write_request(
+            &mut client,
+            &codec,
+            family::SURFACE,
+            yas_wire::schema::surface::request::OPEN_VIEW,
+            11,
+            &yas_surface::OpenView {
+                surface_handle,
+                width: 320,
+                height: 180,
+                max_fps: 60,
+                decoder_capacity: 4,
+                codec_versions: vec![yas_wire::schema::surface::CODEC_H264_V1 as u16],
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_result(
+            &mut client,
+            &codec,
+            family::SURFACE,
+            yas_wire::schema::surface::request::OPEN_VIEW,
+            11,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        write_request(
+            &mut client,
+            &codec,
+            family::SURFACE,
+            yas_wire::schema::surface::request::FOCUS,
+            13,
+            &yas_surface::Focus {
+                surface_handle,
+                operation_id: [13; 16],
+                focused: true,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_result(
+                &mut client,
+                &codec,
+                family::SURFACE,
+                yas_wire::schema::surface::request::FOCUS,
+                13
+            )
+            .await
+            .status,
+            Status::Ok
+        );
+        surface_test_ping(&mut client, &codec, 12).await;
+        next_result(
+            &mut client,
+            &codec,
+            family::CORE,
+            yas_wire::core::request_kind::PING,
+            12,
+        )
+        .await
+    })
+    .await;
+    release.send(()).unwrap();
+    state
+        .session
+        .lock()
+        .await
+        .compositor
+        .as_mut()
+        .unwrap()
+        .handle
+        .command_tx = original;
+    drain.join().unwrap();
+    drop(client);
+    timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+    assert_eq!(
+        responsive
+            .expect("opening a view must leave Ping responsive with a full compositor queue")
+            .status,
+        Status::Ok
+    );
 }

@@ -108,8 +108,20 @@ const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FONT_FAMILIES: u32 = u16::MAX as u32;
 const MAX_FONT_FACES_PER_FAMILY: u32 = u16::MAX as u32;
 
-fn accumulate_write_duration(counter: &AtomicU64, elapsed: Duration) {
-    let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+// A small FIFO streams Surface fragments while yielding to the transport.
+// Summing every such yield mistakes normal serialization for congestion:
+// 125 healthy 2 ms writes already total 250 ms of supposed pressure. Count
+// only time beyond a short per-write allowance. The 16 KiB scheduling slice
+// takes about 1.6 ms on an 80 Mbit/s link; longer stalls still accumulate and
+// trigger the existing quality backoff without enlarging any queue.
+const WRITE_SERIALIZATION_ALLOWANCE: Duration = Duration::from_millis(5);
+
+pub(super) fn accumulate_write_duration(counter: &AtomicU64, elapsed: Duration) {
+    let blocked = elapsed.saturating_sub(WRITE_SERIALIZATION_ALLOWANCE);
+    let elapsed_us = u64::try_from(blocked.as_micros()).unwrap_or(u64::MAX);
+    if elapsed_us == 0 {
+        return;
+    }
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(elapsed_us))
     });
@@ -1106,6 +1118,8 @@ struct Services {
     #[cfg(test)]
     outbound_writer_gate: Option<Arc<OutboundWriterGate>>,
     #[cfg(test)]
+    result_queued_probe: Option<mpsc::UnboundedSender<FrameHeader>>,
+    #[cfg(test)]
     events_stream_publication_probe: Option<Arc<EventsStreamPublicationProbe>>,
     #[cfg(test)]
     terminal_frame_drop_probe: Option<Arc<TerminalFrameDropProbe>>,
@@ -1166,6 +1180,8 @@ impl Services {
             terminal_writer_gate: None,
             #[cfg(test)]
             outbound_writer_gate: None,
+            #[cfg(test)]
+            result_queued_probe: None,
             #[cfg(test)]
             events_stream_publication_probe: None,
             #[cfg(test)]
@@ -28398,7 +28414,12 @@ impl Session {
         self.out
             .send(Frame { header, payload })
             .await
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        #[cfg(test)]
+        if let Some(probe) = &self.services.result_queued_probe {
+            let _ = probe.send(header);
+        }
+        Ok(())
     }
 }
 
@@ -40424,6 +40445,7 @@ mod tests {
             outbound_max_override: None,
             terminal_writer_gate: None,
             outbound_writer_gate: None,
+            result_queued_probe: None,
             events_stream_publication_probe: None,
             terminal_frame_drop_probe: None,
             surface_watch_publication_probe: None,

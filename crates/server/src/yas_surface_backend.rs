@@ -620,11 +620,8 @@ pub(crate) async fn register(
             .keys()
             .any(|(known, _, _)| *known == surface_id)
         {
-            let _ = compositor
-                .handle
-                .command_tx
-                .send(CompositorCommand::Recomposite { surface_id });
-            compositor.handle.wake();
+            compositor.pending_recomposites.insert(surface_id);
+            compositor.flush_state_updates();
         }
     }
     session.sync_touch_capability();
@@ -1099,15 +1096,15 @@ pub(crate) async fn release_claim(state: &AppState, owner: [u8; 16], surface_id:
 }
 
 pub(crate) async fn focus(state: &AppState, surface_id: u16) -> bool {
-    compositor_command(state, surface_id, |surface_id| {
-        CompositorCommand::SurfaceFocus { surface_id }
+    compositor_command(state, surface_id, |compositor| {
+        compositor.pending_focus = Some(surface_id);
     })
     .await
 }
 
 pub(crate) async fn close(state: &AppState, surface_id: u16) -> bool {
-    compositor_command(state, surface_id, |surface_id| {
-        CompositorCommand::SurfaceClose { surface_id }
+    compositor_command(state, surface_id, |compositor| {
+        compositor.pending_closes.insert(surface_id);
     })
     .await
 }
@@ -1115,24 +1112,17 @@ pub(crate) async fn close(state: &AppState, surface_id: u16) -> bool {
 async fn compositor_command(
     state: &AppState,
     surface_id: u16,
-    command: impl FnOnce(u16) -> CompositorCommand,
+    command: impl FnOnce(&mut SharedCompositor),
 ) -> bool {
-    let session = state.session.lock().await;
-    let Some(compositor) = session.compositor.as_ref() else {
+    let mut session = state.session.lock().await;
+    let Some(compositor) = session.compositor.as_mut() else {
         return false;
     };
     if !compositor.surfaces.contains_key(&surface_id) {
         return false;
     }
-    if compositor
-        .handle
-        .command_tx
-        .send(command(surface_id))
-        .is_err()
-    {
-        return false;
-    }
-    compositor.handle.wake();
+    command(compositor);
+    compositor.flush_state_updates();
     drop(session);
     state.delivery_notify.notify_one();
     true

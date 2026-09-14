@@ -15,6 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+mod web_transport_send;
+
 type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
 type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
 
@@ -195,9 +197,6 @@ struct Config {
 type AppState = Arc<Config>;
 
 const INTERACTIVE_TOS: u32 = 34 << 2;
-// Priority cannot overtake bytes already copied into the reliable QUIC
-// stream. Propagate backpressure instead of hiding it in Quinn's 10 MB default.
-const WEBTRANSPORT_SEND_WINDOW: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT: u32 = 64 * 1024;
 
@@ -444,7 +443,8 @@ fn prepare_web_transport(
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport = quinn::TransportConfig::default();
     transport
-        .send_window(WEBTRANSPORT_SEND_WINDOW)
+        .send_window(web_transport_send::QUEUE_BYTES)
+        .congestion_controller_factory(Arc::new(web_transport_send::Factory))
         .max_idle_timeout(Some(
             WEBTRANSPORT_PEER_TIMEOUT
                 .try_into()
@@ -676,10 +676,11 @@ async fn handle_web_transport(
 async fn bridge_reliable_web_transport(
     session: web_transport_quinn::Session,
     mut recv: web_transport_quinn::RecvStream,
-    mut send: web_transport_quinn::SendStream,
+    send: web_transport_quinn::SendStream,
     mut home_reader: BoxedReader,
     mut home_writer: BoxedWriter,
 ) {
+    let mut send = web_transport_send::Writer::new(&session, send);
     let down = async {
         let _ = tokio::io::copy(&mut recv, &mut home_writer).await;
         let _ = home_writer.shutdown().await;
@@ -701,10 +702,11 @@ async fn bridge_reliable_web_transport(
 async fn bridge_composite_web_transport(
     session: web_transport_quinn::Session,
     mut recv: web_transport_quinn::RecvStream,
-    mut send: web_transport_quinn::SendStream,
+    send: web_transport_quinn::SendStream,
     home: CompositeHome,
     maximum: u32,
 ) {
+    let mut send = web_transport_send::Writer::new(&session, send);
     let CompositeHome {
         mut main_reader,
         mut main_writer,
