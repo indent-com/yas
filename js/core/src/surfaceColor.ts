@@ -45,10 +45,20 @@ export function surface2DContext(
   canvas: HTMLCanvasElement,
 ): CanvasRenderingContext2D | null {
   try {
-    return canvas.getContext("2d", { colorSpace: "display-p3" });
-  } catch {
+    const context = canvas.getContext("2d", { colorSpace: "display-p3" });
+    if (context) return context;
+  } catch {}
+  try {
     return canvas.getContext("2d");
+  } catch {
+    return null;
   }
+}
+
+/** Release the backing allocation without waiting for canvas garbage collection. */
+export function releaseSurfaceCanvas(canvas: HTMLCanvasElement): void {
+  canvas.width = 0;
+  canvas.height = 0;
 }
 
 let capabilities = 0;
@@ -529,6 +539,7 @@ export class SurfaceHdrPresenter {
     for (const target of this.intermediates) target.destroy();
     this.intermediates = [];
     this.context.unconfigure();
+    releaseSurfaceCanvas(this.canvas);
     this.canvas.remove();
   }
 }

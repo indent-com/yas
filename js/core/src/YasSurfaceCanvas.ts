@@ -1,5 +1,9 @@
 /// <reference lib="es2022.intl" />
-import { surface2DContext, SurfaceHdrPresenter } from "./surfaceColor";
+import {
+  releaseSurfaceCanvas,
+  surface2DContext,
+  SurfaceHdrPresenter,
+} from "./surfaceColor";
 
 import { plannedDropExtension, plannedDropName } from "./surfaceDrop";
 import type { ConnectionId, SurfaceId, YasSurface } from "./types";
@@ -1293,6 +1297,12 @@ export class YasSurfaceCanvas {
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
+  private readonly restoreCanvas = () => {
+    if (this.disposed) return;
+    this.ctx = null;
+    const store = this.getConn()?.surfaceStore ?? this._store;
+    if (store) this.presentFromStore(store);
+  };
   private hdrPresenter: SurfaceHdrPresenter | null = null;
   /** Pointer overlay for the client currently driving this shared surface.
    *  The originating client is told to hide it and keeps its native cursor. */
@@ -1723,8 +1733,10 @@ export class YasSurfaceCanvas {
     (
       canvas.style as CSSStyleDeclaration & { webkitTouchCallout?: string }
     ).webkitTouchCallout = "none";
-    canvas.width = this.surface?.width || 640;
-    canvas.height = this.surface?.height || 480;
+    // The catalogue can describe another viewer's much larger display.
+    // Allocate this viewer's pixels only once a decoded frame arrives.
+    canvas.width = 640;
+    canvas.height = 480;
     if (this._awaitingInitialDisplaySize) {
       const dpr = (globalThis.devicePixelRatio ?? 1) || 1;
       Object.assign(canvas.style, {
@@ -1819,6 +1831,7 @@ export class YasSurfaceCanvas {
 
     this.canvas = canvas;
     this.ctx = surface2DContext(canvas);
+    canvas.addEventListener("contextrestored", this.restoreCanvas);
     mountedSurfaceCanvases.set(canvas, this);
 
     this.observePresentBox(container);
@@ -1963,7 +1976,11 @@ export class YasSurfaceCanvas {
       if (this.container) this.container.removeChild(this.textInput);
     }
     this.textInput = null;
-    if (this.canvas) mountedSurfaceCanvases.delete(this.canvas);
+    if (this.canvas) {
+      mountedSurfaceCanvases.delete(this.canvas);
+      this.canvas.removeEventListener("contextrestored", this.restoreCanvas);
+      releaseSurfaceCanvas(this.canvas);
+    }
     if (this.canvas && this.container) {
       this.container.removeChild(this.canvas);
     }
@@ -2470,13 +2487,9 @@ export class YasSurfaceCanvas {
             this.resendDisplaySize();
           }
         }
-        // Size the canvas backing buffer to the surface when info first
-        // arrives so the canvas has sensible intrinsic dimensions before
-        // any frame has been decoded. presentFromStore will re-snap it to
-        // the actual frame size on first paint.
+        // Metadata must not allocate the remote display's full-size buffer
+        // or clear an already decoded frame. Presentation owns canvas sizing.
         if (!prev && this.canvas) {
-          this.canvas.width = this.surface.width;
-          this.canvas.height = this.surface.height;
           this.scrollGeometry = null;
           this.applyLayout();
         }
@@ -2747,8 +2760,7 @@ export class YasSurfaceCanvas {
   private presentFromStore(store: import("./SurfaceStore").SurfaceStore): void {
     const src = store.getCanvas(this._surfaceId);
     const canvas = this.canvas;
-    const ctx = this.ctx;
-    if (!src || !canvas || !ctx) return;
+    if (!src || !canvas) return;
     if (src.width === 0 || src.height === 0) return;
     this._framePresentationSize =
       typeof store.getCanvasPresentationSize === "function"
@@ -2777,6 +2789,10 @@ export class YasSurfaceCanvas {
       canvas.height = h;
       this.scrollGeometry = null;
     }
+    // Context allocation can fail transiently under canvas memory pressure.
+    // Retry at the actual frame size instead of keeping a pane black forever.
+    const ctx = (this.ctx ??= surface2DContext(canvas));
+    if (!ctx || ctx.isContextLost?.()) return;
     this.applyLayout();
     const hdr = store.getHdrFrame?.(this._surfaceId);
     if (hdr) {

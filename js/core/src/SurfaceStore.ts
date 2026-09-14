@@ -1,4 +1,5 @@
 import {
+  releaseSurfaceCanvas,
   surface2DContext,
   videoColorSpace,
   SDR_COLOR,
@@ -250,6 +251,7 @@ interface CanvasEntry {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   presentation: SurfaceFramePresentationSize;
+  dispose: () => void;
 }
 
 /** Per-surface presenter state.  Queues decoded frames so presentation
@@ -1570,7 +1572,7 @@ export class SurfaceStore {
     const entry = this.decoders.get(surfaceId);
     if (entry) safeClose(entry.decoder);
     this.decoders.delete(surfaceId);
-    this.canvases.delete(surfaceId);
+    this.releaseCanvas(surfaceId);
     this.surfaceColors.delete(surfaceId);
     this.hdrFrames.get(surfaceId)?.close();
     this.hdrFrames.delete(surfaceId);
@@ -2297,7 +2299,7 @@ export class SurfaceStore {
       safeClose(entry.decoder);
     }
     this.decoders.clear();
-    this.canvases.clear();
+    for (const id of this.canvases.keys()) this.releaseCanvas(id);
     this.surfaceColors.clear();
     for (const frame of this.hdrFrames.values()) frame.close();
     this.hdrFrames.clear();
@@ -2334,7 +2336,7 @@ export class SurfaceStore {
       safeClose(entry.decoder);
     }
     this.decoders.clear();
-    this.canvases.clear();
+    for (const id of this.canvases.keys()) this.releaseCanvas(id);
     this.surfaceColors.clear();
     for (const frame of this.hdrFrames.values()) frame.close();
     this.hdrFrames.clear();
@@ -2879,7 +2881,7 @@ export class SurfaceStore {
           String(frame.colorSpace?.transfer) === "hlg"
         )
           this.hdrFrames.set(surfaceId, frame.clone());
-        ce.ctx.drawImage(frame, 0, 0);
+        if (!ce.ctx.isContextLost?.()) ce.ctx.drawImage(frame, 0, 0);
         ce.presentation = this.framePresentation.get(frame) ?? {
           width: frame.displayWidth,
           height: frame.displayHeight,
@@ -2988,15 +2990,32 @@ export class SurfaceStore {
       canvas.width = w;
       canvas.height = h;
       const ctx = surface2DContext(canvas);
-      if (!ctx) return;
+      if (!ctx) {
+        releaseSurfaceCanvas(canvas);
+        return;
+      }
+      const restored = () => {
+        if (this.canvases.get(surfaceId)?.canvas === canvas)
+          this._keyframeSender?.(surfaceId);
+      };
+      canvas.addEventListener("contextrestored", restored);
       this.canvases.set(surfaceId, {
         canvas,
         ctx,
         presentation: { width: w, height: h },
+        dispose: () => {
+          canvas.removeEventListener("contextrestored", restored);
+          releaseSurfaceCanvas(canvas);
+        },
       });
     } catch {
       // Fallback for environments where canvas creation fails.
     }
+  }
+
+  private releaseCanvas(surfaceId: SurfaceId): void {
+    this.canvases.get(surfaceId)?.dispose();
+    this.canvases.delete(surfaceId);
   }
 
   private webCodecsUnavailableWarned = false;

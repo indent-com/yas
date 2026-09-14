@@ -67,6 +67,14 @@ describe("Surface color negotiation", () => {
       surface2DContext({ getContext } as unknown as HTMLCanvasElement),
     ).toBe(context);
     expect(getContext).toHaveBeenLastCalledWith("2d");
+    getContext.mockReturnValueOnce(null);
+    expect(
+      surface2DContext({ getContext } as unknown as HTMLCanvasElement),
+    ).toBe(context);
+    getContext.mockReturnValue(null);
+    expect(
+      surface2DContext({ getContext } as unknown as HTMLCanvasElement),
+    ).toBeNull();
   });
   it("validates masks without changing legacy OPEN_VIEW bytes", () => {
     const ext = (value: number[]) => ({
