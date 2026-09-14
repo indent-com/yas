@@ -313,15 +313,57 @@ fn p3_and_pq_survive_composition_and_unset_restores_sdr() {
     color.unset_image_description();
     root.commit();
     queue.roundtrip(&mut app).unwrap();
-    loop {
+    let (sid, native) = loop {
         if let CompositorEvent::SurfaceCommit {
-            pixels: PixelData::Bgra(_),
+            surface_id,
+            pixels: PixelData::Bgra(pixels),
             ..
         } = handle
             .event_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
         {
+            break (surface_id, pixels);
+        }
+    };
+    // A CPU subscriber can arrive after the image exists. Its first frame
+    // must provision target-sized readback storage and deliver real pixels.
+    handle
+        .command_tx
+        .send(yas_compositor::CompositorCommand::RegisterDownscaleTarget {
+            surface_id: u32::from(sid),
+            target_w: 32,
+            target_h: 32,
+            native_w: 64,
+            native_h: 64,
+            want_nv12_opaque: false,
+            want_cpu_pixels: true,
+            opaque_is_444: false,
+            opaque_color: yas_compositor::color::OutputColor::Srgb,
+        })
+        .unwrap();
+    handle.wake();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "no CPU downscale readback");
+        if let CompositorEvent::SurfaceCommit {
+            width: 32,
+            height: 32,
+            pixels: PixelData::Bgra(pixels),
+            ..
+        } = handle
+            .event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+        {
+            assert_eq!(pixels.len(), 32 * 32 * 4);
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel == &native[..4])
+            );
             break;
         }
     }

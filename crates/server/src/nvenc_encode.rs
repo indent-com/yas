@@ -475,11 +475,33 @@ fn rptr(buf: &[u8], off: usize) -> *mut c_void {
 // ---------------------------------------------------------------------------
 
 /// A compositor NV12 buffer imported into CUDA and registered with NVENC.
-/// Held for the encoder's lifetime so the per-frame path is map/encode/unmap
-/// only; see `NvencDirectEncoder::nv12_imports`.
+/// Cached so the per-frame path is map/encode/unmap only; see
+/// `NvencDirectEncoder::nv12_imports`.
 struct Nv12Import {
     ext_mem: gpu_libs::CUexternalMemory,
+    devptr: gpu_libs::CUdeviceptr,
     registered: *mut c_void,
+}
+
+impl Nv12Import {
+    /// The owning CUDA context is current and NVENC has unmapped the input.
+    unsafe fn release(
+        self,
+        cuda: &gpu_libs::CudaFns,
+        encoder: *mut c_void,
+        fns: &NvEncFunctionList,
+    ) {
+        unsafe {
+            (fns.nvEncUnregisterResource)(encoder, self.registered);
+            // CUDA requires each cuExternalMemoryGetMappedBuffer pointer to
+            // be freed separately, before destroying its external-memory
+            // handle. Destroying only the handle leaks the device mapping.
+            (cuda.cuMemFree_v2)(self.devptr);
+            if let Some(destroy) = cuda.cuDestroyExternalMemory {
+                destroy(self.ext_mem);
+            }
+        }
+    }
 }
 
 /// CPU-readable NV12 fallback resources.
@@ -1169,10 +1191,7 @@ impl NvencDirectEncoder {
                 (cuda.cuMemFree_v2)(upload.cuda_devptr);
             }
             for (_, imp) in self.nv12_imports.drain() {
-                (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
-                if let Some(destroy) = cuda.cuDestroyExternalMemory {
-                    destroy(imp.ext_mem);
-                }
+                imp.release(cuda, self.encoder, self.fns);
             }
         }
     }
@@ -1554,11 +1573,9 @@ impl NvencDirectEncoder {
         // the encode path unmaps before returning — so this is safe.
         const MAX_CACHED_IMPORTS: usize = 6;
         if self.nv12_imports.len() >= MAX_CACHED_IMPORTS {
-            let stale: Vec<Nv12Import> = self.nv12_imports.drain().map(|(_, v)| v).collect();
-            for imp in stale {
+            for (_, imp) in self.nv12_imports.drain() {
                 unsafe {
-                    (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
-                    cu_destroy(imp.ext_mem);
+                    imp.release(cuda, self.encoder, self.fns);
                 }
             }
             if self.verbose {
@@ -1631,7 +1648,10 @@ impl NvencDirectEncoder {
             (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
         };
         if nv_status != NV_ENC_SUCCESS {
-            unsafe { cu_destroy(ext_mem) };
+            unsafe {
+                (cuda.cuMemFree_v2)(devptr);
+                cu_destroy(ext_mem);
+            }
             eprintln!("[nvenc-zerocopy] nvEncRegisterResource failed: {nv_status}");
             return None;
         }
@@ -1647,6 +1667,7 @@ impl NvencDirectEncoder {
             buf_id,
             Nv12Import {
                 ext_mem,
+                devptr,
                 registered,
             },
         );
@@ -2102,16 +2123,17 @@ impl Drop for NvencDirectEncoder {
             // release the CUDA side (which also closes the dup'd fd it took
             // ownership of at import).
             for (_, imp) in self.nv12_imports.drain() {
-                (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
-                if let Some(cuda) = cuda
-                    && let Some(destroy) = cuda.cuDestroyExternalMemory
-                {
-                    destroy(imp.ext_mem);
+                if let Some(cuda) = cuda.filter(|_| pushed) {
+                    imp.release(cuda, self.encoder, self.fns);
+                } else {
+                    // A lost context cannot release CUDA allocations. Still
+                    // unregister the input before destroying the session.
+                    (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
                 }
             }
             (self.fns.nvEncDestroyBitstreamBuffer)(self.encoder, self.output_buffer);
             (self.fns.nvEncDestroyEncoder)(self.encoder);
-            if let Some(cuda) = cuda {
+            if let Some(cuda) = cuda.filter(|_| pushed) {
                 if let Some(upload) = upload {
                     (cuda.cuMemFreeHost)(upload.pinned_host as *mut c_void);
                     (cuda.cuMemFree_v2)(upload.cuda_devptr);
@@ -2119,10 +2141,8 @@ impl Drop for NvencDirectEncoder {
                 // The context is the shared device primary context — other
                 // encoders are using it, so it is never destroyed here (the
                 // retain in `primary_ctx` is process-lifetime).
-                if pushed {
-                    let mut previous: gpu_libs::CUcontext = ptr::null_mut();
-                    (cuda.cuCtxPopCurrent_v2)(&mut previous);
-                }
+                let mut previous: gpu_libs::CUcontext = ptr::null_mut();
+                (cuda.cuCtxPopCurrent_v2)(&mut previous);
             }
         }
     }
@@ -2131,6 +2151,145 @@ impl Drop for NvencDirectEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires NVIDIA Vulkan and NVENC; select YAS_COLOR_GPU"]
+    fn nvenc_external_import_release_frees_mapping() {
+        use crate::{color_gpu_tests::client::ColorClient, surface_encoder::ChromaSubsampling};
+        use std::os::fd::AsRawFd;
+        use yas_compositor::{CompositorCommand, PixelData, color::OutputColor};
+
+        let device =
+            std::env::var("YAS_COLOR_GPU").unwrap_or_else(|_| "/dev/dri/renderD129".into());
+        let mut source = ColorClient::new(&device, OutputColor::DisplayP3);
+        source
+            .handle
+            .command_tx
+            .send(CompositorCommand::SetColorOutputTargets {
+                surface_id: source.surface_id as u32,
+                target_w: 256,
+                target_h: 256,
+                native_w: 256,
+                native_h: 256,
+                want_cpu_pixels: false,
+                targets: vec![yas_compositor::ColorOutputTarget {
+                    width: 256,
+                    height: 256,
+                    color: OutputColor::DisplayP3,
+                    is_444: false,
+                    buffers: Vec::new(),
+                }],
+            })
+            .unwrap();
+        source.handle.wake();
+        source.repaint();
+        let bundle = source.gpu_frame(256, false);
+        let pixels = match &bundle {
+            PixelData::GpuVariants(variants) => &variants[0],
+            pixels => pixels,
+        };
+        let PixelData::Nv12OpaqueFd {
+            fd,
+            buf_id,
+            allocation_size,
+            stride,
+            uv_offset,
+            width,
+            height,
+            is_444,
+            sync_fd,
+            ..
+        } = pixels
+        else {
+            panic!("expected a CUDA-importable compositor frame");
+        };
+        let cuda = gpu_libs::cuda().unwrap();
+        let lib = gpu_libs::DynLib::open(&["libcuda.so.1"]).unwrap();
+        let pointer_attribute: unsafe extern "C" fn(*mut c_void, u32, u64) -> i32 =
+            unsafe { lib.sym("cuPointerGetAttribute").unwrap() };
+        let buffer_id = |devptr| {
+            let mut id = 0u64;
+            // CU_POINTER_ATTRIBUTE_BUFFER_ID identifies a mapping even if
+            // CUDA reuses its virtual address for a later allocation.
+            let status = unsafe { pointer_attribute((&mut id as *mut u64).cast(), 7, devptr) };
+            match status {
+                0 => Some(id),
+                1 => None, // CUDA_ERROR_INVALID_VALUE: no allocation here.
+                status => panic!("cuPointerGetAttribute failed: {status}"),
+            }
+        };
+        let encode = |encoder: &mut NvencDirectEncoder, id| {
+            encoder
+                .encode_nv12_opaque_fd(
+                    fd.as_raw_fd(),
+                    id,
+                    *allocation_size,
+                    *stride,
+                    *uv_offset,
+                    *width,
+                    *height,
+                    *is_444,
+                    8,
+                    sync_fd.as_ref().map(|fd| fd.as_raw_fd()),
+                )
+                .expect("encode imported frame");
+        };
+        let mut retained = Vec::new();
+        for action in ["resize", "eviction", "drop"] {
+            let mut encoder = NvencDirectEncoder::try_new_color(
+                "h264",
+                256,
+                256,
+                20,
+                1,
+                true,
+                ChromaSubsampling::Cs420,
+                Some(OutputColor::DisplayP3),
+            )
+            .unwrap();
+            encode(&mut encoder, *buf_id);
+            let devptr = encoder.nv12_imports[buf_id].devptr;
+            unsafe {
+                assert_eq!((cuda.cuCtxPushCurrent_v2)(encoder.cuda_ctx), 0);
+            }
+            let before = buffer_id(devptr).expect("live mapped CUDA buffer");
+            match action {
+                "resize" => {
+                    assert!(encoder.resize(192, 192));
+                    assert!(encoder.nv12_imports.is_empty());
+                }
+                "eviction" => {
+                    // Give each import a fresh compositor identity to model
+                    // buffer replacement without changing encoder dimensions.
+                    for offset in 1..=6 {
+                        encode(&mut encoder, buf_id + offset);
+                    }
+                    assert!(!encoder.nv12_imports.contains_key(buf_id));
+                }
+                "drop" => drop(encoder),
+                _ => unreachable!(),
+            }
+            let after = buffer_id(devptr);
+            unsafe {
+                // Clean up the leaked mapping when running against old code.
+                if after == Some(before) {
+                    retained.push(action);
+                    (cuda.cuMemFree_v2)(devptr);
+                }
+                let mut previous = ptr::null_mut();
+                assert_eq!((cuda.cuCtxPopCurrent_v2)(&mut previous), 0);
+            }
+            eprintln!(
+                "{action}: CUDA mapping retained = {}",
+                after == Some(before)
+            );
+        }
+        assert!(
+            retained.is_empty(),
+            "CUDA mappings retained after {retained:?}"
+        );
+    }
 
     fn caps() -> NvencCaps {
         // What an Ada-generation AV1 engine reports.

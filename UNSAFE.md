@@ -100,6 +100,8 @@ The `NvEncFunctionList` struct must match the SDK's `NV_ENCODE_API_FUNCTION_LIST
 
 NVENC sessions share a retained CUDA primary context. Each worker pushes that context before GPU operations and pops it afterwards; dropping a session must not destroy the shared context. Input registrations describe the current dimensions and pitch, whether they import compositor allocations or reference a lazily allocated CUDA upload buffer.
 
+An imported compositor buffer owns both a CUDA external-memory handle and the device pointer returned by `cuExternalMemoryGetMappedBuffer`. After the last encode has unmapped its input, cleanup unregisters the NVENC resource, frees the mapped pointer with `cuMemFree_v2`, then destroys the external-memory handle. Cache eviction, resize, and encoder teardown use this same order under the owning CUDA context. Failed NVENC registration also frees the mapped pointer before destroying the handle. [CUDA requires explicit release of mapped buffers](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html); destroying the external-memory handle alone does not discharge that ownership.
+
 Resolution changes use `nvEncReconfigureEncoder` with exclusive session ownership on a blocking worker, after the previous encode has unmapped its input and unlocked its output. Sessions reserve at most 25% growth per axis, capped by hardware limits; shrinking below one quarter of that reserved area rebuilds to release memory. A successful resize unregisters and releases the old input resources before another encode can allocate or import replacements; it also clears cached H.264 headers and forces an IDR. Dimensions beyond the reservation, split-frame mode changes, or driver refusals take the normal rebuild path. Codec, chroma, preset, and maximum dimensions remain fixed within a session.
 
 ## VA-API direct encoder in `server`
@@ -171,7 +173,7 @@ Peer-controlled packets are capped at 4 MiB before any decoder. Negotiated dimen
 - **Windows handle leaks** — every `CreatePipe`/`CreatePseudoConsole`/`CreateProcessW` path must close all handles on failure. `CloseHandle(pi.hThread)` must be called after `CreateProcessW` since the thread handle is unused.
 - **Vulkan renderer resource ordering** — `VulkanRenderer::Drop` must destroy images, image views, descriptor sets, pipelines, and command buffers before destroying the device, and the device before the instance.
 - **DMA-BUF import lifetime** — imported Vulkan memory from DMA-BUF fds must not outlive the client buffer; evicted persistent textures are deferred to `pending_destroy_textures` until the in-flight GPU submission completes.
-- **Staging pointer lifetime** — the raw `vkMapMemory` pointer in `OutputImage::staging_ptr` is valid for one frame cycle (double-buffered output images). The encoder must consume the `PixelData::Bgra` before `retire_pending` is called again for the same output image.
+- **Staging pointer lifetime** — the raw `vkMapMemory` pointer in `ReadbackBuffer::ptr` belongs to an optional native or downscale readback allocation. Recording a CPU copy first creates that allocation; retirement reads it only after the submission fence completes. Published `PixelData` owns separate bytes through `Arc`, so later readback reuse or eviction cannot invalidate a consumer's frame.
 - **`PR_SET_PDEATHSIG` on service children** — every long-lived child spawned by `AudioPipeline` or `DesktopBus` must use `pre_exec(pdeathsig_hook())`. Missing it means the child survives server restarts and leaks.
 
 ## Managed surface color
@@ -180,8 +182,22 @@ Peer-controlled packets are capped at 4 MiB before any decoder. Negotiated dimen
 passes and output rings for managed trees. Their staging allocation and read
 length are eight bytes per pixel, against four for BGRA8; the ring cache key
 includes that format. A submission retains the format and color class until
-its fence completes. Only then are half floats read and expanded into owned
-`Vec<f32>` pixels; resizing and transfer/gamut encoding use safe Rust. New
+its fence completes. Only then are half floats expanded directly from the
+mapped staging slice into owned `Vec<f32>` pixels; the slice is consumed before
+the output can be reused or evicted. Idle output-ring and SHM-texture caches
+count Vulkan allocation sizes, staging, and retained CPU buffers against byte
+budgets; eviction uses the existing fence-retired destruction paths. Native
+and downscale readback allocation is lazy, checks the byte extent, and unwinds
+every acquired Vulkan resource on failure. A periodic sweep expires old output
+sizes, reusable SHM textures, and unused readbacks only when no tracked or
+abandoned submission can reference them. Downscale BGRA scratch is likewise
+optional: the render plan creates it before recording any blit or compute
+reference, and retains it until that submission retires. Managed-color and
+native-size CPU paths need no scratch. Unused scratch expires through the
+same sweep; target teardown still defers destruction while GPU work is live.
+Current native render images and live surface textures remain allocated.
+Resizing and transfer/gamut encoding use
+safe Rust. New
 2:10:10:10 and 16-bit integer/float SHM and DMA-BUF formats use matching
 Vulkan formats. SHM staging offsets, row lengths, and bounds use each format's
 texel size. Linear DMA-BUF mmap fallback checks the complete range including

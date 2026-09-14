@@ -428,6 +428,30 @@ sequenceDiagram
 
 The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `ash` (dlopen `libvulkan.so`). Client surface buffers (SHM or DMA-BUF) are uploaded as persistent GPU textures at `wl_surface.commit` time and reused across frames until the surface commits a new buffer. SHM normally copies only accumulated damaged rows into a reusable mapped staging buffer. When `VK_EXT_external_memory_host` exposes the client mapping as coherent device-local memory, Vulkan reads those damaged rows directly and the compositor retains the `wl_buffer` until the submission fence signals. NVIDIA host import remains opt-in because its driver currently shadows the full allocation, which is slower than the damage-aware staging path.
 
+Idle Vulkan resources have byte budgets as well as entry limits: old native
+output rings retain at most 256 MiB across eight sizes, and reusable SHM
+textures retain at most 64 MiB across sixteen textures. The budgets include
+GPU allocations and mapped staging buffers; output rings also count retained
+CPU pixel buffers. Oldest-used sizes are evicted first so repeatedly rendered
+windows reuse their allocations. Active resources are outside these cache
+budgets. Old sizes and reusable SHM textures become eligible for eviction after
+five seconds without reuse. A once-per-second sweep runs only after tracked
+GPU work retires, including when applications stop repainting.
+
+Native and downscale CPU readback buffers are allocated only when a frame
+needs CPU pixels. GPU-only output paths allocate no host staging upfront.
+Readback buffers and their CPU pixel pools also expire after five seconds
+without a CPU read, so bootstrap frames and occasional captures do not leave
+permanent host mappings. A later capture or CPU subscriber recreates them on
+demand. Managed-color readback expands half floats directly from mapped
+staging into the owned float frame, avoiding an extra full-frame CPU copy.
+
+Per-target BGRA scratch images are also lazy. Managed-color conversion scales
+directly from the native float image, and native-size CPU targets read the
+native image, so neither path reserves an unused BGRA copy. Other targets
+allocate scratch before their first blit, reuse it while active, and release
+it after five seconds without use once GPU work has retired.
+
 #### Output pipeline
 
 The render pipeline has three tiers, chosen at runtime based on hardware capabilities:
@@ -467,6 +491,11 @@ av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, av1-vulkan, h264-vulkan, h264-soft
 ```
 
 NVENC and VA-API are tried before the Vulkan tier. Vulkan Video remains ahead of software and encodes on the compositor's own device, so a frame never leaves the GPU that composited it and no server-side encode enters the path at all. It takes the same per-client target and pacing path as the other encoders. It has no speed control and no rate control beyond the adaptive QP, and a session can still be declined after selection. None of that strands a client — a 4:4:4 refusal retries the same codec at 4:2:0, and a 4:2:0 refusal falls through to the encoders below it.
+
+NVENC caches up to six imported compositor buffers per encoder. Eviction,
+resolution changes, and encoder shutdown release both the CUDA device mapping
+and its external-memory handle after unregistering the NVENC input, so replaced
+buffers do not retain GPU memory for the life of the server.
 
 The rank needs explicit code because the Vulkan tier is selected by the tick loop rather than by the walk down the preference list: `outranking_encoder_pending()` in `crates/server/src/surface_encoder.rs` holds the tier back while any encoder ranked **above** it could still serve the client at this size. On the default list that means NVENC and VA-API get their turn first. While Vulkan is held back, server-side creation stops at the Vulkan boundary so software cannot jump ahead of it. "Could still" is what the host has proven — NVENC answers exactly from its cached capability query, and any family that failed to build and reproduced the failure at probe size is written off. VA-API has no cheap probe, so it stays a candidate until the fallback chain has tried it once.
 

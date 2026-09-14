@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -36,9 +37,15 @@ use super::render::{GpuLayer, SurfaceMeta, collect_gpu_layers, to_physical};
 /// broken — at 60 fps this is a fifth of a second.
 const VULKAN_ENCODE_FAILURE_LIMIT: u32 = 12;
 const MAX_REUSABLE_SHM_TEXTURES: usize = 16;
+// Bounds for idle resources only. Active images and textures are required by
+// their surfaces; old resize dimensions must not retain gigabytes of buffers.
+const REUSABLE_SHM_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const OUTPUT_IMAGE_CACHE_BYTE_LIMIT: u64 = 256 * 1024 * 1024;
 const SHM_DAMAGE_HISTORY_LIMIT: usize = 64;
 const MAX_SHM_DAMAGE_RECTS: usize = 32;
 const OUTPUT_IMAGE_CACHE_LIMIT: usize = 8;
+const IDLE_GPU_CACHE_TTL: Duration = Duration::from_secs(5);
+const GPU_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShmDamageRect {
@@ -127,6 +134,8 @@ struct ShmTextureState {
     staging_memory: vk::DeviceMemory,
     mapped_ptr: usize,
     row_pitch: usize,
+    allocation_bytes: u64,
+    cached_at: Instant,
     surface_id: Option<ObjectId>,
     generation: u64,
 }
@@ -365,9 +374,11 @@ pub(crate) struct VulkanRenderer {
     // compositor alternated between differently sized surfaces.
     output_images: Vec<OutputImage>,
     output_idx: usize,
-    output_image_cache: HashMap<(u32, u32, bool), (Vec<OutputImage>, usize)>,
+    // Oldest use first; a hit removes the set until it becomes idle again.
+    output_image_cache: VecDeque<CachedOutputImages>,
     output_image_cache_switches: u64,
     output_image_cache_hits: u64,
+    last_cache_sweep: Instant,
 
     // Per-frame temporary textures (SHM uploads) — freed at start of next frame.
     frame_textures: Vec<TempTexture>,
@@ -1006,6 +1017,7 @@ unsafe impl Send for VulkanRenderer {}
 
 struct OutputImage {
     linear: bool,
+    allocation_bytes: u64,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -1013,30 +1025,83 @@ struct OutputImage {
     width: u32,
     height: u32,
 
-    /// Staging buffer for CPU readback (fallback when DMA-BUF export unavailable).
-    staging_buf: vk::Buffer,
-    staging_mem: vk::DeviceMemory,
-    staging_ptr: *mut u8,
+    /// Created only when a frame actually needs CPU pixels.
+    readback: Option<ReadbackBuffer>,
+}
 
-    /// Readback frame-buffer pool, see [`pooled_pixel_buf`].
+struct CachedOutputImages {
+    key: (u32, u32, bool),
+    images: Vec<OutputImage>,
+    index: usize,
+    last_used: Instant,
+}
+
+impl CachedOutputImages {
+    fn retained_bytes(&self) -> u64 {
+        self.images
+            .iter()
+            .map(|image| {
+                image.allocation_bytes
+                    + image
+                        .readback
+                        .as_ref()
+                        .map_or(0, ReadbackBuffer::retained_bytes)
+            })
+            .sum()
+    }
+}
+
+/// Per-client target that doesn't import GBM buffers. Managed-color
+/// conversion reads the native float image directly; native-sized CPU
+/// targets also need no BGRA scratch image. Allocate scratch and readback
+/// storage independently, only when the render plan actually uses them.
+struct DownscaleOutput {
+    scratch: Option<DownscaleScratch>,
+    width: u32,
+    height: u32,
+    readback: Option<ReadbackBuffer>,
+}
+
+impl DownscaleOutput {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            scratch: None,
+            width,
+            height,
+            readback: None,
+        }
+    }
+}
+
+/// BGRA image used only by the unmanaged downscale/compute path.
+struct DownscaleScratch {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    last_used: Instant,
+}
+
+/// Host-visible storage read only after its submission fence completes.
+/// Keeping this separate from render images avoids staging allocations for
+/// GPU-only streams, including their per-client downscale targets.
+struct ReadbackBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    size: usize,
+    allocation_bytes: u64,
+    last_used: Instant,
     pixel_pool: Vec<Arc<Vec<u8>>>,
 }
 
-/// Server-allocated BGRA target sized at `(width, height)` for a
-/// per-client encoder that doesn't import GBM buffers.  The render
-/// loop blits the native composite into `image` (LINEAR downscale)
-/// and copies the result into `staging_*` for CPU readback by the
-/// per-client `SurfaceEncoder`.
-struct DownscaleOutput {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    width: u32,
-    height: u32,
-    staging_buf: vk::Buffer,
-    staging_mem: vk::DeviceMemory,
-    staging_ptr: *mut u8,
-    /// Readback frame-buffer pool, see [`pooled_pixel_buf`].
-    pixel_pool: Vec<Arc<Vec<u8>>>,
+impl ReadbackBuffer {
+    fn retained_bytes(&self) -> u64 {
+        self.allocation_bytes
+            + self
+                .pixel_pool
+                .iter()
+                .map(|pixels| pixels.capacity() as u64)
+                .sum::<u64>()
+    }
 }
 
 /// Reclaim a uniquely-owned readback buffer from the pool, or allocate.
@@ -2007,9 +2072,10 @@ impl VulkanRenderer {
             compute_image_descriptor_set_layout,
             output_images: Vec::new(),
             output_idx: 0,
-            output_image_cache: HashMap::new(),
+            output_image_cache: VecDeque::new(),
             output_image_cache_switches: 0,
             output_image_cache_hits: 0,
+            last_cache_sweep: Instant::now(),
             frame_textures: Vec::new(),
             color_luts: HashMap::new(),
             pending_submit: None,
@@ -2561,16 +2627,8 @@ impl VulkanRenderer {
             },
         };
 
-        if encoder.is_some()
-            && (w, h) != (native_w, native_h)
-            && !self.ensure_vulkan_downscale_target(surface_id, w, h, (native_w, native_h))
-        {
-            if let Some(mut enc) = encoder
-                && let Some(ref vfns) = self.video_fns
-            {
-                unsafe { enc.destroy(&self.device, vfns) };
-            }
-            return false;
+        if encoder.is_some() && (w, h) != (native_w, native_h) {
+            self.register_vulkan_downscale_target(surface_id, w, h, (native_w, native_h));
         }
 
         // The encoder reads its source from an image, and until now the only
@@ -3087,40 +3145,34 @@ impl VulkanRenderer {
     // Server-allocated BGRA downscale targets
     // ---------------------------------------------------------------
 
-    /// Ensure a target-sized BGRA scratch image exists for Vulkan Video.
+    /// Register a downscale target for Vulkan Video. Scratch is lazy because
+    /// managed-color conversion scales directly from the native float image.
     ///
     /// Unlike `register_downscale_target`, this does not change which
     /// representations are published for server-side readers sharing the
     /// same target. Vulkan Video consumes the scratch image entirely inside
     /// the compositor after the BGRA→NV12/NV24 compute pass.
-    fn ensure_vulkan_downscale_target(
+    fn register_vulkan_downscale_target(
         &mut self,
         surface_id: u32,
         target_w: u32,
         target_h: u32,
         native: (u32, u32),
-    ) -> bool {
+    ) {
         let key = (surface_id, target_w, target_h);
         self.target_natives.insert(key, native);
         if self.downscale_outputs.contains_key(&key) {
-            return true;
+            return;
         }
-        let Some(out) = self.create_downscale_output(target_w, target_h) else {
-            eprintln!(
-                "[vulkan-render] failed to allocate Vulkan downscale target \
-                 {target_w}x{target_h} for sid {surface_id}",
-            );
-            return false;
-        };
-        self.downscale_outputs.insert(key, out);
+        self.downscale_outputs
+            .insert(key, DownscaleOutput::new(target_w, target_h));
         eprintln!(
             "[vulkan-render] registered Vulkan downscale target sid {surface_id} \
              {target_w}x{target_h}",
         );
-        true
     }
 
-    /// Allocate a downscale target sized at `(target_w, target_h)` for
+    /// Register a downscale target sized at `(target_w, target_h)` for
     /// `surface_id`. Used by per-client encoders that don't import GBM
     /// buffers (NVENC, software). The target may publish host-visible BGRA,
     /// opaque NV12/NV24, or both. Re-registering updates those outputs.
@@ -3154,7 +3206,7 @@ impl VulkanRenderer {
             self.cpu_readback_targets.remove(&key);
         }
         if self.downscale_outputs.contains_key(&key) {
-            // The BGRA buffer is reusable, but the live representations are
+            // Existing scratch is reusable, but the live representations are
             // a property of the current subscribers. The server re-registers
             // when that set changes, so reconcile the opaque allocation and
             // CPU staging flag rather than freezing the first answer.
@@ -3202,19 +3254,13 @@ impl VulkanRenderer {
             }
             return;
         }
-        let Some(out) = self.create_downscale_output(target_w, target_h) else {
-            eprintln!(
-                "[vulkan-render] failed to allocate downscale target {target_w}x{target_h} for sid {surface_id}",
-            );
-            return;
-        };
-        self.downscale_outputs.insert(key, out);
+        self.downscale_outputs
+            .insert(key, DownscaleOutput::new(target_w, target_h));
 
-        // The BGRA image above is still the compute pass's source, so it is
-        // allocated either way; what the NV12 buffer removes is everything
-        // downstream of it — the image→staging copy and the `to_vec()` that
-        // publishes it. Best-effort: a failure here leaves the plain BGRA
-        // target registered and the caller simply keeps its old path.
+        // NV12 output removes the image→staging copy and CPU publication.
+        // Managed frames convert directly from the native float image;
+        // unmanaged frames allocate BGRA scratch before their first blit.
+        // Best-effort: failure here leaves the CPU target registered.
         if want_nv12_opaque {
             self.create_nv12_outputs(
                 surface_id,
@@ -3357,17 +3403,217 @@ impl VulkanRenderer {
         }
     }
 
-    fn destroy_downscale_output(&self, out: DownscaleOutput) {
+    fn create_readback(&self, w: u32, h: u32, linear: bool) -> Option<ReadbackBuffer> {
+        // Widen and check before multiplying; never wrap a large extent into
+        // a short staging allocation that the GPU would then write past.
+        let bytes = u64::from(w)
+            .checked_mul(u64::from(h))?
+            .checked_mul(if linear { 8 } else { 4 })?;
+        let size = usize::try_from(bytes).ok()?;
+        let info = vk::BufferCreateInfo::default()
+            .size(bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.device.create_buffer(&info, None) }
+            .inspect_err(|error| eprintln!("[readback] create buffer {w}x{h}: {error}"))
+            .ok()?;
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let Some(memory_type) = self.find_readback_memory_type(requirements.memory_type_bits)
+        else {
+            unsafe { self.device.destroy_buffer(buffer, None) };
+            eprintln!("[readback] no host-visible memory for {w}x{h}");
+            return None;
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.device.allocate_memory(&alloc, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                eprintln!("[readback] allocate {w}x{h}: {error}");
+                return None;
+            }
+        };
+        if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+            eprintln!("[readback] bind {w}x{h}: {error}");
+            return None;
+        }
+        let ptr = match unsafe {
+            self.device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        } {
+            Ok(ptr) => ptr.cast(),
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                eprintln!("[readback] map {w}x{h}: {error}");
+                return None;
+            }
+        };
+        Some(ReadbackBuffer {
+            buffer,
+            memory,
+            ptr,
+            size,
+            allocation_bytes: requirements.size,
+            last_used: Instant::now(),
+            pixel_pool: Vec::new(),
+        })
+    }
+
+    fn destroy_readback(&self, readback: ReadbackBuffer) {
+        // All callers have retired the owning submission or waited for device
+        // teardown. Published frames own their bytes separately through Arc.
         unsafe {
-            self.device.unmap_memory(out.staging_mem);
-            self.device.destroy_buffer(out.staging_buf, None);
-            self.device.free_memory(out.staging_mem, None);
-            self.device.destroy_image(out.image, None);
-            self.device.free_memory(out.memory, None);
+            self.device.unmap_memory(readback.memory);
+            self.device.destroy_buffer(readback.buffer, None);
+            self.device.free_memory(readback.memory, None);
         }
     }
 
-    fn create_downscale_output(&self, w: u32, h: u32) -> Option<DownscaleOutput> {
+    fn ensure_native_readback(&mut self, index: usize) -> bool {
+        let image = &self.output_images[index];
+        if image.readback.is_none() {
+            let Some(readback) = self.create_readback(image.width, image.height, image.linear)
+            else {
+                return false;
+            };
+            self.output_images[index].readback = Some(readback);
+        }
+        self.output_images[index]
+            .readback
+            .as_mut()
+            .unwrap()
+            .last_used = Instant::now();
+        true
+    }
+
+    fn ensure_downscale_readback(&mut self, key: (u32, u32, u32)) -> bool {
+        let Some(out) = self.downscale_outputs.get(&key) else {
+            return false;
+        };
+        if out.readback.is_none() {
+            let Some(readback) = self.create_readback(out.width, out.height, false) else {
+                return false;
+            };
+            self.downscale_outputs.get_mut(&key).unwrap().readback = Some(readback);
+        }
+        self.downscale_outputs
+            .get_mut(&key)
+            .unwrap()
+            .readback
+            .as_mut()
+            .unwrap()
+            .last_used = Instant::now();
+        true
+    }
+
+    fn ensure_downscale_scratch(&mut self, key: (u32, u32, u32)) -> bool {
+        let Some(out) = self.downscale_outputs.get(&key) else {
+            return false;
+        };
+        if out.scratch.is_none() {
+            let Some(scratch) = self.create_downscale_scratch(out.width, out.height) else {
+                return false;
+            };
+            self.downscale_outputs.get_mut(&key).unwrap().scratch = Some(scratch);
+        }
+        self.downscale_outputs
+            .get_mut(&key)
+            .unwrap()
+            .scratch
+            .as_mut()
+            .unwrap()
+            .last_used = Instant::now();
+        true
+    }
+
+    fn expire_idle_resources(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_cache_sweep) < GPU_CACHE_SWEEP_INTERVAL
+            || self.has_tracked_in_flight_work()
+            || !self.abandoned_submits.is_empty()
+        {
+            return;
+        }
+        self.last_cache_sweep = now;
+        // The cache is ordered by last use. Preserve current render images;
+        // only old sizes and uniquely owned, fence-retired SHM textures expire.
+        while self.output_image_cache.front().is_some_and(|cached| {
+            now.saturating_duration_since(cached.last_used) >= IDLE_GPU_CACHE_TTL
+        }) {
+            let cached = self.output_image_cache.pop_front().unwrap();
+            self.destroy_output_image_set(cached.images);
+        }
+        while self.reusable_shm_textures.first().is_some_and(|texture| {
+            texture.shm.as_ref().is_some_and(|state| {
+                now.saturating_duration_since(state.cached_at) >= IDLE_GPU_CACHE_TTL
+            })
+        }) {
+            let texture = self.reusable_shm_textures.remove(0);
+            self.destroy_cached_texture(texture);
+        }
+        // A bootstrap frame or capture should not keep host mappings and CPU
+        // pools alive for the lifetime of a subsequently GPU-only stream.
+        let mut expired = Vec::new();
+        for image in self.output_images.iter_mut().chain(
+            self.output_image_cache
+                .iter_mut()
+                .flat_map(|cached| &mut cached.images),
+        ) {
+            if image.readback.as_ref().is_some_and(|readback| {
+                now.saturating_duration_since(readback.last_used) >= IDLE_GPU_CACHE_TTL
+            }) {
+                expired.push(image.readback.take().unwrap());
+            }
+        }
+        let mut expired_scratch = Vec::new();
+        for out in self.downscale_outputs.values_mut() {
+            if out.readback.as_ref().is_some_and(|readback| {
+                now.saturating_duration_since(readback.last_used) >= IDLE_GPU_CACHE_TTL
+            }) {
+                expired.push(out.readback.take().unwrap());
+            }
+            if out.scratch.as_ref().is_some_and(|scratch| {
+                now.saturating_duration_since(scratch.last_used) >= IDLE_GPU_CACHE_TTL
+            }) {
+                expired_scratch.push(out.scratch.take().unwrap());
+            }
+        }
+        for readback in expired {
+            self.destroy_readback(readback);
+        }
+        for scratch in expired_scratch {
+            self.destroy_downscale_scratch(scratch);
+        }
+    }
+
+    fn destroy_downscale_output(&self, out: DownscaleOutput) {
+        if let Some(readback) = out.readback {
+            self.destroy_readback(readback);
+        }
+        if let Some(scratch) = out.scratch {
+            self.destroy_downscale_scratch(scratch);
+        }
+    }
+
+    fn destroy_downscale_scratch(&self, scratch: DownscaleScratch) {
+        unsafe {
+            self.device.destroy_image(scratch.image, None);
+            self.device.free_memory(scratch.memory, None);
+        }
+    }
+
+    fn create_downscale_scratch(&self, w: u32, h: u32) -> Option<DownscaleScratch> {
+        if w == 0 || h == 0 {
+            return None;
+        }
         let format = vk::Format::B8G8R8A8_UNORM;
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -3399,15 +3645,18 @@ impl VulkanRenderer {
             self.device
                 .create_image(&image_info, None)
                 .inspect_err(|&e| {
-                    eprintln!("[create_downscale_output] create_image failed: {e}");
+                    eprintln!("[create_downscale_scratch] create_image failed: {e}");
                 })
                 .ok()?
         };
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
-        let mem_type = self.find_memory_type(
+        let Some(mem_type) = self.find_memory_type(
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
+        ) else {
+            unsafe { self.device.destroy_image(image, None) };
+            return None;
+        };
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
@@ -3415,7 +3664,7 @@ impl VulkanRenderer {
             match self.device.allocate_memory(&alloc, None) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("[create_downscale_output] allocate_memory failed: {e}");
+                    eprintln!("[create_downscale_scratch] allocate_memory failed: {e}");
                     self.device.destroy_image(image, None);
                     return None;
                 }
@@ -3429,85 +3678,10 @@ impl VulkanRenderer {
             return None;
         }
 
-        // Staging buffer for CPU readback.
-        let staging_size = (w as u64) * (h as u64) * 4;
-        let buf_info = vk::BufferCreateInfo::default()
-            .size(staging_size)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let staging_buf = unsafe {
-            match self.device.create_buffer(&buf_info, None) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[create_downscale_output] create_buffer failed: {e}");
-                    self.device.destroy_image(image, None);
-                    self.device.free_memory(memory, None);
-                    return None;
-                }
-            }
-        };
-        let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
-        let buf_mem_type = self.find_readback_memory_type(buf_reqs.memory_type_bits);
-        let Some(buf_mem_type) = buf_mem_type else {
-            unsafe {
-                self.device.destroy_buffer(staging_buf, None);
-                self.device.destroy_image(image, None);
-                self.device.free_memory(memory, None);
-            }
-            return None;
-        };
-        let buf_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(buf_reqs.size)
-            .memory_type_index(buf_mem_type);
-        let staging_mem = unsafe {
-            match self.device.allocate_memory(&buf_alloc, None) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[create_downscale_output] allocate_memory(staging) failed: {e}");
-                    self.device.destroy_buffer(staging_buf, None);
-                    self.device.destroy_image(image, None);
-                    self.device.free_memory(memory, None);
-                    return None;
-                }
-            }
-        };
-        if unsafe { self.device.bind_buffer_memory(staging_buf, staging_mem, 0) }.is_err() {
-            unsafe {
-                self.device.destroy_buffer(staging_buf, None);
-                self.device.free_memory(staging_mem, None);
-                self.device.destroy_image(image, None);
-                self.device.free_memory(memory, None);
-            }
-            return None;
-        }
-        let staging_ptr = unsafe {
-            match self.device.map_memory(
-                staging_mem,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
-            ) {
-                Ok(p) => p as *mut u8,
-                Err(e) => {
-                    eprintln!("[create_downscale_output] map_memory failed: {e}");
-                    self.device.destroy_buffer(staging_buf, None);
-                    self.device.free_memory(staging_mem, None);
-                    self.device.destroy_image(image, None);
-                    self.device.free_memory(memory, None);
-                    return None;
-                }
-            }
-        };
-
-        Some(DownscaleOutput {
+        Some(DownscaleScratch {
             image,
             memory,
-            width: w,
-            height: h,
-            staging_buf,
-            staging_mem,
-            staging_ptr,
-            pixel_pool: Vec::new(),
+            last_used: Instant::now(),
         })
     }
 
@@ -3732,20 +3906,47 @@ impl VulkanRenderer {
             self.free_frame_textures();
         }
         if let Some(current) = self.output_images.first() {
-            let key = (current.width, current.height, current.linear);
-            let images = std::mem::take(&mut self.output_images);
-            let index = std::mem::replace(&mut self.output_idx, 0);
-            if let Some((replaced, _)) = self.output_image_cache.insert(key, (images, index)) {
-                self.destroy_output_image_set(replaced);
+            let cached = CachedOutputImages {
+                key: (current.width, current.height, current.linear),
+                images: std::mem::take(&mut self.output_images),
+                index: std::mem::replace(&mut self.output_idx, 0),
+                last_used: Instant::now(),
+            };
+            if cached.retained_bytes() <= OUTPUT_IMAGE_CACHE_BYTE_LIMIT {
+                self.output_image_cache.push_back(cached);
+            } else {
+                // One oversized ring must not flush every reusable small one.
+                self.destroy_output_image_set(cached.images);
             }
         }
 
         self.output_image_cache_switches += 1;
-        if let Some((images, index)) = self.output_image_cache.remove(&(w, h, linear)) {
+        if let Some(position) = self
+            .output_image_cache
+            .iter()
+            .position(|set| set.key == (w, h, linear))
+        {
+            let cached = self.output_image_cache.remove(position).unwrap();
             self.output_image_cache_hits += 1;
-            self.output_idx = index % images.len().max(1);
-            self.output_images = images;
-        } else {
+            self.output_idx = cached.index % cached.images.len().max(1);
+            self.output_images = cached.images;
+        }
+
+        // Evict before allocating the next size, including Vulkan's alignment
+        // padding, mapped staging, and any retained CPU frame buffers. A
+        // count-only limit kept nearly a GiB after a handful of large resizes.
+        while self.output_image_cache.len() > OUTPUT_IMAGE_CACHE_LIMIT
+            || self
+                .output_image_cache
+                .iter()
+                .map(CachedOutputImages::retained_bytes)
+                .sum::<u64>()
+                > OUTPUT_IMAGE_CACHE_BYTE_LIMIT
+        {
+            let cached = self.output_image_cache.pop_front().unwrap();
+            self.destroy_output_image_set(cached.images);
+        }
+        if self.output_images.is_empty() {
             // Double-buffered: one being rendered to, one being read back.
             for _ in 0..2 {
                 if let Some(img) = self.create_output_image(w, h, linear) {
@@ -3755,14 +3956,6 @@ impl VulkanRenderer {
             self.output_idx = 0;
         }
 
-        while self.output_image_cache.len() > OUTPUT_IMAGE_CACHE_LIMIT {
-            let Some(key) = self.output_image_cache.keys().next().copied() else {
-                break;
-            };
-            if let Some((images, _)) = self.output_image_cache.remove(&key) {
-                self.destroy_output_image_set(images);
-            }
-        }
         if self.output_image_cache_switches <= 10
             || self.output_image_cache_switches.is_multiple_of(1000)
         {
@@ -5648,84 +5841,27 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        // Widen before multiplying: `w` and `h` are u32 and the product
-        // wraps past 2^30 pixels. 32768x32768 lands on exactly 2^32, which
-        // truncates to a zero-sized buffer while the copy below is still
-        // issued with the full extent. `create_downscale_output` gets this
-        // right; this path did not.
-        let staging_size = u64::from(w) * u64::from(h) * if linear { 8 } else { 4 };
-        let buf_info = vk::BufferCreateInfo::default()
-            .size(staging_size)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let staging_buf = unsafe {
-            self.device
-                .create_buffer(&buf_info, None)
-                .inspect_err(|&e| {
-                    eprintln!("[create_output_image] create_buffer(staging) failed: {e}");
-                })
-                .ok()?
-        };
-        let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
-        let buf_mem_type = self.find_readback_memory_type(buf_reqs.memory_type_bits);
-        if buf_mem_type.is_none() {
-            eprintln!(
-                "[create_output_image] no HOST_VISIBLE memory for staging (bits={:#x})",
-                buf_reqs.memory_type_bits
-            );
-        }
-        let buf_mem_type = buf_mem_type?;
-        let buf_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(buf_reqs.size)
-            .memory_type_index(buf_mem_type);
-        let staging_mem = unsafe {
-            self.device
-                .allocate_memory(&buf_alloc, None)
-                .inspect_err(|&e| {
-                    eprintln!("[create_output_image] allocate_memory(staging) failed: {e}");
-                })
-                .ok()?
-        };
-        unsafe {
-            self.device
-                .bind_buffer_memory(staging_buf, staging_mem, 0)
-                .inspect_err(|&e| {
-                    eprintln!("[create_output_image] bind_buffer_memory(staging) failed: {e}");
-                })
-                .ok()?
-        };
-        let staging_ptr = unsafe {
-            self.device
-                .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .inspect_err(|&e| {
-                    eprintln!("[create_output_image] map_memory(staging) failed: {e}");
-                })
-                .ok()?
-        } as *mut u8;
-
         Some(OutputImage {
             linear,
+            allocation_bytes: mem_reqs.size,
             image,
             memory,
             view,
             framebuffer,
             width: w,
             height: h,
-            staging_buf,
-            staging_mem,
-            staging_ptr,
-            pixel_pool: Vec::new(),
+            readback: None,
         })
     }
 
     fn destroy_output_image_set(&self, images: Vec<OutputImage>) {
         for img in images {
+            if let Some(readback) = img.readback {
+                self.destroy_readback(readback);
+            }
             unsafe {
                 self.device.destroy_framebuffer(img.framebuffer, None);
                 self.device.destroy_image_view(img.view, None);
-                self.device.unmap_memory(img.staging_mem);
-                self.device.destroy_buffer(img.staging_buf, None);
-                self.device.free_memory(img.staging_mem, None);
                 self.device.destroy_image(img.image, None);
                 self.device.free_memory(img.memory, None);
             }
@@ -5741,8 +5877,8 @@ impl VulkanRenderer {
         self.destroy_output_images();
         let cached: Vec<Vec<OutputImage>> = self
             .output_image_cache
-            .drain()
-            .map(|(_, (images, _))| images)
+            .drain(..)
+            .map(|cached| cached.images)
             .collect();
         for images in cached {
             self.destroy_output_image_set(images);
@@ -6025,7 +6161,7 @@ impl VulkanRenderer {
                     .position(|texture| texture.shm.as_ref().is_some_and(|state| state.key == key))
             });
         let (mut texture, newly_allocated) = match reusable_index {
-            Some(index) => (self.reusable_shm_textures.swap_remove(index), false),
+            Some(index) => (self.reusable_shm_textures.remove(index), false),
             None => (self.allocate_reusable_shm_texture(key)?, true),
         };
         // A texture may have been superseded before any composite consumed
@@ -6380,6 +6516,8 @@ impl VulkanRenderer {
                 staging_memory,
                 mapped_ptr: map_ptr as usize,
                 row_pitch,
+                allocation_bytes: mem_reqs.size + staging_reqs.size,
+                cached_at: Instant::now(),
                 surface_id: None,
                 generation: 0,
             }),
@@ -6672,22 +6810,33 @@ impl VulkanRenderer {
             let Ok(mut tex) = Arc::try_unwrap(tex) else {
                 continue;
             };
-            if tex.shm.is_some() {
+            if let Some(state) = tex.shm.as_mut() {
                 // If it was superseded before rendering, no command buffer
                 // will consume its pending source. Retire that source (and
                 // any wl_buffer release parked on it) before pooling.
                 if let Some(upload) = self.pending_shm_uploads.remove(&tex.image) {
                     Self::release_pending_shm_upload(upload);
-                    if let Some(state) = tex.shm.as_mut() {
-                        state.surface_id = None;
-                        state.generation = 0;
-                    }
+                    state.surface_id = None;
+                    state.generation = 0;
                 }
-                if self.reusable_shm_textures.len() >= MAX_REUSABLE_SHM_TEXTURES {
+                state.cached_at = Instant::now();
+                if state.allocation_bytes > REUSABLE_SHM_BYTE_LIMIT {
+                    self.destroy_cached_texture(tex);
+                    continue;
+                }
+                self.reusable_shm_textures.push(tex);
+                while self.reusable_shm_textures.len() > MAX_REUSABLE_SHM_TEXTURES
+                    || self
+                        .reusable_shm_textures
+                        .iter()
+                        .filter_map(|texture| texture.shm.as_ref())
+                        .map(|state| state.allocation_bytes)
+                        .sum::<u64>()
+                        > REUSABLE_SHM_BYTE_LIMIT
+                {
                     let evicted = self.reusable_shm_textures.remove(0);
                     self.destroy_cached_texture(evicted);
                 }
-                self.reusable_shm_textures.push(tex);
             } else {
                 self.destroy_cached_texture(tex);
             }
@@ -7584,6 +7733,7 @@ impl VulkanRenderer {
         // because its staging readback is what produces a frame.
         let Some(pending) = self.pending_submit.take() else {
             self.last_pending_poll = None;
+            self.expire_idle_resources(Instant::now());
             return (None, Vec::new());
         };
         const MIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(500);
@@ -7619,6 +7769,7 @@ impl VulkanRenderer {
         let results = self.retire_pending(pending);
         // Free per-frame temporary textures now that the GPU is done.
         self.free_frame_textures();
+        self.expire_idle_resources(Instant::now());
         (
             Some(native),
             results
@@ -7680,15 +7831,19 @@ impl VulkanRenderer {
                         let size = pending.phys_w as usize
                             * pending.phys_h as usize
                             * if img.linear { 8 } else { 4 };
-                        let mut bgra = pooled_pixel_buf(&mut img.pixel_pool, size);
-                        Arc::get_mut(&mut bgra)
-                            .expect("pooled_pixel_buf returns a uniquely owned buffer")
-                            .extend_from_slice(unsafe {
-                                std::slice::from_raw_parts(img.staging_ptr, size)
-                            });
-                        pool_pixel_buf(&mut img.pixel_pool, &bgra);
+                        // The fence has signalled and this mapped allocation
+                        // remains owned by img throughout the conversion/copy.
+                        let readback = img
+                            .readback
+                            .as_mut()
+                            .expect("submitted native readback retains its allocation");
+                        assert_eq!(readback.size, size);
+                        let staged = unsafe { std::slice::from_raw_parts(readback.ptr, size) };
                         if let Some(hdr) = pending.managed {
-                            let linear: Vec<f32> = bgra
+                            // Convert directly from mapped half-floats. Keeping
+                            // an intermediate copy in pixel_pool retained two
+                            // extra 8-byte/pixel frames per output size.
+                            let linear: Vec<f32> = staged
                                 .as_chunks::<2>()
                                 .0
                                 .iter()
@@ -7728,6 +7883,11 @@ impl VulkanRenderer {
                                 false,
                             ));
                         } else {
+                            let mut bgra = pooled_pixel_buf(&mut readback.pixel_pool, size);
+                            Arc::get_mut(&mut bgra)
+                                .expect("pooled_pixel_buf returns a uniquely owned buffer")
+                                .extend_from_slice(staged);
+                            pool_pixel_buf(&mut readback.pixel_pool, &bgra);
                             results.push((
                                 pending.phys_w,
                                 pending.phys_h,
@@ -7762,11 +7922,16 @@ impl VulkanRenderer {
                 continue;
             }
             let size = (tw as usize) * (th as usize) * 4;
-            let mut bgra = pooled_pixel_buf(&mut out.pixel_pool, size);
+            let readback = out
+                .readback
+                .as_mut()
+                .expect("submitted target readback retains its allocation");
+            assert_eq!(readback.size, size);
+            let mut bgra = pooled_pixel_buf(&mut readback.pixel_pool, size);
             Arc::get_mut(&mut bgra)
                 .expect("pooled_pixel_buf returns a uniquely owned buffer")
-                .extend_from_slice(unsafe { std::slice::from_raw_parts(out.staging_ptr, size) });
-            pool_pixel_buf(&mut out.pixel_pool, &bgra);
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(readback.ptr, size) });
+            pool_pixel_buf(&mut readback.pixel_pool, &bgra);
             results.push((tw, th, PixelData::Bgra(bgra), false));
         }
 
@@ -7981,6 +8146,7 @@ impl VulkanRenderer {
         } else {
             self.free_frame_textures();
         }
+        self.expire_idle_resources(Instant::now());
         if entry_n < 20 || entry_n.is_multiple_of(50) {
             eprintln!(
                 "[render_tree_sized #{entry_n}] had_pending={had_pending} prev_results={} ext_outputs={} deferred={} pending_after={}",
@@ -8299,9 +8465,23 @@ impl VulkanRenderer {
             return (None, results);
         }
         let self_output_idx = self.output_idx;
+        let wants_native_readback = matches!(native_readback, NativeReadback::Readback { .. });
+        if wants_native_readback && !self.ensure_native_readback(self_output_idx) {
+            return (None, results);
+        }
+        for &(tw, th) in &downscale_targets {
+            let key = (sid, tw, th);
+            if !self.ensure_downscale_scratch(key) {
+                return (None, results);
+            }
+            if self.cpu_readback_targets.contains(&key) && !self.ensure_downscale_readback(key) {
+                return (None, results);
+            }
+        }
         let (out_framebuffer, out_image, out_staging_buf) = {
             let img = &self.output_images[self_output_idx];
-            (img.framebuffer, img.image, img.staging_buf)
+            let staging = wants_native_readback.then(|| img.readback.as_ref().unwrap().buffer);
+            (img.framebuffer, img.image, staging)
         };
 
         // Reuse the previous frame's reset primary command buffer. The
@@ -8903,10 +9083,11 @@ impl VulkanRenderer {
         // readers, convert it to opaque NV12/NV24, copy it to CPU-mapped
         // staging, or do both.
         for &(tw, th) in &downscale_targets {
-            let (ds_image, ds_staging) = {
-                let out = &self.downscale_outputs[&(sid, tw, th)];
-                (out.image, out.staging_buf)
-            };
+            let ds_image = self.downscale_outputs[&(sid, tw, th)]
+                .scratch
+                .as_ref()
+                .expect("downscale scratch allocated before recording")
+                .image;
             let to_dst = vk::ImageMemoryBarrier::default()
                 .image(ds_image)
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -9112,7 +9293,11 @@ impl VulkanRenderer {
                     cb,
                     ds_image,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    ds_staging,
+                    self.downscale_outputs[&(sid, tw, th)]
+                        .readback
+                        .as_ref()
+                        .expect("CPU target readback allocated before recording")
+                        .buffer,
                     &[region],
                 );
             }
@@ -9120,7 +9305,7 @@ impl VulkanRenderer {
 
         // Out_image is in TRANSFER_SRC_OPTIMAL after the render pass. Only
         // transfer it to host-visible memory when retirement will read it.
-        if matches!(native_readback, NativeReadback::Readback { .. }) {
+        if let Some(out_staging_buf) = out_staging_buf {
             let region = vk::BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
@@ -10392,6 +10577,266 @@ mod tests {
     };
     use ash::vk;
     use std::collections::VecDeque;
+
+    #[test]
+    #[ignore = "requires Vulkan; checks expiry, retained frames, and readback recreation"]
+    fn idle_gpu_resources_expire_and_readbacks_recreate() {
+        let device = std::env::var("YAS_COLOR_GPU").unwrap_or_default();
+        let mut renderer = super::VulkanRenderer::try_new(&device).expect("Vulkan renderer");
+        renderer.ensure_output_images(256, 128, false);
+        assert!(renderer.ensure_native_readback(0));
+        let buffer = renderer.output_images[0].readback.as_ref().unwrap().buffer;
+        assert!(renderer.ensure_native_readback(0));
+        assert_eq!(
+            renderer.output_images[0].readback.as_ref().unwrap().buffer,
+            buffer
+        );
+        let published = std::sync::Arc::new(vec![127; 256 * 128 * 4]);
+        super::pool_pixel_buf(
+            &mut renderer.output_images[0]
+                .readback
+                .as_mut()
+                .unwrap()
+                .pixel_pool,
+            &published,
+        );
+        renderer.ensure_output_images(320, 180, true);
+        assert!(renderer.ensure_native_readback(0));
+        assert!(renderer.ensure_native_readback(1));
+        renderer.register_vulkan_downscale_target(1, 160, 90, (320, 180));
+        assert!(renderer.downscale_outputs[&(1, 160, 90)].scratch.is_none());
+        assert!(renderer.ensure_downscale_scratch((1, 160, 90)));
+        let image = renderer.downscale_outputs[&(1, 160, 90)]
+            .scratch
+            .as_ref()
+            .unwrap()
+            .image;
+        assert!(renderer.ensure_downscale_scratch((1, 160, 90)));
+        assert_eq!(
+            renderer.downscale_outputs[&(1, 160, 90)]
+                .scratch
+                .as_ref()
+                .unwrap()
+                .image,
+            image
+        );
+        renderer.register_vulkan_downscale_target(2, 160, 90, (320, 180));
+        assert!(renderer.ensure_downscale_scratch((2, 160, 90)));
+        assert!(renderer.ensure_downscale_readback((1, 160, 90)));
+        let texture = renderer.allocate_reusable_shm_texture(shm_key()).unwrap();
+        renderer
+            .pending_destroy_textures
+            .push(std::sync::Arc::new(texture));
+        renderer.drain_pending_destroy_textures();
+
+        let now = std::time::Instant::now();
+        renderer.expire_idle_resources(now + super::GPU_CACHE_SWEEP_INTERVAL);
+        assert_eq!(renderer.output_image_cache.len(), 1);
+        assert_eq!(renderer.reusable_shm_textures.len(), 1);
+        assert!(renderer.downscale_outputs[&(1, 160, 90)].readback.is_some());
+        assert!(renderer.downscale_outputs[&(1, 160, 90)].scratch.is_some());
+
+        let later = now + super::IDLE_GPU_CACHE_TTL + super::GPU_CACHE_SWEEP_INTERVAL;
+        // A continuously used CPU readback stays warm while old captures and
+        // resize dimensions expire. Advancing timestamps avoids test sleeps.
+        renderer.output_images[0]
+            .readback
+            .as_mut()
+            .unwrap()
+            .last_used = later;
+        renderer
+            .downscale_outputs
+            .get_mut(&(2, 160, 90))
+            .unwrap()
+            .scratch
+            .as_mut()
+            .unwrap()
+            .last_used = later;
+        renderer.expire_idle_resources(later);
+        assert!(renderer.output_image_cache.is_empty());
+        assert!(renderer.reusable_shm_textures.is_empty());
+        assert_eq!(renderer.output_images.len(), 2);
+        assert!(renderer.output_images[0].readback.is_some());
+        assert!(renderer.output_images[1].readback.is_none());
+        assert!(renderer.downscale_outputs[&(1, 160, 90)].readback.is_none());
+        assert!(renderer.downscale_outputs[&(1, 160, 90)].scratch.is_none());
+        assert!(renderer.downscale_outputs[&(2, 160, 90)].scratch.is_some());
+        assert_eq!(std::sync::Arc::strong_count(&published), 1);
+        assert!(published.iter().all(|&byte| byte == 127));
+
+        // A later capture or CPU subscriber can recreate exactly the required
+        // storage, including the distinct managed/native and BGRA target sizes.
+        assert!(renderer.ensure_native_readback(1));
+        assert_eq!(
+            renderer.output_images[1].readback.as_ref().unwrap().size,
+            320 * 180 * 8
+        );
+        assert!(renderer.ensure_downscale_readback((1, 160, 90)));
+        assert!(renderer.ensure_downscale_scratch((1, 160, 90)));
+        assert_eq!(
+            renderer.downscale_outputs[&(1, 160, 90)]
+                .readback
+                .as_ref()
+                .unwrap()
+                .size,
+            160 * 90 * 4
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan; measures GPU-only output allocations"]
+    fn gpu_only_output_memory() {
+        let device = std::env::var("YAS_COLOR_GPU").unwrap_or_default();
+        let mut renderer = super::VulkanRenderer::try_new(&device).expect("Vulkan renderer");
+        renderer.ensure_output_images(3840, 2160, true);
+        assert_eq!(renderer.output_images.len(), 2);
+        for sid in [1, 2] {
+            renderer.register_vulkan_downscale_target(sid, 3840, 2160, (3840, 2160));
+        }
+        assert!(
+            renderer
+                .output_images
+                .iter()
+                .all(|image| image.readback.is_none())
+        );
+        assert!(
+            renderer
+                .downscale_outputs
+                .values()
+                .all(|out| out.readback.is_none() && out.scratch.is_none())
+        );
+        let native_bytes: u64 = renderer
+            .output_images
+            .iter()
+            .map(|image| image.allocation_bytes)
+            .sum();
+        let target_bytes: u64 = renderer
+            .downscale_outputs
+            .values()
+            .filter_map(|out| out.scratch.as_ref())
+            .map(|scratch| {
+                // SAFETY: the image is live, owned by renderer throughout.
+                unsafe {
+                    renderer
+                        .device
+                        .get_image_memory_requirements(scratch.image)
+                        .size
+                }
+            })
+            .sum();
+        assert_eq!(target_bytes, 0, "managed targets need no BGRA scratch");
+        eprintln!(
+            "GPU-only native/target allocation bytes={}",
+            native_bytes + target_bytes
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan; measures retained allocations after window resizing"]
+    fn output_cache_resize_memory() {
+        let device = std::env::var("YAS_COLOR_GPU").unwrap_or_default();
+        let mut renderer = super::VulkanRenderer::try_new(&device).expect("Vulkan renderer");
+        for step in 0..12 {
+            renderer.ensure_output_images(1200 + step * 10, 2100, true);
+            assert_eq!(renderer.output_images.len(), 2);
+            // Include CPU pool capacity in the budget, even for an output
+            // with the larger managed-color Vulkan allocations.
+            for index in 0..renderer.output_images.len() {
+                assert!(renderer.ensure_native_readback(index));
+                let readback = renderer.output_images[index].readback.as_mut().unwrap();
+                super::pool_pixel_buf(
+                    &mut readback.pixel_pool,
+                    &std::sync::Arc::new(vec![127; readback.size]),
+                );
+            }
+        }
+        let cached_bytes: u64 = renderer
+            .output_image_cache
+            .iter()
+            .map(super::CachedOutputImages::retained_bytes)
+            .sum();
+        assert!(cached_bytes <= super::OUTPUT_IMAGE_CACHE_BYTE_LIMIT);
+        assert_eq!(
+            renderer.output_image_cache.back().unwrap().key,
+            (1300, 2100, true)
+        );
+        // Alternating between two active window sizes must keep both rings.
+        let expected_image = renderer.output_image_cache.back().unwrap().images[0].image;
+        let hits = renderer.output_image_cache_hits;
+        renderer.ensure_output_images(1300, 2100, true);
+        assert_eq!(renderer.output_images[0].image, expected_image);
+        assert_eq!(renderer.output_image_cache_hits, hits + 1);
+        renderer.ensure_output_images(1310, 2100, true);
+        assert_eq!(renderer.output_image_cache_hits, hits + 2);
+        eprintln!(
+            "cached output bytes={cached_bytes}, sets={}",
+            renderer.output_image_cache.len()
+        );
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        eprintln!(
+            "{}",
+            status
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan; checks idle SHM memory and live texture ownership"]
+    fn shm_cache_resize_memory() {
+        use std::sync::Arc;
+        let device = std::env::var("YAS_COLOR_GPU").unwrap_or_default();
+        let mut renderer = super::VulkanRenderer::try_new(&device).expect("Vulkan renderer");
+        let mut key = ShmTextureKey {
+            width: 1200,
+            height: 2100,
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            force_opaque: true,
+            swap_rb: false,
+        };
+        for step in 0..12 {
+            key.width = 1200 + step * 10;
+            let texture = renderer.allocate_reusable_shm_texture(key).unwrap();
+            renderer.pending_destroy_textures.push(Arc::new(texture));
+            renderer.drain_pending_destroy_textures();
+        }
+        let retained: u64 = renderer
+            .reusable_shm_textures
+            .iter()
+            .map(|texture| texture.shm.as_ref().unwrap().allocation_bytes)
+            .sum();
+        assert!(retained <= super::REUSABLE_SHM_BYTE_LIMIT);
+        let last = renderer.reusable_shm_textures.last().unwrap();
+        assert_eq!(last.shm.as_ref().unwrap().key.width, 1310);
+        let reusable_image = last.image;
+
+        // Oversized one-off buffers must leave useful cached textures alone.
+        key.width = 2300;
+        let oversized = renderer.allocate_reusable_shm_texture(key).unwrap();
+        assert!(oversized.shm.as_ref().unwrap().allocation_bytes > super::REUSABLE_SHM_BYTE_LIMIT);
+        renderer.pending_destroy_textures.push(Arc::new(oversized));
+        renderer.drain_pending_destroy_textures();
+        assert_eq!(
+            renderer.reusable_shm_textures.last().unwrap().image,
+            reusable_image
+        );
+
+        // A texture still held by a live surface cannot be pooled or freed.
+        key.width = 1200;
+        let live = Arc::new(renderer.allocate_reusable_shm_texture(key).unwrap());
+        renderer.pending_destroy_textures.push(Arc::clone(&live));
+        renderer.drain_pending_destroy_textures();
+        assert!(
+            !renderer
+                .reusable_shm_textures
+                .iter()
+                .any(|texture| texture.image == live.image)
+        );
+        assert_eq!(Arc::strong_count(&live), 1);
+        renderer.pending_destroy_textures.push(live);
+        renderer.drain_pending_destroy_textures();
+    }
 
     fn rect(x: i32, y: i32, w: u32, h: u32, fw: u32, fh: u32) -> (i32, i32, u32, u32) {
         let r = clamped_scissor(x, y, w, h, fw, fh);
