@@ -179,7 +179,7 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
     views: new Map(),
     session: { ready: true },
     listeners: new Set(),
-    surfaceStore: { handleSurfaceEncoder: vi.fn() },
+    surfaceStore: { handleSurfaceEncoder: vi.fn(), releaseStream: vi.fn() },
   });
   return {
     connection,
@@ -199,6 +199,29 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
 }
 
 describe("YasNativeWorkspaceConnection", () => {
+  it("releases browser stream resources only when the last mount closes", async () => {
+    const view = surfaceTestView(YAS_SURFACE_CODEC_H264_V1);
+    const closed = deferred<void>();
+    view.close.mockReturnValue(closed.promise);
+    const { connection, lifecycle } = surfaceTestConnection(vi.fn());
+    const release = vi.mocked(connection.surfaceStore.releaseStream);
+    const removeFrames = vi.fn();
+    lifecycle.surfaceViews.set(1n, { view, removeFrames });
+    connection.sendSurfaceSubscribe(1n, "second", null);
+    connection.sendSurfaceUnsubscribe(1n, "second");
+    expect(release).not.toHaveBeenCalled();
+    connection.sendSurfaceUnsubscribe(1n, "view");
+    // Resource release must not wait for the remote CLOSE result, nor run
+    // after it and accidentally retire a stream opened during that wait.
+    expect(release).toHaveBeenCalledExactlyOnceWith(1n);
+    expect(removeFrames).toHaveBeenCalledOnce();
+    expect(view.close).toHaveBeenCalledOnce();
+    expect(lifecycle.surfaceViews.has(1n)).toBe(false);
+    closed.resolve();
+    await flush();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it("lets a browser copy supersede Wayland owners on every connection", () => {
     const epoch = currentBrowserClipboardEpoch();
     const connection = Object.create(
@@ -1509,6 +1532,7 @@ describe("YasNativeWorkspaceConnection", () => {
       surfaceViews: new Map([
         [9n, { removeFrames: vi.fn(), view: { close: closeSurface } }],
       ]),
+      surfaceStore: { releaseStream: vi.fn() },
       session: { ready: true },
       terminalClient: { openView, setFocus: vi.fn() },
       focusedSessionId: null,

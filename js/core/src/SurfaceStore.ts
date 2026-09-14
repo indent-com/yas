@@ -201,6 +201,7 @@ type SurfaceCodec = "h264" | "av1";
 interface DecoderEntry {
   pendingPresentation: {
     ptsUs: number;
+    submittedAt: number;
     size: SurfaceFramePresentationSize;
     ackToken?: SurfaceFrameAckToken;
   }[];
@@ -713,9 +714,8 @@ function codecFromFlags(flags: number): SurfaceCodec {
   return "h264";
 }
 
-/** Gracefully shut down a decoder, ensuring every in-flight VideoFrame
- *  reaches the output callback (which calls frame.close()) before the
- *  decoder is destroyed.
+/** Drain a retired decoder through its output callback before closing it,
+ *  with a deadline for hardware decoders that no longer make progress.
  *
  *  Chromium's reset()/close() drops internally-queued VideoFrame objects
  *  without calling .close(), triggering the "VideoFrame was garbage
@@ -727,21 +727,26 @@ function codecFromFlags(flags: number): SurfaceCodec {
  *  output callback still closes every frame via its finally block even
  *  after the decoder entry has been removed from the map. */
 function safeClose(decoder: VideoDecoder): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const close = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    try {
+      if (decoder.state !== "closed") decoder.close();
+    } catch {
+      /* already closed */
+    }
+  };
   try {
     if (decoder.state === "configured") {
-      const close = () => {
-        try {
-          if (decoder.state !== "closed") decoder.close();
-        } catch {
-          /* already closed */
-        }
-      };
+      // A stalled hardware decoder can leave flush pending forever. Bound
+      // draining so retired instances cannot exhaust the device's codecs.
+      timer = setTimeout(close, 1000);
       decoder.flush().then(close, close);
-    } else if (decoder.state !== "closed") {
-      decoder.close();
+    } else {
+      close();
     }
   } catch {
-    // Already closed or in an invalid state.
+    close();
   }
 }
 
@@ -944,6 +949,7 @@ export class SurfaceStore {
     errors: 0,
   };
   private _diagTimer: ReturnType<typeof setInterval> | null = null;
+  private _decoderRecoveryTimer: ReturnType<typeof setInterval> | null = null;
   private _visibilityHandler: (() => void) | null = null;
   private diagnosticsEnabled = true;
   /** Whether continuous streams may trade latency for smoother cadence.
@@ -1265,6 +1271,49 @@ export class SurfaceStore {
     for (const frame of pending) this.sendAck(surfaceId, frame.ackToken);
   }
 
+  /** An accepted chunk must eventually produce output, even if the server
+   * stops sending because that chunk holds its last frame credit. */
+  private recoverStalledDecoders(): void {
+    if (
+      typeof document !== "undefined" &&
+      document.visibilityState === "hidden"
+    )
+      return;
+    const now = performance.now();
+    for (const [surfaceId, entry] of this.decoders) {
+      const oldest = entry.pendingPresentation[0];
+      if (!oldest || now - oldest.submittedAt < 2000) continue;
+      console.warn("[YAS] surface decoder stalled:", surfaceId);
+      this.decoders.delete(surfaceId);
+      this.discardPendingDecoderFrames(surfaceId, entry);
+      this.discardPresenter(surfaceId);
+      this._pendingFrameSamples.delete(surfaceId);
+      this._pendingFrameReceiveTimes.delete(surfaceId);
+      safeClose(entry.decoder);
+      this.retryUnconfigured(surfaceId);
+    }
+  }
+
+  /** Release a closed stream's browser resources while retaining catalogue
+   * state. Mounted display canvases keep their last pixels until reopening. */
+  releaseStream(surfaceId: SurfaceId): void {
+    const entry = this.decoders.get(surfaceId);
+    this.decoders.delete(surfaceId);
+    if (entry) {
+      entry.pendingPresentation.length = 0;
+      safeClose(entry.decoder);
+    }
+    this.discardPresenter(surfaceId);
+    this._pendingFrameSamples.delete(surfaceId);
+    this._pendingFrameReceiveTimes.delete(surfaceId);
+    this._unconfiguredRetry.delete(surfaceId);
+    this._decodeFailStreak.delete(surfaceId);
+    this.releaseCanvas(surfaceId);
+    this.surfaceColors.delete(surfaceId);
+    this.hdrFrames.get(surfaceId)?.close();
+    this.hdrFrames.delete(surfaceId);
+  }
+
   /** Send an ACK unconditionally — used by the connection layer's catch
    *  path when handleSurfaceFrame throws before it can ACK itself. */
   sendAckFallback(surfaceId: SurfaceId, ackToken?: SurfaceFrameAckToken): void {
@@ -1326,6 +1375,10 @@ export class SurfaceStore {
             0;
       }
     }, 5000);
+    this._decoderRecoveryTimer = setInterval(
+      () => this.recoverStalledDecoders(),
+      1000,
+    );
     if (typeof document !== "undefined") {
       // Drain presenter queues the moment the tab goes hidden: any pending
       // rAF will never fire while hidden, and enqueueFrame's hidden path
@@ -1877,6 +1930,7 @@ export class SurfaceStore {
       // this frame. Updating the canvas here relabels still-visible old pixels.
       entry.pendingPresentation.push({
         ptsUs,
+        submittedAt: receiveT,
         ackToken,
         size: {
           width: presentationWidth || width,
@@ -2363,6 +2417,10 @@ export class SurfaceStore {
    * Full teardown — only called when the connection is permanently disposed.
    */
   destroy(): void {
+    if (this._decoderRecoveryTimer !== null) {
+      clearInterval(this._decoderRecoveryTimer);
+      this._decoderRecoveryTimer = null;
+    }
     if (this._diagTimer !== null) {
       clearInterval(this._diagTimer);
       this._diagTimer = null;
@@ -3084,18 +3142,8 @@ export class SurfaceStore {
             const [pending] = entry.pendingPresentation.splice(pendingIndex, 1);
             this.sendAck(surfaceId, pending.ackToken);
           }
-          this._pendingFrameReceiveTimes
-            .get(surfaceId)
-            ?.takeByPts(frame.timestamp);
-          const staleSample = this._pendingFrameSamples
-            .get(surfaceId)
-            ?.takeByPts(frame.timestamp);
-          if (staleSample !== undefined && staleSample >= 0) {
-            this._surfaceDrops.set(
-              surfaceId,
-              (this._surfaceDrops.get(surfaceId) ?? 0) + 1,
-            );
-          }
+          // Correlation queues belong to the replacement. A replayed
+          // keyframe can have the same PTS as this retired decoder's output.
           try {
             frame.close();
           } catch {
@@ -3157,6 +3205,10 @@ export class SurfaceStore {
         );
       },
       error: (e: DOMException) => {
+        // Closing/draining a retired decoder can still deliver an error.
+        // It must not reset a replacement stream or revive a closed view.
+        const entry = this.decoders.get(surfaceId);
+        if (entry?.decoder !== decoder) return;
         console.warn(
           "[yas] surface decoder error:",
           surfaceId,
@@ -3167,15 +3219,9 @@ export class SurfaceStore {
           "state:",
           decoder.state,
         );
-        // Only clean up if this decoder is still the active one —
-        // handleSurfaceFrame may have already replaced it with a fresh
-        // instance by the time this async callback fires.
-        const entry = this.decoders.get(surfaceId);
-        if (entry?.decoder === decoder) {
-          this.discardPendingDecoderFrames(surfaceId, entry);
-          safeClose(entry.decoder);
-          this.decoders.delete(surfaceId);
-        }
+        this.decoders.delete(surfaceId);
+        this.discardPendingDecoderFrames(surfaceId, entry);
+        safeClose(entry.decoder);
         this.noteDecodeFailure(surfaceId, codec);
         // Ask the server for a keyframe so the next decoder gets a clean
         // reference point. Decoder errors can repeat once per incoming

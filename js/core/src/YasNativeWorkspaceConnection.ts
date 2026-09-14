@@ -3526,6 +3526,7 @@ export class YasNativeWorkspaceConnection {
     if (!state) return;
     this.surfaceViews.delete(surfaceId);
     state.removeFrames();
+    this.surfaceStore.releaseStream(surfaceId);
     await state.view.close().catch(() => undefined);
   }
 
@@ -3883,9 +3884,10 @@ export class YasNativeWorkspaceConnection {
       state.view.closeLocal();
     }
     this.views.clear();
-    for (const state of this.surfaceViews.values()) {
+    for (const [surfaceId, state] of this.surfaceViews) {
       state.removeFrames();
       state.view.closeLocal();
+      this.surfaceStore.releaseStream(surfaceId);
     }
     this.surfaceViews.clear();
     this.cancelAllNativeSurfaceViewRetries();

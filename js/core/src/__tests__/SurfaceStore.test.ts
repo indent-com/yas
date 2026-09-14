@@ -1175,6 +1175,10 @@ describe("SurfaceStore decoder recovery", () => {
     output(frame: VideoFrame) {
       this.onOutput(frame);
     }
+    error() {
+      this.state = "closed";
+      this.onError(new DOMException("hardware decoder lost", "EncodingError"));
+    }
   }
 
   let clock = 0;
@@ -1207,8 +1211,214 @@ describe("SurfaceStore decoder recovery", () => {
     });
   });
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("recovers a silent decoder without needing another incoming frame", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const store = newStore();
+    const request = vi.fn();
+    const ack = vi.fn();
+    store.setKeyframeSender(request);
+    store.setAckSender(ack);
+    const token = { viewId: 7, sequence: 1n };
+    store.handleSurfaceFrame(
+      1,
+      0,
+      KEY_AV1,
+      1280,
+      720,
+      frame,
+      0,
+      1280,
+      720,
+      undefined,
+      token,
+    );
+    const stalled = FakeDecoder.instances[0];
+    // WebCodecs can consume its input queue without emitting any output.
+    stalled.decodeQueueSize = 0;
+    try {
+      clock = 1999;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(request).not.toHaveBeenCalled();
+      clock = 2000;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(request).toHaveBeenCalledExactlyOnceWith(1);
+      expect(ack).toHaveBeenCalledExactlyOnceWith(1, token, 0);
+      expect(stalled.state).toBe("closed");
+
+      store.handleSurfaceFrame(1, 1, KEY_AV1, 1280, 720, frame);
+      const replacement = FakeDecoder.instances.at(-1)!;
+      expect(replacement).not.toBe(stalled);
+      const output = {
+        timestamp: 1000,
+        displayWidth: 1280,
+        displayHeight: 720,
+        close: vi.fn(),
+      } as unknown as VideoFrame;
+      replacement.output(output);
+      expect(output.close).toHaveBeenCalledOnce();
+      clock = 10_000;
+      await vi.advanceTimersByTimeAsync(3000);
+      // An idle app has no pending chunk and needs no periodic reset.
+      expect(request).toHaveBeenCalledOnce();
+    } finally {
+      store.destroy();
+    }
+  });
+
+  it("caps repeated silent-decoder recovery and skips hidden pages", async () => {
+    vi.useFakeTimers();
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden");
+    const store = newStore();
+    const request = vi.fn();
+    store.setKeyframeSender(request);
+    try {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      clock = 2000;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(request).not.toHaveBeenCalled();
+      visibility.mockReturnValue("visible");
+      for (let i = 0; i < 10; i++) {
+        clock += 2000;
+        await vi.advanceTimersByTimeAsync(2000);
+        store.handleSurfaceFrame(1, i, KEY_AV1, 1280, 720, frame);
+      }
+      expect(request).toHaveBeenCalledTimes(5);
+      store.destroy();
+      clock += 10_000;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(request).toHaveBeenCalledTimes(5);
+    } finally {
+      store.destroy();
+    }
+  });
+
+  it.each(["pending", "throws", "rejects"] as const)(
+    "releases a retired decoder even when flush %s",
+    async (failure) => {
+      vi.useFakeTimers();
+      const store = newStore();
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      const decoder = FakeDecoder.instances[0];
+      vi.spyOn(decoder, "flush").mockImplementation(() => {
+        if (failure === "throws") throw new Error("flush failed");
+        if (failure === "rejects")
+          return Promise.reject(new Error("flush failed"));
+        return new Promise<void>(() => {});
+      });
+      store.releaseStream(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(decoder.state).toBe("closed");
+      store.destroy();
+    },
+  );
+
+  it("releases closed-stream buffers without removing the surface catalogue", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      drawImage: vi.fn(),
+    } as never);
+    const store = newStore();
+    const request = vi.fn();
+    const onFrame = vi.fn();
+    store.setKeyframeSender(request);
+    store.onFrame(onFrame);
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    const decoder = FakeDecoder.instances[0];
+    const canvas = store.getCanvas(1)!;
+    const info = store.getSurface(1);
+    try {
+      store.releaseStream(1);
+      expect(store.getCanvas(1)).toBeNull();
+      expect([canvas.width, canvas.height]).toEqual([0, 0]);
+      expect(store.getSurface(1)).toBe(info);
+      expect(info).toBeDefined();
+      const output = {
+        timestamp: 0,
+        displayWidth: 1280,
+        displayHeight: 720,
+        close: vi.fn(),
+      } as unknown as VideoFrame;
+      decoder.output(output);
+      decoder.error();
+      expect(output.close).toHaveBeenCalledOnce();
+      expect(onFrame).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+      canvas.dispatchEvent(new Event("contextrestored"));
+      expect(request).not.toHaveBeenCalled();
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      expect(FakeDecoder.instances.at(-1)).not.toBe(decoder);
+      expect(store.getCanvas(1)).not.toBe(canvas);
+    } finally {
+      store.destroy();
+    }
+  });
+
+  it("ignores a retired decoder's error after a replacement starts", () => {
+    const store = newStore();
+    const request = vi.fn();
+    store.setKeyframeSender(request);
+    try {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      const retired = FakeDecoder.instances[0];
+      store.handleSurfaceFrame(1, 1, KEY_AV1, 640, 360, frame);
+      const replacement = FakeDecoder.instances.at(-1)!;
+      retired.error();
+      expect(request).not.toHaveBeenCalled();
+      store.handleSurfaceFrame(1, 2, DELTA_AV1, 640, 360, frame);
+      expect(replacement.decoded).toBe(2);
+    } finally {
+      store.destroy();
+    }
+  });
+
+  it("releases queued and retained HDR frames when a stream closes", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      drawImage: vi.fn(),
+    } as never);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    const store = newStore();
+    const retained = { close: vi.fn() };
+    const first = {
+      timestamp: 0,
+      displayWidth: 1280,
+      displayHeight: 720,
+      colorSpace: { transfer: "pq" },
+      clone: () => retained,
+      close: vi.fn(),
+    } as unknown as VideoFrame;
+    const queued = {
+      timestamp: 1000,
+      displayWidth: 1280,
+      displayHeight: 720,
+      close: vi.fn(),
+    } as unknown as VideoFrame;
+    try {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      FakeDecoder.instances[0].output(first);
+      store.handleSurfaceFrame(1, 1, DELTA_AV1, 1280, 720, frame);
+      FakeDecoder.instances[0].output(queued);
+      expect(store.getHdrFrame(1)).toBe(retained);
+      expect(queued.close).not.toHaveBeenCalled();
+      store.releaseStream(1);
+      expect(queued.close).toHaveBeenCalledOnce();
+      expect(retained.close).toHaveBeenCalledOnce();
+      expect(store.getHdrFrame(1)).toBeUndefined();
+      expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
+    } finally {
+      store.destroy();
+    }
   });
 
   it("configures AV1 from the frame when the announced string is not AV1", () => {
