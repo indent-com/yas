@@ -2581,8 +2581,10 @@ the set of faces or any description relevant to loading them changes. Family
 names are canonical UTF-8 names suitable for a CSS `font-family` descriptor;
 display names may be localized. Flag bit 0 is MONOSPACE, bit 1 VARIABLE, bit 2
 COLOR, and bit 3 FETCHABLE, meaning at least one face can be fetched. Remaining
-bits are zero. A family can be listed but not fetchable when server policy or
-the font's embedding metadata forbids export.
+bits are zero. The YAS server enables export by default and only lists faces
+permitted by their embedding metadata, omitting families with no exportable
+faces. `YAS_FONT_EXPORT=0` disables export and leaves the catalogue empty.
+Clients also filter non-fetchable families advertised by older servers.
 
 DESCRIBE payload is:
 

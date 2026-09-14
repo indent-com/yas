@@ -19,11 +19,11 @@ still answers for both when one secret is what you want.
   services.yas = {
     enable = true;
 
-    # Server-owned Font protocol. Bytes remain unavailable unless allowExport
-    # is true and the face's embedding metadata also permits export.
+    # Server-owned Font protocol. Export defaults on; only faces whose
+    # embedding metadata permits export appear in the catalogue.
     fonts = {
       enable = true;
-      allowExport = false;
+      allowExport = true;
       dirs = [ "/Library/Fonts" ];
     };
 
@@ -70,7 +70,7 @@ See [`darwin-module.nix`](darwin-module.nix) for the full list of options.
 
     fonts = {
       enable = true;
-      allowExport = false;
+      allowExport = true;
       dirs = [ "/usr/share/fonts" ];
     };
 

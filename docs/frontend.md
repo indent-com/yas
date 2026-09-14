@@ -477,10 +477,13 @@ renewal timer.
 The home server owns the native YAS Font family. `yas-fonts` discovers every
 face in configured system directories, extracts its family/style/weight,
 monospace and variable/color metadata, metrics, OS/2 embedding policy, byte
-length, and BLAKE3 content hash. LIST and DESCRIBE expose metadata without
-filesystem paths; FETCH returns the exact standalone face bytes only when
-`YAS_FONT_EXPORT=1` and the face's embedding bits permit it. The edge does not
-inspect or serve fonts.
+length, and BLAKE3 content hash. Font export is enabled by default;
+`YAS_FONT_EXPORT=0` disables it. LIST and DESCRIBE expose only exportable faces
+without filesystem paths; FETCH returns their exact standalone bytes. Faces
+whose embedding bits forbid export, and families with no exportable faces,
+are omitted. Disabling export leaves the catalogue empty. The edge does not
+inspect or serve fonts. The browser picker also filters out non-fetchable
+families advertised by older servers.
 
 The browser watches the selected server's Font catalogue, describes only the
 families it needs, and creates `FontFace` objects from fetched bytes. It derives

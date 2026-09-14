@@ -118,11 +118,11 @@ in
 
       allowExport = mkOption {
         type = types.bool;
-        default = false;
+        default = true;
         description = ''
           Permit authenticated clients to fetch font bytes. OS/2 embedding
-          restrictions still take precedence. Catalogue metadata remains
-          available when <option>fonts.enable</option> is true.
+          restrictions still take precedence. Only exportable faces appear
+          in the catalogue; disabling export leaves it empty.
         '';
       };
 
@@ -324,12 +324,10 @@ in
           ];
           EnvironmentVariables = {
             YAS_SCROLLBACK = toString cfg.scrollback;
+            YAS_FONT_EXPORT = if cfg.fonts.allowExport then "1" else "0";
           }
           // lib.optionalAttrs (!cfg.fonts.enable) {
             YAS_FONTS = "0";
-          }
-          // lib.optionalAttrs cfg.fonts.allowExport {
-            YAS_FONT_EXPORT = "1";
           }
           // lib.optionalAttrs (cfg.fonts.dirs != [ ]) {
             YAS_FONT_DIRS = lib.concatStringsSep ":" cfg.fonts.dirs;

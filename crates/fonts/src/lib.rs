@@ -226,7 +226,7 @@ fn read_font_source(path: &Path) -> Result<Vec<u8>, FontSourceReadError> {
     }
 }
 
-/// A deterministic, path-free view of the server's installed fonts.
+/// A deterministic, path-free view of the server's exportable fonts.
 ///
 /// Source paths remain private and are keyed by the hash of the exact bytes a
 /// client asks for. Files are re-read and re-hashed at fetch time, preventing
@@ -287,6 +287,12 @@ impl FontCatalog {
                         face_index: face_index as u32,
                         export_status: description.export_status,
                     });
+                // LIST and DESCRIBE must only advertise faces FETCH permits.
+                // Retain private sources so direct fetches still report why
+                // a restricted face cannot be exported.
+                if description.flags & FONT_FACE_FETCHABLE == 0 {
+                    continue;
+                }
                 let faces = grouped.entry(family).or_default();
                 if !faces
                     .iter()
@@ -1936,17 +1942,15 @@ mod tests {
     }
 
     #[test]
-    fn export_policy_is_explicit_and_disables_fetch() {
+    fn disabled_export_hides_the_catalogue_and_disables_fetch() {
         let bytes = face_with_metadata("Private Mono", "Regular", 400, 0);
         let file = TempFont::write("disabled", &bytes);
         let catalogue = FontCatalog::from_paths(FontExportPolicy::Deny, [&file.0]);
-        let description = catalogue.describe("Private Mono").unwrap();
-        let face = &description.faces[0];
-        assert_eq!(face.export_status, FontExportStatus::DisabledByPolicy);
-        assert_eq!(face.flags & FONT_FACE_FETCHABLE, 0);
-        assert_eq!(description.flags & FONT_FAMILY_FETCHABLE, 0);
+        assert!(catalogue.families().is_empty());
+        assert!(catalogue.summaries().is_empty());
+        assert!(catalogue.describe("Private Mono").is_none());
         assert_eq!(
-            catalogue.fetch_face(&face.content_hash),
+            catalogue.fetch_face(&blake3_hash(&bytes)),
             Err(FontFetchError::DisabledByPolicy)
         );
     }
@@ -1960,11 +1964,15 @@ mod tests {
             let bytes = face_with_metadata("Restricted Mono", "Regular", 400, fs_type);
             let file = TempFont::write("restricted", &bytes);
             let catalogue = FontCatalog::from_paths(FontExportPolicy::Allow, [&file.0]);
-            let face = &catalogue.families()[0].faces[0];
-            assert_eq!(face.export_status, expected);
-            assert_eq!(face.flags & FONT_FACE_FETCHABLE, 0);
             assert_eq!(
-                catalogue.fetch_face(&face.content_hash),
+                embedding_status_in(&bytes, 0, FontExportPolicy::Allow),
+                expected
+            );
+            assert!(catalogue.families().is_empty());
+            assert!(catalogue.summaries().is_empty());
+            assert!(catalogue.describe("Restricted Mono").is_none());
+            assert_eq!(
+                catalogue.fetch_face(&blake3_hash(&bytes)),
                 Err(FontFetchError::RestrictedEmbedding)
             );
         }
@@ -1975,6 +1983,29 @@ mod tests {
         let file = TempFont::write("preview", &bytes);
         let catalogue = FontCatalog::from_paths(FontExportPolicy::Allow, [&file.0]);
         let face = &catalogue.families()[0].faces[0];
+        assert_eq!(face.export_status, FontExportStatus::Allowed);
+        assert!(catalogue.fetch_face(&face.content_hash).is_ok());
+    }
+
+    #[test]
+    fn mixed_family_only_describes_and_counts_exportable_faces() {
+        let regular = face_with_metadata("Mixed Mono", "Regular", 400, 0);
+        let bold = face_with_metadata("Mixed Mono", "Bold", 700, 0x0002);
+        let italic = face_with_metadata("Mixed Mono", "Italic", 400, 0x0200);
+        let file = TempFont::write("mixed", &build_test_ttc(&[regular, bold, italic]));
+        let catalogue = FontCatalog::from_paths(FontExportPolicy::Allow, [&file.0]);
+
+        let summaries = catalogue.summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].face_count, 1);
+        assert_eq!(
+            summaries[0].flags,
+            FONT_FAMILY_MONOSPACE | FONT_FAMILY_FETCHABLE
+        );
+        let description = catalogue.describe("Mixed Mono").unwrap();
+        assert_eq!(description.faces.len(), 1);
+        let face = &description.faces[0];
+        assert_eq!(face.subfamily, "Regular");
         assert_eq!(face.export_status, FontExportStatus::Allowed);
         assert!(catalogue.fetch_face(&face.content_hash).is_ok());
     }

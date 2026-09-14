@@ -2,6 +2,7 @@ import { createRoot, createSignal } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   YAS_FONT_FAMILY_MONOSPACE,
+  YAS_FONT_FAMILY_FETCHABLE,
   YAS_FONT_FACE_FETCHABLE,
   YAS_FONT_STYLE_ITALIC,
   YAS_FONT_STYLE_NORMAL,
@@ -204,22 +205,28 @@ describe("protocolFontFamilies", () => {
     expect(
       protocolFontFamilies([
         {
-          flags: YAS_FONT_FAMILY_MONOSPACE,
+          flags: YAS_FONT_FAMILY_MONOSPACE | YAS_FONT_FAMILY_FETCHABLE,
           faceCount: 1,
           family: "opaque-z",
           display: "Readable A",
         },
         {
-          flags: 0,
+          flags: YAS_FONT_FAMILY_FETCHABLE,
           faceCount: 1,
           family: "proportional",
           display: "Proportional",
         },
         {
-          flags: YAS_FONT_FAMILY_MONOSPACE,
+          flags: YAS_FONT_FAMILY_MONOSPACE | YAS_FONT_FAMILY_FETCHABLE,
           faceCount: 1,
           family: "opaque-a",
           display: "Readable Z",
+        },
+        {
+          flags: YAS_FONT_FAMILY_MONOSPACE,
+          faceCount: 1,
+          family: "unavailable",
+          display: "Not exported",
         },
       ]),
     ).toEqual(["opaque-a", "opaque-z"]);

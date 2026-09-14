@@ -23,7 +23,7 @@ connections that are no longer needed.
 | `YAS_REMOTES`                        | `~/.config/yas/yas.remotes`                                   | Only the file the one-time import reads; the live catalogue is the `remotes` KV key   |
 | `YAS_RELAY`                          | `1`                                                           | `0` disables the native YAS Relay family                                              |
 | `YAS_FONTS`                          | `1`                                                           | `0` disables the native YAS Font family                                               |
-| `YAS_FONT_EXPORT`                    | unset                                                         | `1` permits face-byte fetch when OS/2 embedding policy also permits it                |
+| `YAS_FONT_EXPORT`                    | enabled                                                       | `0` disables font export and empties the catalogue; OS/2 embedding restrictions apply |
 | `YAS_EDGE`                           | unset                                                         | `1` serves the browser from this process (also `--edge`); needs a passphrase          |
 | `YAS_SHARE`                          | unset                                                         | `1` publishes this server over WebRTC from this process (also `--share`)              |
 | `YAS_EDGE_PASSPHRASE`                | `YAS_PASSPHRASE`                                              | The hosted edge's own passphrase                                                      |

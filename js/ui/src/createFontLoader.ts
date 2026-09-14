@@ -1,6 +1,7 @@
 import { createSignal, createEffect, onCleanup } from "solid-js";
 import {
   YAS_FONT_FAMILY_MONOSPACE,
+  YAS_FONT_FAMILY_FETCHABLE,
   YAS_FONT_FACE_FETCHABLE,
   YAS_FONT_STYLE_ITALIC,
   YAS_FONT_STYLE_OBLIQUE,
@@ -83,6 +84,7 @@ export function protocolFontFamilies(
   let chars = 0;
   for (const family of families) {
     if ((family.flags & YAS_FONT_FAMILY_MONOSPACE) === 0) continue;
+    if ((family.flags & YAS_FONT_FAMILY_FETCHABLE) === 0) continue;
     const name = family.family.trim();
     if (
       name.length === 0 ||
