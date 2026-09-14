@@ -3150,10 +3150,9 @@ struct SurfaceInFlightFrame {
 #[derive(Default)]
 struct SurfaceAckTiming {
     baseline_ms: Option<f32>,
-    /// Uncapped empty-pipe sample awaiting an ACK for a frame sent after this
-    /// observation before it may move the baseline by more than one bounded
-    /// step. Frames already in flight can all belong to the same browser
-    /// pause and are not independent evidence.
+    /// Slow empty-pipe sample awaiting a second empty-pipe round trip sent
+    /// after this observation. Frames sent with video already outstanding
+    /// can all belong to the same serialization burst and cannot confirm it.
     upward_candidate: Option<SurfaceAckCandidate>,
     last_ack_at: Option<Instant>,
     spacing_ms: f32,
@@ -3168,9 +3167,11 @@ struct SurfaceAckCandidate {
 /// Maximum increase one empty-pipe ACK may make to the Surface turnaround
 /// baseline. Empty at send time excludes our own older Surface frames, but it
 /// does not exclude a browser/event-loop pause after the send. A bounded rise
-/// lets a real path change recover immediately up to ordinary interactive
-/// latencies and then keep climbing on later samples, without turning one
-/// multi-second pause into a multi-second byte window.
+/// lets a real path change recover across later empty-pipe samples, without
+/// turning one multi-second pause into a multi-second byte window. A frame
+/// sent while another is outstanding is never independent evidence: even if
+/// it was sent after the slow ACK was observed, it can still sit behind the
+/// same continuous serialization burst.
 const SURFACE_ACK_BASELINE_RISE_MAX_MS: f32 = 100.0;
 
 impl SurfaceAckTiming {
@@ -3188,20 +3189,22 @@ impl SurfaceAckTiming {
             self.baseline_ms = Some(sample_ms);
             self.upward_candidate = None;
         } else if frame.started_empty {
-            let bounded_ms = sample_ms.min(baseline_ms + SURFACE_ACK_BASELINE_RISE_MAX_MS);
-            self.baseline_ms = Some(bounded_ms);
-            self.upward_candidate = (sample_ms > bounded_ms).then_some(SurfaceAckCandidate {
-                sample_ms,
-                observed_at: now,
-            });
-        } else if let Some(candidate) = self.upward_candidate
-            && frame.sent_at >= candidate.observed_at
-        {
-            // A whole later send/ACK round trip corroborates a real path
-            // increase. Use the lower observation; either may still include
-            // serialization ahead of that frame.
-            self.baseline_ms = Some(candidate.sample_ms.min(sample_ms));
-            self.upward_candidate = None;
+            if let Some(candidate) = self.upward_candidate
+                && frame.sent_at >= candidate.observed_at
+            {
+                // Two fully independent empty-pipe round trips corroborate a
+                // real path increase. Use the lower observation so a later,
+                // larger browser pause cannot amplify the first one.
+                self.baseline_ms = Some(candidate.sample_ms.min(sample_ms));
+                self.upward_candidate = None;
+            } else {
+                let bounded_ms = sample_ms.min(baseline_ms + SURFACE_ACK_BASELINE_RISE_MAX_MS);
+                self.baseline_ms = Some(bounded_ms);
+                self.upward_candidate = (sample_ms > bounded_ms).then_some(SurfaceAckCandidate {
+                    sample_ms,
+                    observed_at: now,
+                });
+            }
         }
 
         if let Some(spacing) = ack_spacing_ms {
@@ -17648,6 +17651,22 @@ mod tests {
     }
 
     #[test]
+    fn two_independent_empty_pipe_samples_confirm_a_high_rtt_path() {
+        let mut client = test_client();
+        client.min_rtt_ms = 0.0;
+        let start = Instant::now();
+
+        record_surface_frame_sent(&mut client, 1, 10_000, false, start);
+        record_surface_ack_at(&mut client, 1, start + Duration::from_secs(1));
+        assert_eq!(surface_ack_window_ms(&client), 150.0);
+
+        let second = start + Duration::from_secs(2);
+        record_surface_frame_sent(&mut client, 1, 10_000, false, second);
+        record_surface_ack_at(&mut client, 1, second + Duration::from_secs(1));
+        assert_eq!(surface_ack_window_ms(&client), 1_000.0);
+    }
+
+    #[test]
     fn one_browser_pause_cannot_inflate_surface_credit_to_seconds() {
         // Live logs showed one empty-pipe ACK at 1.3-2.5 seconds replacing a
         // 50 ms path estimate. The resulting multi-megabyte credit window
@@ -17675,6 +17694,34 @@ mod tests {
         record_surface_frame_sent(&mut client, 1, 10_000, false, sent);
         record_surface_ack_at(&mut client, 1, sent + Duration::from_millis(70));
         assert_eq!(surface_ack_window_ms(&client), 70.0);
+    }
+
+    #[test]
+    fn continuous_scroll_acks_cannot_confirm_a_stalled_empty_pipe_sample() {
+        // A large scroll frame can stall the browser after an otherwise empty
+        // pipe, while subsequent frames are serialized behind the same burst.
+        // Those later ACKs are not independent path samples, even when their
+        // frames were sent after the first slow ACK arrived.
+        let mut client = test_client();
+        client.surface_ack_timing.baseline_ms = Some(175.0);
+        client.surface_goodput_sampled = true;
+        client.surface_goodput_bps = 1_250_000.0;
+        let start = Instant::now();
+
+        record_surface_frame_sent(&mut client, 1, 120_000, false, start);
+        record_surface_frame_sent(&mut client, 2, 120_000, false, start);
+        let first_ack = start + Duration::from_millis(762);
+        record_surface_ack_at(&mut client, 1, first_ack);
+        assert_eq!(surface_ack_window_ms(&client), 275.0);
+
+        // Surface 2 is still outstanding, so this post-observation frame did
+        // not start with an empty pipe.
+        record_surface_frame_sent(&mut client, 1, 120_000, false, first_ack);
+        record_surface_ack_at(&mut client, 2, start + Duration::from_millis(800));
+        record_surface_ack_at(&mut client, 1, first_ack + Duration::from_millis(762));
+
+        assert_eq!(surface_ack_window_ms(&client), 275.0);
+        assert!(surface_credit_limit_bytes(&client, 120_000) < 550_000);
     }
 
     #[test]
