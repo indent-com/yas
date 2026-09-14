@@ -2279,6 +2279,22 @@ Surface destruction retires every associated view and emits one reliable
 keyframe-shaped FRAME with END_OF_STREAM before the watched Surface REMOVE.
 Receivers discard any older optional-path fragments that arrive after that
 terminal frame.
+EOS consumes a normal frame slot: a full view waits for FRAME_ACK before its
+terminal frame is sent. Retiring views continue accepting delayed feedback;
+their decoder reservation survives through the EOS write. Explicit CLOSE_VIEW
+can end that wait because its receiver has already stopped accepting frames.
+
+Surface serialization does not run inside request dispatch. One access unit
+is written at a time per session, with at most one additional encoded frame
+waiting at the backend sink. Each reliable fragment is at most 16 KiB, and its
+write completes before the next fragment is admitted. Control Results can
+therefore interleave with even a large keyframe. CONFIGURE_VIEW, RESET_VIEW,
+and CLOSE_VIEW wait for their write barriers asynchronously, so incoming ping,
+input, and frame acknowledgements remain dispatchable under backpressure.
+The hosted endpoint buffers 64 KiB per direction, and Edge caps WebTransport's
+unacknowledged send window at 64 KiB rather than Quinn's 10 MB default. This
+bounds buffering ahead of control; it is not an absolute RTT guarantee and can
+limit throughput on links with a large bandwidth-delay product.
 
 Successful OPEN_VIEW and CONFIGURE_VIEW Results are write barriers before
 frames from the new or replacement configuration become observable across the

@@ -195,6 +195,9 @@ struct Config {
 type AppState = Arc<Config>;
 
 const INTERACTIVE_TOS: u32 = 34 << 2;
+// Priority cannot overtake bytes already copied into the reliable QUIC
+// stream. Propagate backpressure instead of hiding it in Quinn's 10 MB default.
+const WEBTRANSPORT_SEND_WINDOW: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT: u32 = 64 * 1024;
 
@@ -441,6 +444,7 @@ fn prepare_web_transport(
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport = quinn::TransportConfig::default();
     transport
+        .send_window(WEBTRANSPORT_SEND_WINDOW)
         .max_idle_timeout(Some(
             WEBTRANSPORT_PEER_TIMEOUT
                 .try_into()

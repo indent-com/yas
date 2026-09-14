@@ -164,6 +164,9 @@ const SURFACE_CODEC_SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
 // KiB bulk ceiling so those messages can interleave during a large scroll
 // frame instead of waiting behind one long serialization burst.
 const SURFACE_RELIABLE_FRAGMENT_BYTES: usize = 16 * 1024;
+// One frame is being serialized and one may wait for it. Encoders see a full
+// sink before doing more work; decoded-frame credit is not a writer queue.
+const SURFACE_EVENT_QUEUE: usize = 1;
 const MAX_SELECTION_OPERATION_REPLAYS: usize = 512;
 #[cfg(target_os = "linux")]
 const MAX_DESKTOP_OPERATION_REPLAYS: usize = 512;
@@ -2191,7 +2194,7 @@ async fn serve_registered<S>(
     // while the session is servicing other families.
     let (internal_tx, mut internal_rx) = mpsc::channel(INTERNAL_QUEUE);
     let (terminal_frame_tx, mut terminal_frame_rx) = mpsc::channel(INTERNAL_QUEUE);
-    let (surface_event_tx, mut surface_event_rx) = mpsc::channel(INTERNAL_QUEUE);
+    let (surface_event_tx, mut surface_event_rx) = mpsc::channel(SURFACE_EVENT_QUEUE);
     let (media_audio_tx, mut media_audio_rx) = mpsc::channel(INTERNAL_QUEUE);
     // Subscribe before taking the initial snapshot. A toplevel can be created
     // between those two operations; retaining the watch generation makes the
@@ -2360,8 +2363,24 @@ async fn serve_registered<S>(
                     }
                     None => break 'session "native Terminal frame channel closed".to_owned(),
                 },
-                event = surface_event_rx.recv() => match event {
+                sent = async {
+                    session.surface_send.as_mut().expect("guarded Surface writer").await
+                }, if session.surface_send.is_some() => {
+                    session.surface_send = None;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        break 'session "Surface writer failed".to_owned();
+                    }
+                    if let Some(state) = &session.services.app_state {
+                        state.delivery_notify.notify_one();
+                    }
+                },
+                event = surface_event_rx.recv(), if session.surface_send.is_none() => match event {
                     Some(event) => {
+                        // Returning the sink slot can wake a deferred encode,
+                        // even when this event is input metadata or a stale frame.
+                        if let Some(state) = &session.services.app_state {
+                            state.delivery_notify.notify_one();
+                        }
                         if session.handle_native_surface_event(event).await.is_err() {
                             break 'session "native Surface event handler failed".to_owned();
                         }
@@ -2608,6 +2627,7 @@ struct Session {
     internal: mpsc::Sender<Internal>,
     terminal_frames: mpsc::Sender<super::yas_terminal_backend::Frame>,
     surface_events: mpsc::Sender<super::yas_surface_backend::Event>,
+    surface_send: Option<tokio::task::JoinHandle<Result<(), ()>>>,
     /// Wall time spent awaiting this connection's reliable writer. Native
     /// Surface delivery clients share it with the adaptive encoder so socket
     /// pressure on the actual WAN path is not hidden behind their event sink.
@@ -2707,6 +2727,11 @@ enum Internal {
     SurfaceOpenTimeout {
         request_id: u32,
         view_id: u32,
+    },
+    SurfaceBoundaryReady {
+        request: Frame,
+        retained: Option<NativeSurfaceView>,
+        complete: tokio::sync::watch::Sender<bool>,
     },
     SurfaceCatalogueBoundaryWritten {
         boundary_id: u64,
@@ -3781,6 +3806,7 @@ struct SurfaceRuntime {
     updates: HashMap<u32, tokio::sync::watch::Sender<SurfaceCatalogue>>,
     next_view_id: u32,
     views: HashMap<u32, NativeSurfaceView>,
+    retired_views: HashMap<u32, RetiredSurfaceView>,
     next_app_handle: u64,
     app_endpoints: HashMap<u64, SurfaceAppEndpoint>,
     operations: HashMap<[u8; 16], SurfaceReplay>,
@@ -3919,6 +3945,23 @@ fn complete_app_socket_remove_submission(
     }
 }
 
+struct SurfaceRetirement {
+    view_id: u32,
+    view: NativeSurfaceView,
+    credit: tokio::sync::watch::Receiver<bool>,
+    complete: tokio::sync::watch::Sender<bool>,
+    eos_queued: Arc<AtomicBool>,
+}
+
+struct RetiredSurfaceView {
+    eos_queued: Arc<AtomicBool>,
+    last_sequence: u64,
+    capacity: u8,
+    acknowledged: u64,
+    credit: tokio::sync::watch::Sender<bool>,
+    written: SurfaceWriteReceipt,
+}
+
 struct NativeSurfaceView {
     surface_handle: u64,
     surface_id: u16,
@@ -3936,10 +3979,33 @@ struct NativeSurfaceView {
     // exact worst-case window in the session's aggregate outbound budget for
     // the whole view lifetime.
     outbound_credit: CreditLease,
-    // Reliable Surface fragments share the Data lane. A receipt for the
-    // newest reliable frame therefore covers every older reliable frame for
-    // this view; datagram frames remain deliberately lossy and reorderable.
-    last_frame_written: Option<oneshot::Receiver<()>>,
+    // Frames and lifecycle Results chain through this write barrier. The
+    // dispatcher never waits for it; serialization and retirement tasks do.
+    last_frame_written: Option<SurfaceWriteReceipt>,
+}
+
+/// Cloneable ordering barrier, without retaining the frame's encoded bytes.
+#[derive(Clone)]
+struct SurfaceWriteReceipt(tokio::sync::watch::Receiver<bool>);
+
+impl SurfaceWriteReceipt {
+    fn new() -> (tokio::sync::watch::Sender<bool>, Self) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (tx, Self(rx))
+    }
+
+    fn is_written(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    async fn wait(&self) -> Result<(), ()> {
+        self.0
+            .clone()
+            .wait_for(|written| *written)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
+    }
 }
 
 /// An admitted view waiting for its first frame to select the encoder codec.
@@ -3988,6 +4054,7 @@ impl SurfaceRuntime {
             updates: HashMap::new(),
             next_view_id: 1,
             views: HashMap::new(),
+            retired_views: HashMap::new(),
             next_app_handle: 1,
             app_endpoints: HashMap::new(),
             operations: HashMap::new(),
@@ -4000,7 +4067,7 @@ impl SurfaceRuntime {
         for _ in 0..u32::MAX {
             let view_id = self.next_view_id.max(1);
             self.next_view_id = self.next_view_id.wrapping_add(1).max(1);
-            if !self.views.contains_key(&view_id) {
+            if !self.views.contains_key(&view_id) && !self.retired_views.contains_key(&view_id) {
                 return Some(view_id);
             }
         }
@@ -6292,6 +6359,9 @@ struct PendingRequest {
 }
 
 enum PendingOperation {
+    SurfaceBoundary {
+        task: tokio::task::JoinHandle<()>,
+    },
     SurfaceOpen(Box<PendingSurfaceOpen>),
     RelayConnect {
         task: tokio::task::JoinHandle<()>,
@@ -6998,6 +7068,7 @@ impl Session {
             internal,
             terminal_frames,
             surface_events,
+            surface_send: None,
             write_blocked_us,
             media_audio,
             _registration: registration,
@@ -7675,6 +7746,7 @@ impl Session {
                     if matches!(
                         &pending.operation,
                         PendingOperation::KvDurable { .. }
+                            | PendingOperation::SurfaceBoundary { .. }
                             | PendingOperation::EventsOperation { .. }
                             | PendingOperation::Fs {
                                 committed_mutation: true,
@@ -7690,6 +7762,7 @@ impl Session {
                         return self.send_result(&frame, Status::Conflict, Vec::new()).await;
                     }
                     match pending.operation {
+                        PendingOperation::SurfaceBoundary { task } => task.abort(),
                         PendingOperation::SurfaceOpen(mut opening) => opening.release().await,
                         PendingOperation::RelayConnect { task, .. } => task.abort(),
                         PendingOperation::TerminalQuery { task, .. } => task.abort(),
@@ -8993,7 +9066,14 @@ impl Session {
             .filter(|pending| matches!(pending.operation, PendingOperation::SurfaceOpen(_)))
             .count();
         if self.native.as_ref().is_some_and(|native| {
-            native.surface.views.len() + opening
+            native.surface.views.len()
+                + opening
+                + native
+                    .surface
+                    .retired_views
+                    .values()
+                    .filter(|view| !view.written.is_written())
+                    .count()
                 >= yas_surface::Limits::HARD.max_views_per_session as usize
         }) {
             return self
@@ -9181,6 +9261,17 @@ impl Session {
     }
 
     async fn configure_surface_view(&mut self, frame: Frame) -> Result<(), ()> {
+        if self
+            .pending_requests
+            .values()
+            .filter(|pending| matches!(pending.operation, PendingOperation::SurfaceBoundary { .. }))
+            .count()
+            >= MAX_SURFACE_OPERATION_REPLAYS
+        {
+            return self
+                .send_result(&frame, Status::ResourceExhausted, Vec::new())
+                .await;
+        }
         let request = match yas_surface::ConfigureView::decode(&frame.payload) {
             Ok(request) => request,
             Err(_) => return self.send_result(&frame, Status::Invalid, Vec::new()).await,
@@ -9274,13 +9365,30 @@ impl Session {
         else {
             return Err(());
         };
-        self.await_surface_frame_written(written).await?;
-        self.send_result_confirmed(&frame, Status::Ok, Vec::new())
-            .await?;
+        let barrier = self.queue_surface_result(frame, written, None)?;
+        self.native
+            .as_mut()
+            .ok_or(())?
+            .surface
+            .views
+            .get_mut(&request.view_id)
+            .ok_or(())?
+            .last_frame_written = Some(barrier);
         Ok(())
     }
 
     async fn reset_surface_view(&mut self, frame: Frame) -> Result<(), ()> {
+        if self
+            .pending_requests
+            .values()
+            .filter(|pending| matches!(pending.operation, PendingOperation::SurfaceBoundary { .. }))
+            .count()
+            >= MAX_SURFACE_OPERATION_REPLAYS
+        {
+            return self
+                .send_result(&frame, Status::ResourceExhausted, Vec::new())
+                .await;
+        }
         let request = match yas_surface::ResetView::decode(&frame.payload) {
             Ok(request) => request,
             Err(_) => return self.send_result(&frame, Status::Invalid, Vec::new()).await,
@@ -9310,16 +9418,44 @@ impl Session {
             .as_mut()
             .and_then(|native| native.surface.views.get_mut(&request.view_id))
             .and_then(|view| view.last_frame_written.take());
-        self.await_surface_frame_written(written).await?;
-        self.send_result(&frame, Status::Ok, Vec::new()).await?;
+        let barrier = self.queue_surface_result(frame, written, None)?;
+        self.native
+            .as_mut()
+            .ok_or(())?
+            .surface
+            .views
+            .get_mut(&request.view_id)
+            .ok_or(())?
+            .last_frame_written = Some(barrier);
         Ok(())
     }
 
     async fn close_surface_view(&mut self, frame: Frame) -> Result<(), ()> {
+        if self
+            .pending_requests
+            .values()
+            .filter(|pending| matches!(pending.operation, PendingOperation::SurfaceBoundary { .. }))
+            .count()
+            >= MAX_SURFACE_OPERATION_REPLAYS
+        {
+            return self
+                .send_result(&frame, Status::ResourceExhausted, Vec::new())
+                .await;
+        }
         let request = match yas_surface::CloseView::decode(&frame.payload) {
             Ok(request) => request,
             Err(_) => return self.send_result(&frame, Status::Invalid, Vec::new()).await,
         };
+        if let Some(retired) = self
+            .native
+            .as_ref()
+            .and_then(|native| native.surface.retired_views.get(&request.view_id))
+        {
+            retired.credit.send_replace(true);
+            let written = retired.written.clone();
+            self.queue_surface_result(frame, Some(written), None)?;
+            return Ok(());
+        }
         let view = self
             .native
             .as_mut()
@@ -9331,23 +9467,75 @@ impl Session {
                 .map(|native| native.state.clone())
                 .ok_or(())?;
             super::yas_surface_backend::remove(&state, view.backend_client_id).await;
-            self.await_surface_frame_written(view.last_frame_written)
-                .await?;
+            let last_sequence = view.next_sequence.saturating_sub(1);
+            let capacity = view.decoder_capacity;
+            let acknowledged = view.acknowledged_sequence;
+            let written =
+                self.queue_surface_result(frame, view.last_frame_written.clone(), Some(view))?;
+            let surface = &mut self.native.as_mut().ok_or(())?.surface;
+            if surface.retired_views.len() >= MAX_SURFACE_OPERATION_REPLAYS {
+                surface
+                    .retired_views
+                    .retain(|_, view| !view.written.is_written());
+            }
+            surface.retired_views.insert(
+                request.view_id,
+                RetiredSurfaceView {
+                    eos_queued: Arc::new(AtomicBool::new(false)),
+                    last_sequence,
+                    capacity,
+                    acknowledged,
+                    credit: tokio::sync::watch::channel(true).0,
+                    written,
+                },
+            );
+            return Ok(());
         }
         self.send_result(&frame, Status::Ok, Vec::new()).await
     }
 
-    async fn await_surface_frame_written(
-        &self,
-        written: Option<oneshot::Receiver<()>>,
-    ) -> Result<(), ()> {
-        if let Some(written) = written {
-            tokio::select! {
-                result = written => result.map_err(|_| ())?,
-                _ = self.cancellation.cancelled() => return Err(()),
+    fn queue_surface_result(
+        &mut self,
+        request: Frame,
+        previous: Option<SurfaceWriteReceipt>,
+        retained: Option<NativeSurfaceView>,
+    ) -> Result<SurfaceWriteReceipt, ()> {
+        let request_id = request.header.request_id.ok_or(())?;
+        let kind = request.header.kind;
+        let internal = self.internal.clone();
+        let cancellation = self.cancellation.clone();
+        let (complete, receipt) = SurfaceWriteReceipt::new();
+        let task = tokio::spawn(async move {
+            let sending = async {
+                if let Some(previous) = previous {
+                    previous.wait().await?;
+                }
+                internal
+                    .send(Internal::SurfaceBoundaryReady {
+                        request,
+                        retained,
+                        complete,
+                    })
+                    .await
+                    .map_err(|_| ())
+            };
+            let result = tokio::select! {
+                result = sending => result,
+                _ = cancellation.cancelled() => Err(()),
+            };
+            if result.is_err() {
+                cancellation.cancel();
             }
-        }
-        Ok(())
+        });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                family: family::SURFACE,
+                kind,
+                operation: PendingOperation::SurfaceBoundary { task },
+            },
+        );
+        Ok(receipt)
     }
 
     async fn capture_surface(&mut self, frame: Frame) -> Result<(), ()> {
@@ -9768,6 +9956,72 @@ impl Session {
     }
 
     async fn handle_surface_event(&mut self, frame: Frame) -> Result<(), ()> {
+        let view_id = u32::from_le_bytes(
+            frame
+                .payload
+                .get(..4)
+                .ok_or(())?
+                .try_into()
+                .map_err(|_| ())?,
+        );
+        if let Some(retired) = self
+            .native
+            .as_mut()
+            .and_then(|native| native.surface.retired_views.get_mut(&view_id))
+        {
+            let feedback = match frame.header.kind {
+                yas_wire::schema::surface::event::FRAME_ACK => Some(
+                    yas_surface::FrameAck::decode(&frame.payload)
+                        .map_err(|_| ())?
+                        .feedback,
+                ),
+                yas_wire::schema::surface::event::KEY => Some(
+                    yas_surface::Key::decode(&frame.payload)
+                        .map_err(|_| ())?
+                        .feedback,
+                ),
+                yas_wire::schema::surface::event::TEXT => Some(
+                    yas_surface::Text::decode(&frame.payload)
+                        .map_err(|_| ())?
+                        .feedback,
+                ),
+                yas_wire::schema::surface::event::POINTER => Some(
+                    yas_surface::Pointer::decode(&frame.payload)
+                        .map_err(|_| ())?
+                        .feedback,
+                ),
+                yas_wire::schema::surface::event::AXIS => Some(
+                    yas_surface::Axis::decode(&frame.payload)
+                        .map_err(|_| ())?
+                        .feedback,
+                ),
+                yas_wire::schema::surface::event::PREEDIT => {
+                    yas_surface::Preedit::decode(&frame.payload).map_err(|_| ())?;
+                    None
+                }
+                yas_wire::schema::surface::event::TOUCH => {
+                    yas_surface::Touch::decode(&frame.payload).map_err(|_| ())?;
+                    None
+                }
+                _ => return Err(()),
+            };
+            if let Some(feedback) = feedback {
+                if feedback.presented_sequence
+                    > retired
+                        .last_sequence
+                        .saturating_add(u64::from(retired.eos_queued.load(Ordering::Acquire)))
+                {
+                    return Err(());
+                }
+                retired.acknowledged = retired.acknowledged.max(feedback.presented_sequence);
+                if retired.last_sequence.saturating_sub(retired.acknowledged)
+                    < u64::from(retired.capacity)
+                {
+                    retired.credit.send_replace(true);
+                }
+            }
+            return Ok(());
+        }
         let state = self
             .native
             .as_ref()
@@ -23511,6 +23765,40 @@ impl Session {
                     self.publish_terminal_catalogue();
                 }
             }
+            Internal::SurfaceBoundaryReady {
+                request,
+                retained,
+                complete,
+            } => {
+                let request_id = request.header.request_id.ok_or(())?;
+                // Release the request ID before its Result is observable, so
+                // immediate reuse cannot race an asynchronous completion.
+                self.pending_requests.remove(&request_id);
+                drop(retained);
+                let written = self
+                    .enqueue_result_parts_with_sensitivity_receipt(
+                        family::SURFACE,
+                        request.header.kind,
+                        request_id,
+                        Status::Ok,
+                        Vec::new(),
+                        false,
+                    )
+                    .await?;
+                let cancellation = self.cancellation.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = written => {
+                            if result.is_ok() {
+                                complete.send_replace(true);
+                            } else {
+                                cancellation.cancel();
+                            }
+                        }
+                        _ = cancellation.cancelled() => {}
+                    }
+                });
+            }
             Internal::SurfaceCatalogueBoundaryWritten {
                 boundary_id,
                 retired_surface_handles,
@@ -26715,6 +27003,41 @@ impl Session {
                     .map(|view| (view_id, view))
             })
             .collect::<Vec<_>>();
+        if native.surface.retired_views.len() >= MAX_SURFACE_OPERATION_REPLAYS {
+            native
+                .surface
+                .retired_views
+                .retain(|_, view| !view.written.is_written());
+        }
+        let retired_views = retired_views
+            .into_iter()
+            .map(|(view_id, view)| {
+                let last_sequence = view.next_sequence.saturating_sub(1);
+                let has_credit = last_sequence.saturating_sub(view.acknowledged_sequence)
+                    < u64::from(view.decoder_capacity);
+                let (credit, wait_credit) = tokio::sync::watch::channel(has_credit);
+                let (complete, written) = SurfaceWriteReceipt::new();
+                let eos_queued = Arc::new(AtomicBool::new(false));
+                native.surface.retired_views.insert(
+                    view_id,
+                    RetiredSurfaceView {
+                        eos_queued: Arc::clone(&eos_queued),
+                        last_sequence,
+                        capacity: view.decoder_capacity,
+                        acknowledged: view.acknowledged_sequence,
+                        credit,
+                        written,
+                    },
+                );
+                SurfaceRetirement {
+                    view_id,
+                    view,
+                    credit: wait_credit,
+                    complete,
+                    eos_queued,
+                }
+            })
+            .collect::<Vec<_>>();
         let boundary = if retired_views.is_empty() {
             for surface_handle in retired_surface_handles {
                 native.surface.retire_surface_replays(surface_handle);
@@ -26744,7 +27067,7 @@ impl Session {
         &self,
         boundary_id: u64,
         retired_surface_handles: Vec<u64>,
-        retired_views: Vec<(u32, NativeSurfaceView)>,
+        retired_views: Vec<SurfaceRetirement>,
         state: AppState,
     ) {
         let out = self.out.clone();
@@ -26752,32 +27075,56 @@ impl Session {
         let cancellation = self.cancellation.clone();
         tokio::spawn(async move {
             let result = async {
-                let mut last_written = None;
-                for (view_id, view) in &retired_views {
+                // Stop every backend immediately, even if another retired view
+                // must wait for its last decoder slot before sending EOS.
+                for retirement in &retired_views {
+                    let view = &retirement.view;
                     tokio::select! {
                         _ = super::yas_surface_backend::remove(&state, view.backend_client_id) => {}
                         _ = cancellation.cancelled() => return Err(()),
                     }
-                    last_written = Some(
+                }
+                // Drain the whole retirement batch before any EOS, including
+                // idle views whose own write barrier is already complete.
+                for retirement in &retired_views {
+                    if let Some(previous) = &retirement.view.last_frame_written {
+                        tokio::select! {
+                            result = previous.wait() => result?,
+                            _ = cancellation.cancelled() => return Err(()),
+                        }
+                    }
+                }
+                for SurfaceRetirement {
+                    view_id,
+                    view,
+                    mut credit,
+                    complete,
+                    eos_queued,
+                } in retired_views
+                {
+                    let sending = async {
+                        credit.wait_for(|ready| *ready).await.map_err(|_| ())?;
+                        eos_queued.store(true, Ordering::Release);
                         send_surface_eos(
                             &out,
                             &cancellation,
-                            *view_id,
+                            view_id,
                             view.next_sequence.max(1),
                             view.codec_version,
                         )
-                        .await?,
-                    );
-                }
-                if let Some(written) = last_written {
+                        .await?
+                        .await
+                        .map_err(|_| ())?;
+                        complete.send_replace(true);
+                        // Keep the aggregate reservation through the EOS write.
+                        drop(view);
+                        Ok::<(), ()>(())
+                    };
                     tokio::select! {
-                        result = written => result.map_err(|_| ())?,
+                        result = sending => result?,
                         _ = cancellation.cancelled() => return Err(()),
                     }
                 }
-                // Retain each view's aggregate outbound lease until the final
-                // Data-lane receipt covers every EOS in this retirement batch.
-                drop(retired_views);
                 let complete = Internal::SurfaceCatalogueBoundaryWritten {
                     boundary_id,
                     retired_surface_handles,
@@ -26929,26 +27276,24 @@ impl Session {
                     flags |= yas_wire::schema::surface::FRAME_KEYFRAME as u16
                         | yas_wire::schema::surface::FRAME_CODEC_CONFIG as u16;
                 }
-                let written = self
-                    .send_surface_frame(
-                        frame.view_id,
-                        sequence,
-                        base_sequence,
-                        capture_ns,
-                        flags,
-                        codec_version,
-                        payload,
-                    )
-                    .await?;
+                let previous = view.last_frame_written.clone();
+                let written = self.send_surface_frame(
+                    frame.view_id,
+                    sequence,
+                    base_sequence,
+                    capture_ns,
+                    flags,
+                    codec_version,
+                    payload,
+                    previous,
+                )?;
                 if let Some(view) = self
                     .native
                     .as_mut()
                     .and_then(|runtime| runtime.surface.views.get_mut(&frame.view_id))
                 {
                     view.next_sequence = sequence.checked_add(1).unwrap_or(1);
-                    if let Some(written) = written {
-                        view.last_frame_written = Some(written);
-                    }
+                    view.last_frame_written = Some(written);
                 }
                 Ok(())
             }
@@ -26978,8 +27323,8 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn send_surface_frame(
-        &self,
+    fn send_surface_frame(
+        &mut self,
         view_id: u32,
         sequence: u64,
         base_sequence: u64,
@@ -26987,63 +27332,70 @@ impl Session {
         flags: u16,
         codec_version: u16,
         payload: Vec<u8>,
-    ) -> Result<Option<oneshot::Receiver<()>>, ()> {
+        previous: Option<SurfaceWriteReceipt>,
+    ) -> Result<SurfaceWriteReceipt, ()> {
+        if self.surface_send.is_some() {
+            return Err(());
+        }
         let reliable_maximum = self
             .negotiated
             .peer_receive
             .max_frame
             .min(self.negotiated.peer_receive.max_decoded) as usize;
-        // H.264 and AV1 deltas are reference frames unless the encoder says
-        // otherwise, and this bridge carries no dependency metadata. Sending
-        // a small delta as an unreliable datagram while larger successors use
-        // the reliable lane lets one packet loss silently break the decoder's
-        // reference chain. It also leaves sequence/ACK credit behind until the
-        // view resets, which presents as a frozen picture and lost cursor.
-        // Keep every inter-frame Surface access unit on the ordered reliable
-        // lane; byte credit bounds its queue. The protocol's datagram flags
-        // remain available for a future independently-decodable Surface codec.
         let chunk_bytes = reliable_maximum
             .saturating_sub(5 + 48)
             .clamp(1, SURFACE_RELIABLE_FRAGMENT_BYTES);
         let fragment_count = u16::try_from(payload.len().div_ceil(chunk_bytes)).map_err(|_| ())?;
         let complete_len = u32::try_from(payload.len()).map_err(|_| ())?;
         let presentation_ns = monotonic_ns();
-        let (written, receipt) = oneshot::channel();
-        let mut written = Some(written);
-        for (index, chunk) in payload.chunks(chunk_bytes).enumerate() {
-            let payload = yas_surface::SurfaceFrame {
-                view_id,
-                sequence,
-                base_sequence,
-                capture_ns,
-                presentation_ns,
-                flags,
-                codec_version,
-                fragment_index: u16::try_from(index).map_err(|_| ())?,
-                fragment_count,
-                complete_len,
-                payload: chunk.to_vec(),
-            }
-            .encode()
-            .map_err(|_| ())?;
-            let frame = Frame {
-                header: FrameHeader {
-                    sensitive: true,
-                    ..FrameHeader::event(family::SURFACE, yas_wire::schema::surface::event::FRAME)
-                },
-                payload,
+        let (complete, receipt) = SurfaceWriteReceipt::new();
+        let out = self.out.clone();
+        let cancellation = self.cancellation.clone();
+        self.surface_send = Some(tokio::spawn(async move {
+            let sending = async {
+                if let Some(previous) = previous {
+                    previous.wait().await?;
+                }
+                // Inter-frame dependencies stay reliable. Only one fragment is
+                // admitted at a time, and the dispatcher remains free to put
+                // ping replies and input effects in the priority Control lane.
+                for (index, chunk) in payload.chunks(chunk_bytes).enumerate() {
+                    let payload = yas_surface::SurfaceFrame {
+                        view_id,
+                        sequence,
+                        base_sequence,
+                        capture_ns,
+                        presentation_ns,
+                        flags,
+                        codec_version,
+                        fragment_index: index as u16,
+                        fragment_count,
+                        complete_len,
+                        payload: chunk.to_vec(),
+                    }
+                    .encode()
+                    .map_err(|_| ())?;
+                    let frame = Frame {
+                        header: FrameHeader {
+                            sensitive: true,
+                            ..FrameHeader::event(
+                                family::SURFACE,
+                                yas_wire::schema::surface::event::FRAME,
+                            )
+                        },
+                        payload,
+                    };
+                    out.send_confirmed(frame).await.map_err(|_| ())?;
+                }
+                complete.send_replace(true);
+                Ok(())
             };
-            let confirmation = (index + 1 == usize::from(fragment_count)).then(|| {
-                written
-                    .take()
-                    .expect("last reliable Surface fragment has write receipt")
-            });
             tokio::select! {
-                result = self.out.send_queued(frame, confirmation) => result.map_err(|_| ())?,
-                _ = self.cancellation.cancelled() => return Err(()),
+                result = sending => result,
+                _ = cancellation.cancelled() => Err(()),
             }
-        }
-        Ok(Some(receipt))
+        }));
+        Ok(receipt)
     }
 
     async fn refresh_terminal_catalogue(&mut self) -> bool {
@@ -28127,6 +28479,7 @@ impl Drop for Session {
         }
         for (_, pending) in self.pending_requests.drain() {
             match pending.operation {
+                PendingOperation::SurfaceBoundary { task } => task.abort(),
                 PendingOperation::SurfaceOpen(opening) => drop(opening),
                 PendingOperation::RelayConnect { task, .. }
                 | PendingOperation::KvDurable { task } => task.abort(),
@@ -36655,6 +37008,7 @@ async fn send_state_event_with_sensitivity(
 
 #[cfg(test)]
 mod tests {
+    include!("yas_surface_backpressure_tests.rs");
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU64, Ordering};

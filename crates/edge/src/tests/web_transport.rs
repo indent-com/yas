@@ -356,3 +356,27 @@ async fn keep_alive_preserves_quiet_sessions_without_application_traffic() {
         );
     }
 }
+
+#[tokio::test]
+async fn congested_video_cannot_fill_a_multi_megabyte_quic_send_queue() {
+    let (client, mut edge, relay) = peers().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.blackhole.store(true, Ordering::SeqCst);
+    let video = vec![0x5a; 2 * 1024 * 1024];
+    let accepted = timeout(TEST_TIMEOUT, edge.send.write(&video))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        accepted <= WEBTRANSPORT_SEND_WINDOW as usize,
+        "QUIC accepted {accepted} bytes before applying backpressure"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), edge.send.write_all(&video))
+            .await
+            .is_err(),
+        "a vanished reader must backpressure video, not absorb megabytes"
+    );
+    edge.session.close(0, b"test complete");
+    client.session.close(0, b"test complete");
+}

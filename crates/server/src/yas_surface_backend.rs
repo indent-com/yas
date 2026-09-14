@@ -124,6 +124,10 @@ pub(crate) struct Sink {
 }
 
 impl Sink {
+    pub(super) fn has_capacity(&self) -> bool {
+        self.events.capacity() > 0
+    }
+
     fn send_frame(&self, frame: EncodedFrame) -> Result<usize, ()> {
         // The dispatcher uses the first frame to settle codec negotiation,
         // writing OPEN_VIEW's Result before publishing that same frame.

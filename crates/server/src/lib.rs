@@ -3696,7 +3696,12 @@ fn surface_frame_credit_open_for(
                 .count()
                 < maximum
         });
-    slot_open && surface_credit_open_for(client, next_frame_bytes)
+    slot_open
+        && client
+            .native_surface
+            .as_ref()
+            .is_none_or(|sink| sink.has_capacity())
+        && surface_credit_open_for(client, next_frame_bytes)
 }
 
 /// Check per-surface delivery credit and remember real demand that it denied.
