@@ -27,7 +27,6 @@ export function FontOverlay(props: {
   const originalSize = props.currentSize;
   const originalGamma = props.currentGamma;
   const initialFamily = originalFamily.trim();
-  const initialFamilyLower = initialFamily.toLowerCase();
   /** Choices come from the host, or from the server's installed families —
    *  where the family is its own label. */
   const catalog = () => props.fontChoices ?? [];
@@ -36,14 +35,15 @@ export function FontOverlay(props: {
     curated()
       ? catalog()
       : props.serverFonts.map((f) => ({ label: f, stack: f }));
-  const initialIdx = () =>
-    choices().findIndex((c) => c.stack.toLowerCase() === initialFamilyLower);
-
   const [query, setQuery] = createSignal(initialFamily);
   const [filterQuery, setFilterQuery] = createSignal("");
   const [size, setSize] = createSignal(props.currentSize);
   const [gamma, setGamma] = createSignal(props.currentGamma);
-  const [selectedIdx, setSelectedIdx] = createSignal(initialIdx());
+  // Keep the choice independently of the server catalogue, which disappears
+  // during a disconnect and may return in a different order.
+  const [selectedFamily, setSelectedFamily] = createSignal<string | null>(
+    initialFamily,
+  );
   const [hoverIdx, setHoverIdx] = createSignal(-1);
 
   let inputRef!: HTMLInputElement;
@@ -59,6 +59,10 @@ export function FontOverlay(props: {
     const q = lowerFilter();
     return choices().filter((c) => c.label.toLowerCase().includes(q));
   };
+  const selectedIdx = () => {
+    const family = selectedFamily()?.toLowerCase();
+    return filtered().findIndex((c) => c.stack.toLowerCase() === family);
+  };
 
   const dismiss = () => {
     props.onPreview(originalFamily, originalSize, originalGamma);
@@ -69,12 +73,11 @@ export function FontOverlay(props: {
     props.onPreview(family, size(), gamma());
   };
 
-  /** The family the form would apply right now: the highlighted list entry,
+  /** The family the form would apply right now: the selected family,
    *  else whatever has been typed, else what we opened with. */
   const pendingFamily = () => {
-    const f = filtered();
-    const idx = selectedIdx();
-    if (idx >= 0 && idx < f.length) return f[idx].stack;
+    const family = selectedFamily();
+    if (family !== null) return family;
     // Curated hosts have no text box to fall back to.
     return (!curated() && trimmedQuery()) || originalFamily;
   };
@@ -86,7 +89,7 @@ export function FontOverlay(props: {
 
   const selectFont = (idx: number) => {
     const f = filtered();
-    setSelectedIdx(idx);
+    setSelectedFamily(f[idx]?.stack ?? null);
     setHoverIdx(-1);
     if (idx >= 0 && idx < f.length) {
       setQuery(f[idx].label);
@@ -141,16 +144,6 @@ export function FontOverlay(props: {
     }
   });
 
-  // Reset selection when query changes from typing (not from selectFont)
-  createEffect(() => {
-    if (curated()) return;
-    if (showAllFonts()) {
-      setSelectedIdx(initialIdx());
-    } else {
-      setSelectedIdx(-1);
-    }
-  });
-
   const inputStyle = () => ({
     ...ui.input,
     "background-color": theme.inputBg,
@@ -199,6 +192,7 @@ export function FontOverlay(props: {
               value={query()}
               onInput={(e) => {
                 const v = e.currentTarget.value;
+                setSelectedFamily(null);
                 setQuery(v);
                 setFilterQuery(v);
               }}

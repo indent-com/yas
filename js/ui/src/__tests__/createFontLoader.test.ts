@@ -391,6 +391,47 @@ describe("createFontLoader FONT protocol", () => {
     expect(deleted).toEqual([added[0]]);
   });
 
+  it("retains the selected faces and metrics throughout reconnect negotiation", async () => {
+    const remote = connection();
+    const [active, setActive] = createSignal<FontProtocolSource | null>(
+      source("home:1", remote.connection),
+    );
+    let dispose = () => {};
+    let loader!: ReturnType<typeof createFontLoader>;
+    createRoot((cleanup) => {
+      dispose = cleanup;
+      loader = createFontLoader(() => "Test Mono", "monospace", active);
+    });
+
+    try {
+      await vi.waitFor(() => expect(loader.fontLoading()).toBe(false));
+      const selectedFaces = [...added];
+      expect(selectedFaces).toHaveLength(2);
+
+      for (const next of [
+        { key: "home:1", connected: false, connection: null },
+        null,
+        { key: "home:2", connected: true, connection: null },
+      ]) {
+        setActive(next);
+        await vi.waitFor(() => expect(loader.fontLoading()).toBe(false));
+        expect(loader.resolvedFont()).toBe("Test Mono");
+        expect(loader.advanceRatio()).toBe(0.6);
+        expect(deleted).toEqual([]);
+      }
+
+      setActive(source("home:2", remote.connection));
+      await vi.waitFor(() => expect(loader.fontLoading()).toBe(false));
+      expect(loader.resolvedFont()).toBe("Test Mono");
+      expect(loader.advanceRatio()).toBe(0.6);
+      expect(remote.fetchFont).toHaveBeenCalledTimes(2);
+      expect(deleted).toEqual(selectedFaces);
+    } finally {
+      dispose();
+    }
+    expect(deleted).toEqual(added);
+  });
+
   it("does not trust the global cache without a local BLAKE3 verifier", async () => {
     const remote = connection();
     faceCache.set("01".repeat(32), new Uint8Array([1, 2, 3, 4]));

@@ -1,4 +1,5 @@
 import { PALETTES } from "@yas-run/core";
+import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FontOverlay } from "../FontOverlay";
@@ -34,6 +35,10 @@ afterEach(() => {
 });
 
 function mount(curated = false) {
+  const [serverFonts, setServerFonts] = createSignal([
+    "First Mono",
+    "Second Mono",
+  ]);
   const preview = vi.fn();
   const select = vi.fn();
   const close = vi.fn();
@@ -43,7 +48,7 @@ function mount(curated = false) {
         currentFamily="First Mono"
         currentSize={14}
         currentGamma={1}
-        serverFonts={["First Mono", "Second Mono"]}
+        serverFonts={serverFonts()}
         fontChoices={
           curated
             ? [
@@ -61,7 +66,7 @@ function mount(curated = false) {
     ),
     document.body,
   );
-  return { preview, select, close };
+  return { preview, select, close, setServerFonts };
 }
 
 function touch(element: HTMLElement, type: string, x = 20) {
@@ -80,6 +85,51 @@ function secondFont() {
 }
 
 describe("Font panel touch selection", () => {
+  it.each([
+    { fonts: [] },
+    { fonts: ["First Mono", "Second Mono"] },
+    { fonts: ["Second Mono", "First Mono"] },
+    { fonts: ["First Mono"] },
+  ])(
+    "keeps the choice across a disconnect and catalogue refresh: $fonts",
+    ({ fonts }) => {
+      const { preview, select, setServerFonts } = mount();
+      secondFont().click();
+      expect(preview).toHaveBeenLastCalledWith("Second Mono", 14, 1);
+
+      setServerFonts([]);
+      setServerFonts(fonts);
+      const selected = document.querySelector('ul button[aria-pressed="true"]');
+      expect(selected?.textContent ?? null).toBe(
+        fonts.includes("Second Mono") ? "Second Mono" : null,
+      );
+
+      document
+        .querySelector("form")!
+        .dispatchEvent(
+          new Event("submit", { bubbles: true, cancelable: true }),
+        );
+      expect(select).toHaveBeenCalledExactlyOnceWith("Second Mono", 14, 1);
+    },
+  );
+
+  it("applies a typed family after replacing a list selection", () => {
+    const { select, setServerFonts } = mount();
+    secondFont().click();
+    const input = document.querySelector<HTMLInputElement>(
+      'input[name="yas-font-search"]',
+    )!;
+    input.value = "Custom Mono";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    setServerFonts([]);
+    setServerFonts(["First Mono", "Second Mono", "Custom Mono"]);
+
+    document
+      .querySelector("form")!
+      .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(select).toHaveBeenCalledExactlyOnceWith("Custom Mono", 14, 1);
+  });
+
   it.each([false, true])(
     "previews a tap once, then applies it (curated=%s)",
     (curated) => {

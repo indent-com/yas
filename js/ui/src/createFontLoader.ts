@@ -418,7 +418,8 @@ export function createFontLoader(
       }
 
       if (cancelled || version !== requestVersion) return;
-      setAdvanceRatio(ratio);
+      // A retained face keeps its metrics even while FONT is unavailable.
+      if (!retainingInstalledFaces) setAdvanceRatio(ratio);
       setResolvedFont(requestedFont);
       setFontLoading(false);
     };
