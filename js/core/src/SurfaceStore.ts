@@ -1,3 +1,10 @@
+import {
+  surface2DContext,
+  videoColorSpace,
+  SDR_COLOR,
+  rejectSurfaceColorProfile,
+} from "./surfaceColor";
+import type { YasSurfaceColorSpace } from "./yas/packed";
 import type { YasSurface, ConnectionId, SurfaceId } from "./types";
 import {
   SURFACE_FRAME_FLAG_KEYFRAME,
@@ -11,22 +18,7 @@ import {
 // Shared with the codec probe rather than duplicated: the probe answers
 // for what this browser accepts at a given level, and a decoder configured
 // here at a different one would be asking a question nobody answered.
-import { av1LevelString } from "./videoCodec";
-
-/**
- * Every YAS encoder produces limited-range BT.601 (sRGB
- * primaries/transfer). Most streams also say so in-band (H.264 VUI, AV1
- * color_config); this hint covers encoders that cannot write it and keeps
- * decoder resets identical. Studio swing is intentional: Firefox can lose a
- * full-range flag before decoded YUV becomes RGB, progressively crushing dark
- * UI colors in a recursively captured surface.
- */
-const LIMITED_RANGE_BT601: VideoColorSpaceInit = {
-  primaries: "bt709",
-  transfer: "iec61966-2-1",
-  matrix: "smpte170m",
-  fullRange: false,
-};
+import { av1LevelString, av1SequenceProfile } from "./videoCodec";
 
 /** Configure from the encoded stream, not the pane or logical window. Without
  * size hints Chromium guesses 1280×720 when initializing hardware decoding.
@@ -36,6 +28,7 @@ function surfaceDecoderConfig(
   codec: string,
   width: number,
   height: number,
+  colorSpace: VideoColorSpaceInit = SDR_COLOR,
 ): VideoDecoderConfig {
   return {
     codec,
@@ -44,7 +37,7 @@ function surfaceDecoderConfig(
     displayAspectWidth: width,
     displayAspectHeight: height,
     optimizeForLatency: true,
-    colorSpace: LIMITED_RANGE_BT601,
+    colorSpace,
   };
 }
 
@@ -904,6 +897,12 @@ export class SurfaceStore {
   private connectionId: ConnectionId = "";
   private decoders = new Map<SurfaceId, DecoderEntry>();
   private canvases = new Map<SurfaceId, CanvasEntry>();
+  private surfaceColors = new Map<SurfaceId, VideoColorSpaceInit>();
+  private hdrFrames = new Map<SurfaceId, VideoFrame>();
+  /** Borrowed until the next presentation; callers must not close it. */
+  getHdrFrame(surfaceId: SurfaceId): VideoFrame | undefined {
+    return this.hdrFrames.get(surfaceId);
+  }
   private frameListeners = new Set<SurfaceFrameCallback>();
   private presentationClockListeners = new Set<
     (sample: {
@@ -1132,6 +1131,10 @@ export class SurfaceStore {
     height: number,
   ): string {
     const announced = this.codecStrings.get(surfaceId);
+    if (String(this.surfaceColors.get(surfaceId)?.transfer) === "pq") {
+      const profile = announced?.startsWith("av01.1.") ? 1 : 0;
+      return `av01.${profile}.${av1LevelString(width, height)}M.10`;
+    }
     if (announced?.startsWith("av01")) return announced;
     const remembered = this.av1CodecStrings.get(surfaceId);
     if (remembered) return remembered;
@@ -1151,7 +1154,14 @@ export class SurfaceStore {
   ): boolean {
     const cs = this.av1CodecString(surfaceId, width, height);
     try {
-      entry.decoder.configure(surfaceDecoderConfig(cs, width, height));
+      entry.decoder.configure(
+        surfaceDecoderConfig(
+          cs,
+          width,
+          height,
+          this.surfaceColors.get(surfaceId),
+        ),
+      );
       entry.lastCodecString = cs;
       entry.lastConfiguredWidth = width;
       entry.lastConfiguredHeight = height;
@@ -1231,6 +1241,10 @@ export class SurfaceStore {
         : announced?.startsWith("avc1.F4")
           ? CODEC_SUPPORT_H264_444
           : CODEC_SUPPORT_H264 | CODEC_SUPPORT_H264_444;
+    rejectSurfaceColorProfile(
+      announced,
+      String(this.surfaceColors.get(surfaceId)?.transfer) === "pq",
+    );
     this._codecDemoter?.(surfaceId, bits);
   }
 
@@ -1557,6 +1571,9 @@ export class SurfaceStore {
     if (entry) safeClose(entry.decoder);
     this.decoders.delete(surfaceId);
     this.canvases.delete(surfaceId);
+    this.surfaceColors.delete(surfaceId);
+    this.hdrFrames.get(surfaceId)?.close();
+    this.hdrFrames.delete(surfaceId);
     this.emitChange();
   }
 
@@ -1572,7 +1589,27 @@ export class SurfaceStore {
     presentationHeight: number = height,
     logicalSize?: { width: number; height: number },
     ackToken?: SurfaceFrameAckToken,
+    color?: YasSurfaceColorSpace,
   ): void {
+    const nextColor = videoColorSpace(color);
+    const previousColor = this.surfaceColors.get(surfaceId) ?? SDR_COLOR;
+    if (JSON.stringify(previousColor) !== JSON.stringify(nextColor)) {
+      if (!(flags & SURFACE_FRAME_FLAG_KEYFRAME)) {
+        this.sendAck(surfaceId, ackToken);
+        this._keyframeSender?.(surfaceId);
+        return;
+      }
+      this.discardPresenter(surfaceId);
+      const oldDecoder = this.decoders.get(surfaceId);
+      if (oldDecoder) {
+        this.discardPendingDecoderFrames(surfaceId, oldDecoder);
+        safeClose(oldDecoder.decoder);
+      }
+      this.decoders.delete(surfaceId);
+      this.codecStrings.delete(surfaceId);
+      this.av1CodecStrings.delete(surfaceId);
+    }
+    this.surfaceColors.set(surfaceId, nextColor);
     this._diag.received++;
     const receiveT = performance.now();
     const isKey = (flags & SURFACE_FRAME_FLAG_KEYFRAME) !== 0;
@@ -1610,6 +1647,25 @@ export class SurfaceStore {
     }
 
     const codec = codecFromFlags(flags);
+
+    if (isKey && codec === "av1") {
+      const profile = av1SequenceProfile(data);
+      if (profile !== undefined) {
+        const depth = String(nextColor.transfer) === "pq" ? 10 : 8;
+        const cs = `av01.${profile}.${av1LevelString(width, height)}M.${depth.toString().padStart(2, "0")}`;
+        if (this.codecStrings.get(surfaceId) !== cs) {
+          this.discardPresenter(surfaceId);
+          const old = this.decoders.get(surfaceId);
+          if (old) {
+            this.discardPendingDecoderFrames(surfaceId, old);
+            safeClose(old.decoder);
+          }
+          this.decoders.delete(surfaceId);
+          this.codecStrings.set(surfaceId, cs);
+          this.av1CodecStrings.set(surfaceId, cs);
+        }
+      }
+    }
 
     let entry = this.decoders.get(surfaceId);
     if (!entry || entry.codec !== codec) {
@@ -1731,6 +1787,7 @@ export class SurfaceStore {
           if (sps && pps) {
             const description = buildAvccDescription(sps, pps);
             const cs = h264CodecStringFromSps(sps) ?? "avc1.42001e";
+            this.codecStrings.set(surfaceId, cs);
             const dimsChanged =
               width !== entry.lastConfiguredWidth ||
               height !== entry.lastConfiguredHeight;
@@ -1757,7 +1814,12 @@ export class SurfaceStore {
                 });
               }
               entry.decoder.configure({
-                ...surfaceDecoderConfig(cs, width, height),
+                ...surfaceDecoderConfig(
+                  cs,
+                  width,
+                  height,
+                  this.surfaceColors.get(surfaceId),
+                ),
                 description,
               });
             }
@@ -2236,6 +2298,9 @@ export class SurfaceStore {
     }
     this.decoders.clear();
     this.canvases.clear();
+    this.surfaceColors.clear();
+    for (const frame of this.hdrFrames.values()) frame.close();
+    this.hdrFrames.clear();
     this.surfaces.clear();
     this._pendingResizes.clear();
     this._destroyedSurfaceIds.clear();
@@ -2270,6 +2335,9 @@ export class SurfaceStore {
     }
     this.decoders.clear();
     this.canvases.clear();
+    this.surfaceColors.clear();
+    for (const frame of this.hdrFrames.values()) frame.close();
+    this.hdrFrames.clear();
     this.surfaces.clear();
     this._pendingResizes.clear();
     this._destroyedSurfaceIds.clear();
@@ -2804,6 +2872,13 @@ export class SurfaceStore {
           ce.canvas.width = frame.displayWidth;
           ce.canvas.height = frame.displayHeight;
         }
+        this.hdrFrames.get(surfaceId)?.close();
+        this.hdrFrames.delete(surfaceId);
+        if (
+          String(frame.colorSpace?.transfer) === "pq" ||
+          String(frame.colorSpace?.transfer) === "hlg"
+        )
+          this.hdrFrames.set(surfaceId, frame.clone());
         ce.ctx.drawImage(frame, 0, 0);
         ce.presentation = this.framePresentation.get(frame) ?? {
           width: frame.displayWidth,
@@ -2912,7 +2987,7 @@ export class SurfaceStore {
       const canvas = document.createElement("canvas");
       canvas.width = w;
       canvas.height = h;
-      const ctx = canvas.getContext("2d");
+      const ctx = surface2DContext(canvas);
       if (!ctx) return;
       this.canvases.set(surfaceId, {
         canvas,

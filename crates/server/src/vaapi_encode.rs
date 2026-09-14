@@ -41,13 +41,7 @@ const VA_RT_FORMAT_YUV420_10: u32 = 0x00000100;
 #[allow(dead_code)]
 const VA_RT_FORMAT_YUV444: u32 = 0x00000004;
 
-// Fourcc of the image `vaDeriveImage` hands back for a 4:4:4 surface.
-// Only the planar layout is supported: it carries explicit per-plane
-// pitches and offsets, so there is no byte-order guesswork.  The packed
-// layouts (AYUV/XYUV) disagree between vendors on channel order in memory,
-// and guessing wrong yields silently colour-swapped video rather than a
-// clean failure — so an unrecognised fourcc is reported as an error and
-// the encoder chain falls back to 4:2:0.
+// Planar 4:4:4 returned by vaDeriveImage; packed layouts are handled below.
 const VA_FOURCC_444P: u32 = 0x50343434;
 
 // Buffer types
@@ -206,7 +200,9 @@ const VAIMG_FOURCC_OFF: usize = 4;
 /// The surface is fixed for the encoder's lifetime, so the derived image
 /// metadata (pitches, offsets, buffer ID) never changes.  Caching avoids
 /// two VA-API driver round-trips per frame (vaDeriveImage + vaDestroyImage).
+#[derive(Clone)]
 struct CachedDerivedImage {
+    data_size: usize,
     image_id: u32,
     buf_id: u32,
     fourcc: u32,
@@ -219,6 +215,117 @@ struct CachedDerivedImage {
     /// interleaved in plane 1.
     v_pitch: usize,
     v_offset: usize,
+}
+
+fn color_layout_supported(fourcc: u32, is_444: bool, hdr: bool) -> bool {
+    match (is_444, hdr) {
+        (false, false) => fourcc == u32::from_le_bytes(*b"NV12"),
+        (false, true) => fourcc == u32::from_le_bytes(*b"P010"),
+        (true, false) => {
+            fourcc == VA_FOURCC_444P
+                || fourcc == u32::from_le_bytes(*b"AYUV")
+                || fourcc == u32::from_le_bytes(*b"XYUV")
+        }
+        (true, true) => {
+            fourcc == u32::from_le_bytes(*b"Y410")
+                || fourcc == u32::from_le_bytes(*b"Y416")
+                || fourcc == u32::from_le_bytes(*b"Q416")
+        }
+    }
+}
+
+/// Copy converted samples to the driver's actual layout. Check every row
+/// against VAImage.data_size before mapping or writing the allocation.
+fn upload_color(
+    va: &gpu_libs::VaFns,
+    display: VADisplay,
+    img: &CachedDerivedImage,
+    yuv: &crate::color_yuv::ColorYuv,
+) -> Option<()> {
+    if !color_layout_supported(img.fourcc, yuv.is_444, yuv.bit_depth == 10) {
+        return None;
+    }
+    let (w, h) = (yuv.width, yuv.height);
+    let mut rows: Vec<(usize, Vec<u8>)> = Vec::new();
+    if yuv.is_444 && img.fourcc != VA_FOURCC_444P && img.fourcc != u32::from_le_bytes(*b"Q416") {
+        for y in 0..h {
+            let mut row = Vec::new();
+            for x in 0..w {
+                let i = y * w + x;
+                let (l, u, v) = (yuv.planes[0][i], yuv.planes[1][i], yuv.planes[2][i]);
+                if img.fourcc == u32::from_le_bytes(*b"Y410") {
+                    row.extend_from_slice(
+                        &(u32::from(u) | (u32::from(l) << 10) | (u32::from(v) << 20) | (3 << 30))
+                            .to_le_bytes(),
+                    );
+                } else if img.fourcc == u32::from_le_bytes(*b"Y416") {
+                    for value in [u << 6, l << 6, v << 6, u16::MAX] {
+                        row.extend_from_slice(&value.to_le_bytes());
+                    }
+                } else if img.fourcc == u32::from_le_bytes(*b"XYUV") {
+                    row.extend_from_slice(&[v as u8, u as u8, l as u8, 255]);
+                } else {
+                    row.extend_from_slice(&[v as u8, u as u8, l as u8, 255]); // Little-endian AYUV
+                }
+            }
+            if row.len() > img.y_pitch {
+                return None;
+            }
+            rows.push((img.y_offset.checked_add(y.checked_mul(img.y_pitch)?)?, row));
+        }
+    } else {
+        let bytes = yuv.hardware_bytes();
+        let row_bytes = w.checked_mul(if yuv.bit_depth == 10 { 2 } else { 1 })?;
+        let mut source = 0;
+        let planes = if yuv.is_444 {
+            vec![
+                (img.y_offset, img.y_pitch, h),
+                (img.uv_offset, img.uv_pitch, h),
+                (img.v_offset, img.v_pitch, h),
+            ]
+        } else {
+            vec![
+                (img.y_offset, img.y_pitch, h),
+                (img.uv_offset, img.uv_pitch, h / 2),
+            ]
+        };
+        for (offset, pitch, height) in planes {
+            if row_bytes > pitch {
+                return None;
+            }
+            for y in 0..height {
+                rows.push((
+                    offset.checked_add(y.checked_mul(pitch)?)?,
+                    bytes.get(source..source + row_bytes)?.to_vec(),
+                ));
+                source += row_bytes;
+            }
+        }
+    }
+    if rows.iter().any(|(offset, row)| {
+        offset
+            .checked_add(row.len())
+            .is_none_or(|end| end > img.data_size)
+    }) {
+        return None;
+    }
+    let mut mapped: *mut c_void = ptr::null_mut();
+    // SAFETY: VA owns this derived image; every destination range is checked
+    // above and each source row is owned. Unmap once after all copies.
+    unsafe {
+        if (va.vaMapBuffer)(display, img.buf_id, &mut mapped) != VA_STATUS_SUCCESS {
+            return None;
+        }
+        if mapped.is_null() {
+            (va.vaUnmapBuffer)(display, img.buf_id);
+            return None;
+        }
+        for (offset, row) in rows {
+            ptr::copy_nonoverlapping(row.as_ptr(), mapped.cast::<u8>().add(offset), row.len());
+        }
+        (va.vaUnmapBuffer)(display, img.buf_id);
+    }
+    Some(())
 }
 
 // VA-API fourcc values differ from DRM fourcc values.
@@ -281,6 +388,8 @@ pub(crate) struct GbmExportedBuffer {
 /// NV12 buffer for the Vulkan compute shader → VA-API encoder zero-copy path.
 /// VA-API allocates the surface, exports a DMA-BUF fd for Vulkan to write into.
 pub(crate) struct GbmNv12Buffer {
+    pub fourcc: u32,
+    pub planes: Vec<yas_compositor::ExternalOutputPlane>,
     pub fd: std::sync::Arc<std::os::fd::OwnedFd>,
     pub stride: u32,
     pub uv_offset: u32,
@@ -291,6 +400,8 @@ pub(crate) struct GbmNv12Buffer {
 }
 
 pub(crate) struct VppContext {
+    pub is_444: bool,
+    pub output_color: Option<yas_compositor::color::OutputColor>,
     va: &'static crate::gpu_libs::VaFns,
     display: VADisplay,
     config: u32,
@@ -313,6 +424,34 @@ pub(crate) struct VppContext {
 }
 
 impl VppContext {
+    /// GPU conversion needs only VA surfaces, not a video-processing engine
+    /// or an intermediate GBM RGB pool.
+    fn color_output(
+        va: &'static gpu_libs::VaFns,
+        display: VADisplay,
+        width: u32,
+        height: u32,
+        is_444: bool,
+        verbose: bool,
+    ) -> Self {
+        Self {
+            va,
+            display,
+            config: VA_INVALID_SURFACE,
+            context: VA_INVALID_SURFACE,
+            nv12_surfaces: [VA_INVALID_SURFACE; NUM_NV12_SURFACES],
+            enc_width: width,
+            enc_height: height,
+            bgra_width: width,
+            bgra_height: height,
+            gbm_buffers: Vec::new(),
+            gbm_nv12_buffers: Vec::new(),
+            output_color: None,
+            is_444,
+            verbose,
+        }
+    }
+
     /// Try to create a VPP context on an existing VADisplay.
     /// Returns None if VAEntrypointVideoProc is unavailable.
     ///
@@ -478,6 +617,8 @@ impl VppContext {
             bgra_height,
             gbm_buffers,
             gbm_nv12_buffers: Vec::new(),
+            output_color: None,
+            is_444: false,
             verbose,
         })
     }
@@ -510,7 +651,7 @@ impl VppContext {
         let to_destroy: Vec<u32> = surfaces
             .iter()
             .copied()
-            .filter(|s| *s != 0 && !tracked.contains(s))
+            .filter(|s| *s != VA_INVALID_SURFACE && !tracked.contains(s))
             .collect();
         if !to_destroy.is_empty() {
             let mut buf = to_destroy;
@@ -522,18 +663,47 @@ impl VppContext {
 
     /// Try VA-API allocate → export. Returns true on success.
     fn try_vaapi_nv12_export(&mut self, w: u32, h: u32, count: usize) -> bool {
+        self.try_vaapi_yuv_export(w, h, count, None)
+    }
+    fn try_vaapi_yuv_export(&mut self, w: u32, h: u32, count: usize, fourcc: Option<u32>) -> bool {
+        // VASurfaceAttrib with VAGenericValueTypeInteger; the union is 8-byte aligned.
+        #[repr(C)]
+        struct IntegerAttribute {
+            kind: u32,
+            flags: u32,
+            value_type: u32,
+            padding: u32,
+            value: u64,
+        }
+        let mut attribute = IntegerAttribute {
+            kind: 1,
+            flags: 2,
+            value_type: 1,
+            padding: 0,
+            value: u64::from(fourcc.unwrap_or_default()),
+        };
         let va = self.va;
-        let mut surfaces = vec![0u32; count];
+        let hdr = self.output_color == Some(yas_compositor::color::OutputColor::Hdr10);
+        let mut surfaces = vec![VA_INVALID_SURFACE; count];
         let st = unsafe {
             (va.vaCreateSurfaces)(
                 self.display,
-                VA_RT_FORMAT_YUV420,
+                match (self.is_444, hdr) {
+                    (true, true) => 0x400, // VA_RT_FORMAT_YUV444_10
+                    (true, false) => VA_RT_FORMAT_YUV444,
+                    (false, true) => VA_RT_FORMAT_YUV420_10,
+                    (false, false) => VA_RT_FORMAT_YUV420,
+                },
                 w,
                 h,
                 surfaces.as_mut_ptr(),
                 count as u32,
-                ptr::null_mut(),
-                0,
+                if fourcc.is_some() {
+                    (&mut attribute as *mut IntegerAttribute).cast()
+                } else {
+                    ptr::null_mut()
+                },
+                u32::from(fourcc.is_some()),
             )
         };
         if st != VA_STATUS_SUCCESS {
@@ -548,7 +718,7 @@ impl VppContext {
                     self.display,
                     surf,
                     0x40000000, // VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2
-                    0x07,       // VA_EXPORT_SURFACE_READ_WRITE
+                    if self.is_444 { 0x0b } else { 0x07 }, // READ_WRITE + COMPOSED/SEPARATE_LAYERS
                     &mut desc as *mut _ as *mut c_void,
                 )
             };
@@ -557,34 +727,94 @@ impl VppContext {
                     "[vaapi-vpp] NV12 export failed: st={st} layers={}",
                     desc.num_layers,
                 );
-                if desc.objects[0].fd >= 0 && st == VA_STATUS_SUCCESS {
-                    unsafe { libc::close(desc.objects[0].fd) };
+                if st == VA_STATUS_SUCCESS {
+                    for obj in desc.objects.iter().take(desc.num_objects as usize) {
+                        if obj.fd >= 0 {
+                            unsafe { libc::close(obj.fd) };
+                        }
+                    }
                 }
                 self.destroy_nv12_compute_surfaces(&mut surfaces);
                 return false;
             }
 
-            let fd = desc.objects[0].fd;
-            let modifier = desc.objects[0].drm_format_modifier;
-
-            // NV12 export layout varies by driver:
-            //   Intel (iHD): 1 layer, 2 planes — offset[0]=Y, offset[1]=UV
-            //   AMD (radeonsi): 2 layers, 1 plane each — layer 0=Y, layer 1=UV
-            let (stride, uv_offset) = if desc.num_layers >= 2 {
-                // AMD: 2 layers × 1 plane
-                (desc.layers[0].pitch[0], desc.layers[1].offset[0])
-            } else if desc.layers[0].num_planes >= 2 {
-                // Intel: 1 layer × 2 planes
-                (desc.layers[0].pitch[0], desc.layers[0].offset[1])
+            // Exported objects can include auxiliary planes. Preserve the
+            // driver's offsets/pitches and reject layouts this importer cannot
+            // address instead of guessing tiling from dimensions.
+            let valid_counts = desc.num_objects == 1
+                && desc.num_layers > 0
+                && desc.num_layers as usize <= desc.layers.len()
+                && desc
+                    .layers
+                    .iter()
+                    .take(desc.num_layers as usize)
+                    .all(|l| l.num_planes > 0 && l.num_planes as usize <= l.pitch.len());
+            let planes: Vec<_> = if valid_counts {
+                desc.layers[..desc.num_layers as usize]
+                    .iter()
+                    .flat_map(|l| {
+                        (0..(l.num_planes as usize).min(l.pitch.len()))
+                            .map(move |p| (l.object_index[p], l.offset[p], l.pitch[p]))
+                    })
+                    .collect()
             } else {
+                Vec::new()
+            };
+            let fourcc = if self.is_444 && desc.num_layers == 1 {
+                desc.layers[0].drm_format
+            } else {
+                desc.fourcc
+            };
+            let valid = color_layout_supported(desc.fourcc, self.is_444, hdr)
+                && desc.width >= w
+                && desc.height >= h
+                && !planes.is_empty()
+                && planes.iter().all(|p| p.0 == 0)
+                && if self.is_444 {
+                    desc.num_layers == 1
+                        && match (fourcc.to_le_bytes(), hdr) {
+                            ([b'A', b'Y', b'U', b'V'] | [b'X', b'Y', b'U', b'V'], false)
+                            | ([b'Y', b'4', b'1', b'0'], true) => planes[0].2 >= w * 4,
+                            ([b'Y', b'4', b'1', b'6'], true) => planes[0].2 >= w * 8,
+                            ([b'Y', b'U', b'2', b'4'], false) => {
+                                planes.len() >= 3 && planes[..3].iter().all(|p| p.2 >= w)
+                            }
+                            ([b'Q', b'4', b'1', b'6'], true) => {
+                                planes.len() >= 3 && planes[..3].iter().all(|p| p.2 >= w * 2)
+                            }
+                            _ => false,
+                        }
+                } else {
+                    planes.len() >= 2
+                        && planes[0].1 == 0
+                        && planes[0].2 == planes[1].2
+                        && planes[0].2 >= w * if hdr { 2 } else { 1 }
+                };
+            if !valid {
                 eprintln!(
-                    "[vaapi-vpp] NV12 export: unexpected layout layers={} planes={}",
-                    desc.num_layers, desc.layers[0].num_planes,
+                    "[vaapi-vpp] unsupported export VA={:?} DRM={:?} objects={} layers={} planes={:?}",
+                    desc.fourcc.to_le_bytes(),
+                    fourcc.to_le_bytes(),
+                    desc.num_objects,
+                    desc.num_layers,
+                    planes
                 );
-                unsafe { libc::close(fd) };
+                for obj in desc.objects.iter().take(desc.num_objects as usize) {
+                    if obj.fd >= 0 {
+                        unsafe { libc::close(obj.fd) };
+                    }
+                }
                 self.destroy_nv12_compute_surfaces(&mut surfaces);
                 return false;
-            };
+            }
+            let fd = desc.objects[0].fd;
+            let modifier = desc.objects[0].drm_format_modifier;
+            let stride = planes[0].2;
+            let uv_offset = planes.get(1).map_or(0, |p| p.1);
+            let planes = planes
+                .into_iter()
+                .map(|(_, offset, pitch)| yas_compositor::ExternalOutputPlane { offset, pitch })
+                .collect();
 
             if self.verbose && i == 0 {
                 eprintln!(
@@ -593,6 +823,8 @@ impl VppContext {
                 );
             }
             self.gbm_nv12_buffers.push(GbmNv12Buffer {
+                fourcc,
+                planes,
                 fd: std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
                 stride,
                 uv_offset,
@@ -639,13 +871,19 @@ impl Drop for VppContext {
                     compute_surfs.len() as i32,
                 );
             }
-            (va.vaDestroyContext)(self.display, self.context);
-            (va.vaDestroySurfaces)(
-                self.display,
-                self.nv12_surfaces.as_mut_ptr(),
-                NUM_NV12_SURFACES as i32,
-            );
-            (va.vaDestroyConfig)(self.display, self.config);
+            if self.context != VA_INVALID_SURFACE {
+                (va.vaDestroyContext)(self.display, self.context);
+            }
+            if self.nv12_surfaces[0] != VA_INVALID_SURFACE {
+                (va.vaDestroySurfaces)(
+                    self.display,
+                    self.nv12_surfaces.as_mut_ptr(),
+                    NUM_NV12_SURFACES as i32,
+                );
+            }
+            if self.config != VA_INVALID_SURFACE {
+                (va.vaDestroyConfig)(self.display, self.config);
+            }
         }
     }
 }
@@ -1080,6 +1318,7 @@ pub struct VaapiDirectEncoder {
 unsafe impl Send for VaapiDirectEncoder {}
 
 impl VaapiDirectEncoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         width: u32,
         height: u32,
@@ -1088,9 +1327,10 @@ impl VaapiDirectEncoder {
         quality_level: u32,
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
+        managed: bool,
     ) -> Result<Self, String> {
         if chroma.is_444() {
-            return Err("VA-API H.264 4:4:4 encoding is not yet supported".into());
+            return Err("VA-API has no H.264 4:4:4 profile".into());
         }
 
         let va = gpu_libs::va().map_err(|e| format!("VA-API: {e}"))?;
@@ -1247,7 +1487,7 @@ impl VaapiDirectEncoder {
                  (ep={entrypoint}, qp={qp})"
             );
         }
-        Ok(Self {
+        let mut encoder = Self {
             va,
             display,
             config,
@@ -1268,21 +1508,50 @@ impl VaapiDirectEncoder {
             qp,
             quality_level,
             _verbose: verbose,
-            vpp: unsafe {
-                VppContext::try_new(
-                    va,
-                    display,
-                    width,
-                    height,
-                    width,
-                    height,
-                    drm_fd.as_raw_fd(),
-                    verbose,
-                )
+            vpp: if managed {
+                Some(VppContext::color_output(
+                    va, display, width, height, false, verbose,
+                ))
+            } else {
+                unsafe {
+                    VppContext::try_new(
+                        va,
+                        display,
+                        width,
+                        height,
+                        width,
+                        height,
+                        drm_fd.as_raw_fd(),
+                        verbose,
+                    )
+                }
             },
             _drm_fd: drm_fd,
             cached_input_images: [None, None],
-        })
+        };
+        if managed {
+            let image = encoder
+                .derive_input_image(0)
+                .ok_or("VA-API: cannot derive managed input image")?;
+            if !color_layout_supported(image.fourcc, false, false) {
+                return Err("VA-API: managed H.264 needs NV12 upload".into());
+            }
+        }
+        Ok(encoder)
+    }
+
+    pub(crate) fn encode_color(
+        &mut self,
+        yuv: &crate::color_yuv::ColorYuv,
+    ) -> Option<(Vec<u8>, bool)> {
+        if yuv.width != self.width as usize || yuv.height != self.height as usize {
+            return None;
+        }
+        let slot = self.next_input_slot;
+        self.next_input_slot = (slot + 1) % NUM_INPUT_SURFACES;
+        let img = self.derive_input_image(slot)?.clone();
+        upload_color(self.va, self.display, &img, yuv)?;
+        self.encode_surface(self.surfaces[NUM_REF_SURFACES + slot])
     }
 
     pub fn request_keyframe(&mut self) {
@@ -1332,6 +1601,7 @@ impl VaapiDirectEncoder {
                 return None;
             }
             self.cached_input_images[slot] = Some(CachedDerivedImage {
+                data_size: r32(&image, 60) as usize,
                 image_id: r32(&image, VAIMG_ID_OFF),
                 buf_id: r32(&image, VAIMG_BUF_OFF),
                 fourcc: r32(&image, VAIMG_FOURCC_OFF),
@@ -2212,6 +2482,7 @@ pub struct VaapiAv1Encoder {
     cur_ref_idx: usize,
     base_qindex: u8,
     quality_level: u32,
+    color: Option<yas_compositor::color::OutputColor>,
     chroma: crate::surface_encoder::ChromaSubsampling,
     _verbose: bool,
     pub(crate) _drm_fd: OwnedFd,
@@ -2226,7 +2497,7 @@ unsafe impl Send for VaapiAv1Encoder {}
 
 impl VaapiAv1Encoder {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub fn try_new_color(
         width: u32,
         height: u32,
         source_width: u32,
@@ -2236,13 +2507,25 @@ impl VaapiAv1Encoder {
         quality_level: u32,
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
+        color: Option<yas_compositor::color::OutputColor>,
     ) -> Result<Self, String> {
+        let hdr = color == Some(yas_compositor::color::OutputColor::Hdr10);
         // 8-bit 4:4:4 lives on seq_profile 1 ("High"); 4:2:0 on profile 0.
         let is_444 = chroma.is_444();
         let (va_profile, rt_format) = if is_444 {
-            (VAProfileAV1Profile1, VA_RT_FORMAT_YUV444)
+            (
+                VAProfileAV1Profile1,
+                if hdr { 0x400 } else { VA_RT_FORMAT_YUV444 },
+            )
         } else {
-            (VAProfileAV1Profile0, VA_RT_FORMAT_YUV420)
+            (
+                VAProfileAV1Profile0,
+                if hdr {
+                    VA_RT_FORMAT_YUV420_10
+                } else {
+                    VA_RT_FORMAT_YUV420
+                },
+            )
         };
         let va = gpu_libs::va().map_err(|e| format!("VA-API: {e}"))?;
         let va_drm = gpu_libs::va_drm().map_err(|e| format!("VA-DRM: {e}"))?;
@@ -2292,13 +2575,14 @@ impl VaapiAv1Encoder {
         };
 
         let mut config: VAConfigID = 0;
+        let mut rt_attribute = [0u32, rt_format]; // VAConfigAttribRTFormat
         let st = unsafe {
             (va.vaCreateConfig)(
                 display,
                 va_profile,
                 entrypoint,
-                ptr::null_mut(),
-                0,
+                rt_attribute.as_mut_ptr().cast(),
+                1,
                 &mut config,
             )
         };
@@ -2381,17 +2665,11 @@ impl VaapiAv1Encoder {
                 "[vaapi-direct] initialized AV1 {profile_name} encoder for {width}x{height} (ep={entrypoint})"
             );
         }
-        // NV12 surfaces must match the encoder context's resolution (64-pixel
-        // aligned for AV1).  BGRA surfaces are created at the *source*
-        // resolution so the compositor's external-output dimension check
-        // passes and the zero-copy path is used — eliminating the staging
-        // readback memcpy and CPU BGRA→NV12 conversion entirely.
-        //
-        // The VPP path is NV12-only: it allocates NV12 surfaces and exports
-        // them to the compositor, which would half the chroma resolution and
-        // defeat the point of 4:4:4.  Leave it off there and take the CPU
-        // upload path, which writes full-resolution chroma.
-        let vpp = if is_444 {
+        let vpp = if color.is_some() {
+            Some(VppContext::color_output(
+                va, display, width, height, is_444, verbose,
+            ))
+        } else if is_444 {
             None
         } else {
             unsafe {
@@ -2426,6 +2704,7 @@ impl VaapiAv1Encoder {
             base_qindex,
             quality_level,
             chroma,
+            color,
             _verbose: verbose,
             _drm_fd: drm_fd,
             vpp,
@@ -2438,7 +2717,17 @@ impl VaapiAv1Encoder {
         // construction failure, so the encoder chain falls back to 4:2:0
         // instead of installing an encoder that drops every frame.
         // `Drop` releases the context, surfaces and display on the way out.
-        if is_444 {
+        if color.is_some() {
+            let img = encoder
+                .derive_input_image()
+                .ok_or("cannot map managed AV1 input")?;
+            if !color_layout_supported(img.fourcc, is_444, hdr) {
+                return Err(format!(
+                    "unsupported managed AV1 input format: {:#x}",
+                    img.fourcc
+                ));
+            }
+        } else if is_444 {
             encoder.validate_444_surface_layout()?;
         }
 
@@ -2461,6 +2750,19 @@ impl VaapiAv1Encoder {
             String::from_utf8_lossy(&fcc),
             img.fourcc,
         ))
+    }
+
+    pub(crate) fn encode_color(
+        &mut self,
+        yuv: &crate::color_yuv::ColorYuv,
+    ) -> Option<(Vec<u8>, bool)> {
+        if yuv.width != self.width as usize || yuv.height != self.height as usize {
+            return None;
+        }
+
+        let img = self.derive_input_image()?.clone();
+        upload_color(self.va, self.display, &img, yuv)?;
+        self.encode_surface(self.surfaces[2])
     }
 
     pub fn request_keyframe(&mut self) {
@@ -2486,6 +2788,7 @@ impl VaapiAv1Encoder {
                 return None;
             }
             self.cached_input_image = Some(CachedDerivedImage {
+                data_size: r32(&image, 60) as usize,
                 image_id: r32(&image, VAIMG_ID_OFF),
                 buf_id: r32(&image, VAIMG_BUF_OFF),
                 fourcc: r32(&image, VAIMG_FOURCC_OFF),
@@ -2965,6 +3268,9 @@ impl VaapiAv1Encoder {
         // 4:4:4 leaves both subsampling bits clear — chroma is full
         // resolution in each direction.
         seq.seq_fields = (1 << 8) | (1 << 12);
+        if self.color == Some(yas_compositor::color::OutputColor::Hdr10) {
+            seq.seq_fields |= 2 << 14;
+        }
         if !self.chroma.is_444() {
             seq.seq_fields |= (1 << 17) | (1 << 18);
         }
@@ -2997,11 +3303,12 @@ impl VaapiAv1Encoder {
     }
 
     fn pack_sequence_header(&self) -> Vec<u8> {
-        pack_av1_sequence_header(
+        pack_av1_color_sequence_header(
             self.chroma.is_444(),
             self.level_idx,
             self.source_width,
             self.source_height,
+            self.color,
         )
     }
 }
@@ -3012,11 +3319,22 @@ impl VaapiAv1Encoder {
 /// without a VA-API display: this is hand-packed bitstream syntax where a
 /// single misplaced bit desynchronises everything after it, and the 4:4:4
 /// (`seq_profile` 1) and 4:2:0 (`seq_profile` 0) forms differ mid-header.
+#[cfg(test)]
 fn pack_av1_sequence_header(
     is_444: bool,
     level_idx: u8,
     source_width: u32,
     source_height: u32,
+) -> Vec<u8> {
+    pack_av1_color_sequence_header(is_444, level_idx, source_width, source_height, None)
+}
+
+fn pack_av1_color_sequence_header(
+    is_444: bool,
+    level_idx: u8,
+    source_width: u32,
+    source_height: u32,
+    color: Option<yas_compositor::color::OutputColor>,
 ) -> Vec<u8> {
     let mut ret = PackedData::new();
     ret.write(if is_444 { 1 } else { 0 }, 3); // seq_profile
@@ -3062,11 +3380,16 @@ fn pack_av1_sequence_header(
     //     flags are set, i.e. 4:2:0 only.
     // Writing the 4:2:0 bit pattern under profile 1 would desynchronise
     // every field after it, so the two cases diverge explicitly.
-    ret.write_bool(false); // high bitdepth (8-bit)
+    ret.write_bool(color == Some(yas_compositor::color::OutputColor::Hdr10)); // high_bitdepth
     if !is_444 {
         ret.write_bool(false); // monochrome
     }
-    ret.write_bool(false); // no color description
+    ret.write_bool(color.is_some());
+    if let Some(color) = color {
+        for value in &color.cicp()[..3] {
+            ret.write(u64::from(*value), 8);
+        }
+    }
     ret.write_bool(false); // color_range: studio swing
     if !is_444 {
         ret.write(0, 2); // chroma sample position
@@ -3329,6 +3652,54 @@ impl Drop for VaapiAv1Encoder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn managed_av1_sequence_headers_parse_with_independent_decoder() {
+        use rav1d::{
+            include::dav1d::headers::Dav1dSequenceHeader, src::lib::dav1d_parse_sequence_header,
+        };
+        use std::{mem::MaybeUninit, ptr::NonNull};
+        use yas_compositor::color::OutputColor;
+        for color in [
+            OutputColor::Srgb,
+            OutputColor::DisplayP3,
+            OutputColor::Hdr10,
+        ] {
+            for is_444 in [false, true] {
+                let header = pack_av1_color_sequence_header(is_444, 8, 1920, 1080, Some(color));
+                assert!(header.len() < 128);
+                let mut obu = vec![0x0a, header.len() as u8];
+                obu.extend(header);
+                let mut seq = MaybeUninit::<Dav1dSequenceHeader>::uninit();
+                // SAFETY: the decoder borrows the owned OBU and writes a POD
+                // sequence header; read it only after successful parsing.
+                let seq = unsafe {
+                    assert_eq!(
+                        dav1d_parse_sequence_header(
+                            NonNull::new(seq.as_mut_ptr()),
+                            NonNull::new(obu.as_mut_ptr()),
+                            obu.len()
+                        )
+                        .0,
+                        0
+                    );
+                    seq.assume_init()
+                };
+                assert_eq!(seq.profile, u8::from(is_444));
+                assert_eq!(seq.hbd, u8::from(color == OutputColor::Hdr10));
+                assert_eq!((seq.max_width, seq.max_height), (1920, 1080));
+                assert_eq!(
+                    [
+                        seq.pri as u8,
+                        seq.trc as u8,
+                        seq.mtrx as u8,
+                        seq.color_range
+                    ],
+                    color.cicp()
+                );
+            }
+        }
+    }
+
     /// Sequential MSB-first bit reader, mirroring `PackedData`'s writer so a
     /// header can be parsed back field by field.
     struct BitReader<'a> {
@@ -3459,5 +3830,254 @@ mod tests {
         assert_eq!(w, 1919);
         assert_eq!(h, 1079);
         assert_eq!(sep_uv, 1);
+    }
+}
+
+#[cfg(test)]
+mod gpu_color_export_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires VA-API NV12/P010/444P/AYUV/Y410/Y416 surfaces and Vulkan on the same GPU; no AV1 encoder needed"]
+    fn direct_gpu_yuv_surfaces() {
+        use crate::color_gpu_tests::client::ColorClient;
+        use yas_compositor::{CompositorCommand as Cmd, PixelData, color::OutputColor};
+        let device =
+            std::env::var("YAS_COLOR_GPU").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        for (color, is_444, format) in [
+            (OutputColor::Hdr10, false, None),
+            (OutputColor::DisplayP3, true, None),
+            (OutputColor::Hdr10, true, None),
+            (OutputColor::DisplayP3, true, Some(*b"AYUV")),
+            (OutputColor::Hdr10, true, Some(*b"Y416")),
+        ] {
+            let mut source = ColorClient::new(&device, color);
+            // H.264 supplies a VA display and allocation owner; it never encodes
+            // the P010 frames. This isolates HDR GPU conversion on older Intel GPUs
+            // that support P010 surfaces but have no AV1 encoder.
+            for size in [256, 192] {
+                let mut encoder = VaapiDirectEncoder::try_new(
+                    size,
+                    size,
+                    &device,
+                    23,
+                    0,
+                    true,
+                    crate::surface_encoder::ChromaSubsampling::Cs420,
+                    true,
+                )
+                .unwrap();
+                let vpp = encoder.vpp.as_mut().unwrap();
+                vpp.output_color = Some(color);
+                vpp.is_444 = is_444;
+                assert!(vpp.try_vaapi_yuv_export(size, size, 3, format.map(u32::from_le_bytes)));
+                assert!(!encoder.gbm_nv12_buffers().is_empty());
+                let buffers = encoder
+                    .gbm_nv12_buffers()
+                    .iter()
+                    .map(|b| yas_compositor::ColorDmaBuffer {
+                        fd: b.fd.clone(),
+                        fourcc: b.fourcc,
+                        modifier: b.modifier,
+                        planes: b.planes.clone(),
+                    })
+                    .collect();
+                source
+                    .handle
+                    .command_tx
+                    .send(Cmd::SetColorOutputTargets {
+                        surface_id: source.surface_id as u32,
+                        target_w: size,
+                        target_h: size,
+                        native_w: 256,
+                        native_h: 256,
+                        want_cpu_pixels: false,
+                        targets: vec![yas_compositor::ColorOutputTarget {
+                            width: size,
+                            height: size,
+                            color,
+                            is_444,
+                            buffers,
+                        }],
+                    })
+                    .unwrap();
+                source.handle.wake();
+                source.repaint();
+                let bundle = source.gpu_frame(size, true);
+                let PixelData::Nv12DmaBuf { fd, sync_fd, .. } = bundle
+                    .find_gpu_variant(|p| matches!(p, PixelData::Nv12DmaBuf { .. }))
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                if let Some(sync) = sync_fd {
+                    let mut poll = libc::pollfd {
+                        fd: sync.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    assert!(
+                        unsafe { libc::poll(&mut poll, 1, 5000) } > 0
+                            && poll.revents & libc::POLLIN != 0
+                    );
+                }
+                let surface = encoder
+                    .gbm_nv12_buffers()
+                    .iter()
+                    .find(|b| std::sync::Arc::ptr_eq(&b.fd, fd))
+                    .unwrap()
+                    .va_surface;
+                let mut image = [0u8; VA_IMAGE_SIZE];
+                assert_eq!(
+                    unsafe {
+                        (encoder.va.vaDeriveImage)(
+                            encoder.display,
+                            surface,
+                            image.as_mut_ptr().cast(),
+                        )
+                    },
+                    VA_STATUS_SUCCESS
+                );
+                let image_id = r32(&image, VAIMG_ID_OFF);
+                let buffer = r32(&image, VAIMG_BUF_OFF);
+                let mut data: *mut c_void = ptr::null_mut();
+                let status =
+                    unsafe { (encoder.va.vaMapBuffer)(encoder.display, buffer, &mut data) };
+                if status != VA_STATUS_SUCCESS {
+                    unsafe {
+                        (encoder.va.vaDestroyImage)(encoder.display, image_id);
+                    }
+                    panic!("P010 map failed: {status}");
+                }
+                // Read only within VAImage.data_size, then release both resources
+                // before assertions so a failed pixel check does not leak mappings.
+                let result = (|| {
+                    if data.is_null() {
+                        return None;
+                    }
+                    let len = r32(&image, 60) as usize;
+                    let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
+                    let y_offset = r32(&image, VAIMG_OFFSETS_OFF) as usize;
+                    let y_pitch = r32(&image, VAIMG_PITCHES_OFF) as usize;
+                    let uv_offset = r32(&image, VAIMG_OFFSETS_OFF + 4) as usize;
+                    let sample = |offset| {
+                        Some(
+                            u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?)
+                                >> 6,
+                        )
+                    };
+                    match r32(&image, VAIMG_FOURCC_OFF).to_le_bytes() {
+                        [b'P', b'0', b'1', b'0'] => Some((
+                            sample(y_offset + y_pitch * (size / 2) as usize + size as usize)?,
+                            sample(uv_offset)?,
+                            sample(uv_offset + 2)?,
+                        )),
+                        [b'Y', b'4', b'1', b'0'] => {
+                            let word = u32::from_le_bytes(
+                                bytes.get(y_offset..y_offset + 4)?.try_into().ok()?,
+                            );
+                            Some((
+                                ((word >> 10) & 1023) as u16,
+                                (word & 1023) as u16,
+                                ((word >> 20) & 1023) as u16,
+                            ))
+                        }
+                        [b'Y', b'4', b'1', b'6'] => Some((
+                            sample(y_offset + 2)?,
+                            sample(y_offset)?,
+                            sample(y_offset + 4)?,
+                        )),
+                        [b'4', b'4', b'4', b'P'] => Some((
+                            bytes[y_offset] as u16,
+                            bytes[uv_offset] as u16,
+                            bytes[r32(&image, VAIMG_OFFSETS_OFF + 8) as usize] as u16,
+                        )),
+                        [b'A', b'Y', b'U', b'V'] | [b'X', b'Y', b'U', b'V'] => {
+                            let q = bytes.get(y_offset..y_offset + 4)?;
+                            eprintln!("VA AYUV memory {q:?}");
+                            Some((q[2] as u16, q[1] as u16, q[0] as u16))
+                        }
+                        _ => None,
+                    }
+                })();
+                let prefix = if data.is_null() {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 8).to_vec() }
+                };
+                unsafe {
+                    (encoder.va.vaUnmapBuffer)(encoder.display, buffer);
+                }
+                if let Some((y, u, v)) = result {
+                    let image = CachedDerivedImage {
+                        data_size: r32(&image, 60) as usize,
+                        image_id,
+                        buf_id: buffer,
+                        fourcc: r32(&image, VAIMG_FOURCC_OFF),
+                        y_pitch: r32(&image, VAIMG_PITCHES_OFF) as usize,
+                        uv_pitch: r32(&image, VAIMG_PITCHES_OFF + 4) as usize,
+                        v_pitch: r32(&image, VAIMG_PITCHES_OFF + 8) as usize,
+                        y_offset: r32(&image, VAIMG_OFFSETS_OFF) as usize,
+                        uv_offset: r32(&image, VAIMG_OFFSETS_OFF + 4) as usize,
+                        v_offset: r32(&image, VAIMG_OFFSETS_OFF + 8) as usize,
+                    };
+                    let samples = (size * size) as usize;
+                    let chroma_samples = if is_444 { samples } else { samples / 4 };
+                    let yuv = crate::color_yuv::ColorYuv {
+                        planes: [
+                            vec![y; samples],
+                            vec![u; chroma_samples],
+                            vec![v; chroma_samples],
+                        ],
+                        width: size as usize,
+                        height: size as usize,
+                        is_444,
+                        bit_depth: if color == OutputColor::Hdr10 { 10 } else { 8 },
+                    };
+                    assert!(upload_color(encoder.va, encoder.display, &image, &yuv).is_some());
+                    let mut uploaded: *mut c_void = ptr::null_mut();
+                    let status =
+                        unsafe { (encoder.va.vaMapBuffer)(encoder.display, buffer, &mut uploaded) };
+                    assert_eq!(status, VA_STATUS_SUCCESS);
+                    assert!(!uploaded.is_null());
+                    let cpu_prefix =
+                        unsafe { std::slice::from_raw_parts(uploaded.cast::<u8>(), 8).to_vec() };
+                    unsafe {
+                        (encoder.va.vaUnmapBuffer)(encoder.display, buffer);
+                    }
+                    assert_eq!(
+                        cpu_prefix,
+                        prefix,
+                        "CPU and GPU YUV packing differ for {:?}",
+                        image.fourcc.to_le_bytes()
+                    );
+                }
+                unsafe {
+                    (encoder.va.vaDestroyImage)(encoder.display, image_id);
+                }
+                let actual = result.expect("valid mapped YUV layout");
+                let expected = if color == OutputColor::Hdr10 {
+                    (723, 512, 512)
+                } else {
+                    (63, 102, 240)
+                };
+                assert!(
+                    actual.0.abs_diff(expected.0) <= 2
+                        && actual.1.abs_diff(expected.1) <= 2
+                        && actual.2.abs_diff(expected.2) <= 2,
+                    "{color:?} 444={is_444} {size}: {actual:?} expected {expected:?}"
+                );
+                eprintln!("VA-API {color:?} 444={is_444} {size}: direct GPU {actual:?}");
+                source
+                    .handle
+                    .command_tx
+                    .send(Cmd::ClearDownscaleTarget {
+                        surface_id: source.surface_id as u32,
+                        target_w: size,
+                        target_h: size,
+                    })
+                    .unwrap();
+                source.handle.wake();
+            }
+        }
     }
 }

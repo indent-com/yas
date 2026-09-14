@@ -129,7 +129,7 @@ export class YasEdgeWebSocketTransport implements YasTransport {
         if (!this.authRejected) this.scheduleRetry();
       }
     };
-    // Status listeners can synchronously unmount or reconnect during HMR.
+    // Status listeners can synchronously unmount or reconnect.
     // Own the socket and install its callbacks before notifying them.
     this.setStatus("connecting");
   }

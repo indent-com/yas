@@ -27,3 +27,38 @@ export function av1LevelString(width: number, height: number): string {
   }
   return "19";
 }
+
+/** Read seq_profile from a low-overhead AV1 sequence-header OBU. Native
+ * Surface frames carry the codec family; the bitstream carries the profile. */
+export function av1SequenceProfile(data: Uint8Array): number | undefined {
+  let offset = 0;
+  while (offset < data.length) {
+    const header = data[offset++];
+    if (header & 0x81) return undefined; // forbidden/reserved bits
+    const type = (header >> 3) & 15;
+    if (header & 4) {
+      if (offset >= data.length || data[offset++] & 7) return undefined;
+    }
+    let size = data.length - offset;
+    if (header & 2) {
+      size = 0;
+      let complete = false;
+      for (let i = 0; i < 8 && offset < data.length; i++) {
+        const byte = data[offset++];
+        size += (byte & 127) * 2 ** (i * 7);
+        if (!(byte & 128)) {
+          complete = true;
+          break;
+        }
+      }
+      if (!complete || !Number.isSafeInteger(size)) return undefined;
+    }
+    if (size > data.length - offset) return undefined;
+    if (type === 1 && size > 0) {
+      const profile = data[offset] >> 5;
+      return profile <= 2 ? profile : undefined;
+    }
+    offset += size;
+  }
+  return undefined;
+}

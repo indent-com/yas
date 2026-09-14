@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { openSwitcher } from "./workspace-auth";
+import { createTerminal, openSwitcher } from "./workspace-auth";
 import { closeAllTerminals } from "./yas-cli";
 
 async function authenticate(page: import("@playwright/test").Page) {
@@ -19,7 +19,7 @@ async function authenticateAndCreateTerminal(
   await page.waitForTimeout(500);
   const canvas = page.locator("canvas").first();
   if (!(await canvas.isVisible().catch(() => false))) {
-    await page.getByRole("button", { name: "New terminal" }).first().click();
+    await createTerminal(page);
   }
   await expect(canvas).toBeVisible({ timeout: 10_000 });
 }
@@ -192,7 +192,7 @@ test.describe("Terminal", () => {
     await page.waitForTimeout(500);
     const canvas = page.locator("canvas").first();
     if (!(await canvas.isVisible().catch(() => false))) {
-      await page.getByRole("button", { name: "New terminal" }).first().click();
+      await createTerminal(page);
     }
     await expect(canvas).toBeVisible({ timeout: 10_000 });
 

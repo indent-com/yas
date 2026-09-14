@@ -2,6 +2,8 @@
 
 Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. Nothing to configure, no required dependencies.
 
+Wayland surfaces support [Display-P3 and HDR](docs/color.md), with SDR fallback for other viewers.
+
 We publish a [computer agent skill](https://yas.run/SKILL.md).
 
 Install and run locally:

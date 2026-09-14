@@ -70,12 +70,15 @@ test("the pinned SDK preserves a zero sandbox timeout in the API request", async
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert(address && typeof address === "object");
-  await assert.rejects(Sandbox.create({
-    apiUrl: `http://127.0.0.1:${address.port}`,
-    apiKey: "local-test-only",
-    image: "test-yas",
-    timeoutSecs: sandboxTimeout(),
-  }), /intentional local test stop/);
+  await assert.rejects(
+    Sandbox.create({
+      apiUrl: `http://127.0.0.1:${address.port}`,
+      apiKey: "local-test-only",
+      image: "test-yas",
+      timeoutSecs: sandboxTimeout(),
+    }),
+    /intentional local test stop/,
+  );
   assert.equal(requests.length, 1);
   assert.match(requests[0].url, /\/sandboxes$/);
   assert.equal(JSON.parse(requests[0].body).timeout_secs, 0);

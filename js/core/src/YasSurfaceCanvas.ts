@@ -1,4 +1,5 @@
 /// <reference lib="es2022.intl" />
+import { surface2DContext, SurfaceHdrPresenter } from "./surfaceColor";
 
 import { plannedDropExtension, plannedDropName } from "./surfaceDrop";
 import type { ConnectionId, SurfaceId, YasSurface } from "./types";
@@ -1292,6 +1293,7 @@ export class YasSurfaceCanvas {
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
+  private hdrPresenter: SurfaceHdrPresenter | null = null;
   /** Pointer overlay for the client currently driving this shared surface.
    *  The originating client is told to hide it and keeps its native cursor. */
   private remotePointerSvg: SVGSVGElement | null = null;
@@ -1816,7 +1818,7 @@ export class YasSurfaceCanvas {
     this.remotePointerImage = remotePointerImage;
 
     this.canvas = canvas;
-    this.ctx = canvas.getContext("2d");
+    this.ctx = surface2DContext(canvas);
     mountedSurfaceCanvases.set(canvas, this);
 
     this.observePresentBox(container);
@@ -1968,6 +1970,8 @@ export class YasSurfaceCanvas {
     if (this.remotePointerSvg && this.container) {
       this.container.removeChild(this.remotePointerSvg);
     }
+    this.hdrPresenter?.dispose();
+    this.hdrPresenter = null;
     this.canvas = null;
     this.ctx = null;
     this.remotePointerSvg = null;
@@ -2181,6 +2185,7 @@ export class YasSurfaceCanvas {
    */
   private applyLayout(): void {
     this.layoutCanvasBox();
+    if (this.canvas) this.hdrPresenter?.syncLayout(this.canvas);
     // The IME capture element is placed in client coordinates, so every box
     // move invalidates it — and this runs on each drawn frame, which is the
     // only notification a pane being dragged or resized gives us.
@@ -2333,7 +2338,7 @@ export class YasSurfaceCanvas {
       : (this._workspace.getConnection(this._connectionId) ?? null);
   }
 
-  /** HMR and Relay can replace a connection without changing its UI id.
+  /** Relay can replace a connection without changing its UI id.
    * Keep input, cursor/frame listeners, and view claims on the same instance. */
   private refreshConnection(): void {
     const next = this._workspace.getConnection(this._connectionId) ?? null;
@@ -2773,6 +2778,19 @@ export class YasSurfaceCanvas {
       this.scrollGeometry = null;
     }
     this.applyLayout();
+    const hdr = store.getHdrFrame?.(this._surfaceId);
+    if (hdr) {
+      this.hdrPresenter ??= SurfaceHdrPresenter.create();
+      if (this.hdrPresenter && this.hdrPresenter.draw(hdr, canvas)) {
+        if (!this.hdrPresenter.canvas.parentNode)
+          canvas.after(this.hdrPresenter.canvas);
+        canvas.style.opacity = "0";
+        return;
+      }
+    }
+    this.hdrPresenter?.dispose();
+    this.hdrPresenter = null;
+    canvas.style.opacity = "";
     drawHalved(ctx, src, src.width, src.height, n);
   }
 
@@ -2787,6 +2805,9 @@ export class YasSurfaceCanvas {
   }
 
   private serverUnsubscribe(): void {
+    this.hdrPresenter?.dispose();
+    this.hdrPresenter = null;
+    if (this.canvas) this.canvas.style.opacity = "";
     const sub = this._subscribedSurface;
     this._framePresentationSize = null;
     // Hiding, replacing, or disposing a canvas does not reliably produce a
@@ -3294,8 +3315,8 @@ export class YasSurfaceCanvas {
    * This deliberately changes only the host canvas CSS. The remote cursor
    * state remains hidden, so co-viewer overlays and Wayland focus are
    * untouched. While this canvas owns pointer focus, every application cursor
-   * update remains authoritative, including video idle hides. HMR, reconnects,
-   * and viewer handoffs retire ownership, so their first motion can recover a
+   * update remains authoritative, including video idle hides. Reconnects and
+   * viewer handoffs retire ownership, so their first motion can recover a
    * cached cursor while waiting for a fresh application update.
    */
   private wakeHiddenHostCursor(): void {

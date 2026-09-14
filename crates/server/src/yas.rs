@@ -3943,7 +3943,7 @@ struct NativeSurfaceView {
 }
 
 /// An admitted view waiting for its first frame to select the encoder codec.
-/// Ownership includes the provisional backend, even if HMR disconnects before
+/// Ownership includes the provisional backend, even if the client disconnects before
 /// a Result can publish the view into the session's live view map.
 struct PendingSurfaceOpen {
     header: FrameHeader,
@@ -8967,7 +8967,10 @@ impl Session {
             Ok(request) => request,
             Err(_) => return self.send_result(&frame, Status::Invalid, Vec::new()).await,
         };
-        if has_unknown_required(&request.extensions, &[]) {
+        if has_unknown_required(
+            &request.extensions,
+            &[yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16],
+        ) {
             return self
                 .send_result(&frame, Status::Unsupported, Vec::new())
                 .await;
@@ -9041,6 +9044,8 @@ impl Session {
             .map(|native| native.state.clone())
             .ok_or(())?;
         let config = super::yas_surface_backend::ViewConfig {
+            color_capabilities: yas_surface::color_capabilities(&request.extensions)
+                .map_err(|_| ())?,
             width,
             height,
             max_fps: request.max_fps,
@@ -9180,7 +9185,10 @@ impl Session {
             Ok(request) => request,
             Err(_) => return self.send_result(&frame, Status::Invalid, Vec::new()).await,
         };
-        if has_unknown_required(&request.extensions, &[]) {
+        if has_unknown_required(
+            &request.extensions,
+            &[yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16],
+        ) {
             return self
                 .send_result(&frame, Status::Unsupported, Vec::new())
                 .await;
@@ -9227,6 +9235,8 @@ impl Session {
             None
         };
         let config = super::yas_surface_backend::ViewConfig {
+            color_capabilities: yas_surface::color_capabilities(&request.extensions)
+                .map_err(|_| ())?,
             width,
             height,
             max_fps: request.max_fps,
@@ -9409,8 +9419,15 @@ impl Session {
                 if pixels.is_dmabuf() {
                     return None;
                 }
+                if matches!(pixels, yas_compositor::PixelData::LinearRgba { .. }) {
+                    return Some((width, height, pixels));
+                }
                 let rgba = pixels.to_rgba(width, height);
-                (!rgba.is_empty()).then_some((width, height, rgba))
+                (!rgba.is_empty()).then_some((
+                    width,
+                    height,
+                    yas_compositor::PixelData::Rgba(std::sync::Arc::new(rgba)),
+                ))
             });
         }
         let Some((width, height, pixels)) = captured else {
@@ -26886,7 +26903,12 @@ impl Session {
                 let payload = yas_wire::packed::encode_surface(
                     codec_version,
                     &yas_wire::packed::SurfacePayload {
-                        color_space: None,
+                        color_space: Some(yas_wire::packed::SurfaceColorSpace {
+                            primaries: frame.color_space[0],
+                            transfer: frame.color_space[1],
+                            matrix: frame.color_space[2],
+                            range: frame.color_space[3],
+                        }),
                         damage: None,
                         dimensions: Some(yas_wire::packed::SurfaceDimensions {
                             width: frame.width,
@@ -45662,6 +45684,7 @@ mod tests {
                             super::super::yas_surface_backend::enqueue_frame(
                                 client,
                                 super::super::yas_surface_backend::EncodedFrame {
+                                    color_space: yas_compositor::color::OutputColor::Srgb.cicp(),
                                     logical_size: shared
                                         .compositor
                                         .as_ref()
@@ -45731,7 +45754,7 @@ mod tests {
                 },
             )
             .await;
-            // No encoder frame arrives. A new HMR pane must still resize and
+            // No encoder frame arrives. A replacement pane must still resize and
             // the old connection must release its claims as soon as it closes.
             write_request(
                 &mut client,
@@ -45802,7 +45825,7 @@ mod tests {
             drop(client);
             timeout(Duration::from_secs(1), server_task)
                 .await
-                .expect("HMR disconnect must not await codec selection")
+                .expect("client disconnect must not await codec selection")
                 .unwrap();
             timeout(Duration::from_secs(1), async {
                 loop {

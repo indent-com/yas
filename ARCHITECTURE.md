@@ -12,6 +12,7 @@ Detailed references:
 - [protocol/yas/wire.md](protocol/yas/wire.md) — generated exact IDs, layouts, limits, and codec registry
 - [docs/transports.md](docs/transports.md) — all transport options, topology diagrams, deployment patterns
 - [docs/server.md](docs/server.md) — PTY lifecycle, compositor, frame pacing, server control
+- [docs/color.md](docs/color.md) — Wayland color descriptions, linear composition, per-view P3/HDR encoding and presentation
 - [docs/frontend.md](docs/frontend.md) — WASM runtime, WebGL renderer, glyph atlas, input handling
 
 ---

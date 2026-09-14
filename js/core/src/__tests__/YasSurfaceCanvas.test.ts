@@ -2873,7 +2873,7 @@ describe("YasSurfaceCanvas size mediation", () => {
 });
 
 describe("YasSurfaceCanvas visibility", () => {
-  it("rebinds cursor and frame listeners when HMR replaces a connection under the same id", () => {
+  it("rebinds cursor and frame listeners when Relay replaces a connection under the same id", () => {
     const makeConnection = (name: string, initialCursor: string) => {
       const cursorListeners = new Set<
         (sid: SurfaceId, shape: string) => void
@@ -5929,7 +5929,7 @@ describe("YasSurfaceCanvas iOS keyboard input", () => {
   });
 });
 
-describe("YasSurfaceCanvas focus after HMR", () => {
+describe("YasSurfaceCanvas focus after connection replacement", () => {
   const cleanup: (() => void)[] = [];
 
   beforeEach(() => {

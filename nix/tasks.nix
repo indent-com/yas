@@ -15,6 +15,13 @@
   uplinkE2eFixture,
 }:
 let
+  # The color integration tests require Vulkan, including on headless runners.
+  # Use the same software device for normal tests and coverage.
+  softwareVulkanEnv = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+    export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export VK_DRIVER_FILES="${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json"
+  '';
+
   # Helper to set up WASM browser pkg for JS builds.
   setupBrowserPkg = ''
     mkdir -p crates/browser/pkg/snippets
@@ -576,11 +583,15 @@ let
       pkgs.python3
       pkgs.pkg-config
       pkgs.libopus
-    ];
+    ]
+    # The software Vulkan driver loads Nix libraries at runtime. Link the
+    # instrumented tests with the same libc instead of the runner's system cc.
+    ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.stdenv.cc ];
     text = ''
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
       export YAS_WEB_DIST="${webDist}"
+      ${softwareVulkanEnv}
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -850,6 +861,7 @@ in
       pkgs.jq
       pkgs.pkg-config
       pkgs.libopus
+      pkgs.glslang
     ];
     text = ''
       check=false
@@ -900,6 +912,9 @@ in
         ${fmt}/bin/yas-fmt
       fi
       echo ""
+      echo "=== Compositor shader artifacts ==="
+      ./bin/build-shaders --check
+      echo ""
       ${clippy}/bin/yas-clippy
     '';
   };
@@ -935,6 +950,7 @@ in
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
       export YAS_TEST_DBUS_SESSION_CONF="${testDbusSessionConfig}"
       export YAS_FONT_DIRS="${pkgs.dejavu_fonts}/share/fonts/truetype"
+      ${softwareVulkanEnv}
 
       # Rust tests exercise the UI routes, so their include_bytes! inputs must
       # be valid Brotli streams with representative content. Building the

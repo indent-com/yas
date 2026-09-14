@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { openReturningWorkspace } from "./workspace-auth";
+import { createTerminal, openReturningWorkspace } from "./workspace-auth";
 
 /**
  * The hidden capture textarea is what the host IME anchors its candidate
@@ -21,7 +21,7 @@ async function authenticate(page: Page) {
   await page.waitForTimeout(500);
   const canvas = terminalCanvas(page);
   if (!(await canvas.isVisible().catch(() => false))) {
-    await page.getByRole("button", { name: "New terminal" }).first().click();
+    await createTerminal(page);
   }
   await expect(canvas).toBeVisible({ timeout: 15_000 });
   await page.waitForTimeout(1500);

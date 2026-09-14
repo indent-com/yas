@@ -15,6 +15,7 @@ pub(crate) enum Codec {
 
 #[derive(Debug)]
 pub(crate) struct Frame {
+    pub(crate) color_space: [u8; 4],
     pub(crate) logical_size: Option<(u32, u32)>,
     pub(crate) view_id: u32,
     pub(crate) surface_id: u16,
@@ -31,6 +32,7 @@ pub(crate) struct Frame {
 /// Keeping the frame metadata together avoids a positional encoder call
 /// surface.
 pub(crate) struct EncodedFrame {
+    pub(crate) color_space: [u8; 4],
     pub(crate) logical_size: Option<(u32, u32)>,
     pub(crate) surface_id: u16,
     pub(crate) codec: Codec,
@@ -128,6 +130,7 @@ impl Sink {
         let bytes = frame.data.len().saturating_add(64);
         self.events
             .try_send(Event::Frame(Frame {
+                color_space: frame.color_space,
                 logical_size: frame.logical_size,
                 view_id: self.view_id,
                 surface_id: frame.surface_id,
@@ -169,6 +172,7 @@ pub(crate) struct ViewConfig {
     pub(crate) max_fps: u16,
     pub(crate) decoder_capacity: u8,
     pub(crate) codec_support: u8,
+    pub(crate) color_capabilities: u8,
 }
 
 pub(crate) struct Registration {
@@ -563,6 +567,7 @@ fn hidden_client(
         surface_view_sizes: FxHashMap::default(),
         surface_claim_lapses: FxHashMap::default(),
         surface_codec_support: config.codec_support,
+        surface_color_capabilities: config.color_capabilities,
         surface_max_decode: (config.width, config.height),
         pressed_surface_keys: HashSet::new(),
         direct_touch_enabled: true,
@@ -639,6 +644,7 @@ pub(crate) async fn configure(
     }
     client.display_fps = f32::from(config.max_fps.max(1));
     client.surface_codec_support = config.codec_support;
+    client.surface_color_capabilities = config.color_capabilities;
     client.surface_max_decode = (config.width, config.height);
     client
         .surface_view_sizes
@@ -760,7 +766,7 @@ pub(crate) async fn remove(state: &AppState, client_id: u64) {
     }
     if let Some(compositor) = session.compositor.as_mut() {
         compositor.frame_clocks_dirty = true;
-        // Reload/HMR can close the view before its canvas sends LEAVE. Retire
+        // A page reload can close the view before its canvas sends LEAVE. Retire
         // its Wayland focus too, so the next viewer receives a fresh enter.
         for command in input_releases {
             let _ = compositor.handle.command_tx.send(command);
@@ -1152,6 +1158,96 @@ pub(crate) fn enqueue_remote_input(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn managed_surface_delivers_independent_sdr_p3_and_hdr_views() {
+        let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
+        let mut receivers = Vec::new();
+        {
+            let mut session = state.session.lock().await;
+            session.ensure_compositor(false, Arc::new(|| {}), "");
+            session.compositor.as_mut().unwrap().surfaces.insert(
+                7,
+                CachedSurfaceInfo {
+                    surface_id: 7,
+                    parent_id: 0,
+                    origin: None,
+                    width: 64,
+                    height: 64,
+                    logical_width: 64,
+                    logical_height: 64,
+                    title: "color test".into(),
+                    app_id: "yas.test".into(),
+                },
+            );
+            for (i, capabilities) in [0, 1, 3].into_iter().enumerate() {
+                let (events, received) = mpsc::channel(32);
+                let mut client = hidden_client(
+                    i as u32 + 1,
+                    events,
+                    ViewConfig {
+                        width: 64,
+                        height: 64,
+                        max_fps: 60,
+                        decoder_capacity: 4,
+                        codec_support: CODEC_SUPPORT_AV1,
+                        color_capabilities: capabilities,
+                    },
+                    Arc::new(AtomicU64::new(0)),
+                );
+                client.surface_subscriptions.insert(7);
+                client.surface_subs.entry(7).or_default().burst_remaining = 16;
+                session.clients.insert(i as u64 + 1, client);
+                receivers.push(received);
+            }
+        }
+        let mut received_colors = [None; 3];
+        let pixels =
+            Arc::new([1000.0 / 203.0, 1000.0 / 203.0, 1000.0 / 203.0, 1.0].repeat(64 * 64));
+        for n in 0..200 {
+            {
+                let mut session = state.session.lock().await;
+                let cs = session.compositor.as_mut().unwrap();
+                cache_surface_commit(
+                    &mut cs.last_pixels,
+                    &mut cs.pixel_generation,
+                    (7, 64, 64),
+                    Some((64, 64)),
+                    yas_compositor::PixelData::LinearRgba {
+                        peak_nits: None,
+                        data: Arc::clone(&pixels),
+                        hdr: true,
+                    },
+                    n * 16,
+                    0,
+                    false,
+                );
+                cs.mark_pixel_snapshot_dirty();
+            }
+            tick(&state).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for (i, rx) in receivers.iter_mut().enumerate() {
+                while let Ok(event) = rx.try_recv() {
+                    if let Event::Frame(frame) = event {
+                        assert!(frame.keyframe || received_colors[i].is_some());
+                        received_colors[i] = Some(frame.color_space);
+                    }
+                }
+            }
+            if received_colors.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        assert_eq!(
+            received_colors,
+            [
+                Some([1, 13, 6, 0]),
+                Some([12, 13, 1, 0]),
+                Some([9, 16, 9, 0])
+            ]
+        );
+    }
+
     #[test]
     fn pointer_leave_and_handoff_publish_immediate_remote_retirement() {
         use yas_wire::codec::{Decode, Encode};
@@ -1167,6 +1263,7 @@ mod tests {
                 max_fps: 60,
                 decoder_capacity: 4,
                 codec_support: CODEC_SUPPORT_H264,
+                color_capabilities: 0,
             },
             Arc::new(AtomicU64::new(0)),
         );
@@ -1214,6 +1311,7 @@ mod tests {
                 max_fps: 60,
                 decoder_capacity: 4,
                 codec_support: CODEC_SUPPORT_H264,
+                color_capabilities: 0,
             },
             Arc::clone(&write_blocked_us),
         );
@@ -1236,6 +1334,7 @@ mod tests {
                 max_fps: 60,
                 decoder_capacity: 1,
                 codec_support: CODEC_SUPPORT_H264,
+                color_capabilities: 0,
             },
             Arc::new(AtomicU64::new(0)),
         );
@@ -1372,6 +1471,7 @@ mod tests {
                             max_fps: 60,
                             decoder_capacity: 4,
                             codec_support: CODEC_SUPPORT_H264,
+                            color_capabilities: 0,
                         },
                         Arc::new(AtomicU64::new(0)),
                     ),

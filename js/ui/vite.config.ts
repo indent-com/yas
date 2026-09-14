@@ -27,17 +27,7 @@ const SW_DEV_ENTRY = "/src/sw/index.ts";
 export default defineConfig({
   base: "/",
   plugins: [
-    solid(),
-    isDev && {
-      name: "yas-touch-focus-trace",
-      configureServer(server) {
-        server.ws.on("yas:touch-focus", (entries) => {
-          const data = JSON.stringify(entries);
-          if (data.length <= 262144)
-            writeFileSync("/tmp/yas-ipad-touch-focus.json", data);
-        });
-      },
-    },
+    solid({ hot: false }),
     // Compiles src/ide/nix/syntax.grammar to a Lezer parser at build time.
     // The grammar is vendored (and patched — see its header) because the
     // only published Nix grammar mis-parses formatted Nix.
@@ -177,11 +167,7 @@ export default bin.buffer;
           head: Buffer,
         ) => {
           const path = req.url || "/";
-
-          // Let Vite handle its own WS connections (HMR, etc.).
-          if (path.startsWith("/__") || path.startsWith("/@")) return;
-          const url = new URL(path, "http://localhost");
-          if (url.searchParams.has("token")) return;
+          if (new URL(path, "http://localhost").pathname !== "/edge") return;
 
           // Native YAS WebSocket connections → edge.
           proxyWsToEdge(req, socket, head, path);
@@ -225,6 +211,7 @@ export default bin.buffer;
     dedupe: ["solid-js"],
   },
   server: {
+    hmr: false,
     port: parseInt(process.env.YAS_DEV_UI_PORT || "3265"),
     host: "0.0.0.0",
     allowedHosts: true,

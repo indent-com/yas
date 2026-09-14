@@ -13,7 +13,7 @@ const isBuild = process.argv.includes("build");
 
 export default defineConfig({
   plugins: [
-    solid(),
+    solid({ hot: false }),
     tailwindcss(),
     lezer(),
     {
@@ -54,6 +54,7 @@ export default bytes.buffer;
     dedupe: ["solid-js"],
   },
   server: {
+    hmr: false,
     strictPort: true,
     allowedHosts: true,
     fs: { allow: [resolve(root, "../..")] },

@@ -59,6 +59,8 @@ wasmparser = { version = "0.239", default-features = false, features = ["std"] }
 rquickjs = { version = "0.12", default-features = false, features = ["std"] }
 redb = "2"
 rav1e = { version = "0.8", default-features = false }
+avif-serialize = "0.8.9"
+half = "2"
 ravif = { version = "0.13", default-features = false }
 rgb = "0.8"
 png = "0.18"
@@ -110,3 +112,10 @@ windows-sys = { version = "0.61", features = [
 tokio = { version = "1", features = ["test-util"] }
 wat = "1"
 rcgen = "0.14"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Validate the actual 10-bit surface bitstream with an independent decoder.
+rav1d = { version = "=1.1.0", default-features = false, features = ["bitdepth_16"] }
+
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }

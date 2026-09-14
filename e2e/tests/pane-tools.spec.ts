@@ -171,7 +171,7 @@ test.describe("Pane multitool on a main-view terminal", () => {
     // Parked: the main view shows the empty pane, and the session is now a
     // card in the dock.
     await expect(
-      page.getByRole("button", { name: "New terminal" }).first(),
+      page.getByRole("button", { name: "Start with ctrl-b", exact: true }),
     ).toBeVisible({ timeout: 10_000 });
     await openPreviewPanel(page);
     await expect(
@@ -198,7 +198,7 @@ test.describe("Pane multitool on a main-view terminal", () => {
     await page.keyboard.press("q");
 
     await expect(
-      page.getByRole("button", { name: "New terminal" }).first(),
+      page.getByRole("button", { name: "Start with ctrl-b", exact: true }),
     ).toBeVisible({ timeout: 10_000 });
     await openPreviewPanel(page);
     await expect(
@@ -239,7 +239,7 @@ test.describe("Parked terminal remains recoverable", () => {
     // Park A.
     await parkViaGrip(page);
     await expect(
-      page.getByRole("button", { name: "New terminal" }).first(),
+      page.getByRole("button", { name: "Start with ctrl-b", exact: true }),
     ).toBeVisible({ timeout: 10_000 });
 
     // Open B: A un-parks into the dock and B takes the view.
@@ -255,7 +255,7 @@ test.describe("Parked terminal remains recoverable", () => {
       .click();
     await page.waitForTimeout(1000);
     await expect(
-      page.getByRole("button", { name: "New terminal" }).first(),
+      page.getByRole("button", { name: "Start with ctrl-b", exact: true }),
     ).toBeVisible({
       timeout: 10_000,
     });

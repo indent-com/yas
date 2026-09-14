@@ -44,10 +44,8 @@ test.describe("Auth flow", () => {
     await passInput.press("Enter");
 
     await expect(passInput).toBeHidden({ timeout: 10_000 });
-    const newTerminal = page
-      .getByRole("button", { name: "New terminal" })
-      .first();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    const workspace = page.getByRole("status", { name: "Connected" });
+    await expect(workspace).toBeVisible({ timeout: 10_000 });
   });
 
   test("bad stored passphrase is cleared and prompts again", async ({
@@ -76,10 +74,8 @@ test.describe("Auth flow", () => {
     await passInput.fill("test-secret");
     await passInput.press("Enter");
 
-    const newTerminal = page
-      .getByRole("button", { name: "New terminal" })
-      .first();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    const workspace = page.getByRole("status", { name: "Connected" });
+    await expect(workspace).toBeVisible({ timeout: 10_000 });
 
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("yas-passphrase")))
@@ -87,7 +83,7 @@ test.describe("Auth flow", () => {
     expect(page.url()).not.toContain("test-secret");
 
     await page.reload();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    await expect(workspace).toBeVisible({ timeout: 10_000 });
   });
 
   test("psk passphrase in hash is stored and stripped", async ({ page }) => {
@@ -96,10 +92,8 @@ test.describe("Auth flow", () => {
     const passInput = page.locator('input[type="password"]');
     await expect(passInput).toBeHidden({ timeout: 10_000 });
 
-    const newTerminal = page
-      .getByRole("button", { name: "New terminal" })
-      .first();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    const workspace = page.getByRole("status", { name: "Connected" });
+    await expect(workspace).toBeVisible({ timeout: 10_000 });
 
     const url = page.url();
     expect(url).not.toContain("psk=test-secret");
@@ -109,7 +103,7 @@ test.describe("Auth flow", () => {
       .toBe("test-secret");
 
     await page.reload();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    await expect(workspace).toBeVisible({ timeout: 10_000 });
   });
 
   test("debug hash does not replace stored passphrase", async ({ page }) => {
@@ -120,10 +114,8 @@ test.describe("Auth flow", () => {
 
     await page.goto("/#debug");
 
-    const newTerminal = page
-      .getByRole("button", { name: "New terminal" })
-      .first();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    const workspace = page.getByRole("status", { name: "Connected" });
+    await expect(workspace).toBeVisible({ timeout: 10_000 });
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("yas-passphrase")))
       .toBe("test-secret");

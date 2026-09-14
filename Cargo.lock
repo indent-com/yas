@@ -1267,6 +1267,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "crypto-bigint"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3081,6 +3087,17 @@ dependencies = [
  "ff",
  "rand_core 0.10.1",
  "subtle",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy 0.8.48",
 ]
 
 [[package]]
@@ -8185,7 +8202,9 @@ version = "0.1.4"
 dependencies = [
  "ash",
  "calloop",
+ "half",
  "libc",
+ "moxcms",
  "rustc-hash",
  "wayland-client",
  "wayland-protocols",
@@ -8325,10 +8344,12 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "ash",
+ "avif-serialize",
  "blake3",
  "close_fds",
  "cros-codecs",
  "getrandom 0.3.4",
+ "half",
  "ignore",
  "image",
  "libc",
@@ -8359,6 +8380,8 @@ dependencies = [
  "wasmi",
  "wasmparser 0.239.0",
  "wat",
+ "wayland-client",
+ "wayland-protocols",
  "windows-sys 0.61.2",
  "x264-sys",
  "yas-composite-transport",

@@ -6,14 +6,12 @@ The browser side of YAS consists of a TypeScript native YAS session
 validates native frames, and owns workspace and input state. WASM consumes a
 private renderer snapshot and produces GPU-ready vertex data.
 
-The App module owns one home connection across its mounts. HMR permanently
-retires the old module's connection slot, including late mounts from that
-module, before the replacement connects. Ownership changes precede synchronous
-close/status callbacks so reentrant mounts cannot orphan a connection. Module
-teardown closes and disposes the connection, including ping timers and renderer
-subscriptions, even if component cleanup never runs. Closing the home
-connection also releases its nested Relay sessions and their terminal
-and surface views; abandoned views must not keep constraining shared sizes.
+Each connected App owns its home connection and workspace. Component cleanup
+closes and disposes the connection, including ping timers, renderer
+subscriptions, nested Relay sessions, and their terminal and surface views.
+Workspace layouts are restored from the attached backend session, or local
+storage for embedded workspaces. Development source changes require a manual
+page reload.
 
 On iOS/iPadOS, Safari and installed apps share a fixed opaque top strip to
 suppress the system scroll-edge blur. It follows the palette, sits above
@@ -405,7 +403,7 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 - Surface key events carry the browser's observed Caps Lock state. The compositor applies that snapshot directly, so reloads, focus changes, and other viewers cannot leave case dependent on a browser's remembered toggle history. Committed text already includes the browser's case selection; synthesis temporarily clears Shift and Caps Lock and restores them before the next raw key.
 - Mirrored pointer overlays disappear on leave or ownership handoff. The browser also honors each remote-input expiry, independently per surface and input kind, so stale cursors cannot persist and pointer cleanup preserves active touch contacts.
 - Surface cursor metadata drives the canvas CSS cursor. Withdrawing that metadata, removing a surface, or resetting the store restores the default cursor on mounted canvases. Motion within the same surface preserves the application's cursor visibility, including video idle hides and pointer-lock cursors; it does not synthesize Wayland leave/re-enter or flash a local arrow. The browser provides immediate local recovery only when taking pointer ownership with cached hidden state, such as after a guest reload or viewer handoff. A non-empty mirrored pointer proves another viewer took the shared Wayland pointer, so the prior viewer drops its local ownership claim. Real pointer entries and same-surface viewer handoffs produce a Wayland leave/re-enter, giving the new owner a fresh cursor serial and invalidating late cursor requests from the old position.
-- Mounted surface canvases follow connection instances as well as IDs. When HMR or Relay replaces a connection under the same ID, they release the old view and rebind cursor, frame, and input state to the replacement. A browser-focused surface reasserts remote keyboard focus once its display box and replacement catalogue are ready, without requiring another tap or stealing focus from chrome. Server-side view removal also retires its pointer focus, covering disconnects that cannot send a pointer leave.
+- Mounted surface canvases follow connection instances as well as IDs. When Relay replaces a connection under the same ID, they release the old view and rebind cursor, frame, and input state to the replacement. A browser-focused surface reasserts remote keyboard focus once its display box and replacement catalogue are ready, without requiring another tap or stealing focus from chrome. Server-side view removal also retires its pointer focus, covering disconnects that cannot send a pointer leave.
 - A zero-size pane or hidden browser page withdraws its surface size claim and cancels queued resizes. Showing it again reclaims its measured box, even if the dimensions are unchanged. Window resize events remeasure the box independently of changes in display DPI.
 - Native file drags announce planned screenshot filenames during hover. Selection creates private files for that drag, exposes their URI list to the destination, and fills them only after every DROP payload has validated. No prior FS upload is required. File offers expose URI and binary representations rather than making Chromium wait for unavailable image bytes during hover; this supports screenshot-thumbnail drops into Electron apps such as Legcord. Dropped files remain available until the session closes.
 - Surface views accept `touchMode="pointer" | "direct"`. Direct mode is the default and forwards each event's contact changes as Surface `TOUCH` for native Wayland multitouch. Pointer mode is the explicit fallback and maps touch to tap, finger scroll, long-press right-click, and hold-drag. The UI exposes this as **Media → Touch input**.

@@ -549,7 +549,7 @@ export class YasTerminalSurface {
   private dirtyUnsub: (() => void) | null = null;
   private scrollAnchorUnsub: (() => void) | null = null;
   private resizeObserver: ResizeObserver | null = null;
-  /** Used by the workspace connection to reap a surface whose HMR cleanup was skipped. */
+  /** Prefer an attached pane when choosing the terminal view size. */
   private readonly viewIsActive = () => this.container?.isConnected === true;
   private dprMq: MediaQueryList | null = null;
   private dprCheckHandler: (() => void) | null = null;
@@ -1841,9 +1841,8 @@ export class YasTerminalSurface {
     const rows = Math.max(1, Math.floor(h / this.cell.h));
     const sizeChanged = cols !== this._cols || rows !== this._rows;
     // `immediate` is used when an observer is first installed. Register the
-    // view even when its box happens to be exactly the 80x24 defaults; after an
-    // HMR registry reset (and on an ordinary first mount) equality must not
-    // turn the registration into a no-op.
+    // view even when its box happens to be exactly the 80x24 defaults;
+    // equality must not turn the first registration into a no-op.
     if (sizeChanged || immediate || firstMeasurement) {
       this._rows = rows;
       this._cols = cols;

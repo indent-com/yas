@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { openReturningWorkspace } from "./workspace-auth";
+import { createTerminal, openReturningWorkspace } from "./workspace-auth";
 import { execFileSync } from "node:child_process";
 
 /**
@@ -39,7 +39,7 @@ async function openPanel(page: Page) {
   // repository", which is not what these tests are about.
   const canvas = page.locator("canvas").first();
   if (!(await canvas.isVisible().catch(() => false))) {
-    await page.getByRole("button", { name: "New terminal" }).first().click();
+    await createTerminal(page);
   }
   await expect(canvas).toBeVisible({ timeout: 20_000 });
   // Give the pty's cwd poll and the repo open time to land: every git-backed

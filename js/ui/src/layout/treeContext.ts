@@ -1,17 +1,7 @@
 import type { WebPaneHostRegistrar } from "../WebPaneHost";
 import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 import type { SpatialDirection } from "./spatialNavigation";
-/**
- * The layout tree's shared context, deliberately in its own module.
- *
- * `createContext` mints an identity: a Provider and a consumer only match
- * when both hold the *same* object. Defining it alongside the components
- * meant every hot reload of `LayoutContainer.tsx` created a fresh context, so
- * consumers re-rendered against it while ancestor Providers still carried
- * the previous one — `useContext` then returned undefined and the first
- * field read threw. Keeping it here means the identity survives reloads of
- * the components that use it.
- */
+/** Shared context for the layout tree's provider and consumers. */
 
 import { createContext, useContext } from "solid-js";
 import type { YasTerminalSurface, TerminalPalette } from "@yas-run/core";

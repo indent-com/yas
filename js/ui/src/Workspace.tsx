@@ -314,25 +314,11 @@ import {
   workspaceSessionRemoteMembershipSetter,
 } from "./workspaceSessionRemotes";
 import {
-  cancelHmrRelease,
-  claimHmrLease,
-  deferHmrRelease,
-  type HmrLeaseState,
-} from "./hmrLease";
-import {
   removeOwnedWorkspaceConnection,
   removeOwnedWorkspaceConnections,
   type WorkspaceTransportOwnership,
 } from "./workspaceConnectionOwnership";
 import { WorkspaceSessionView } from "./WorkspaceSessionView";
-import {
-  claimWorkspaceScreenHmr,
-  type WorkspaceScreenHmrCache,
-} from "./workspaceScreenHmr";
-
-const screenHmrCache: WorkspaceScreenHmrCache | undefined = import.meta.hot
-  ? (import.meta.hot.data.screens ??= new WeakMap())
-  : undefined;
 
 export type Overlay =
   | "expose"
@@ -346,17 +332,6 @@ export type Overlay =
   | "link"
   | null;
 
-type HmrWorkspaceData = HmrLeaseState & {
-  workspace: YasWorkspace;
-  /** Module-local identity. A new object means this module was hot-reloaded. */
-  owner: object;
-  /** Transport generation owned by the parent ConnectedApp. */
-  key: object;
-  /** Whether this workspace or its parent closes the transport objects. */
-  transportOwnership: WorkspaceTransportOwnership;
-};
-
-const hmrWorkspaceOwner = {};
 const WORKSPACE_SESSION_PATCH_DEBOUNCE_MS = 250;
 const UI_SESSION_HISTORY_MAX_ITEMS = 4_096;
 const UI_SESSION_HISTORY_MAX_ENTRY_CHARS = 8_192;
@@ -390,64 +365,9 @@ function setBoundedStringLru(
   boundedStringLruBytes.set(cache, bytes);
 }
 
-/** Reset terminal view leases before handing an HMR workspace to new views. */
-function resetHmrViewSizes(workspace: YasWorkspace): void {
-  workspace.resetViewSizes();
-}
-
-function getHmrWorkspace(
-  wasm: YasWasmModule,
-  key: object,
-  leaseOwner: object,
-  transportOwnership: WorkspaceTransportOwnership,
-): HmrWorkspaceData {
-  const raw = import.meta.hot?.data?.workspace as
-    | HmrWorkspaceData
-    | YasWorkspace
-    | undefined;
-  // Accept the raw YasWorkspace stored by versions before HmrWorkspaceData.
-  const prev = raw && "workspace" in raw ? raw.workspace : raw;
-  const previousOwner = raw && "workspace" in raw ? raw.owner : null;
-  const previousKey = raw && "workspace" in raw ? raw.key : null;
-  if (prev && previousKey === key) {
-    // Solid normally disposes every old terminal surface, but HMR is allowed to
-    // replace a component boundary without visiting all of those cleanups. The
-    // preserved workspace would then retain the vanished pane's size forever,
-    // and the minimum-size policy would leave most of a larger pane blank.
-    // Reset once per module generation; the replacement surfaces immediately
-    // register their real boxes while transports and terminal state stay live.
-    if (previousOwner !== hmrWorkspaceOwner) resetHmrViewSizes(prev);
-    const data = raw as HmrWorkspaceData;
-    data.owner = hmrWorkspaceOwner;
-    data.transportOwnership = transportOwnership;
-    claimHmrLease(data, leaseOwner);
-    if (import.meta.hot) import.meta.hot.data.workspace = data;
-    return data;
-  }
-  if (prev) {
-    if (raw && "workspace" in raw) cancelHmrRelease(raw);
-    removeOwnedWorkspaceConnections(
-      prev,
-      raw && "workspace" in raw
-        ? (raw.transportOwnership ?? "workspace")
-        : "workspace",
-    );
-  }
-  const ws = new YasWorkspace({ wasm });
-  const data = claimHmrLease<HmrWorkspaceData>(
-    { workspace: ws, owner: hmrWorkspaceOwner, key, transportOwnership },
-    leaseOwner,
-  );
-  if (import.meta.hot) {
-    import.meta.hot.data.workspace = data;
-  }
-  return data;
-}
-
 export function Workspace(props: {
   connections: ConnectionSpec[] | (() => ConnectionSpec[]);
   wasm: YasWasmModule;
-  hmrKey?: object;
   onAuthError: () => void;
   relayRoutes?: () => readonly YasRelayRoute[];
   workspaceSession?:
@@ -456,16 +376,8 @@ export function Workspace(props: {
   workspaceSessions?: WorkspaceSessionController;
   transportOwnership?: WorkspaceTransportOwnership;
 }) {
-  const hmrLeaseOwner = {};
-  const hmrKey = props.hmrKey ?? {};
   const transportOwnership = props.transportOwnership ?? "workspace";
-  const hmrData = getHmrWorkspace(
-    props.wasm,
-    hmrKey,
-    hmrLeaseOwner,
-    transportOwnership,
-  );
-  const workspace = hmrData.workspace;
+  const workspace = new YasWorkspace({ wasm: props.wasm });
 
   // Normalise: accept either a static array or a reactive accessor.
   const getConnections =
@@ -549,25 +461,8 @@ export function Workspace(props: {
   onCleanup(() => {
     for (const { callback } of notifiedConnections.values()) callback(null);
     notifiedConnections.clear();
-    if (import.meta.hot) {
-      deferHmrRelease(
-        hmrData,
-        hmrLeaseOwner,
-        () => import.meta.hot?.data?.workspace === hmrData,
-        () =>
-          removeOwnedWorkspaceConnections(
-            workspace,
-            hmrData.transportOwnership,
-          ),
-        () => {
-          if (import.meta.hot?.data?.workspace === hmrData) {
-            delete import.meta.hot.data.workspace;
-          }
-        },
-      );
-    } else {
-      removeOwnedWorkspaceConnections(workspace, transportOwnership);
-    }
+    removeOwnedWorkspaceConnections(workspace, transportOwnership);
+    workspace.dispose();
   });
 
   const connectionSpecs = createMemo(() => getConnections());
@@ -607,15 +502,8 @@ function WorkspaceScreen(props: {
   );
   const wsState = createYasWorkspaceState(workspace);
   const sessions = createYasSessions(workspace);
-  const screenHmr = claimWorkspaceScreenHmr(
-    screenHmrCache,
-    workspace,
-    props.workspaceSession?.id ?? null,
-  );
-  onCleanup(screenHmr.release);
-  const restoredHmrWorkspace = screenHmr.state.snapshot;
   const initialSessionWorkspace =
-    restoredHmrWorkspace ?? props.workspaceSession?.current().workspace ?? null;
+    props.workspaceSession?.current().workspace ?? null;
   const clientFocusedPaneKey = props.workspaceSession
     ? `yas.workspaceSession.${props.workspaceSession.id}.focusedPane`
     : null;
@@ -4138,7 +4026,7 @@ function WorkspaceScreen(props: {
   const pendingFloatingPlacements = new Set<string>();
   // New compositor toplevels are not ordinary focused-pane replacements.
   // Retain them until LayoutContainer can append/split a managed window.
-  const pendingManagedWindowPlacements = screenHmr.state.pendingPlacements;
+  const pendingManagedWindowPlacements = new Set<string>();
   // Drop every LayoutContainer control-fn reference. These close over a specific
   // LayoutContainer instance; when the container unmounts that instance is
   // disposed, so the stale fns must be cleared or a later call would write into
@@ -4254,7 +4142,7 @@ function WorkspaceScreen(props: {
     if (addManagedWindowFn?.(assignment)) {
       // Keep the request pending until LayoutContainer publishes the
       // assignment. Accepting a callback is not delivery: its tree can be
-      // replaced in the same reactive turn during a layout/HMR transition.
+      // replaced in the same reactive turn during a layout transition.
       const confirmed = Object.values(
         layoutAssignments()?.assignments ?? {},
       ).includes(assignment);
@@ -4283,10 +4171,8 @@ function WorkspaceScreen(props: {
     initialSessionWorkspace?.layout != null ||
     localLayoutState?.parkedPlacements != null;
   const initialSurfaceCataloguesComplete = new Set<string>();
-  // Re-observing a parked window after HMR must not make it a new arrival.
-  const knownTopLevelSurfacePlacementKeys = screenHmr.state.knownTopLevels;
-  const deferredRestoredSurfacePlacements =
-    screenHmr.state.deferredRestoredPlacements;
+  const knownTopLevelSurfacePlacementKeys = new Set<string>();
+  const deferredRestoredSurfacePlacements = new Set<string>();
   createEffect(() => {
     const current = surfaces();
     const restoredAssignmentsResolved = assignmentsResolved();
@@ -5257,7 +5143,6 @@ function WorkspaceScreen(props: {
     const binding = props.workspaceSession;
     const restoring = binding?.restoring() ?? true;
     const next = currentStoredWorkspace();
-    screenHmr.state.snapshot = next;
     latestWorkspacePatchTarget = binding ?? null;
     latestUiWorkspace = next;
     clearTimeout(workspacePatchTimer);

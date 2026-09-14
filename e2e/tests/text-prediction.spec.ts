@@ -2,7 +2,7 @@ import { test, expect, type Page } from "@playwright/test";
 import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openReturningWorkspace } from "./workspace-auth";
+import { createTerminal, openReturningWorkspace } from "./workspace-auth";
 import { closeAllTerminals } from "./yas-cli";
 
 /**
@@ -28,9 +28,7 @@ async function authenticate(page: Page) {
   await expect(page.getByRole("status", { name: "Connected" })).toBeVisible({
     timeout: 15_000,
   });
-  const create = page.getByRole("button", { name: "New terminal" }).first();
-  await expect(create).toBeVisible({ timeout: 15_000 });
-  await create.click();
+  await createTerminal(page);
   const focusedPane = page.locator('[data-yas-pane-focused="true"]');
   const canvas = focusedPane.locator("canvas").first();
   await expect(canvas).toBeVisible({ timeout: 15_000 });

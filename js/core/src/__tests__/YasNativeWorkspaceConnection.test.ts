@@ -1703,7 +1703,7 @@ describe("YasNativeWorkspaceConnection", () => {
 
     const first = lifecycle.refreshNativeSurfaceView(1n);
     const second = lifecycle.refreshNativeSurfaceView(1n);
-    expect(openView).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(openView).toHaveBeenCalledOnce());
     expect(openView).toHaveBeenLastCalledWith(
       expect.objectContaining({ decoderCapacity: 16, maxFps: 120 }),
     );
@@ -1719,6 +1719,7 @@ describe("YasNativeWorkspaceConnection", () => {
     expect(view.close).not.toHaveBeenCalled();
 
     const late = lifecycle.refreshNativeSurfaceView(2n);
+    await vi.waitFor(() => expect(openView).toHaveBeenCalledTimes(2));
     connection.sendSurfaceUnsubscribe(2n, "view");
     cancelledResult.resolve(cancelledView);
     await late;
@@ -2113,6 +2114,7 @@ describe("YasNativeWorkspaceConnection", () => {
     const { connection, lifecycle } = surfaceTestConnection(openView);
 
     const opening = lifecycle.refreshNativeSurfaceView(1n);
+    await vi.waitFor(() => expect(openView).toHaveBeenCalledOnce());
     connection.setSurfaceStreamingEnabled(false);
     const view = surfaceTestView(YAS_SURFACE_CODEC_H264_V1);
     result.resolve(view);
@@ -2246,6 +2248,7 @@ describe("YasNativeWorkspaceConnection", () => {
     try {
       const { connection, lifecycle } = surfaceTestConnection(openView);
       const first = lifecycle.refreshNativeSurfaceView(1n);
+      await vi.waitFor(() => expect(openView).toHaveBeenCalledOnce());
       expect(openView).toHaveBeenCalledWith(
         expect.objectContaining({
           decoderCapacity: 16,

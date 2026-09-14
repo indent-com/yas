@@ -499,6 +499,12 @@ export const YAS_SURFACE_RESIZE_SCALE_120_EXTENSION = 4 as const;
 export const YAS_SURFACE_STATE_MAXIMIZE_REQUEST_EXTENSION = 5 as const;
 export const YAS_SURFACE_STATE_MINIMUM_SIZE_EXTENSION = 6 as const;
 export const YAS_SURFACE_STATE_TEXT_INPUT_REQUEST_REVISION_EXTENSION = 7 as const;
+export const YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION = 8 as const;
+export const YAS_SURFACE_COLOR_CAP_DISPLAY_P3 = 1 as const;
+export const YAS_SURFACE_COLOR_CAP_HDR10_AV1 = 2 as const;
+export const YAS_SURFACE_COLOR_CAP_HDR10_AV1_444 = 4 as const;
+export const YAS_SURFACE_COLOR_CAP_AV1_444 = 8 as const;
+export const YAS_SURFACE_COLOR_CAP_H264_444 = 16 as const;
 export const YAS_SURFACE_MAX_INLINE_CURSOR_BYTES = 32768 as const;
 export const YAS_SURFACE_CURSOR_NAMED = 0 as const;
 export const YAS_SURFACE_CURSOR_HIDDEN = 1 as const;
@@ -5093,6 +5099,10 @@ export const YAS_SCHEMA = {
           "layout": "revision:u64; nonzero last committed text-input enable; retained across caret updates, changes request an input panel for existing viewers; initial snapshots do not request a panel"
         },
         {
+          "name": "view_color_capabilities",
+          "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 8: capabilities:u8; bit 0 accepts Display-P3 SDR, bit 1 accepts 10-bit AV1 BT.2020/PQ and HDR presentation, bit 2 additionally accepts 10-bit AV1 4:4:4 Profile 1, bit 3 accepts 8-bit AV1 4:4:4, bit 4 accepts H.264 4:4:4; unknown bits are invalid; absent means sRGB SDR; output is described by each frame COLOR_SPACE using H.273 primaries/transfer/matrix and range 0 limited, 1 full; HDR output requires AV1 codec 2 and uses 10 bits, SDR output uses 8 bits"
+        },
+        {
           "name": "family_limits",
           "layout": "ordered optional extensions: tags 1..9 encode max surfaces/session:u32,views/session:u32,view dimension:u32,view pixels:u64,frame rate:u32,inline cursor bytes:u32,remote contacts:u32,app endpoints/session:u32,app endpoint lifetime ns:u64; all tags are present in a selected family descriptor"
         }
@@ -5125,6 +5135,30 @@ export const YAS_SCHEMA = {
         {
           "name": "STATE_TEXT_INPUT_REQUEST_REVISION_EXTENSION",
           "value": 7
+        },
+        {
+          "name": "VIEW_COLOR_CAPABILITIES_EXTENSION",
+          "value": 8
+        },
+        {
+          "name": "COLOR_CAP_DISPLAY_P3",
+          "value": 1
+        },
+        {
+          "name": "COLOR_CAP_HDR10_AV1",
+          "value": 2
+        },
+        {
+          "name": "COLOR_CAP_HDR10_AV1_444",
+          "value": 4
+        },
+        {
+          "name": "COLOR_CAP_AV1_444",
+          "value": 8
+        },
+        {
+          "name": "COLOR_CAP_H264_444",
+          "value": 16
         },
         {
           "name": "MAX_INLINE_CURSOR_BYTES",

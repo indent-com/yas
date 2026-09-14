@@ -5,6 +5,11 @@
 //! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
+#[path = "color_wayland.rs"]
+mod color_wayland;
+#[path = "icc.rs"]
+mod icc;
+
 use crate::input_region::{self, RegionOp};
 use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
@@ -168,6 +173,14 @@ impl CompositorEventSender {
 /// Pixel data in its native format, avoiding unnecessary colorspace conversions.
 #[derive(Clone)]
 pub enum PixelData {
+    /// Independent GPU profiles for viewers sharing a target size.
+    GpuVariants(Arc<Vec<PixelData>>),
+    /// Linear BT.2020 RGBA, 1.0 = 203 nits; never quantized through SDR.
+    LinearRgba {
+        peak_nits: Option<f32>,
+        data: Arc<Vec<f32>>,
+        hdr: bool,
+    },
     Bgra(Arc<Vec<u8>>),
     Rgba(Arc<Vec<u8>>),
     /// The frame exists only on the GPU: a Vulkan Video encoder owns the
@@ -181,6 +194,10 @@ pub enum PixelData {
     /// place.  Consumers that need real pixels must treat this as "no
     /// frame this tick", not as an empty one.
     GpuOnly,
+    /// A GPU-resident managed frame; retains color negotiation without readback.
+    GpuOnlyColor {
+        hdr: bool,
+    },
     Nv12 {
         data: Arc<Vec<u8>>,
         y_stride: usize,
@@ -197,7 +214,7 @@ pub enum PixelData {
         /// the image right-side-up.
         y_invert: bool,
     },
-    /// NV12 in a single DMA-BUF (Y at offset 0, UV at uv_offset) —
+    /// NV12/P010 in a single DMA-BUF (Y at offset 0, UV at uv_offset) —
     /// zero-copy from Vulkan compute shader to VA-API encoder.
     Nv12DmaBuf {
         fd: Arc<OwnedFd>,
@@ -209,6 +226,9 @@ pub enum PixelData {
         /// BGRA→NV12 compute dispatch.  The consumer (encoder) must poll()
         /// this fd before reading the NV12 data.  `None` when implicit
         /// DMA-BUF fencing handles synchronisation (linear buffers).
+        /// Managed output color; HDR uses P010. Only the exporting encoder
+        /// may consume a managed buffer, whose modifier can be tiled.
+        color: Option<crate::color::OutputColor>,
         sync_fd: Option<Arc<OwnedFd>>,
     },
     /// NV12 in a single Vulkan allocation exported as `OPAQUE_FD` — the
@@ -244,6 +264,9 @@ pub enum PixelData {
         /// NVENC buffer format — a mismatch reads chroma from the wrong
         /// rows and NVENC rejects or garbles the picture.
         is_444: bool,
+        /// Output color also determines precision: HDR is 10-bit P010,
+        /// other outputs use 8-bit samples.
+        color: crate::color::OutputColor,
         /// sync_file exported from the fence guarding the BGRA→NV12 compute
         /// dispatch. The consumer MUST poll it when present. `None` means
         /// the producer completed a blocking fence wait before publishing;
@@ -279,7 +302,7 @@ pub struct EncodedFrame {
 /// renderer output target.  The compositor renders into the EGL FBO
 /// backed by this fd; the encoder references the VA-API surface by ID.
 /// Per-plane offset + pitch for multi-plane DMA-BUF import (e.g. AMD DCC).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExternalOutputPlane {
     pub offset: u32,
     pub pitch: u32,
@@ -309,6 +332,28 @@ pub struct ExternalOutputBuffer {
     /// encoder alignment, e.g. AV1 64-pixel superblock alignment).
     pub nv12_width: u32,
     pub nv12_height: u32,
+    pub nv12_color: Option<crate::color::OutputColor>,
+    pub nv12_planes: Vec<ExternalOutputPlane>,
+}
+
+/// Empty buffers request CUDA OPAQUE_FD output. Nonempty pools belong to
+/// individual VA-API encoders and must never be shared with another encoder.
+#[derive(Clone)]
+pub struct ColorOutputTarget {
+    pub width: u32,
+    pub height: u32,
+    pub color: crate::color::OutputColor,
+    pub is_444: bool,
+    pub buffers: Vec<ColorDmaBuffer>,
+}
+
+#[derive(Clone)]
+pub struct ColorDmaBuffer {
+    pub fd: Arc<OwnedFd>,
+    /// DRM fourcc, not VAImage fourcc.
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub planes: Vec<ExternalOutputPlane>,
 }
 
 pub mod drm_fourcc {
@@ -316,10 +361,30 @@ pub mod drm_fourcc {
     pub const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
     pub const ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
     pub const XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
+    pub const ARGB2101010: u32 = u32::from_le_bytes(*b"AR30");
+    pub const XRGB2101010: u32 = u32::from_le_bytes(*b"XR30");
+    pub const ABGR2101010: u32 = u32::from_le_bytes(*b"AB30");
+    pub const XBGR2101010: u32 = u32::from_le_bytes(*b"XB30");
+    pub const ABGR16161616F: u32 = u32::from_le_bytes(*b"AB4H");
+    pub const ARGB16161616: u32 = u32::from_le_bytes(*b"AR48");
+    pub const XRGB16161616: u32 = u32::from_le_bytes(*b"XR48");
+    pub const ARGB16161616F: u32 = u32::from_le_bytes(*b"AR4H");
+    pub const XRGB16161616F: u32 = u32::from_le_bytes(*b"XR4H");
+    pub const ABGR16161616: u32 = u32::from_le_bytes(*b"AB48");
+    pub const XBGR16161616: u32 = u32::from_le_bytes(*b"XB48");
+    pub const XBGR16161616F: u32 = u32::from_le_bytes(*b"XB4H");
     pub const NV12: u32 = u32::from_le_bytes(*b"NV12");
 }
 
 impl PixelData {
+    pub fn find_gpu_variant(&self, accepts: impl Fn(&Self) -> bool) -> Option<&Self> {
+        if let Self::GpuVariants(variants) = self {
+            variants.iter().find(|p| accepts(p))
+        } else {
+            accepts(self).then_some(self)
+        }
+    }
+
     pub fn to_rgba(&self, width: u32, height: u32) -> Vec<u8> {
         let w = width as usize;
         let h = height as usize;
@@ -335,7 +400,23 @@ impl PixelData {
             // `is_empty()` below reports it honestly.
             // Same for a GPU-only commit: it deliberately carries no
             // pixels, and the server never routes it to a CPU consumer.
-            PixelData::Nv12OpaqueFd { .. } | PixelData::GpuOnly => Vec::new(),
+            PixelData::GpuVariants(_)
+            | PixelData::Nv12DmaBuf { color: Some(_), .. }
+            | PixelData::Nv12OpaqueFd { .. }
+            | PixelData::GpuOnly
+            | PixelData::GpuOnlyColor { .. } => Vec::new(),
+            PixelData::LinearRgba {
+                data,
+                hdr,
+                peak_nits,
+            } => crate::color::rgba8(
+                data,
+                crate::color::OutputColor::Srgb,
+                crate::color::ToneMapping {
+                    hdr: *hdr,
+                    peak_nits: *peak_nits,
+                },
+            ),
             PixelData::Rgba(data) => data.as_ref().clone(),
             PixelData::Bgra(data) => {
                 let mut rgba = Vec::with_capacity(w * h * 4);
@@ -463,6 +544,7 @@ impl PixelData {
                 width: nv12_w,
                 height: nv12_h,
                 sync_fd,
+                ..
             } => {
                 // The compositor writes BGRA → NV12 from a Vulkan compute
                 // shader into this DMA-BUF.  Wait on the fence (if any) so
@@ -562,6 +644,8 @@ impl PixelData {
 
     pub fn is_empty(&self) -> bool {
         match self {
+            PixelData::GpuVariants(v) => v.is_empty(),
+            PixelData::LinearRgba { data, .. } => data.is_empty(),
             PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
             PixelData::Nv12 { data, .. } => data.is_empty(),
             // `GpuOnly` is not an empty frame — it is a real commit whose
@@ -572,7 +656,8 @@ impl PixelData {
             | PixelData::VaSurface { .. }
             | PixelData::Nv12DmaBuf { .. }
             | PixelData::Nv12OpaqueFd { .. }
-            | PixelData::GpuOnly => false,
+            | PixelData::GpuOnly
+            | PixelData::GpuOnlyColor { .. } => false,
         }
     }
 
@@ -769,6 +854,15 @@ pub struct AppIdentity {
 }
 
 pub enum CompositorCommand {
+    SetColorOutputTargets {
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+        native_w: u32,
+        native_h: u32,
+        targets: Vec<ColorOutputTarget>,
+        want_cpu_pixels: bool,
+    },
     /// Adopt an already-bound listening socket whose clients are known to
     /// belong to `identity`.
     ///
@@ -956,7 +1050,7 @@ pub enum CompositorCommand {
     Capture {
         surface_id: u16,
         scale_120: u16,
-        reply: mpsc::SyncSender<Option<(u32, u32, Vec<u8>)>>,
+        reply: mpsc::SyncSender<Option<(u32, u32, PixelData)>>,
     },
     RequestFrame {
         surface_id: u16,
@@ -1048,6 +1142,7 @@ pub enum CompositorCommand {
         /// expects — planar YUV444 for a 4:4:4 NVENC session, NV12
         /// otherwise.  Ignored when `want_nv12_opaque` is false.
         opaque_is_444: bool,
+        opaque_color: crate::color::OutputColor,
     },
     /// Re-stamp an already-registered target with the composite size it is
     /// now the right inscription of, without touching its buffers.
@@ -1109,6 +1204,7 @@ pub enum CompositorCommand {
         native_w: u32,
         native_h: u32,
         is_444: bool,
+        output: crate::color::OutputColor,
     },
     /// Retarget one client's encoder quantizer without rebuilding it.
     SetVulkanEncoderQp {
@@ -1174,6 +1270,9 @@ pub(crate) enum MapState {
 pub(crate) struct Surface {
     pub surface_id: u16,
     pub wl_surface: WlSurface,
+    pub color_description: crate::color::ImageDescription,
+    pending_color_description: Option<crate::color::ImageDescription>,
+    color_surface: Option<wayland_protocols::wp::color_management::v1::server::wp_color_management_surface_v1::WpColorManagementSurfaceV1>,
 
     // pending state
     /// Double-buffered `wl_surface.attach` state.  The outer `Option`
@@ -1539,7 +1638,10 @@ impl ShmPool {
         let h = height as u32;
         let s = stride as usize;
         let off = offset as usize;
-        let row_bytes = (w as usize).checked_mul(4)?;
+        let row_bytes = (w as usize).checked_mul(shm_texel_bytes(format))?;
+        if s < row_bytes {
+            return None;
+        }
         let needed = s
             .checked_mul(h as usize - 1)
             .and_then(|body| body.checked_add(off))
@@ -1560,6 +1662,74 @@ impl ShmPool {
             }
             packed
         };
+        if shm_texel_bytes(format) == 8 {
+            let fcc = u32::from(format).to_le_bytes();
+            let floating = fcc[3] == b'H';
+            let opaque = fcc[0] == b'X';
+            let swap = fcc[1] == b'R';
+            let rgba = bgra
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .flat_map(|px| {
+                    std::array::from_fn::<_, 4, _>(|i| {
+                        if i == 3 && opaque {
+                            return 255;
+                        }
+                        let i = if swap && i == 0 {
+                            2
+                        } else if swap && i == 2 {
+                            0
+                        } else {
+                            i
+                        };
+                        let bits = u16::from_le_bytes([px[i * 2], px[i * 2 + 1]]);
+                        let value = if floating {
+                            half::f16::from_bits(bits).to_f32()
+                        } else {
+                            f32::from(bits) / 65535.0
+                        };
+                        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+                    })
+                })
+                .collect();
+            return Some((w, h, PixelData::Rgba(Arc::new(rgba))));
+        }
+        // Cursor/CPU fallback only. Window composition uploads the original
+        // packed 10-bit buffer to Vulkan without this quantization.
+        if matches!(
+            format,
+            wl_shm::Format::Argb2101010
+                | wl_shm::Format::Xrgb2101010
+                | wl_shm::Format::Abgr2101010
+                | wl_shm::Format::Xbgr2101010
+        ) {
+            let opaque = matches!(
+                format,
+                wl_shm::Format::Xrgb2101010 | wl_shm::Format::Xbgr2101010
+            );
+            for px in bgra.as_chunks_mut::<4>().0 {
+                let v = u32::from_ne_bytes(*px);
+                *px = [
+                    ((v & 1023) * 255 / 1023) as u8,
+                    (((v >> 10) & 1023) * 255 / 1023) as u8,
+                    (((v >> 20) & 1023) * 255 / 1023) as u8,
+                    if opaque { 255 } else { ((v >> 30) * 85) as u8 },
+                ];
+            }
+            return Some((
+                w,
+                h,
+                if matches!(
+                    format,
+                    wl_shm::Format::Abgr2101010 | wl_shm::Format::Xbgr2101010
+                ) {
+                    PixelData::Rgba(Arc::new(bgra))
+                } else {
+                    PixelData::Bgra(Arc::new(bgra))
+                },
+            ));
+        }
         if matches!(format, wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888) {
             for px in bgra.as_chunks_mut::<4>().0 {
                 px[3] = 255;
@@ -1570,6 +1740,43 @@ impl ShmPool {
         } else {
             Some((w, h, PixelData::Bgra(Arc::new(bgra))))
         }
+    }
+}
+
+const SHM_FORMATS: [wl_shm::Format; 16] = [
+    wl_shm::Format::Argb8888,
+    wl_shm::Format::Xrgb8888,
+    wl_shm::Format::Abgr8888,
+    wl_shm::Format::Xbgr8888,
+    wl_shm::Format::Argb2101010,
+    wl_shm::Format::Xrgb2101010,
+    wl_shm::Format::Abgr2101010,
+    wl_shm::Format::Xbgr2101010,
+    wl_shm::Format::Argb16161616f,
+    wl_shm::Format::Xrgb16161616f,
+    wl_shm::Format::Abgr16161616f,
+    wl_shm::Format::Xbgr16161616f,
+    wl_shm::Format::Argb16161616,
+    wl_shm::Format::Xrgb16161616,
+    wl_shm::Format::Abgr16161616,
+    wl_shm::Format::Xbgr16161616,
+];
+
+fn shm_texel_bytes(format: wl_shm::Format) -> usize {
+    if matches!(
+        format,
+        wl_shm::Format::Abgr16161616f
+            | wl_shm::Format::Xbgr16161616f
+            | wl_shm::Format::Argb16161616f
+            | wl_shm::Format::Xrgb16161616f
+            | wl_shm::Format::Abgr16161616
+            | wl_shm::Format::Xbgr16161616
+            | wl_shm::Format::Argb16161616
+            | wl_shm::Format::Xrgb16161616
+    ) {
+        8
+    } else {
+        4
     }
 }
 
@@ -2401,6 +2608,9 @@ struct Compositor {
     /// committed callback wait an entire refresh period. Keep only the newest
     /// such deadline per toplevel and consume it after that commit instead.
     pending_request_frames: FxHashMap<u16, std::time::Instant>,
+    /// Color-information `done` destroys its object. Send it only after
+    /// Wayland dispatch has installed the new resource's object data.
+    pending_color_info_done: Vec<color_wayland::WpImageDescriptionInfoV1>,
     /// Toplevels known to contain at least one frame callback or presentation
     /// feedback. Fixed clocks consult this before walking a surface tree.
     frame_callback_toplevels: FxHashSet<u16>,
@@ -3310,6 +3520,18 @@ impl Compositor {
                 | drm_fourcc::XRGB8888
                 | drm_fourcc::ABGR8888
                 | drm_fourcc::XBGR8888
+                | drm_fourcc::ARGB2101010
+                | drm_fourcc::XRGB2101010
+                | drm_fourcc::ABGR2101010
+                | drm_fourcc::XBGR2101010
+                | drm_fourcc::ABGR16161616F
+                | drm_fourcc::XBGR16161616F
+                | drm_fourcc::ABGR16161616
+                | drm_fourcc::XBGR16161616
+                | drm_fourcc::ARGB16161616
+                | drm_fourcc::XRGB16161616
+                | drm_fourcc::ARGB16161616F
+                | drm_fourcc::XRGB16161616F
         ) {
             // Check if this is a DRM GEM fd (importable by VA-API) or an
             // anonymous /dmabuf heap fd (Vulkan WSI, needs CPU mmap).
@@ -4053,13 +4275,15 @@ impl Compositor {
                 continue;
             }
             let kind = match &pixels {
+                PixelData::GpuVariants(_) => "GPU variants",
+                PixelData::LinearRgba { .. } => "linear-bt2020",
                 PixelData::Bgra(_) => "bgra",
                 PixelData::Rgba(_) => "rgba",
                 PixelData::Nv12 { .. } => "nv12",
                 PixelData::VaSurface { .. } => "va-surface",
                 PixelData::Nv12DmaBuf { .. } => "nv12-dmabuf",
                 PixelData::Nv12OpaqueFd { .. } => "nv12-opaque-fd",
-                PixelData::GpuOnly => "gpu-only",
+                PixelData::GpuOnly | PixelData::GpuOnlyColor { .. } => "gpu-only",
                 PixelData::DmaBuf { fd, .. } => {
                     use std::os::fd::AsRawFd;
                     let raw = fd.as_raw_fd();
@@ -4524,6 +4748,9 @@ impl Compositor {
         }
         surf.min_size = surf.pending_min_size;
         surf.max_size = surf.pending_max_size;
+        if let Some(color) = surf.pending_color_description.take() {
+            surf.color_description = color;
+        }
         surf.buffer_scale = surf.pending_buffer_scale;
         surf.viewport_destination = surf.pending_viewport_destination;
         surf.viewport_source = surf.pending_viewport_source;
@@ -4600,10 +4827,8 @@ impl Compositor {
                 && shm.offset >= 0
                 && let Some(ref mut vk) = self.vulkan_renderer
             {
-                let source_bgra =
-                    !matches!(format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
-                let force_opaque =
-                    matches!(format, wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888);
+                let force_opaque = format == wl_shm::Format::Xrgb8888
+                    || u32::from(format).to_le_bytes()[0] == b'X';
                 let (viewport_source, viewport_destination) = self
                     .surfaces
                     .get(surface_id)
@@ -4611,7 +4836,7 @@ impl Compositor {
                     .unwrap_or((None, None));
                 let damage =
                     shm_damage_rects(damage, w, h, scale, viewport_source, viewport_destination);
-                let row_bytes = w as usize * 4;
+                let row_bytes = w as usize * shm_texel_bytes(format);
                 let buffer_id = buf.id();
                 let upload_result = shm
                     .pool
@@ -4636,7 +4861,7 @@ impl Compositor {
                             stride,
                             w,
                             h,
-                            source_bgra,
+                            format as u32,
                             force_opaque,
                             &damage,
                         )
@@ -6311,8 +6536,15 @@ impl Compositor {
                             // irrelevant here: capture IS the CPU-pixel
                             // consumer the flag protects.
                             v.into_iter().find_map(|(_sid, w, h, pixels, _skip)| {
+                                if matches!(pixels, PixelData::LinearRgba { .. }) {
+                                    return Some((w, h, pixels));
+                                }
                                 let rgba = pixels.to_rgba(w, h);
-                                (!rgba.is_empty()).then_some((w, h, rgba))
+                                (!rgba.is_empty()).then_some((
+                                    w,
+                                    h,
+                                    PixelData::Rgba(Arc::new(rgba)),
+                                ))
                             })
                         };
                         let (_, rendered) = vk.render_tree_sized(
@@ -6416,6 +6648,30 @@ impl Compositor {
             } => {
                 self.begin_clipboard_get(generation, &mime_type, reply);
             }
+            CompositorCommand::SetColorOutputTargets {
+                surface_id,
+                target_w,
+                target_h,
+                native_w,
+                native_h,
+                targets,
+                want_cpu_pixels,
+            } => {
+                if let Some(vk) = self.vulkan_renderer.as_mut() {
+                    vk.set_color_output_targets(
+                        surface_id,
+                        target_w,
+                        target_h,
+                        (native_w, native_h),
+                        targets,
+                        want_cpu_pixels,
+                    );
+                }
+                if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
+                    self.pending_recomposite_toplevels
+                        .insert(surface_id as u16, false);
+                }
+            }
             CompositorCommand::SetExternalOutputBuffers {
                 surface_id,
                 target_w,
@@ -6467,8 +6723,10 @@ impl Compositor {
                 want_nv12_opaque,
                 want_cpu_pixels,
                 opaque_is_444,
+                opaque_color,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.clear_color_outputs((surface_id, target_w, target_h));
                     vk.register_downscale_target(
                         surface_id,
                         target_w,
@@ -6477,6 +6735,7 @@ impl Compositor {
                         want_nv12_opaque,
                         want_cpu_pixels,
                         opaque_is_444,
+                        opaque_color,
                     );
                 }
                 // See the SetExternalOutputBuffers handler above for
@@ -6551,10 +6810,12 @@ impl Compositor {
                 native_w,
                 native_h,
                 is_444,
+                output,
             } => {
                 let created = self.vulkan_renderer.as_mut().is_some_and(|vk| {
                     vk.create_vulkan_encoder(
-                        surface_id, client_id, codec, qp, width, height, native_w, native_h, is_444,
+                        surface_id, client_id, codec, qp, width, height, native_w, native_h,
+                        is_444, output,
                     )
                 });
                 if !created {
@@ -7609,6 +7870,9 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         app_id: String::new(),
                         pending_viewport_destination: None,
                         viewport_destination: None,
+                        color_description: crate::color::ImageDescription::default(),
+                        pending_color_description: None,
+                        color_surface: None,
                         pending_viewport_source: None,
                         viewport_source: None,
                         is_cursor: false,
@@ -9078,10 +9342,9 @@ impl GlobalDispatch<WlShm, ()> for Compositor {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let shm = data_init.init(resource, ());
-        shm.format(wl_shm::Format::Argb8888);
-        shm.format(wl_shm::Format::Xrgb8888);
-        shm.format(wl_shm::Format::Abgr8888);
-        shm.format(wl_shm::Format::Xbgr8888);
+        for format in SHM_FORMATS {
+            shm.format(format);
+        }
     }
 }
 
@@ -9130,8 +9393,11 @@ impl Dispatch<WlShmPool, ()> for Compositor {
             } => {
                 // format comes as WEnum<Format>, extract the known value.
                 let fmt = match format {
-                    wayland_server::WEnum::Value(f) => f,
-                    _ => wl_shm::Format::Argb8888, // fallback
+                    wayland_server::WEnum::Value(f) if SHM_FORMATS.contains(&f) => f,
+                    _ => {
+                        resource.post_error(wl_shm::Error::InvalidFormat, "unsupported SHM format");
+                        return;
+                    }
                 };
                 let Some(pool) = state.shm_pools.get(&pool_id).cloned() else {
                     return;
@@ -12417,6 +12683,9 @@ fn run_compositor(
     }
 
     // Create globals.
+    if vulkan_renderer.is_some() {
+        dh.create_global::<Compositor, color_wayland::WpColorManagerV1, ()>(2, ());
+    }
     dh.create_global::<Compositor, WlCompositor, ()>(6, ());
     dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
     dh.create_global::<Compositor, XdgWmBase, ()>(6, ());
@@ -12492,6 +12761,7 @@ fn run_compositor(
         last_request_frame_ms: FxHashMap::default(),
         last_topless_frame_ms: FxHashMap::default(),
         pending_request_frames: FxHashMap::default(),
+        pending_color_info_done: Vec::new(),
         frame_callback_toplevels: FxHashSet::default(),
         client_identity: FxHashMap::default(),
         next_surface_id: 1,
@@ -12608,6 +12878,9 @@ fn run_compositor(
                 && state.verbose
             {
                 eprintln!("[compositor] dispatch_clients error: {e}");
+            }
+            for info in state.pending_color_info_done.drain(..) {
+                info.done();
             }
             if let Err(e) = d.flush_clients()
                 && state.verbose

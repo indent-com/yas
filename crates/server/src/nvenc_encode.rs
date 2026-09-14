@@ -412,6 +412,46 @@ fn write_av1_color_description(config_buf: &mut [u8]) {
     );
 }
 
+/// SDK 12.1.14 layout, verified against nvEncodeAPI.h. AV1's two 3-bit
+/// depth fields start at bits 12 and 15 of the flags word at config byte 184.
+fn write_managed_color_description(
+    config: &mut [u8],
+    codec: &str,
+    color: yas_compositor::color::OutputColor,
+) {
+    let [primaries, transfer, matrix, range] = color.cicp();
+    if codec == "av1" {
+        for (offset, value) in [
+            (236, primaries),
+            (240, transfer),
+            (244, matrix),
+            (248, range),
+        ] {
+            w32(config, offset, u32::from(value));
+        }
+        let depth = if color == yas_compositor::color::OutputColor::Hdr10 {
+            2
+        } else {
+            0
+        };
+        let flags = r32(config, 184) & !(0x3f << 12);
+        w32(config, 184, flags | (depth << 12) | (depth << 15));
+    } else {
+        let vui = NVENC_H264_VUI_OFFSET;
+        for (offset, value) in [
+            (8, 1),
+            (12, 5),
+            (16, range),
+            (20, 1),
+            (24, primaries),
+            (28, transfer),
+            (32, matrix),
+        ] {
+            w32(config, vui + offset, u32::from(value));
+        }
+    }
+}
+
 fn write_split_encode_mode(init_buf: &mut [u8], codec: &str, width: u32) {
     if codec == "av1" && width >= NVENC_SPLIT_MIN_WIDTH {
         let flags = r32(init_buf, 68);
@@ -486,6 +526,7 @@ pub struct NvencDirectEncoder {
     /// OPAQUE_FD encode path, which is Linux-only.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     session_is_444: bool,
+    bit_depth: u8,
     verbose: bool,
     /// Cached SPS+PPS NAL units (Annex B with start codes) from the first
     /// IDR frame.  Prepended to subsequent IDR frames that NVENC emits
@@ -568,6 +609,7 @@ pub struct NvencCaps {
     pub max_width: u32,
     pub max_height: u32,
     pub yuv444: bool,
+    pub ten_bit: bool,
     pub encoder_engines: u32,
 }
 
@@ -670,6 +712,7 @@ pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
                 .unwrap_or(u16::MAX as u32),
             yuv444: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE)
                 .is_some(),
+            ten_bit: encode_cap(fns, encoder, codec_guid, 39).is_some(),
             encoder_engines: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_NUM_ENCODER_ENGINES)
                 .unwrap_or(1),
         };
@@ -816,6 +859,7 @@ impl NvencDirectEncoder {
     /// `codec` should be `"h264"` or `"av1"`.
     /// `qp` is the constant QP value (0–51 for H.264, 0–255 for AV1).
     /// `preset` is the NVENC preset index, 1 (P1, fastest) … 7 (P7, slowest).
+    #[cfg(test)]
     pub fn try_new(
         codec: &str,
         width: u32,
@@ -825,6 +869,24 @@ impl NvencDirectEncoder {
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
+        Self::try_new_color(codec, width, height, qp, preset, verbose, chroma, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_color(
+        codec: &str,
+        width: u32,
+        height: u32,
+        qp: u32,
+        preset: u8,
+        verbose: bool,
+        chroma: crate::surface_encoder::ChromaSubsampling,
+        color: Option<yas_compositor::color::OutputColor>,
+    ) -> Result<Self, String> {
+        let hdr = color == Some(yas_compositor::color::OutputColor::Hdr10);
+        if hdr && codec != "av1" {
+            return Err("10-bit NVENC requires AV1 with SDK 12.1".into());
+        }
         let (codec_guid, codec_flag) = nvenc_codec(codec)?;
 
         // Ask the device what it takes before building anything.  Both
@@ -833,6 +895,12 @@ impl NvencDirectEncoder {
         // — a 256x54 dock thumbnail, say — comes back as a plain refusal
         // that costs no session and says nothing about the host.
         let caps = caps(codec, verbose)?;
+        if hdr && !caps.ten_bit {
+            return Err(format!("NVENC {codec} does not support 10-bit encoding"));
+        }
+        if codec == "av1" && chroma.is_444() {
+            return Err("NVENC SDK 12.1 AV1 supports 4:2:0 only".into());
+        }
         if chroma.is_444() && !caps.yuv444 {
             return Err(format!(
                 "NVENC {codec} does not support 4:4:4 encoding on this GPU"
@@ -917,6 +985,10 @@ impl NvencDirectEncoder {
             write_av1_color_description(&mut config_buf);
         }
 
+        if let Some(color) = color {
+            write_managed_color_description(&mut config_buf, codec, color);
+        }
+
         // Initialize encoder
         let mut init_buf = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
         w32(&mut init_buf, 0, NV_ENC_INITIALIZE_PARAMS_VER);
@@ -971,7 +1043,7 @@ impl NvencDirectEncoder {
         // is shared and stays retained.
         guard.disarm();
 
-        Ok(Self {
+        let result = Self {
             encoder,
             output_buffer: output_buffer_ptr,
             width,
@@ -983,12 +1055,14 @@ impl NvencDirectEncoder {
             cuda_ctx: ctx,
             nv12_upload: None,
             session_is_444: chroma.is_444(),
+            bit_depth: if hdr { 10 } else { 8 },
             verbose,
             h264_sps_pps: Vec::new(),
             nv12_imports: HashMap::new(),
             init_params: init_buf,
             encode_config: config_buf,
-        })
+        };
+        Ok(result)
     }
 
     pub fn request_keyframe(&mut self) {
@@ -1224,13 +1298,14 @@ impl NvencDirectEncoder {
         width: u32,
         height: u32,
         is_444: bool,
+        bit_depth: u8,
         sync_fd: Option<std::os::fd::RawFd>,
     ) -> Option<(Vec<u8>, bool)> {
         // The buffer's format must match the session's chroma: NVENC
         // rejects (or worse, garbles) a picture whose registered format
         // disagrees with the encode config.  A mismatch means the server's
         // target registration and this encoder have drifted apart.
-        if is_444 != self.session_is_444 {
+        if is_444 != self.session_is_444 || bit_depth != self.bit_depth {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1252,7 +1327,9 @@ impl NvencDirectEncoder {
         // two sides have drifted apart and the encode would sample chroma
         // from the wrong place — better to refuse than to emit wrong
         // colour.
-        if uv_offset != stride * height {
+        if stride < width.checked_mul(if bit_depth == 10 { 2 } else { 1 })?
+            || uv_offset != stride.checked_mul(height)?
+        {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1273,19 +1350,10 @@ impl NvencDirectEncoder {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // 10 ms: at 60 fps the whole frame budget is ~16 ms, and the
-            // compute pass has normally long since finished by the time
-            // the encoder thread gets here — this is a guard, not a
-            // scheduling point. Timing out means we fall through and
-            // encode anyway, which is the same race we would have had
-            // without the fence; it is preferable to stalling delivery.
+            // Never read a buffer whose GPU writes have not completed.
             let n = unsafe { libc::poll(&mut pfd, 1, 10) };
-            if n <= 0 {
-                static LOGGED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("[nvenc-zerocopy] sync_fd poll timed out; frame may tear");
-                }
+            if n <= 0 || pfd.revents & libc::POLLIN == 0 {
+                return None;
             }
         }
         let timing_after_fence = std::time::Instant::now();
@@ -1303,7 +1371,7 @@ impl NvencDirectEncoder {
         // The session's dimensions are even-rounded, so they can exceed the
         // compositor's by a pixel; anything more means the two disagree
         // about the frame, and encoding would read past the buffer's rows.
-        if width < enc_w || height < enc_h {
+        if width < enc_w || height != enc_h {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1361,15 +1429,7 @@ impl NvencDirectEncoder {
         w64(&mut pic_buf, 24, self.frame_idx as u64);
         wptr(&mut pic_buf, 40, mapped_resource);
         wptr(&mut pic_buf, 48, self.output_buffer);
-        w32(
-            &mut pic_buf,
-            64,
-            if is_444 {
-                NV_ENC_BUFFER_FORMAT_YUV444
-            } else {
-                NV_ENC_BUFFER_FORMAT_NV12
-            },
-        );
+        w32(&mut pic_buf, 64, self.input_format());
         w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
         if self.force_idr {
             // OUTPUT_SPSPPS (0x4) so AV1 keyframes carry the sequence
@@ -1566,15 +1626,7 @@ impl NvencDirectEncoder {
         w32(&mut reg_buf, 12, enc_h);
         w32(&mut reg_buf, 16, stride);
         wptr(&mut reg_buf, 24, devptr as *mut c_void);
-        w32(
-            &mut reg_buf,
-            40,
-            if is_444 {
-                NV_ENC_BUFFER_FORMAT_YUV444
-            } else {
-                NV_ENC_BUFFER_FORMAT_NV12
-            },
-        );
+        w32(&mut reg_buf, 40, self.input_format());
         let nv_status = unsafe {
             (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
         };
@@ -1628,14 +1680,18 @@ impl NvencDirectEncoder {
         let result = (|| {
             // Semi-planar NV12 is one full-height Y plane plus one
             // half-height interleaved UV plane, both at the same pitch.
-            let alloc_height = self.height as usize + self.height as usize / 2;
+            let alloc_height = if self.session_is_444 {
+                self.height as usize * 3
+            } else {
+                self.height as usize * 3 / 2
+            };
             let mut cuda_devptr: gpu_libs::CUdeviceptr = 0;
             let mut pitch_bytes = 0usize;
             let status = unsafe {
                 (cuda.cuMemAllocPitch_v2)(
                     &mut cuda_devptr,
                     &mut pitch_bytes,
-                    self.width as usize,
+                    self.width as usize * if self.bit_depth == 10 { 2 } else { 1 },
                     alloc_height,
                     16,
                 )
@@ -1653,7 +1709,11 @@ impl NvencDirectEncoder {
                     ));
                 }
             };
-            let pinned_size = match nv12_upload_size(pitch_bytes, self.height) {
+            let pinned_size = match if self.session_is_444 {
+                pitch_bytes.checked_mul(alloc_height)
+            } else {
+                nv12_upload_size(pitch_bytes, self.height)
+            } {
                 Some(size) => size,
                 None => {
                     unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
@@ -1668,7 +1728,7 @@ impl NvencDirectEncoder {
             w32(&mut register, 12, self.height);
             w32(&mut register, 16, pitch);
             wptr(&mut register, 24, cuda_devptr as *mut c_void);
-            w32(&mut register, 40, NV_ENC_BUFFER_FORMAT_NV12);
+            w32(&mut register, 40, self.input_format());
             let status = unsafe {
                 (self.fns.nvEncRegisterResource)(self.encoder, register.as_mut_ptr() as *mut c_void)
             };
@@ -1715,6 +1775,61 @@ impl NvencDirectEncoder {
         Ok(())
     }
 
+    fn input_format(&self) -> u32 {
+        match (self.session_is_444, self.bit_depth) {
+            (false, 10) => 0x00010000, // YUV420_10BIT (P010)
+            (true, 10) => 0x00100000,  // YUV444_10BIT
+            (true, _) => NV_ENC_BUFFER_FORMAT_YUV444,
+            _ => NV_ENC_BUFFER_FORMAT_NV12,
+        }
+    }
+
+    /// The managed path supplies explicitly converted YUV at the session's
+    /// precision. No RGB conversion or 8-bit intermediate is delegated to CUDA.
+    pub(crate) fn encode_color(
+        &mut self,
+        yuv: &crate::color_yuv::ColorYuv,
+    ) -> Option<(Vec<u8>, bool)> {
+        if yuv.width != self.width as usize
+            || yuv.height != self.height as usize
+            || yuv.is_444 != self.session_is_444
+            || yuv.bit_depth != self.bit_depth
+        {
+            return None;
+        }
+        self.ensure_nv12_upload().ok()?;
+        let data = yuv.hardware_bytes();
+        let row_bytes = yuv.width * if self.bit_depth == 10 { 2 } else { 1 };
+        let upload = self.nv12_upload.as_ref()?;
+        let pitch = upload.pitch as usize;
+        if row_bytes > pitch
+            || !data.len().is_multiple_of(row_bytes)
+            || data.len() / row_bytes * pitch > upload.pinned_size
+        {
+            return None;
+        }
+        // SAFETY: The allocation above holds every pitched row. Source rows
+        // are checked slices; the mutable encoder exclusively owns staging.
+        unsafe {
+            ptr::write_bytes(upload.pinned_host, 0, upload.pinned_size);
+            for (y, row) in data.chunks_exact(row_bytes).enumerate() {
+                ptr::copy_nonoverlapping(
+                    row.as_ptr(),
+                    upload.pinned_host.add(y * pitch),
+                    row_bytes,
+                );
+            }
+        }
+        self.upload_and_encode_planar(
+            upload.pinned_size,
+            upload.pinned_host.cast(),
+            upload.cuda_devptr,
+            upload.registered,
+            upload.pitch,
+            self.input_format(),
+        )
+    }
+
     /// Encode from NV12 data directly.  Uploads Y+UV to the NV12-registered
     /// CUDA buffer so NVENC reads it natively — no colorspace conversion.
     ///
@@ -1728,6 +1843,9 @@ impl NvencDirectEncoder {
         uv_stride: usize,
         src_h: usize,
     ) -> Option<(Vec<u8>, bool)> {
+        if self.bit_depth != 8 || self.session_is_444 {
+            return None;
+        }
         if let Err(e) = self.ensure_nv12_upload() {
             eprintln!("[nvenc-direct] cannot allocate CPU NV12 fallback: {e}");
             return None;
@@ -2022,6 +2140,7 @@ mod tests {
             max_width: 8192,
             max_height: 8192,
             yuv444: false,
+            ten_bit: false,
             encoder_engines: 2,
         }
     }

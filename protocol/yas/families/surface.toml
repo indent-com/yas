@@ -240,6 +240,27 @@ value = 6
 name = "STATE_TEXT_INPUT_REQUEST_REVISION_EXTENSION"
 value = 7
 [[constant]]
+name = "VIEW_COLOR_CAPABILITIES_EXTENSION"
+value = 8
+[[constant]]
+name = "COLOR_CAP_DISPLAY_P3"
+value = 1
+[[constant]]
+name = "COLOR_CAP_HDR10_AV1"
+value = 2
+[[constant]]
+name = "COLOR_CAP_HDR10_AV1_444"
+value = 4
+[[constant]]
+name = "COLOR_CAP_AV1_444"
+value = 8
+[[constant]]
+name = "COLOR_CAP_H264_444"
+value = 16
+[[type]]
+name = "view_color_capabilities"
+layout = "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 8: capabilities:u8; bit 0 accepts Display-P3 SDR, bit 1 accepts 10-bit AV1 BT.2020/PQ and HDR presentation, bit 2 additionally accepts 10-bit AV1 4:4:4 Profile 1, bit 3 accepts 8-bit AV1 4:4:4, bit 4 accepts H.264 4:4:4; unknown bits are invalid; absent means sRGB SDR; output is described by each frame COLOR_SPACE using H.273 primaries/transfer/matrix and range 0 limited, 1 full; HDR output requires AV1 codec 2 and uses 10 bits, SDR output uses 8 bits"
+[[constant]]
 name = "MAX_INLINE_CURSOR_BYTES"
 value = 32768
 [[constant]]

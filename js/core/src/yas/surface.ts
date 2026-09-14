@@ -1,3 +1,11 @@
+import {
+  YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION,
+  YAS_SURFACE_COLOR_CAP_DISPLAY_P3,
+  YAS_SURFACE_COLOR_CAP_HDR10_AV1,
+  YAS_SURFACE_COLOR_CAP_HDR10_AV1_444,
+  YAS_SURFACE_COLOR_CAP_AV1_444,
+  YAS_SURFACE_COLOR_CAP_H264_444,
+} from "./generated";
 /** YAS Surface family v1 codecs and browser client. */
 
 import {
@@ -729,6 +737,34 @@ export function decodeSurfaceReleaseAppEndpoint(
   return value;
 }
 
+/** Validate the optional per-view color capability mask. Absence means SDR. */
+export function surfaceColorCapabilities(
+  extensions: readonly YasExtension[] = [],
+): number {
+  const values = extensions.filter(
+    (e) => e.tag === YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION,
+  );
+  if (
+    values.length > 1 ||
+    values.some(
+      (e) =>
+        e.value.length !== 1 ||
+        (e.value[0] &
+          ~(
+            YAS_SURFACE_COLOR_CAP_DISPLAY_P3 |
+            YAS_SURFACE_COLOR_CAP_HDR10_AV1 |
+            YAS_SURFACE_COLOR_CAP_HDR10_AV1_444 |
+            YAS_SURFACE_COLOR_CAP_AV1_444 |
+            YAS_SURFACE_COLOR_CAP_H264_444
+          )) !==
+          0,
+    )
+  ) {
+    throw new YasProtocolError("invalid Surface color capabilities");
+  }
+  return values[0]?.value[0] ?? 0;
+}
+
 export function encodeSurfaceOpenView(value: YasSurfaceOpenView): Uint8Array {
   requireHandle(value.surfaceHandle, "Surface handle");
   if (
@@ -740,6 +776,7 @@ export function encodeSurfaceOpenView(value: YasSurfaceOpenView): Uint8Array {
     value.codecVersions.length > 0xff
   )
     throw new YasProtocolError("invalid Surface OPEN_VIEW parameters");
+  surfaceColorCapabilities(value.extensions);
   let previous = 0;
   const codecs = new YasWriter();
   for (const codec of value.codecVersions) {
@@ -1298,6 +1335,7 @@ export class YasSurfaceView {
   }
 
   private async configureNow(value: YasSurfaceConfigureView): Promise<void> {
+    surfaceColorCapabilities(value.extensions);
     if (this.closed) throw new YasProtocolError("Surface view is closed");
     if (
       value.width === 0 ||

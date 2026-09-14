@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+check=false
+if [[ $# == 1 && $1 == --check ]]; then
+  check=true
+elif [[ $# != 0 ]]; then
+  echo "Usage: $0 [--check]" >&2
+  exit 2
+fi
+
+if ! command -v glslangValidator >/dev/null; then
+  exec nix shell --inputs-from . nixpkgs#glslang -c ./bin/build-shaders "$@"
+fi
+
+shader_dir=crates/compositor/src/shaders
+build_dir=$(mktemp -d)
+trap 'rm -rf "$build_dir"' EXIT
+
+compile() {
+  local source=$1 output=$2
+  shift 2
+  glslangValidator -V "$@" "$shader_dir/$source" -o "$build_dir/$output"
+}
+
+# Most sources have one checked-in binary. Managed video has nine layouts.
+for source in "$shader_dir"/*.vert "$shader_dir"/*.frag "$shader_dir"/*.comp; do
+  source=${source##*/}
+  if [[ $source != linear_to_video.comp ]]; then
+    compile "$source" "$source.spv"
+  fi
+done
+compile linear_to_video.comp linear_to_video8.comp.spv
+compile linear_to_video.comp linear_to_video10.comp.spv -DTEN_BIT
+compile linear_to_video.comp linear_to_buffer8.comp.spv -DBUFFER_OUTPUT
+compile linear_to_video.comp linear_to_buffer10.comp.spv -DBUFFER_OUTPUT -DTEN_BIT
+compile linear_to_video.comp linear_to_packed8.comp.spv -DPACKED_8
+compile linear_to_video.comp linear_to_packed10.comp.spv -DPACKED_10
+compile linear_to_video.comp linear_to_packed16.comp.spv -DPACKED_16
+compile linear_to_video.comp linear_to_planar8.comp.spv -DPLANAR_8
+compile linear_to_video.comp linear_to_planar16.comp.spv -DPLANAR_16
+
+# Compile every variant successfully before replacing any checked-in output.
+status=0
+for output in "$build_dir"/*.spv; do
+  target="$shader_dir/${output##*/}"
+  if ! cmp -s "$output" "$target"; then
+    if "$check"; then
+      echo "Shader needs rebuilding: $target" >&2
+      status=1
+    else
+      cp "$output" "$target"
+    fi
+  fi
+done
+exit "$status"

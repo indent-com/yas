@@ -353,6 +353,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `text_input_state` | flags:u16,reserved:u16=0,content_hint:u32,content_purpose:u32; when HAS_CURSOR_RECT x:i32,y:i32,width:i32,height:i32 |
 | `minimum_size` | width:u32,height:u32; logical pixels, each at most 2147483647; zero means no minimum on that axis |
 | `text_input_request_revision` | revision:u64; nonzero last committed text-input enable; retained across caret updates, changes request an input panel for existing viewers; initial snapshots do not request a panel |
+| `view_color_capabilities` | optional OPEN_VIEW/CONFIGURE_VIEW extension tag 8: capabilities:u8; bit 0 accepts Display-P3 SDR, bit 1 accepts 10-bit AV1 BT.2020/PQ and HDR presentation, bit 2 additionally accepts 10-bit AV1 4:4:4 Profile 1, bit 3 accepts 8-bit AV1 4:4:4, bit 4 accepts H.264 4:4:4; unknown bits are invalid; absent means sRGB SDR; output is described by each frame COLOR_SPACE using H.273 primaries/transfer/matrix and range 0 limited, 1 full; HDR output requires AV1 codec 2 and uses 10 bits, SDR output uses 8 bits |
 | `family_limits` | ordered optional extensions: tags 1..9 encode max surfaces/session:u32,views/session:u32,view dimension:u32,view pixels:u64,frame rate:u32,inline cursor bytes:u32,remote contacts:u32,app endpoints/session:u32,app endpoint lifetime ns:u64; all tags are present in a selected family descriptor |
 
 ## `yas.selection` (`0x0021`/v1)

@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments)]
+use yas_compositor::color::OutputColor;
 
 use yas_compositor::PixelData;
 const CODEC_SUPPORT_H264: u8 = 1 << 0;
@@ -160,6 +161,7 @@ impl SurfaceEncoderPreference {
     /// - `H264Vaapi`: libva has no H.264 4:4:4 encode profile — the enum stops
     ///   at `VAProfileH264High422`, so there is nothing to pass to
     ///   `vaCreateConfig`.
+    /// - `NvencAV1`: the NVENC SDK 12.1 AV1 API only supports 4:2:0.
     /// - `H264Software`: x264 encodes 4:4:4 (High 4:4:4 Predictive); openh264
     ///   is 4:2:0-only.  A build without the x264 feature is structurally
     ///   4:2:0; a build with it stays a runtime probe, since
@@ -178,7 +180,7 @@ impl SurfaceEncoderPreference {
     #[allow(clippy::match_like_matches_macro)]
     pub fn supports_444_by_encoder(self) -> bool {
         match self {
-            Self::H264Vaapi => false,
+            Self::H264Vaapi | Self::NvencAV1 => false,
             // Both Vulkan Video encoders read a two-plane
             // `G8_B8R8_2PLANE_444_UNORM` source at 4:4:4 — H.264 as High
             // 4:4:4 Predictive, AV1 as High profile — but only where the
@@ -629,7 +631,7 @@ impl SurfaceBandwidth {
     }
 
     /// rav1e min_quantizer — floor the encoder is allowed to improve to.
-    fn av1_min_quantizer(self) -> u8 {
+    pub(super) fn av1_min_quantizer(self) -> u8 {
         match self {
             Self::Low => 120,
             Self::Medium => 80,
@@ -725,7 +727,7 @@ impl SurfaceSpeed {
     }
 
     /// rav1e speed preset (0 = slowest/best, 10 = fastest/worst).
-    fn av1_speed(self) -> u8 {
+    pub(super) fn av1_speed(self) -> u8 {
         self.level()
     }
 
@@ -774,6 +776,8 @@ impl SurfaceSpeed {
 }
 
 pub struct SurfaceEncoder {
+    pub managed: bool,
+    pub output_color: OutputColor,
     /// Dimensions the encoder actually operates at (may be padded to even for H.264).
     width: u32,
     height: u32,
@@ -791,6 +795,7 @@ pub struct SurfaceEncoder {
 }
 
 enum SurfaceEncoderKind {
+    Color(Box<super::surface_color_encoder::ColorEncoder>),
     H264Software(Box<SoftwareH264Encoder>),
     NvencH264(Box<crate::nvenc_encode::NvencDirectEncoder>),
     NvencAV1(Box<crate::nvenc_encode::NvencDirectEncoder>),
@@ -802,6 +807,130 @@ enum SurfaceEncoderKind {
 }
 
 impl SurfaceEncoder {
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    pub fn new_color(
+        preferences: &[SurfaceEncoderPreference],
+        width: u32,
+        height: u32,
+        vaapi_device: &str,
+        encoding: SurfaceEncoding,
+        verbose: bool,
+        codec_support: u8,
+        capabilities: u8,
+        hdr: bool,
+        chroma: ChromaSubsampling,
+    ) -> Result<Self, String> {
+        Self::new_color_ranked(
+            preferences,
+            width,
+            height,
+            vaapi_device,
+            encoding,
+            verbose,
+            codec_support,
+            capabilities,
+            hdr,
+            chroma,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_color_ranked(
+        preferences: &[SurfaceEncoderPreference],
+        width: u32,
+        height: u32,
+        vaapi_device: &str,
+        encoding: SurfaceEncoding,
+        verbose: bool,
+        codec_support: u8,
+        capabilities: u8,
+        hdr: bool,
+        chroma: ChromaSubsampling,
+        software_fallback: bool,
+    ) -> Result<Self, String> {
+        let output = Self::negotiate_color(codec_support, capabilities, hdr);
+        let mut last_error = "no compatible color encoder configured".to_string();
+        let mut chain = preferences.to_vec();
+        for fallback in [
+            SurfaceEncoderPreference::H264Software,
+            SurfaceEncoderPreference::AV1Software,
+        ] {
+            if software_fallback && !chain.contains(&fallback) {
+                chain.push(fallback);
+            }
+        }
+        for pref in chain {
+            if pref.is_vulkan_video()
+                || !pref.supported_by_client(codec_support)
+                || (output == OutputColor::Hdr10
+                    && !matches!(
+                        pref,
+                        SurfaceEncoderPreference::AV1Software
+                            | SurfaceEncoderPreference::AV1Vaapi
+                            | SurfaceEncoderPreference::NvencAV1
+                    ))
+            {
+                continue;
+            }
+            use yas_wire::schema::surface as color_caps;
+            let client_444 = if output == OutputColor::Hdr10 {
+                capabilities & color_caps::COLOR_CAP_HDR10_AV1_444 as u8 != 0
+            } else {
+                let explicit = if pref.supported_by_client(CODEC_SUPPORT_H264) {
+                    color_caps::COLOR_CAP_H264_444
+                } else {
+                    color_caps::COLOR_CAP_AV1_444
+                };
+                capabilities & explicit as u8 != 0 || pref.supports_444_by_client(codec_support)
+            };
+            let allow_444 = chroma.is_444() && pref.supports_444_by_encoder() && client_444;
+            for c in [ChromaSubsampling::Cs444, ChromaSubsampling::Cs420] {
+                if c.is_444() && !allow_444 {
+                    continue;
+                }
+                let result = validate_surface_dimensions(width, height, pref).and_then(|()| {
+                    Self::try_one_inner_color(
+                        pref,
+                        width,
+                        height,
+                        width,
+                        height,
+                        vaapi_device,
+                        encoding,
+                        verbose,
+                        c,
+                        Some(output),
+                    )
+                });
+                match result {
+                    Ok(encoder) => return Ok(encoder),
+                    Err(error) => {
+                        if verbose {
+                            eprintln!("[surface-encoder] {pref:?} {output:?} {c:?}: {error}");
+                        }
+                        last_error = error;
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    pub fn negotiate_color(codec_support: u8, capabilities: u8, hdr: bool) -> OutputColor {
+        if hdr
+            && (codec_support == 0 || codec_support & CODEC_SUPPORT_AV1 != 0)
+            && capabilities & yas_wire::schema::surface::COLOR_CAP_HDR10_AV1 as u8 != 0
+        {
+            OutputColor::Hdr10
+        } else if capabilities & yas_wire::schema::surface::COLOR_CAP_DISPLAY_P3 as u8 != 0 {
+            OutputColor::DisplayP3
+        } else {
+            OutputColor::Srgb
+        }
+    }
+
     /// Try each preference in order; return the first that succeeds and
     /// the client can decode.  `codec_support` is a bitmask of
     /// `CODEC_SUPPORT_*` (0 = accept anything).
@@ -1017,6 +1146,33 @@ impl SurfaceEncoder {
         verbose: bool,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
+        Self::try_one_inner_color(
+            pref,
+            width,
+            height,
+            source_width,
+            source_height,
+            vaapi_device,
+            encoding,
+            verbose,
+            chroma,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_one_inner_color(
+        pref: SurfaceEncoderPreference,
+        width: u32,
+        height: u32,
+        source_width: u32,
+        source_height: u32,
+        vaapi_device: &str,
+        encoding: SurfaceEncoding,
+        verbose: bool,
+        chroma: ChromaSubsampling,
+        color: Option<OutputColor>,
+    ) -> Result<Self, String> {
         let _ = vaapi_device;
         match pref {
             SurfaceEncoderPreference::VulkanVideoH264
@@ -1031,8 +1187,10 @@ impl SurfaceEncoder {
                     height,
                     source_width,
                     source_height,
+                    managed: color.is_some(),
+                    output_color: color.unwrap_or_default(),
                     kind: SurfaceEncoderKind::NvencH264(Box::new(
-                        crate::nvenc_encode::NvencDirectEncoder::try_new(
+                        crate::nvenc_encode::NvencDirectEncoder::try_new_color(
                             "h264",
                             width,
                             height,
@@ -1040,6 +1198,7 @@ impl SurfaceEncoder {
                             encoding.speed.nvenc_preset(),
                             verbose,
                             chroma,
+                            color,
                         )?,
                     )),
                     chroma,
@@ -1057,8 +1216,10 @@ impl SurfaceEncoder {
                     height,
                     source_width,
                     source_height,
+                    managed: color.is_some(),
+                    output_color: color.unwrap_or_default(),
                     kind: SurfaceEncoderKind::NvencAV1(Box::new(
-                        crate::nvenc_encode::NvencDirectEncoder::try_new(
+                        crate::nvenc_encode::NvencDirectEncoder::try_new_color(
                             "av1",
                             width,
                             height,
@@ -1066,6 +1227,7 @@ impl SurfaceEncoder {
                             encoding.speed.nvenc_preset(),
                             verbose,
                             chroma,
+                            color,
                         )?,
                     )),
                     chroma,
@@ -1080,6 +1242,8 @@ impl SurfaceEncoder {
                     height,
                     source_width,
                     source_height,
+                    managed: color.is_some(),
+                    output_color: color.unwrap_or_default(),
                     kind: SurfaceEncoderKind::H264Vaapi(Box::new(
                         crate::vaapi_encode::VaapiDirectEncoder::try_new(
                             width,
@@ -1089,6 +1253,7 @@ impl SurfaceEncoder {
                             encoding.speed.vaapi_quality_level(),
                             verbose,
                             chroma,
+                            color.is_some(),
                         )?,
                     )),
                     chroma,
@@ -1132,8 +1297,10 @@ impl SurfaceEncoder {
                     height,
                     source_width,
                     source_height,
+                    managed: color.is_some(),
+                    output_color: color.unwrap_or_default(),
                     kind: SurfaceEncoderKind::AV1Vaapi(Box::new(
-                        crate::vaapi_encode::VaapiAv1Encoder::try_new(
+                        crate::vaapi_encode::VaapiAv1Encoder::try_new_color(
                             width,
                             height,
                             source_width,
@@ -1143,6 +1310,7 @@ impl SurfaceEncoder {
                             encoding.speed.vaapi_quality_level(),
                             verbose,
                             chroma,
+                            color,
                         )?,
                     )),
                     chroma,
@@ -1156,9 +1324,19 @@ impl SurfaceEncoder {
                 height,
                 source_width,
                 source_height,
-                kind: SurfaceEncoderKind::AV1Software(Box::new(SoftwareAV1Encoder::new(
-                    width, height, encoding, chroma,
-                )?)),
+                managed: color.is_some(),
+                output_color: color.unwrap_or_default(),
+                kind: if let Some(output) = color {
+                    SurfaceEncoderKind::Color(Box::new(
+                        super::surface_color_encoder::ColorEncoder::new(
+                            width, height, encoding, output, chroma,
+                        )?,
+                    ))
+                } else {
+                    SurfaceEncoderKind::AV1Software(Box::new(SoftwareAV1Encoder::new(
+                        width, height, encoding, chroma,
+                    )?))
+                },
                 chroma,
                 encoding,
             }),
@@ -1169,6 +1347,8 @@ impl SurfaceEncoder {
                     height,
                     source_width,
                     source_height,
+                    managed: color.is_some(),
+                    output_color: color.unwrap_or_default(),
                     kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new(
                         width, height, encoding, chroma,
                     )?)),
@@ -1215,6 +1395,14 @@ impl SurfaceEncoder {
     /// for display in debug panels.  Includes chroma subsampling when 4:4:4.
     pub fn encoder_name(&self) -> &'static str {
         match (&self.kind, self.chroma) {
+            (SurfaceEncoderKind::Color(_), chroma) => match (self.output_color, chroma.is_444()) {
+                (OutputColor::Hdr10, true) => "av1-software HDR10 4:4:4",
+                (OutputColor::Hdr10, false) => "av1-software HDR10",
+                (OutputColor::DisplayP3, true) => "av1-software Display-P3 4:4:4",
+                (OutputColor::DisplayP3, false) => "av1-software Display-P3",
+                (OutputColor::Srgb, true) => "av1-software 4:4:4",
+                (OutputColor::Srgb, false) => "av1-software",
+            },
             (SurfaceEncoderKind::H264Software(enc), chroma) => enc.name(chroma),
             (SurfaceEncoderKind::NvencH264(_), ChromaSubsampling::Cs444) => "h264-nvenc 4:4:4",
             (SurfaceEncoderKind::NvencH264(_), _) => "h264-nvenc",
@@ -1245,13 +1433,27 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::H264Vaapi(_) => SurfaceEncoderPreference::H264Vaapi,
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::AV1Vaapi(_) => SurfaceEncoderPreference::AV1Vaapi,
-            SurfaceEncoderKind::AV1Software(_) => SurfaceEncoderPreference::AV1Software,
+            SurfaceEncoderKind::AV1Software(_) | SurfaceEncoderKind::Color(_) => {
+                SurfaceEncoderPreference::AV1Software
+            }
         }
     }
 
     /// WebCodecs codec string for the active encoder.  Sent to the client
     /// so it can configure `VideoDecoder` with the correct profile/level.
     pub fn webcodecs_codec_string(&self) -> String {
+        if self.managed && self.codec_flag() == ENCODED_CODEC_AV1 {
+            return format!(
+                "av01.{}.{}M.{}",
+                av1_profile_digit(self.chroma),
+                av1_level_for(self.source_width, self.source_height),
+                if self.output_color == OutputColor::Hdr10 {
+                    "10"
+                } else {
+                    "08"
+                }
+            );
+        }
         match &self.kind {
             SurfaceEncoderKind::H264Software(_) => {
                 if self.chroma.is_444() {
@@ -1269,7 +1471,9 @@ impl SurfaceEncoder {
                 }
             }
             SurfaceEncoderKind::NvencH264(_) => "avc1.640034".to_string(),
-            SurfaceEncoderKind::NvencAV1(_) | SurfaceEncoderKind::AV1Software(_) => {
+            SurfaceEncoderKind::NvencAV1(_)
+            | SurfaceEncoderKind::AV1Software(_)
+            | SurfaceEncoderKind::Color(_) => {
                 let level = av1_level_for(self.source_width, self.source_height);
                 format!("av01.{}.{level}M.08", av1_profile_digit(self.chroma))
             }
@@ -1291,7 +1495,7 @@ impl SurfaceEncoder {
             }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::AV1Vaapi(_) => ENCODED_CODEC_AV1,
-            SurfaceEncoderKind::AV1Software(_) => ENCODED_CODEC_AV1,
+            SurfaceEncoderKind::AV1Software(_) | SurfaceEncoderKind::Color(_) => ENCODED_CODEC_AV1,
         }
     }
 
@@ -1327,7 +1531,7 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::H264Software(enc) => enc.set_bandwidth(bandwidth),
             // rav1e freezes quantizer/min_quantizer into the Context at
             // creation and exposes no setter.
-            SurfaceEncoderKind::AV1Software(_) => false,
+            SurfaceEncoderKind::AV1Software(_) | SurfaceEncoderKind::Color(_) => false,
         };
         if applied {
             self.encoding.bandwidth = bandwidth;
@@ -1346,6 +1550,7 @@ impl SurfaceEncoder {
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::AV1Vaapi(enc) => enc.request_keyframe(),
             SurfaceEncoderKind::AV1Software(enc) => enc.request_keyframe(),
+            SurfaceEncoderKind::Color(enc) => enc.force_keyframe = true,
         }
     }
 
@@ -1353,10 +1558,9 @@ impl SurfaceEncoder {
     /// YUV straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
     /// copy.  Only NVENC can: CUDA is the sole importer of that handle
     /// type.  The buffer's layout must match the session — NV12 for 4:2:0,
-    /// planar YUV444 for 4:4:4 — which is what `opaque_wants_444` reports;
-    /// the target registration carries it to the compositor.
-    ///
-    /// There is no opt-out: NVENC encodes GPU-converted frames or nothing.
+    /// P010 for HDR, planar YUV444 for 4:4:4. Target registration carries
+    /// the output color and chroma layout to the compositor. Managed frames
+    /// retain float CPU fallback when shared targets require another layout.
     #[cfg(target_os = "linux")]
     pub fn wants_nv12_opaque_fd(&self) -> bool {
         matches!(
@@ -1405,11 +1609,13 @@ impl SurfaceEncoder {
         match &mut self.kind {
             SurfaceEncoderKind::H264Vaapi(enc) => {
                 if let Some(vpp) = &mut enc.vpp {
+                    vpp.output_color = self.managed.then_some(self.output_color);
                     vpp.allocate_nv12_buffers(drm_fd, count);
                 }
             }
             SurfaceEncoderKind::AV1Vaapi(enc) => {
                 if let Some(vpp) = &mut enc.vpp {
+                    vpp.output_color = self.managed.then_some(self.output_color);
                     vpp.allocate_nv12_buffers(drm_fd, count);
                 }
             }
@@ -1517,13 +1723,73 @@ impl SurfaceEncoder {
                 enc.encode_bgra_padded(&bgra, sw, sh)
             }
             SurfaceEncoderKind::AV1Software(encoder) => encoder.encode(&rgba),
+            SurfaceEncoderKind::Color(_) => None,
         }
     }
 
     /// Encode a frame from native pixel data (BGRA, NV12, RGBA, or DMA-BUF).
     /// Dispatches to the most efficient path for each format.
     pub fn encode_pixels(&mut self, pixels: &PixelData) -> Option<(Vec<u8>, bool)> {
-        match pixels {
+        if let PixelData::GpuVariants(_) = pixels {
+            let selected = pixels.find_gpu_variant(|p| match p {
+                PixelData::Nv12OpaqueFd { color, is_444, .. } => {
+                    self.wants_nv12_opaque_fd()
+                        && *color == self.output_color
+                        && *is_444 == self.opaque_wants_444()
+                }
+                #[cfg(target_os = "linux")]
+                PixelData::Nv12DmaBuf {
+                    fd,
+                    color: Some(color),
+                    ..
+                } => {
+                    *color == self.output_color
+                        && self
+                            .gbm_nv12_buffers()
+                            .iter()
+                            .any(|b| std::sync::Arc::ptr_eq(fd, &b.fd))
+                }
+                _ => false,
+            })?;
+            return self.encode_pixels(selected);
+        }
+        let packet = match pixels {
+            PixelData::GpuVariants(_) => unreachable!(),
+            PixelData::LinearRgba {
+                data,
+                hdr,
+                peak_nits,
+            } => {
+                let tone = yas_compositor::color::ToneMapping {
+                    hdr: *hdr,
+                    peak_nits: *peak_nits,
+                };
+                if let SurfaceEncoderKind::Color(enc) = &mut self.kind {
+                    return enc.encode(data, tone);
+                }
+                let yuv = crate::color_yuv::ColorYuv::from_linear(
+                    data,
+                    (self.source_width as usize, self.source_height as usize),
+                    (self.width as usize, self.height as usize),
+                    self.output_color,
+                    tone,
+                    self.chroma.is_444(),
+                )?;
+                let packet = match &mut self.kind {
+                    SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
+                        enc.encode_color(&yuv)
+                    }
+                    #[cfg(target_os = "linux")]
+                    SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_color(&yuv),
+                    #[cfg(target_os = "linux")]
+                    SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_color(&yuv),
+                    SurfaceEncoderKind::H264Software(enc) => {
+                        enc.encode_yuv(yuv.planar8(), self.width, self.height)
+                    }
+                    _ => None,
+                }?;
+                Some(packet)
+            }
             PixelData::Nv12 {
                 data,
                 y_stride,
@@ -1572,9 +1838,13 @@ impl SurfaceEncoder {
                 width,
                 height,
                 is_444,
+                color,
                 sync_fd,
             } => {
                 use std::os::fd::AsRawFd;
+                if *color != self.output_color {
+                    return None;
+                }
                 match &mut self.kind {
                     SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => enc
                         .encode_nv12_opaque_fd(
@@ -1586,6 +1856,7 @@ impl SurfaceEncoder {
                             *width,
                             *height,
                             *is_444,
+                            if *color == OutputColor::Hdr10 { 10 } else { 8 },
                             sync_fd.as_ref().map(|s| s.as_raw_fd()),
                         ),
                     _ => {
@@ -1607,7 +1878,7 @@ impl SurfaceEncoder {
             // these out before dispatching an encode, so reaching here means
             // a server-side encoder was handed one anyway — drop it rather
             // than encode a blank frame.
-            PixelData::GpuOnly => {
+            PixelData::GpuOnly | PixelData::GpuOnlyColor { .. } => {
                 static LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1625,7 +1896,11 @@ impl SurfaceEncoder {
                 width,
                 height,
                 sync_fd,
+                color,
             } => {
+                if color.is_some() && *color != Some(self.output_color) {
+                    return None;
+                }
                 // If the compositor exported a sync_fd (tiled NV12 on radv),
                 // wait for the GPU to finish the BGRA→NV12 compute before
                 // reading.  This runs in spawn_blocking so blocking is fine.
@@ -1636,11 +1911,18 @@ impl SurfaceEncoder {
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    unsafe { libc::poll(&mut pfd, 1, 5000) };
+                    if unsafe { libc::poll(&mut pfd, 1, 5000) } <= 0
+                        || pfd.revents & libc::POLLIN == 0
+                    {
+                        return None;
+                    }
                 }
                 self.encode_nv12_dmabuf(fd, *stride, *uv_offset, *width, *height)
             }
             .or_else(|| {
+                if color.is_some() {
+                    return None;
+                }
                 // VA surface lookup failed — mmap the DMA-BUF and
                 // fall back to encode_nv12 (upload path).
                 use std::os::fd::AsRawFd;
@@ -1670,6 +1952,14 @@ impl SurfaceEncoder {
             #[cfg(not(target_os = "linux"))]
             PixelData::Nv12DmaBuf { .. } => None,
             PixelData::VaSurface { .. } => None,
+        }?;
+        if self.managed && self.codec_flag() == ENCODED_CODEC_H264 {
+            Some((
+                crate::h264_color::set_color(&packet.0, self.output_color.cicp())?,
+                packet.1,
+            ))
+        } else {
+            Some(packet)
         }
     }
 
@@ -1964,6 +2254,7 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
+            SurfaceEncoderKind::Color(_) => None,
             SurfaceEncoderKind::AV1Software(encoder) => {
                 let yuv = if self.chroma.is_444() {
                     bgra_to_yuv444_padded(bgra, src_w, src_h, enc_w, enc_h)
@@ -2026,6 +2317,7 @@ impl SurfaceEncoder {
                 let uv_data = &data[uv_offset..];
                 enc.encode_nv12(y_data, uv_data, y_stride, uv_stride)
             }
+            SurfaceEncoderKind::Color(_) => None,
             SurfaceEncoderKind::AV1Software(encoder) => {
                 // NV12 chroma is half-res; a 4:4:4 encoder needs full-res
                 // planes, so take the RGBA path (which upsamples) instead.
@@ -3198,6 +3490,7 @@ mod tests {
                 max_width: 8192,
                 max_height: 4352,
                 yuv444: false,
+                ten_bit: false,
                 encoder_engines: 2,
             })
         };
@@ -3439,8 +3732,8 @@ mod tests {
         assert_eq!(av1_profile_digit(ChromaSubsampling::Cs420), 0);
     }
 
-    /// 4:4:4 is a structural non-starter for H.264 VA-API (and for
-    /// h264-software in builds without x264), so the encoder chain must not
+    /// 4:4:4 is a structural non-starter for H.264 VA-API and NVENC AV1 (and
+    /// for h264-software without x264), so the encoder chain must not
     /// spend a probe on them.  `AV1Vaapi` is excluded from this list on
     /// purpose — it probes for `VAProfileAV1Profile1` at runtime.
     #[test]
@@ -3453,7 +3746,7 @@ mod tests {
         assert!(SurfaceEncoderPreference::AV1Vaapi.supports_444_by_encoder());
         assert!(SurfaceEncoderPreference::AV1Software.supports_444_by_encoder());
         assert!(SurfaceEncoderPreference::NvencH264.supports_444_by_encoder());
-        assert!(SurfaceEncoderPreference::NvencAV1.supports_444_by_encoder());
+        assert!(!SurfaceEncoderPreference::NvencAV1.supports_444_by_encoder());
     }
 
     /// Build a minimal AV1 OBU with the given type, has_size=1.

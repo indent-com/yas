@@ -38,3 +38,9 @@ export async function openSwitcher(page: Page): Promise<void> {
   await page.keyboard.press("Control+b");
   await page.keyboard.press("k");
 }
+
+/** Create a terminal through the workspace shortcut, including an empty pane. */
+export async function createTerminal(page: Page): Promise<void> {
+  await page.keyboard.press("Control+b");
+  await page.keyboard.press("Enter");
+}

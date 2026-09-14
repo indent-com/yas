@@ -18,6 +18,7 @@ impl CompositorCommandRetention {
 // Compiled everywhere: the server derives its announced codec strings from
 // this same table on every platform.
 pub mod av1_level;
+pub mod color;
 #[cfg(target_os = "linux")]
 mod drm_syncobj;
 #[cfg(target_os = "linux")]
@@ -59,9 +60,19 @@ mod stub {
 
     #[derive(Clone)]
     pub enum PixelData {
+        GpuVariants(Arc<Vec<PixelData>>),
+        LinearRgba {
+            peak_nits: Option<f32>,
+            data: Arc<Vec<f32>>,
+            hdr: bool,
+        },
         Bgra(Arc<Vec<u8>>),
         Rgba(Arc<Vec<u8>>),
         GpuOnly,
+        /// A GPU-resident managed frame; retains color negotiation without readback.
+        GpuOnlyColor {
+            hdr: bool,
+        },
         Nv12 {
             data: Arc<Vec<u8>>,
             y_stride: usize,
@@ -81,6 +92,7 @@ mod stub {
             uv_offset: u32,
             width: u32,
             height: u32,
+            color: Option<crate::color::OutputColor>,
             sync_fd: Option<Arc<OwnedFd>>,
         },
         Nv12OpaqueFd {
@@ -92,6 +104,7 @@ mod stub {
             width: u32,
             height: u32,
             is_444: bool,
+            color: crate::color::OutputColor,
             sync_fd: Option<Arc<OwnedFd>>,
         },
         VaSurface {
@@ -114,8 +127,28 @@ mod stub {
     }
 
     impl PixelData {
+        pub fn find_gpu_variant(&self, accepts: impl Fn(&Self) -> bool) -> Option<&Self> {
+            if let Self::GpuVariants(variants) = self {
+                variants.iter().find(|p| accepts(p))
+            } else {
+                accepts(self).then_some(self)
+            }
+        }
+
         pub fn to_rgba(&self, _width: u32, _height: u32) -> Vec<u8> {
             match self {
+                PixelData::LinearRgba {
+                    data,
+                    hdr,
+                    peak_nits,
+                } => crate::color::rgba8(
+                    data,
+                    crate::color::OutputColor::Srgb,
+                    crate::color::ToneMapping {
+                        hdr: *hdr,
+                        peak_nits: *peak_nits,
+                    },
+                ),
                 PixelData::Rgba(data) => data.as_ref().clone(),
                 PixelData::Bgra(data) => {
                     let mut rgba = Vec::with_capacity(data.len());
@@ -130,13 +163,16 @@ mod stub {
 
         pub fn is_empty(&self) -> bool {
             match self {
+                PixelData::GpuVariants(v) => v.is_empty(),
+                PixelData::LinearRgba { data, .. } => data.is_empty(),
                 PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
                 PixelData::Nv12 { data, .. } => data.is_empty(),
                 PixelData::DmaBuf { .. }
                 | PixelData::VaSurface { .. }
                 | PixelData::Nv12DmaBuf { .. }
                 | PixelData::Nv12OpaqueFd { .. }
-                | PixelData::GpuOnly => false,
+                | PixelData::GpuOnly
+                | PixelData::GpuOnlyColor { .. } => false,
             }
         }
 
@@ -293,6 +329,15 @@ mod stub {
     }
 
     pub enum CompositorCommand {
+        SetColorOutputTargets {
+            surface_id: u32,
+            target_w: u32,
+            target_h: u32,
+            native_w: u32,
+            native_h: u32,
+            targets: Vec<ColorOutputTarget>,
+            want_cpu_pixels: bool,
+        },
         KeyInput {
             surface_id: u16,
             keycode: u32,
@@ -456,7 +501,7 @@ mod stub {
             surface_id: u16,
             /// Render scale in 120ths. 0 = current output scale.
             scale_120: u16,
-            reply: mpsc::SyncSender<Option<(u32, u32, Vec<u8>)>>,
+            reply: mpsc::SyncSender<Option<(u32, u32, PixelData)>>,
         },
         /// Fire pending wl_surface.frame callbacks for a surface so the
         /// client will paint and commit its next frame.  Send this when
@@ -495,6 +540,7 @@ mod stub {
             want_nv12_opaque: bool,
             want_cpu_pixels: bool,
             opaque_is_444: bool,
+            opaque_color: crate::color::OutputColor,
         },
         RestampTarget {
             surface_id: u32,
@@ -549,6 +595,7 @@ mod stub {
             native_w: u32,
             native_h: u32,
             is_444: bool,
+            output: crate::color::OutputColor,
         },
         /// Retarget one client's encoder quantizer without rebuilding it.
         SetVulkanEncoderQp {
@@ -590,12 +637,27 @@ mod stub {
         pub y: f64,
     }
 
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
     pub struct ExternalOutputPlane {
         pub offset: u32,
         pub pitch: u32,
     }
 
+    #[derive(Clone)]
+    pub struct ColorOutputTarget {
+        pub width: u32,
+        pub height: u32,
+        pub color: crate::color::OutputColor,
+        pub is_444: bool,
+        pub buffers: Vec<ColorDmaBuffer>,
+    }
+    #[derive(Clone)]
+    pub struct ColorDmaBuffer {
+        pub fd: Arc<OwnedFd>,
+        pub fourcc: u32,
+        pub modifier: u64,
+        pub planes: Vec<ExternalOutputPlane>,
+    }
     pub struct ExternalOutputBuffer {
         pub fd: Arc<OwnedFd>,
         pub fourcc: u32,
@@ -613,6 +675,8 @@ mod stub {
         pub nv12_modifier: u64,
         pub nv12_width: u32,
         pub nv12_height: u32,
+        pub nv12_color: Option<crate::color::OutputColor>,
+        pub nv12_planes: Vec<ExternalOutputPlane>,
     }
 
     pub struct CompositorHandle {

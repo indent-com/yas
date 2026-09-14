@@ -94,6 +94,8 @@ nix build .#yas                  # complete product build
 ./bin/fmt                        # auto-fix formatting
 ./bin/lint --check               # fmt check + clippy (CI gate)
 ./bin/lint                       # auto-fix formatting + clippy
+./bin/build-shaders              # rebuild compositor SPIR-V, including color variants
+./bin/build-shaders --check      # check source/binary consistency without writing
 ```
 
 `./bin/fmt` runs `cargo fmt` (Rust) and `prettier` (JS/TS/JSON/MD). `./bin/lint` runs fmt + clippy together; pass `--check` to check instead of auto-fixing.
@@ -199,6 +201,9 @@ path. Muster supervises these units in each instance:
 | `ui`         | Vite dev server for `js/ui/`                                             | `127.0.0.1:10000`                     |
 | `website`    | Vite dev server for `js/web/`                                            | `127.0.0.1:10002`                     |
 | `extensions` | Builds `extensions/dist`, then serves it as a CORS extension registry    | `127.0.0.1:10003`                     |
+
+HMR is disabled in both Vite dev servers. Reload the page manually to apply
+source changes.
 
 Inspect and control the stack through muster:
 

@@ -1,3 +1,4 @@
+import { surface2DContext } from "./surfaceColor";
 /**
  * Box-filtered minification for canvases the browser would otherwise shrink
  * on its own.
@@ -93,7 +94,7 @@ function scratch(
     ctx =
       typeof document === "undefined"
         ? null
-        : document.createElement("canvas").getContext("2d");
+        : surface2DContext(document.createElement("canvas"));
     if (ctx) ctx.imageSmoothingEnabled = true;
     scratches[slot] = ctx;
   }

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseShareConfiguration, sandboxTimeout, shareConfiguration } from "./startup.ts";
+import {
+  parseShareConfiguration,
+  sandboxTimeout,
+  shareConfiguration,
+} from "./startup.ts";
 
 test("missing passphrases generate distinct share URLs", () => {
   const first = shareConfiguration();
@@ -12,7 +16,10 @@ test("missing passphrases generate distinct share URLs", () => {
 test("passphrases preserve whitespace and shell metacharacters as file data", () => {
   const passphrase = '  "secret" \\ $HOME `id` $(id)\nline two\t';
   const config = shareConfiguration(passphrase);
-  assert.equal(new URL(config.shareUrl).hash, `#psk=${encodeURIComponent(passphrase)}`);
+  assert.equal(
+    new URL(config.shareUrl).hash,
+    `#psk=${encodeURIComponent(passphrase)}`,
+  );
   assert.equal(
     config.environment,
     'YAS_SHARE_PASSPHRASE="  \\"secret\\" \\\\ $HOME `id` $(id)\nline two\t"\n',
@@ -20,7 +27,13 @@ test("passphrases preserve whitespace and shell metacharacters as file data", ()
 });
 
 test("blank, NUL-containing, and malformed Unicode passphrases are rejected", () => {
-  for (const passphrase of ["", " \t\n", "\u2003", "secret\0value", "x\ud800"]) {
+  for (const passphrase of [
+    "",
+    " \t\n",
+    "\u2003",
+    "secret\0value",
+    "x\ud800",
+  ]) {
     assert.throws(() => shareConfiguration(passphrase), /nonblank.*NUL/);
   }
 });
@@ -38,5 +51,8 @@ test("saved passphrases round-trip without interpreting shell syntax", () => {
   const value = ' "\\$HOME`id`$(id)\nsecond line\t';
   const original = shareConfiguration(value);
   assert.deepEqual(parseShareConfiguration(original.environment), original);
-  assert.throws(() => parseShareConfiguration('YAS_SHARE_PASSPHRASE=$(id)\n'), /Invalid saved/);
+  assert.throws(
+    () => parseShareConfiguration("YAS_SHARE_PASSPHRASE=$(id)\n"),
+    /Invalid saved/,
+  );
 });

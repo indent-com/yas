@@ -340,7 +340,7 @@ function MprisChrome(props: {
     }
     if (entry.readOnly) return Promise.resolve();
     // Keep the native handle and the controller that produced it together.
-    // Re-looking up the connection here can cross a reconnect/HMR swap and
+    // Re-looking up the connection here can cross a connection replacement and
     // send a live-looking player's action to a store that does not own it.
     return entry.store
       .act(entry.player.playerId, action)

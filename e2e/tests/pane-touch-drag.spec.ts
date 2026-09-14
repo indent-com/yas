@@ -155,7 +155,7 @@ test.describe("Grip drag with a finger", () => {
 
     // Parked: the main view fell back to the empty pane.
     await expect(
-      page.getByRole("button", { name: "New terminal" }).first(),
+      page.getByRole("button", { name: "Start with ctrl-b", exact: true }),
     ).toBeVisible({ timeout: 10_000 });
   });
 
@@ -189,7 +189,7 @@ test.describe("Grip drag with a finger", () => {
     // empty pane.
     await expect(page.locator("canvas").first()).toBeVisible();
     await expect(
-      page.getByRole("button", { name: "New terminal" }),
+      page.getByRole("button", { name: "Start with ctrl-b", exact: true }),
     ).toHaveCount(0);
   });
 

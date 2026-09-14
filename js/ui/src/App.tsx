@@ -33,13 +33,6 @@ import { Workspace } from "./Workspace";
 import { PASSPHRASE_KEY } from "./passphrase-storage";
 import { preferredPalette } from "./storage";
 import {
-  cancelHmrRelease,
-  claimHmrLease,
-  createHmrConnectionSlot,
-  deferHmrRelease,
-  type HmrLeaseState,
-} from "./hmrLease";
-import {
   boundedRelayRoutes,
   RelayConnectionCache,
 } from "./relayTransportCache";
@@ -277,50 +270,6 @@ function AppCrash(props: { err: unknown }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// HMR-preserved identity: the protocol workspace reuses this key while the
-// replacement app establishes a fresh native YAS session.
-// ---------------------------------------------------------------------------
-
-type HmrData = HmrLeaseState & {
-  version: number;
-  passphrase: string;
-  workspaceKey: object;
-  closed?: boolean;
-};
-
-// Bump when preserved transport instances are incompatible with hot code.
-// Existing class instances keep their old prototype and receive callbacks,
-// so reusing one would silently leave transport fixes inactive until reload.
-const HMR_DATA_VERSION = 12;
-
-// Connection lifetimes belong to the component and its module generation.
-// Preserve workspace identity across HMR, but never an abandoned live socket.
-const homeConnectionSlot = createHmrConnectionSlot();
-import.meta.hot?.dispose(() => homeConnectionSlot.close());
-
-function getHmrData(): HmrData | null {
-  return (import.meta.hot?.data?.connectedApp as HmrData) ?? null;
-}
-
-function setHmrData(data: HmrData): void {
-  if (import.meta.hot) {
-    import.meta.hot.data.connectedApp = data;
-  }
-}
-
-function clearHmrData(data: HmrData): void {
-  if (import.meta.hot?.data?.connectedApp === data) {
-    delete import.meta.hot.data.connectedApp;
-  }
-}
-
-function closeHmrData(data: HmrData): void {
-  cancelHmrRelease(data);
-  if (data.closed) return;
-  data.closed = true;
-}
-
 function ConnectedApp(props: {
   wasm: YasWasmModule;
   passphrase: string;
@@ -328,24 +277,6 @@ function ConnectedApp(props: {
   edgeWebTransport: EdgeWebTransportConfig | null;
   onAuthError: () => void;
 }) {
-  const hmrLeaseOwner = {};
-
-  // Reuse only the Workspace identity across HMR. A native YAS handshake and
-  // its catalogue belong to one physical transport and are never replayed
-  // into a replacement connection object.
-  const prev = getHmrData();
-  const reusablePrev =
-    prev?.version === HMR_DATA_VERSION &&
-    prev.passphrase === props.passphrase &&
-    !prev.closed;
-  if (prev && !reusablePrev) {
-    closeHmrData(prev);
-    clearHmrData(prev);
-  }
-  if (reusablePrev) claimHmrLease(prev, hmrLeaseOwner);
-
-  const workspaceKey = reusablePrev ? prev.workspaceKey : {};
-
   // The edge exposes exactly one native home connection. Relay creates nested
   // server transports inside that authenticated YAS session.
   const edgeTransport = props.edgeWebTransport
@@ -363,10 +294,18 @@ function ConnectedApp(props: {
     props.wasm,
     false,
   );
-  // Retire the previous owner and register cleanup before opening a socket.
-  // A late mount from a disposed HMR module is closed by the slot here.
-  const closeHomeConnection = homeConnectionSlot.replace(homeConnection);
-  onCleanup(closeHomeConnection);
+  let disposeConnectedResources: (() => void) | undefined;
+  onCleanup(() => {
+    try {
+      disposeConnectedResources?.();
+    } finally {
+      try {
+        homeConnection.close();
+      } finally {
+        homeConnection.dispose();
+      }
+    }
+  });
   homeConnection.connect();
   const [relayCacheRevision, setRelayCacheRevision] = createSignal(0);
   const relayCache = new RelayConnectionCache(() =>
@@ -494,36 +433,6 @@ function ConnectedApp(props: {
     });
   });
 
-  const hmrData = reusablePrev
-    ? prev
-    : claimHmrLease<HmrData>(
-        {
-          version: HMR_DATA_VERSION,
-          passphrase: props.passphrase,
-          workspaceKey,
-        },
-        hmrLeaseOwner,
-      );
-  setHmrData(hmrData);
-
-  // import.meta.hot exists for ordinary unmounts too. Give a replacement HMR
-  // mount one task to claim the stable Workspace identity.
-  onCleanup(() => {
-    const current = getHmrData();
-    if (import.meta.hot && current === hmrData) {
-      deferHmrRelease(
-        hmrData,
-        hmrLeaseOwner,
-        () => getHmrData() === hmrData,
-        () => closeHmrData(hmrData),
-        () => clearHmrData(hmrData),
-      );
-    } else {
-      closeHmrData(hmrData);
-      clearHmrData(hmrData);
-    }
-  });
-
   const connections = createMemo<ConnectionSpec[]>(() => {
     relayCacheRevision();
     const next: ConnectionSpec[] = [
@@ -562,18 +471,13 @@ function ConnectedApp(props: {
     return spec?.connection?.native.net ?? null;
   });
 
-  onCleanup(() => {
-    try {
-      stopPreviewNetBroker();
-      sessionController.dispose();
-      sessionDeviceStore.dispose();
-      sessionStore.dispose();
-      relayCache.clear();
-    } finally {
-      closeHomeConnection();
-      homeConnection.dispose();
-    }
-  });
+  disposeConnectedResources = () => {
+    stopPreviewNetBroker();
+    sessionController.dispose();
+    sessionDeviceStore.dispose();
+    sessionStore.dispose();
+    relayCache.clear();
+  };
 
   return (
     <>
@@ -583,7 +487,6 @@ function ConnectedApp(props: {
       <Workspace
         connections={connections}
         wasm={props.wasm}
-        hmrKey={workspaceKey}
         onAuthError={props.onAuthError}
         relayRoutes={() => relayRoutes()}
         workspaceSession={sessionController.binding}

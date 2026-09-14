@@ -35,6 +35,10 @@ mod audio;
 mod audio_pw;
 mod capacity_diagnostics;
 mod channel;
+mod color_capture;
+#[cfg(all(test, target_os = "linux"))]
+mod color_gpu_tests;
+mod color_yuv;
 mod composite_link;
 #[cfg(target_os = "linux")]
 mod desktop_bus;
@@ -44,6 +48,7 @@ pub mod extension_catalog;
 pub mod extension_store;
 mod font;
 mod gpu_libs;
+mod h264_color;
 mod instance_lock;
 mod ipc;
 mod journal;
@@ -59,9 +64,12 @@ mod nvenc_encode;
 mod process;
 mod pty;
 mod relay;
+#[cfg(target_os = "linux")]
+mod screencast_color;
 mod server_name;
 #[cfg(target_os = "linux")]
 mod software_decode;
+mod surface_color_encoder;
 mod surface_encoder;
 pub mod thread_name;
 #[cfg(target_os = "linux")]
@@ -2045,6 +2053,22 @@ fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 fn screencast_thumbnail(frame: &LastPixels) -> Vec<u8> {
     const MAX_THUMBNAIL_BYTES: usize = 64 * 1024;
+    if let yas_compositor::PixelData::LinearRgba { data, hdr, .. } = &frame.pixels {
+        for &(max_width, max_height) in &[(256, 144), (192, 108), (128, 72), (96, 54), (64, 36)] {
+            if let Some(png) = color_capture::thumbnail(
+                data,
+                frame.width,
+                frame.height,
+                *hdr,
+                max_width,
+                max_height,
+            ) && png.len() <= MAX_THUMBNAIL_BYTES
+            {
+                return png;
+            }
+        }
+        return Vec::new();
+    }
     let rgba = frame.pixels.to_rgba(frame.width, frame.height);
     let Some(image) = image::RgbaImage::from_raw(frame.width, frame.height, rgba) else {
         return Vec::new();
@@ -2212,15 +2236,20 @@ enum CaptureEncoding {
 }
 
 fn encode_capture(
-    pixels: &[u8],
+    pixels: &yas_compositor::PixelData,
     width: u32,
     height: u32,
     format: CaptureEncoding,
     quality: u8,
 ) -> Vec<u8> {
+    if let yas_compositor::PixelData::LinearRgba { data, hdr, .. } = pixels {
+        return color_capture::encode(data, width, height, *hdr, format, quality)
+            .unwrap_or_default();
+    }
+    let rgba = pixels.to_rgba(width, height);
     match format {
-        CaptureEncoding::Avif => encode_rgba_to_avif(pixels, width, height, quality),
-        CaptureEncoding::Png => encode_rgba_to_png(pixels, width, height),
+        CaptureEncoding::Avif => encode_rgba_to_avif(&rgba, width, height, quality),
+        CaptureEncoding::Png => encode_rgba_to_png(&rgba, width, height),
     }
 }
 
@@ -2235,32 +2264,42 @@ struct DownscaleTargetMode {
     want_cpu_pixels: bool,
     /// Layout shared by the opaque readers, when `want_nv12_opaque`.
     opaque_is_444: bool,
+    opaque_color: yas_compositor::color::OutputColor,
 }
 
 /// Representations the compositor must publish for one `(surface, w, h)`.
 ///
 /// CPU and NVENC readers can coexist: the compositor keeps the BGRA staging
 /// copy for the former and additionally publishes its GPU-converted opaque
-/// NV12/NV24 buffer for the latter. A split between 4:2:0 and 4:4:4 NVENC
-/// sessions still has no single opaque layout, so that rarer combination
-/// stays on the CPU-compatible representation.
+/// NV12/P010/planar 4:4:4 buffer for the latter. NVENC sessions at the same
+/// size must agree on chroma and output color to share one opaque allocation;
+/// managed frames retain independent CPU conversion when they disagree.
 ///
 /// `others` yields each *other* subscriber's `(target, can_take_nv12,
 /// wants_444, needs_cpu_pixels)`. A subscriber at a different size is
 /// irrelevant. Vulkan Video needs neither published representation: it reads
 /// the shared BGRA scratch inside the compositor.
-fn downscale_target_mode(
+fn downscale_target_color_mode(
     this_wants: bool,
     this_444: bool,
     this_needs_cpu: bool,
+    this_color: yas_compositor::color::OutputColor,
     target: (u32, u32),
-    others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool, bool)>,
+    others: impl Iterator<
+        Item = (
+            Option<(u32, u32)>,
+            bool,
+            bool,
+            bool,
+            yas_compositor::color::OutputColor,
+        ),
+    >,
 ) -> DownscaleTargetMode {
-    let mut opaque_layout = this_wants.then_some(this_444);
+    let mut opaque_layout = this_wants.then_some((this_444, this_color));
     let mut want_cpu_pixels = this_needs_cpu;
     let mut split_opaque_layout = false;
 
-    for (their_target, they_want, their_444, they_need_cpu) in others {
+    for (their_target, they_want, their_444, they_need_cpu, their_color) in others {
         if their_target != Some(target) {
             continue;
         }
@@ -2271,8 +2310,8 @@ fn downscale_target_mode(
             continue;
         }
         match opaque_layout {
-            Some(layout) if layout != their_444 => split_opaque_layout = true,
-            None => opaque_layout = Some(their_444),
+            Some(layout) if layout != (their_444, their_color) => split_opaque_layout = true,
+            None => opaque_layout = Some((their_444, their_color)),
             _ => {}
         }
     }
@@ -2282,12 +2321,14 @@ fn downscale_target_mode(
             want_nv12_opaque: false,
             want_cpu_pixels: true,
             opaque_is_444: false,
+            opaque_color: Default::default(),
         }
     } else {
         DownscaleTargetMode {
             want_nv12_opaque: opaque_layout.is_some(),
             want_cpu_pixels,
-            opaque_is_444: opaque_layout.unwrap_or(false),
+            opaque_is_444: opaque_layout.is_some_and(|(full, _)| full),
+            opaque_color: opaque_layout.map(|(_, color)| color).unwrap_or_default(),
         }
     }
 }
@@ -2297,7 +2338,7 @@ async fn request_surface_capture_with_timeout(
     surface_id: u16,
     scale_120: u16,
     timeout: Duration,
-) -> Option<(u32, u32, Vec<u8>)> {
+) -> Option<(u32, u32, yas_compositor::PixelData)> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     command_tx
         .try_send(CompositorCommand::Capture {
@@ -2410,6 +2451,11 @@ fn request_surface_keyframe(sub: &mut SurfaceSubState, now: Instant, force: bool
 
 #[derive(Default)]
 struct SurfaceSubState {
+    #[cfg(target_os = "linux")]
+    managed_color_target: Option<yas_compositor::ColorOutputTarget>,
+    #[cfg(target_os = "linux")]
+    managed_color: bool,
+    color_mode: (Option<bool>, yas_compositor::color::OutputColor),
     /// Active encoder for this surface.  `None` between encode jobs
     /// while the encoder is temporarily owned by the spawn_blocking
     /// task (see `encode_in_flight`) or before the first encode.
@@ -2426,6 +2472,9 @@ struct SurfaceSubState {
     /// planar YUV444).  Meaningful only with `wants_nv12_opaque`; recorded
     /// for the same reason.
     wants_opaque_444: bool,
+    wants_opaque_color: yas_compositor::color::OutputColor,
+    #[cfg(target_os = "linux")]
+    color_dma_fds: Vec<Arc<std::os::fd::OwnedFd>>,
     /// Next tick this surface may send a frame (pacing deadline).
     next_send_at: Option<Instant>,
     /// Actual shared compositor clock for this surface. Delivery needs a
@@ -2800,6 +2849,7 @@ struct VulkanVideoSurfaceState {
     /// The profile requested from the compositor.  A refusal of 4:4:4 still
     /// leaves the same codec's 4:2:0 profile worth trying.
     is_444: bool,
+    output: yas_compositor::color::OutputColor,
 }
 
 struct ClientState {
@@ -2966,6 +3016,7 @@ struct ClientState {
     /// Intersection of codec support across all surfaces for this client.
     /// Used to pick an encoder the client can decode.  0 = accept anything.
     surface_codec_support: u8,
+    surface_color_capabilities: u8,
     /// Largest frame this client's video decoder reported it can handle,
     /// from Core negotiation. `(0, 0)` = not declared, which covers
     /// every client predating the field; those are held to the H.264
@@ -4678,6 +4729,7 @@ fn enqueue_surface_frame(
     flags: u8,
     keyframe: bool,
     data: Vec<u8>,
+    color_space: [u8; 4],
 ) -> Result<usize, ()> {
     let codec = match flags & SURFACE_FRAME_CODEC_MASK {
         SURFACE_FRAME_CODEC_H264 => yas_surface_backend::Codec::H264,
@@ -4687,6 +4739,7 @@ fn enqueue_surface_frame(
     yas_surface_backend::enqueue_frame(
         client,
         yas_surface_backend::EncodedFrame {
+            color_space,
             logical_size,
             surface_id,
             timestamp_ms,
@@ -5734,7 +5787,46 @@ impl Session {
     /// buffer out from under clients still registered at that size, and it
     /// leaves survivors on BGRA until something unrelated re-registers them.
     fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
-        let survivors: Vec<(bool, bool, bool, (u32, u32))> = self
+        #[cfg(target_os = "linux")]
+        {
+            let readers: Vec<_> = self
+                .clients
+                .values()
+                .filter_map(|c| {
+                    let s = c.surface_subs.get(&surface_id)?;
+                    (s.last_registered_target == Some((tw, th)))
+                        .then_some((s, c.vulkan_video_surfaces.contains_key(&surface_id)))
+                })
+                .collect();
+            if readers.iter().any(|(s, _)| s.managed_color) {
+                let targets = readers
+                    .iter()
+                    .filter_map(|(s, vk)| (!vk).then(|| s.managed_color_target.clone()).flatten())
+                    .collect();
+                let want_cpu_pixels = readers
+                    .iter()
+                    .any(|(s, vk)| !vk && s.managed_color_target.is_none());
+                let (native_w, native_h) = readers[0].0.last_registered_native.unwrap_or((tw, th));
+                if let Some(cs) = self.compositor.as_mut() {
+                    let _ = cs.handle.command_tx.try_send(
+                        yas_compositor::CompositorCommand::SetColorOutputTargets {
+                            surface_id: surface_id as u32,
+                            target_w: tw,
+                            target_h: th,
+                            native_w,
+                            native_h,
+                            targets,
+                            want_cpu_pixels,
+                        },
+                    );
+                    cs.last_opaque_pixels.remove(&(surface_id, tw, th));
+                    cs.mark_pixel_snapshot_dirty();
+                    cs.handle.wake();
+                }
+                return;
+            }
+        }
+        let survivors: Vec<_> = self
             .clients
             .values()
             .filter_map(|c| {
@@ -5746,6 +5838,7 @@ impl Session {
                         s.wants_opaque_444,
                         !is_vulkan && !s.wants_nv12_opaque,
                         s.last_registered_native.unwrap_or((tw, th)),
+                        s.wants_opaque_color,
                     )
                 })
             })
@@ -5753,17 +5846,21 @@ impl Session {
         let Some(cs) = self.compositor.as_mut() else {
             return;
         };
-        if let Some(&(first_wants, first_444, first_cpu, (native_w, native_h))) = survivors.first()
+        if let Some(&(first_wants, first_444, first_cpu, (native_w, native_h), first_color)) =
+            survivors.first()
         {
-            let mode = downscale_target_mode(
+            let mode = downscale_target_color_mode(
                 first_wants,
                 first_444,
                 first_cpu,
+                first_color,
                 (tw, th),
                 survivors
                     .iter()
                     .skip(1)
-                    .map(|(wants, is_444, cpu, _)| (Some((tw, th)), *wants, *is_444, *cpu)),
+                    .map(|(wants, is_444, cpu, _, color)| {
+                        (Some((tw, th)), *wants, *is_444, *cpu, *color)
+                    }),
             );
             let _ = cs.handle.command_tx.try_send(
                 yas_compositor::CompositorCommand::RegisterDownscaleTarget {
@@ -5775,6 +5872,7 @@ impl Session {
                     want_nv12_opaque: mode.want_nv12_opaque,
                     want_cpu_pixels: mode.want_cpu_pixels,
                     opaque_is_444: mode.opaque_is_444,
+                    opaque_color: mode.opaque_color,
                 },
             );
             // Re-registration may replace or remove the Vulkan allocation.
@@ -9062,9 +9160,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     && u32::from(stream.height) == height
                             })
                         });
-                        wanted
-                            .then(|| pixels.to_rgba(width, height))
-                            .filter(|rgba| rgba.len() == width as usize * height as usize * 4)
+                        wanted.then(|| pixels.clone())
                     };
                     // A commit is for one `(surface, target size)`, not
                     // necessarily the native composite.  In particular,
@@ -9081,7 +9177,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .surfaces
                         .get(&surface_id)
                         .and_then(CachedSurfaceInfo::logical_size);
-                    if matches!(&pixels, yas_compositor::PixelData::Nv12OpaqueFd { .. }) {
+                    if matches!(
+                        &pixels,
+                        yas_compositor::PixelData::GpuVariants(_)
+                            | yas_compositor::PixelData::Nv12OpaqueFd { .. }
+                            | yas_compositor::PixelData::Nv12DmaBuf { color: Some(_), .. }
+                    ) {
                         cache_surface_commit(
                             &mut cs.last_opaque_pixels,
                             &mut cs.pixel_generation,
@@ -9106,7 +9207,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                     cs.mark_pixel_snapshot_dirty();
                     #[cfg(target_os = "linux")]
-                    if let Some(rgba) = screencast_frame {
+                    if let Some(pixels) = screencast_frame {
                         for stream in cs
                             .screencasts
                             .values()
@@ -9117,8 +9218,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     && u32::from(stream.height) == height
                             })
                         {
-                            let _ = stream.source.push_timed(
-                                rgba.clone(),
+                            let _ = stream.source.push_pixels_timed(
+                                &pixels,
                                 timestamp_ms,
                                 timestamp_sub_us,
                             );
@@ -9746,6 +9847,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         queued_at: Instant,
     }
     struct EncoderCreateParams {
+        managed: Option<bool>,
+        color_capabilities: u8,
         preferences: Vec<SurfaceEncoderPreference>,
         probing_vulkan_predecessors: bool,
         vaapi_device: String,
@@ -9909,6 +10012,20 @@ async fn tick(state: &AppState) -> TickOutcome {
             .as_ref()
             .is_some_and(|cs| cs.handle.vulkan_video_encode_av1);
         // Same reason, and at most a handful of names.
+        let mut surface_colors: HashMap<u16, (u64, Option<bool>)> = HashMap::new();
+        if let Some(cs) = sess.compositor.as_ref() {
+            for (&(sid, _, _), lp) in &cs.last_pixels {
+                let color = match &lp.pixels {
+                    yas_compositor::PixelData::LinearRgba { hdr, .. }
+                    | yas_compositor::PixelData::GpuOnlyColor { hdr } => Some(*hdr),
+                    _ => None,
+                };
+                let entry = surface_colors.entry(sid).or_insert((0, None));
+                if lp.generation >= entry.0 {
+                    *entry = (lp.generation, color);
+                }
+            }
+        }
         let declined_vulkan_444_encoders = sess
             .compositor
             .as_ref()
@@ -9936,6 +10053,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             native_w: u32,
             native_h: u32,
             is_444: bool,
+            output: yas_compositor::color::OutputColor,
         }
         let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
         let mut pending_vulkan_frame_requests: Vec<(u32, u64)> = Vec::new();
@@ -10049,6 +10167,42 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // — and for the same reason it opts out of the display cap
                 // (passing no logical size below): those pixels are a
                 // literal request, not a pane at a DPR to be reinterpreted.
+                let managed_source = surface_colors
+                    .get(&sid)
+                    .map(|v| v.1)
+                    .unwrap_or_else(|| client.surface_subs.get(&sid).and_then(|s| s.color_mode.0));
+                let output_color =
+                    managed_source.map_or(yas_compositor::color::OutputColor::Srgb, |hdr| {
+                        SurfaceEncoder::negotiate_color(
+                            surface_codec_support(client, sid),
+                            client.surface_color_capabilities,
+                            hdr,
+                        )
+                    });
+                let color_changed = client
+                    .surface_subs
+                    .get(&sid)
+                    .is_some_and(|sub| sub.color_mode != (managed_source, output_color));
+                if color_changed {
+                    // Start within the software fallback budget. A successful
+                    // hardware session installs its own larger cap immediately.
+                    let managed_preference =
+                        if surface_codec_support(client, sid) & CODEC_SUPPORT_AV1 != 0 {
+                            SurfaceEncoderPreference::AV1Software
+                        } else {
+                            SurfaceEncoderPreference::H264Software
+                        };
+                    let sub = client.surface_subs.entry(sid).or_default();
+                    sub.color_mode = (managed_source, output_color);
+                    sub.vulkan_refused_extent = None;
+                    sub.vulkan_predecessors_exhausted_extent = None;
+                    retire_encoder(sub.encoder.take());
+                    sub.pending_encode = None;
+                    sub.encoder_invalidated = sub.encode_in_flight || sub.creation_in_flight;
+                    sub.last_encoded_gen = None;
+                    sub.has_keyframe = false;
+                    sub.selected_encoder = managed_source.map(|_| managed_preference);
+                }
                 let scaled = client.surface_subs.get(&sid).and_then(|s| s.scaled_target);
                 let adaptive_scale_shift = client
                     .surface_subs
@@ -10090,7 +10244,13 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // replaces only this client's session; other viewers keep
                 // their independently sized streams.
                 let has_vulkan_enc = match client.vulkan_video_surfaces.get(&sid) {
-                    Some(vulkan) if (vulkan.width, vulkan.height) == (enc_w, enc_h) => true,
+                    Some(vulkan)
+                        if !color_changed
+                            && vulkan.output == output_color
+                            && (vulkan.width, vulkan.height) == (enc_w, enc_h) =>
+                    {
+                        true
+                    }
                     Some(_) => {
                         client.vulkan_video_surfaces.remove(&sid);
                         if !vulkan_teardown.contains(&(sid, work.cid)) {
@@ -10152,6 +10312,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         cs.handle.wake();
                     }
                 }
+                let color_dma_snapshot = sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.last_opaque_pixels.get(&(sid, target_w, target_h)))
+                    .map(|lp| lp.pixels.clone());
                 let client = sess.clients.get_mut(&work.cid).unwrap();
 
                 if state.config.verbose {
@@ -10177,10 +10342,35 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // encoder garbles content (the encoder reads at
                 // `source_dimensions` stride into a different-sized
                 // buffer, which wraps rows).
-                let wants_opaque_pixels = client
-                    .surface_subs
-                    .get(&sid)
-                    .is_some_and(|s| s.wants_nv12_opaque);
+                let wants_opaque_pixels = client.surface_subs.get(&sid).is_some_and(|sub| {
+                    color_dma_snapshot
+                        .as_ref()
+                        .map_or(sub.wants_nv12_opaque, |p| {
+                            p.find_gpu_variant(|p| match p {
+                                yas_compositor::PixelData::Nv12OpaqueFd {
+                                    color, is_444, ..
+                                } => {
+                                    sub.wants_nv12_opaque
+                                        && *color == output_color
+                                        && *is_444 == sub.wants_opaque_444
+                                }
+                                #[cfg(target_os = "linux")]
+                                yas_compositor::PixelData::Nv12DmaBuf {
+                                    fd,
+                                    color: Some(color),
+                                    ..
+                                } => {
+                                    *color == output_color
+                                        && sub
+                                            .color_dma_fds
+                                            .iter()
+                                            .any(|ours| Arc::ptr_eq(ours, fd))
+                                }
+                                _ => false,
+                            })
+                            .is_some()
+                        })
+                });
                 let preferred_snapshot = if wants_opaque_pixels {
                     opaque_pixel_snapshot.as_slice()
                 } else {
@@ -10393,6 +10583,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             flags,
                             is_keyframe,
                             data.to_vec(),
+                            output_color.cicp(),
                         ) {
                             Err(()) => {
                                 client.surface_subs.entry(sid).or_default().has_keyframe = false;
@@ -10462,7 +10653,13 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // wants a server-side encoder, so treat it as a miss
                         // — the recomposite below asks for the native BGRA
                         // publish that fills the entry for real.
-                        .filter(|lp| !matches!(lp.pixels, yas_compositor::PixelData::GpuOnly))
+                        .filter(|lp| {
+                            !matches!(
+                                lp.pixels,
+                                yas_compositor::PixelData::GpuOnly
+                                    | yas_compositor::PixelData::GpuOnlyColor { .. }
+                            )
+                        })
                         .map(|lp| (lp.pixels.clone(), lp.encoder_skip, lp.logical_size))
                 };
                 // A cache-only entry (on-demand BGRA readback over a live
@@ -10606,7 +10803,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .surface_subs
                         .get(&sid)
                         .and_then(|s| s.encoder.as_ref())
-                        .is_none_or(|e| e.source_dimensions() != (enc_w, enc_h))
+                        .is_none_or(|e| {
+                            e.source_dimensions() != (enc_w, enc_h)
+                                || e.managed != managed_source.is_some()
+                                || e.output_color != output_color
+                        })
                 };
 
                 // If the encoder was dropped due to persistent nal_data=None,
@@ -10734,6 +10935,11 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                     let mut vulkan_selected = false;
                     for &pref in &state.config.surface_encoders {
+                        if output_color == yas_compositor::color::OutputColor::Hdr10
+                            && pref != SurfaceEncoderPreference::VulkanVideoAV1
+                        {
+                            continue;
+                        }
                         if !pref.is_vulkan_video() {
                             continue;
                         }
@@ -10764,8 +10970,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // Would this client actually be served 4:4:4?  Both
                         // the server's configuration and the client's own
                         // announcement have to say so.
-                        let want_444 = state.config.chroma.is_444()
-                            && pref.supports_444_by_client(codec_support);
+                        let color_444 = if output_color == yas_compositor::color::OutputColor::Hdr10
+                        {
+                            client.surface_color_capabilities
+                                & yas_wire::schema::surface::COLOR_CAP_HDR10_AV1_444 as u8
+                                != 0
+                        } else {
+                            let mask = if pref == SurfaceEncoderPreference::VulkanVideoAV1 {
+                                yas_wire::schema::surface::COLOR_CAP_AV1_444
+                            } else {
+                                yas_wire::schema::surface::COLOR_CAP_H264_444
+                            };
+                            pref.supports_444_by_client(codec_support)
+                                || client.surface_color_capabilities & mask as u8 != 0
+                        };
+                        let want_444 = state.config.chroma.is_444() && color_444;
 
                         // Each codec carries 4:4:4 as its own profile — High
                         // 4:4:4 Predictive for H.264, High for AV1 — and the
@@ -10816,6 +11035,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             native_w,
                             native_h,
                             is_444,
+                            output: output_color,
                         });
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         if let Some(s) = client.surface_subs.get_mut(&sid) {
@@ -10845,6 +11065,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 width: enc_w,
                                 height: enc_h,
                                 is_444,
+                                output: output_color,
                             },
                         );
                         if (enc_w, enc_h) != (native_w, native_h) {
@@ -10915,6 +11136,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         native_w,
                         native_h,
                         params: EncoderCreateParams {
+                            managed: managed_source,
+                            color_capabilities: client.surface_color_capabilities,
                             preferences: creation_preferences,
                             probing_vulkan_predecessors,
                             vaapi_device: state.config.vaapi_device.clone(),
@@ -11068,6 +11291,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         native_w: setup.native_w,
                         native_h: setup.native_h,
                         is_444: setup.is_444,
+                        output: setup.output,
                     },
                 );
             }
@@ -11291,6 +11515,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // here — it races with concurrent ticks.  The next
                     // tick's `needs_new_encoder` check rebuilds the
                     // encoder before any encode at the new size.
+                    let frame_color = result.encoder.output_color.cicp();
                     let mut returned_encoder = Some(result.encoder);
                     let accepted = if let Some(client) = sess.clients.get_mut(&result.cid) {
                         let state = client.surface_subs.entry(result.sid).or_default();
@@ -11400,6 +11625,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         flags,
                         is_keyframe,
                         nal_data,
+                        frame_color,
                     ) {
                         Err(()) => {
                             // Receiver dropped (client disconnected during encode).
@@ -11485,11 +11711,29 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && pending.is_some()
                         && !surface_delivery_is_throttled(client, result.sid)
                         && surface_frame_credit_open_or_mark(client, result.sid, reserved_bytes);
+                    let codec_support = surface_codec_support(client, result.sid);
+                    let color_capabilities = client.surface_color_capabilities;
                     let state = client.surface_subs.entry(result.sid).or_default();
                     if can_chain
                         && let Some(pending) = pending
                         && returned_encoder.as_ref().is_some_and(|encoder| {
                             encoder.source_dimensions() == (pending.target_w, pending.target_h)
+                                && encoder.managed
+                                    == matches!(
+                                        pending.pixels,
+                                        yas_compositor::PixelData::LinearRgba { .. }
+                                    )
+                                && match pending.pixels {
+                                    yas_compositor::PixelData::LinearRgba { hdr, .. } => {
+                                        encoder.output_color
+                                            == SurfaceEncoder::negotiate_color(
+                                                codec_support,
+                                                color_capabilities,
+                                                hdr,
+                                            )
+                                    }
+                                    _ => true,
+                                }
                         })
                     {
                         state.encode_in_flight = true;
@@ -11560,17 +11804,34 @@ async fn tick(state: &AppState) -> TickOutcome {
                     tokio::task::spawn_blocking(move || {
                         let params = job.params;
                         #[allow(unused_mut)]
-                        let mut encoder = match SurfaceEncoder::new_or_resize(
-                            job.previous,
-                            &params.preferences,
-                            job.target_w,
-                            job.target_h,
-                            &params.vaapi_device,
-                            params.encoding,
-                            params.verbose,
-                            params.codec_support,
-                            params.chroma,
-                        ) {
+                        let creation = if let Some(hdr) = params.managed {
+                            SurfaceEncoder::new_color_ranked(
+                                &params.preferences,
+                                job.target_w,
+                                job.target_h,
+                                &params.vaapi_device,
+                                params.encoding,
+                                params.verbose,
+                                params.codec_support,
+                                params.color_capabilities,
+                                hdr,
+                                params.chroma,
+                                !params.probing_vulkan_predecessors,
+                            )
+                        } else {
+                            SurfaceEncoder::new_or_resize(
+                                job.previous,
+                                &params.preferences,
+                                job.target_w,
+                                job.target_h,
+                                &params.vaapi_device,
+                                params.encoding,
+                                params.verbose,
+                                params.codec_support,
+                                params.chroma,
+                            )
+                        };
+                        let mut encoder = match creation {
                             Ok(enc) => enc,
                             Err(err) => {
                                 if params.verbose {
@@ -11613,7 +11874,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let external_bufs = {
                             {
                                 let drm_fd = encoder.drm_fd_raw();
-                                let count = encoder.gbm_buffers().len();
+                                let count = if encoder.managed {
+                                    5
+                                } else {
+                                    encoder.gbm_buffers().len()
+                                };
                                 if count > 0 {
                                     encoder.allocate_nv12_buffers(drm_fd, count);
                                 }
@@ -11649,6 +11914,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                                             nv12_modifier: nv12.map_or(0, |n| n.modifier),
                                             nv12_width: enc_w,
                                             nv12_height: enc_h,
+                                            nv12_color: encoder
+                                                .managed
+                                                .then_some(encoder.output_color),
+                                            nv12_planes: nv12
+                                                .map(|n| n.planes.clone())
+                                                .unwrap_or_default(),
                                         })
                                     })
                                     .collect();
@@ -11880,91 +12151,158 @@ async fn tick(state: &AppState) -> TickOutcome {
                         );
                     }
                     let encoder_opaque_444 = encoder.opaque_wants_444();
-                    let target_mode = downscale_target_mode(
-                        encoder_wants_nv12_opaque,
-                        encoder_opaque_444,
-                        !encoder_wants_nv12_opaque,
-                        (tw, th),
-                        sess.clients
+                    if encoder.managed {
+                        let buffers: Vec<_> = encoder
+                            .gbm_nv12_buffers()
                             .iter()
-                            .filter(|(cid, _)| **cid != result.cid)
-                            .map(|(_, c)| {
-                                c.surface_subs
-                                    .get(&result.sid)
-                                    .map(|s| {
-                                        let is_vulkan =
-                                            c.vulkan_video_surfaces.contains_key(&result.sid);
-                                        (
-                                            s.last_registered_target,
-                                            s.wants_nv12_opaque,
-                                            s.wants_opaque_444,
-                                            !is_vulkan && !s.wants_nv12_opaque,
-                                        )
-                                    })
-                                    .unwrap_or((None, true, encoder_opaque_444, false))
-                            }),
-                    );
-                    if let Some(bufs) = external_bufs
-                        && !bufs.is_empty()
-                        && let Some(cs) = sess.compositor.as_mut()
-                    {
-                        let _ = cs.handle.command_tx.try_send(
-                            yas_compositor::CompositorCommand::SetExternalOutputBuffers {
-                                surface_id: result.sid as u32,
-                                target_w: tw,
-                                target_h: th,
-                                native_w: result.native_w,
-                                native_h: result.native_h,
-                                buffers: bufs,
-                            },
+                            .map(|b| yas_compositor::ColorDmaBuffer {
+                                fd: b.fd.clone(),
+                                fourcc: b.fourcc,
+                                modifier: b.modifier,
+                                planes: b.planes.clone(),
+                            })
+                            .collect();
+                        let (width, height) = encoder.encoder_dimensions();
+                        let target =
+                            (encoder_wants_nv12_opaque || !buffers.is_empty()).then(|| {
+                                yas_compositor::ColorOutputTarget {
+                                    width,
+                                    height,
+                                    color: encoder.output_color,
+                                    is_444: encoder.opaque_wants_444(),
+                                    buffers,
+                                }
+                            });
+                        if let Some(client) = sess.clients.get_mut(&result.cid) {
+                            let s = client.surface_subs.entry(result.sid).or_default();
+                            s.managed_color = true;
+                            s.managed_color_target = target;
+                            s.last_registered_target = Some((tw, th));
+                            s.last_registered_native = Some((result.native_w, result.native_h));
+                            s.wants_nv12_opaque = encoder_wants_nv12_opaque;
+                            s.wants_opaque_444 = encoder_opaque_444;
+                            s.wants_opaque_color = encoder.output_color;
+                            s.color_dma_fds = encoder
+                                .gbm_nv12_buffers()
+                                .iter()
+                                .map(|b| b.fd.clone())
+                                .collect();
+                        }
+                        sess.resettle_downscale_target(result.sid, tw, th);
+                    } else {
+                        if let Some(s) = sess
+                            .clients
+                            .get_mut(&result.cid)
+                            .and_then(|c| c.surface_subs.get_mut(&result.sid))
+                        {
+                            s.managed_color = false;
+                            s.managed_color_target = None;
+                        }
+                        let target_mode = downscale_target_color_mode(
+                            encoder_wants_nv12_opaque,
+                            encoder_opaque_444,
+                            !encoder_wants_nv12_opaque,
+                            encoder.output_color,
+                            (tw, th),
+                            sess.clients
+                                .iter()
+                                .filter(|(cid, _)| **cid != result.cid)
+                                .map(|(_, c)| {
+                                    c.surface_subs
+                                        .get(&result.sid)
+                                        .map(|s| {
+                                            let is_vulkan =
+                                                c.vulkan_video_surfaces.contains_key(&result.sid);
+                                            (
+                                                s.last_registered_target,
+                                                s.wants_nv12_opaque,
+                                                s.wants_opaque_444,
+                                                !is_vulkan && !s.wants_nv12_opaque,
+                                                s.wants_opaque_color,
+                                            )
+                                        })
+                                        .unwrap_or((
+                                            None,
+                                            true,
+                                            encoder_opaque_444,
+                                            false,
+                                            encoder.output_color,
+                                        ))
+                                }),
                         );
-                        cs.handle.wake();
-                    } else if let Some(cs) = sess.compositor.as_mut() {
-                        // No GBM externals — register a server-allocated
-                        // downscale target so the compositor can GPU-copy
-                        // the native composite into target-sized pixels for
-                        // this encoder.  Idempotent in the renderer.
-                        //
-                        // NVENC additionally asks for the NV12 OPAQUE_FD
-                        // shape, which converts on the GPU and hands over a
-                        // handle CUDA can import — skipping the readback
-                        // into staging and the Vec that used to carry it.
-                        // Every other backend needs pixels on the CPU and
-                        // takes the BGRA path. The renderer falls back to
-                        // BGRA on its own if the export fails, so this
-                        // stays a request rather than a commitment, and it
-                        // reconciles a `false` here by dropping an NV12
-                        // target it had already built.
-                        // The command can replace the opaque allocation
-                        // (layout change, failed export, or Vulkan takeover).
-                        // Its cached fd must not outlive that allocation.
-                        cs.last_opaque_pixels.remove(&(result.sid, tw, th));
-                        cs.mark_pixel_snapshot_dirty();
-                        let _ = cs.handle.command_tx.try_send(
-                            yas_compositor::CompositorCommand::RegisterDownscaleTarget {
-                                surface_id: result.sid as u32,
-                                target_w: tw,
-                                target_h: th,
-                                native_w: result.native_w,
-                                native_h: result.native_h,
-                                want_nv12_opaque: target_mode.want_nv12_opaque,
-                                want_cpu_pixels: target_mode.want_cpu_pixels,
-                                opaque_is_444: target_mode.opaque_is_444,
-                            },
-                        );
-                        cs.handle.wake();
-                    }
-                    if let Some(client) = sess.clients.get_mut(&result.cid) {
-                        let s = client.surface_subs.entry(result.sid).or_default();
-                        s.last_registered_target = Some((tw, th));
-                        s.last_registered_native = Some((result.native_w, result.native_h));
-                        // This encoder's own capability, not the resolved
-                        // decision above: a later subscriber asks whether
-                        // *we* could take NV12, and must not inherit a
-                        // "no" we only arrived at because of a third party
-                        // that has since gone away.
-                        s.wants_nv12_opaque = encoder_wants_nv12_opaque;
-                        s.wants_opaque_444 = encoder_opaque_444;
+                        if let Some(bufs) = external_bufs
+                            && !bufs.is_empty()
+                            && let Some(cs) = sess.compositor.as_mut()
+                        {
+                            let _ = cs.handle.command_tx.try_send(
+                                yas_compositor::CompositorCommand::SetExternalOutputBuffers {
+                                    surface_id: result.sid as u32,
+                                    target_w: tw,
+                                    target_h: th,
+                                    native_w: result.native_w,
+                                    native_h: result.native_h,
+                                    buffers: bufs,
+                                },
+                            );
+                            cs.handle.wake();
+                        } else if let Some(cs) = sess.compositor.as_mut() {
+                            // No GBM externals — register a server-allocated
+                            // downscale target so the compositor can GPU-copy
+                            // the native composite into target-sized pixels for
+                            // this encoder.  Idempotent in the renderer.
+                            //
+                            // NVENC additionally asks for the NV12 OPAQUE_FD
+                            // shape, which converts on the GPU and hands over a
+                            // handle CUDA can import — skipping the readback
+                            // into staging and the Vec that used to carry it.
+                            // Every other backend needs pixels on the CPU and
+                            // takes the BGRA path. The renderer falls back to
+                            // BGRA on its own if the export fails, so this
+                            // stays a request rather than a commitment, and it
+                            // reconciles a `false` here by dropping an NV12
+                            // target it had already built.
+                            // The command can replace the opaque allocation
+                            // (layout change, failed export, or Vulkan takeover).
+                            // Its cached fd must not outlive that allocation.
+                            cs.last_opaque_pixels.remove(&(result.sid, tw, th));
+                            cs.mark_pixel_snapshot_dirty();
+                            let _ = cs.handle.command_tx.try_send(
+                                yas_compositor::CompositorCommand::RegisterDownscaleTarget {
+                                    surface_id: result.sid as u32,
+                                    target_w: tw,
+                                    target_h: th,
+                                    native_w: result.native_w,
+                                    native_h: result.native_h,
+                                    want_nv12_opaque: target_mode.want_nv12_opaque,
+                                    want_cpu_pixels: target_mode.want_cpu_pixels,
+                                    opaque_is_444: target_mode.opaque_is_444,
+                                    opaque_color: target_mode.opaque_color,
+                                },
+                            );
+                            cs.handle.wake();
+                        }
+                        if let Some(client) = sess.clients.get_mut(&result.cid) {
+                            let s = client.surface_subs.entry(result.sid).or_default();
+                            s.last_registered_target = Some((tw, th));
+                            s.last_registered_native = Some((result.native_w, result.native_h));
+                            // This encoder's own capability, not the resolved
+                            // decision above: a later subscriber asks whether
+                            // *we* could take NV12, and must not inherit a
+                            // "no" we only arrived at because of a third party
+                            // that has since gone away.
+                            s.wants_nv12_opaque = encoder_wants_nv12_opaque;
+                            s.wants_opaque_444 = encoder_opaque_444;
+                            s.wants_opaque_color = encoder.output_color;
+                            s.color_dma_fds = if encoder.managed {
+                                encoder
+                                    .gbm_nv12_buffers()
+                                    .iter()
+                                    .map(|b| b.fd.clone())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -12980,28 +13318,79 @@ mod tests {
     /// CPU/NVENC readers receive both BGRA and opaque NV12; NVENC readers
     /// must still agree on the opaque chroma layout.
     mod nv12_opaque_target {
-        use super::super::{DownscaleTargetMode, downscale_target_mode};
+        use super::super::{DownscaleTargetMode, downscale_target_color_mode};
+        use yas_compositor::color::OutputColor;
+        fn downscale_target_mode(
+            this: bool,
+            full: bool,
+            cpu: bool,
+            target: (u32, u32),
+            others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool, bool)>,
+        ) -> DownscaleTargetMode {
+            downscale_target_color_mode(
+                this,
+                full,
+                cpu,
+                OutputColor::Srgb,
+                target,
+                others.map(|(t, w, f, c)| (t, w, f, c, OutputColor::Srgb)),
+            )
+        }
+        #[test]
+        fn color_conflict_uses_independent_cpu_conversion() {
+            for color in [OutputColor::Srgb, OutputColor::DisplayP3] {
+                assert_eq!(
+                    downscale_target_color_mode(
+                        true,
+                        false,
+                        false,
+                        OutputColor::Hdr10,
+                        T,
+                        [(Some(T), true, false, false, color)].into_iter()
+                    ),
+                    CPU_ONLY
+                );
+            }
+        }
+        #[test]
+        fn matching_hdr_readers_keep_p010() {
+            let mode = downscale_target_color_mode(
+                true,
+                false,
+                false,
+                OutputColor::Hdr10,
+                T,
+                [(Some(T), true, false, false, OutputColor::Hdr10)].into_iter(),
+            );
+            assert!(mode.want_nv12_opaque);
+            assert!(!mode.want_cpu_pixels);
+            assert_eq!(mode.opaque_color, OutputColor::Hdr10);
+        }
 
         const T: (u32, u32) = (1280, 720);
         const OPAQUE_420: DownscaleTargetMode = DownscaleTargetMode {
             want_nv12_opaque: true,
             want_cpu_pixels: false,
             opaque_is_444: false,
+            opaque_color: OutputColor::Srgb,
         };
         const OPAQUE_444: DownscaleTargetMode = DownscaleTargetMode {
             want_nv12_opaque: true,
             want_cpu_pixels: false,
             opaque_is_444: true,
+            opaque_color: OutputColor::Srgb,
         };
         const MIXED_420: DownscaleTargetMode = DownscaleTargetMode {
             want_nv12_opaque: true,
             want_cpu_pixels: true,
             opaque_is_444: false,
+            opaque_color: OutputColor::Srgb,
         };
         const CPU_ONLY: DownscaleTargetMode = DownscaleTargetMode {
             want_nv12_opaque: false,
             want_cpu_pixels: true,
             opaque_is_444: false,
+            opaque_color: OutputColor::Srgb,
         };
 
         #[test]
@@ -13144,6 +13533,7 @@ mod tests {
                     want_nv12_opaque: false,
                     want_cpu_pixels: false,
                     opaque_is_444: false,
+                    opaque_color: OutputColor::Srgb,
                 }
             );
         }
@@ -13295,6 +13685,7 @@ mod tests {
             surface_view_sizes: FxHashMap::default(),
             surface_claim_lapses: FxHashMap::default(),
             surface_codec_support: 0,
+            surface_color_capabilities: 0,
             surface_max_decode: (0, 0),
             pressed_surface_keys: HashSet::new(),
             direct_touch_enabled: false,
@@ -13354,6 +13745,20 @@ mod tests {
             let text = terminal.driver.seq_text(0, 0, None, 10000).text;
             assert!(text.contains("frame-03"));
             assert!(!text.contains("frame-04"));
+            // The child may still be writing frames when we release its read.
+            // Suppress input echo so the acknowledgement cannot interleave
+            // with a frame marker and corrupt the test's output oracle.
+            // SAFETY: the locked terminal owns this live PTY, and tcgetattr
+            // succeeds before its initialized settings are changed.
+            unsafe {
+                let mut settings: libc::termios = std::mem::zeroed();
+                assert_eq!(libc::tcgetattr(terminal.handle.master_fd, &mut settings), 0);
+                settings.c_lflag &= !(libc::ECHO | libc::ECHONL);
+                assert_eq!(
+                    libc::tcsetattr(terminal.handle.master_fd, libc::TCSANOW, &settings),
+                    0
+                );
+            }
             pty::pty_write_all(terminal.handle.master_fd, b"go\n");
         }
         // Let the child exit without allowing delivery to free a frame slot.
@@ -15165,14 +15570,20 @@ mod tests {
                     panic!("expected capture command");
                 };
                 assert_eq!(surface_id, 7);
-                let _ = reply.send(Some((2, 3, vec![1, 2, 3, 4])));
+                let _ = reply.send(Some((
+                    2,
+                    3,
+                    yas_compositor::PixelData::Rgba(Arc::new(vec![1, 2, 3, 4])),
+                )));
             })
             .unwrap();
 
         let result =
             request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
 
-        assert_eq!(result, Some((2, 3, vec![1, 2, 3, 4])));
+        let (w, h, pixels) = result.unwrap();
+        assert_eq!((w, h), (2, 3));
+        assert_eq!(pixels.to_rgba(w, h), vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]
@@ -15188,7 +15599,7 @@ mod tests {
         let result =
             request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
 
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     // ── frame_window ──
@@ -16799,6 +17210,7 @@ mod tests {
                 width: 800,
                 height: 600,
                 is_444: false,
+                output: yas_compositor::color::OutputColor::Srgb,
             },
         );
 

@@ -211,6 +211,8 @@ const PW_VERSION_STREAM_EVENTS: u32 = 2;
 const PW_VERSION_REGISTRY: u32 = 3;
 const PW_VERSION_NODE: u32 = 3;
 
+use crate::screencast_color::RawVideoFormat;
+
 // ── PipeWire constants ────────────────────────────────────────────────
 
 const PW_DIRECTION_INPUT: i32 = 0;
@@ -260,7 +262,6 @@ const SPA_MEDIA_SUBTYPE_RAW: u32 = 1;
 const SPA_FORMAT_VIDEO_SIZE: u32 = 131_075;
 const SPA_FORMAT_VIDEO_FRAMERATE: u32 = 131_076;
 const SPA_FORMAT_VIDEO_FORMAT: u32 = 131_073;
-const SPA_VIDEO_FORMAT_RGBA: u32 = 11;
 const SPA_AUDIO_FORMAT_F32_LE: u32 = 283;
 const SPA_AUDIO_FORMAT_S16_LE: u32 = 259;
 
@@ -756,7 +757,7 @@ fn build_process_latency_pod(ns: u64) -> Vec<u64> {
     aligned
 }
 
-fn build_rgba_format_pod(width: u16, height: u16, fps: u8) -> Vec<u64> {
+fn build_video_format_pod(width: u16, height: u16, fps: u8, format: RawVideoFormat) -> Vec<u64> {
     let mut body: Vec<u8> = Vec::with_capacity(160);
     body.extend_from_slice(&SPA_TYPE_OBJECT_FORMAT.to_le_bytes());
     body.extend_from_slice(&SPA_PARAM_ENUM_FORMAT.to_le_bytes());
@@ -786,8 +787,14 @@ fn build_rgba_format_pod(width: u16, height: u16, fps: u8) -> Vec<u64> {
         &mut body,
         SPA_FORMAT_VIDEO_FORMAT,
         SPA_TYPE_ID,
-        &SPA_VIDEO_FORMAT_RGBA.to_le_bytes(),
+        &format.spa_format().to_le_bytes(),
     );
+    for (key, value) in [131084u32, 131085, 131086, 131087]
+        .into_iter()
+        .zip(format.spa_color())
+    {
+        prop(&mut body, key, SPA_TYPE_ID, &value.to_le_bytes());
+    }
     let mut size = Vec::with_capacity(8);
     size.extend_from_slice(&(width as u32).to_le_bytes());
     size.extend_from_slice(&(height as u32).to_le_bytes());
@@ -815,6 +822,53 @@ fn build_rgba_format_pod(width: u16, height: u16, fps: u8) -> Vec<u64> {
         );
     }
     aligned
+}
+
+fn negotiated_video_format(bytes: &[u8]) -> Option<RawVideoFormat> {
+    let word = |at: usize| {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let end = (word(0)? as usize).checked_add(8)?;
+    if end > bytes.len() || word(4)? != SPA_TYPE_OBJECT || end < 16 {
+        return None;
+    }
+    let (mut format, mut primaries, mut transfer) = (None, 0, 0);
+    let mut at = 16usize;
+    while at < end {
+        let key = word(at)?;
+        let size = word(at + 8)? as usize;
+        let kind = word(at + 12)?;
+        if at.checked_add(16)?.checked_add(size)? > end {
+            return None;
+        }
+        let value = if kind == SPA_TYPE_ID && size == 4 {
+            Some(word(at + 16)?)
+        }
+        // PipeWire may fixate a format as Choice(None, Id), retaining
+        // the choice wrapper even though it contains one selected value.
+        else if kind == 19
+            && size == 20
+            && word(at + 16)? == 0
+            && word(at + 24)? == 4
+            && word(at + 28)? == SPA_TYPE_ID
+        {
+            Some(word(at + 32)?)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            match key {
+                SPA_FORMAT_VIDEO_FORMAT => format = Some(value),
+                131086 => transfer = value,
+                131087 => primaries = value,
+                _ => {}
+            }
+        }
+        at = at.checked_add(16)?.checked_add(size.checked_add(7)? & !7)?;
+    }
+    RawVideoFormat::from_spa(format?, primaries, transfer)
 }
 
 /// Request `SPA_META_Header` on every negotiated raw-video buffer. PipeWire
@@ -1725,6 +1779,7 @@ impl Drop for PcmSource {
 
 #[derive(Debug, PartialEq, Eq)]
 struct RawVideoFrame {
+    format: RawVideoFormat,
     rgba: Vec<u8>,
     pts_ns: i64,
     sequence: u64,
@@ -1737,8 +1792,9 @@ struct RawVideoState {
     node_id: AtomicU32,
     serial: AtomicU64,
     next_sequence: AtomicU64,
-    frame_size: i32,
-    stride: u32,
+    width: u16,
+    height: u16,
+    format: AtomicU32,
     node_name: CString,
     core_hook: SpaHook,
 }
@@ -1842,7 +1898,25 @@ unsafe extern "C" fn on_raw_video_param_changed(data: *mut c_void, id: u32, para
         let Some(s) = syms() else {
             return;
         };
-        let buffers = build_raw_video_buffers_pod(state.frame_size, state.stride as i32);
+        // PipeWire owns the POD for this callback. Parse only its declared
+        // bytes; reject malformed/unsupported formats before allocating buffers.
+        let size = ptr::read_unaligned(param.cast::<u32>()) as usize;
+        if size > 65536 {
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(param.cast::<u8>(), size + 8);
+        let Some(format) = negotiated_video_format(bytes) else {
+            return;
+        };
+        let stride = i32::from(state.width) * format.bytes_per_pixel() as i32;
+        let Some(frame_size) = stride.checked_mul(i32::from(state.height)) else {
+            return;
+        };
+        state.format.store(format as u32, Ordering::Release);
+        if let Ok(mut frames) = state.frames.lock() {
+            frames.clear();
+        }
+        let buffers = build_raw_video_buffers_pod(frame_size, stride);
         let header_meta = build_header_meta_pod();
         let mut params = [
             buffers.as_ptr() as *const c_void,
@@ -1873,8 +1947,10 @@ unsafe extern "C" fn on_raw_video_process(data: *mut c_void) {
                 let plane = &mut *spa.datas;
                 if !plane.data.is_null() && !plane.chunk.is_null() {
                     let capacity = plane.maxsize as usize;
-                    let frame = take_latest_frame(&state.frames)
-                        .filter(|frame| frame.rgba.len() <= capacity);
+                    let frame = take_latest_frame(&state.frames).filter(|frame| {
+                        frame.rgba.len() <= capacity
+                            && frame.format as u32 == state.format.load(Ordering::Acquire)
+                    });
                     let size = frame.as_ref().map_or(0, |frame| frame.rgba.len());
                     if let Some(frame) = frame.as_ref() {
                         ptr::copy_nonoverlapping(
@@ -1886,7 +1962,9 @@ unsafe extern "C" fn on_raw_video_process(data: *mut c_void) {
                     let chunk = &mut *plane.chunk;
                     chunk.offset = 0;
                     chunk.size = size as u32;
-                    chunk.stride = state.stride as i32;
+                    chunk.stride = i32::from(state.width)
+                        * RawVideoFormat::from_id(state.format.load(Ordering::Acquire))
+                            .bytes_per_pixel() as i32;
                     chunk.flags = 0;
                     write_raw_video_header(spa, frame.as_ref());
                 }
@@ -2045,7 +2123,7 @@ impl RawVideoSource {
         let stride = i32::from(width)
             .checked_mul(4)
             .ok_or_else(|| "raw-video stride overflow".to_string())?;
-        let frame_size = stride
+        let _frame_size = stride
             .checked_mul(i32::from(height))
             .ok_or_else(|| "raw-video frame exceeds PipeWire buffer limits".to_string())?;
         let s = syms().ok_or_else(|| "libpipewire-0.3.so.0 not available".to_string())?;
@@ -2086,8 +2164,9 @@ impl RawVideoSource {
                 node_id: AtomicU32::new(PW_ID_ANY),
                 serial: AtomicU64::new(0),
                 next_sequence: AtomicU64::new(0),
-                frame_size,
-                stride: stride as u32,
+                width,
+                height,
+                format: AtomicU32::new(RawVideoFormat::Srgb as u32),
                 node_name,
                 core_hook: SpaHook {
                     link: SpaList {
@@ -2115,8 +2194,19 @@ impl RawVideoSource {
                 return Err("pw_stream_new_simple failed".into());
             }
             (*state).stream = stream;
-            let pod = build_rgba_format_pod(width, height, fps);
-            let mut params = [pod.as_ptr() as *const c_void];
+            let formats: &[RawVideoFormat] = if role == "Screen" {
+                &RawVideoFormat::SCREEN
+            } else {
+                &[RawVideoFormat::Srgb]
+            };
+            let pods: Vec<_> = formats
+                .iter()
+                .map(|&format| build_video_format_pod(width, height, fps, format))
+                .collect();
+            let mut params: Vec<_> = pods
+                .iter()
+                .map(|pod| pod.as_ptr() as *const c_void)
+                .collect();
             let rc = (s.pw_stream_connect)(
                 stream,
                 PW_DIRECTION_OUTPUT,
@@ -2193,27 +2283,38 @@ impl RawVideoSource {
     }
 
     pub fn push(&self, rgba: Vec<u8>) -> Result<(), &'static str> {
-        self.enqueue(rgba, SPA_TIME_INVALID)
+        self.enqueue(rgba, SPA_TIME_INVALID, RawVideoFormat::Srgb)
     }
 
     /// Enqueue one ScreenCast frame with the compositor's wrapping monotonic
     /// timestamp. It is expanded into PipeWire's nanosecond clock domain;
     /// sequence numbers are assigned here so dropped queue entries remain
     /// visible as gaps to consumers.
-    pub fn push_timed(
+    pub fn push_pixels_timed(
         &self,
-        rgba: Vec<u8>,
+        pixels: &yas_compositor::PixelData,
         timestamp_ms: u32,
         timestamp_sub_us: u16,
     ) -> Result<(), &'static str> {
+        let state = unsafe { &*self.state };
+        let format = RawVideoFormat::from_id(state.format.load(Ordering::Acquire));
+        let bytes = format
+            .convert(pixels, u32::from(self.width), u32::from(self.height))
+            .ok_or("cannot convert ScreenCast frame")?;
         let pts_ns = monotonic_now_ns().map_or(SPA_TIME_INVALID, |now| {
             wrapped_timestamp_to_pts_ns(timestamp_ms, timestamp_sub_us, now)
         });
-        self.enqueue(rgba, pts_ns)
+        self.enqueue(bytes, pts_ns, format)
     }
 
-    fn enqueue(&self, rgba: Vec<u8>, pts_ns: i64) -> Result<(), &'static str> {
-        let expected = usize::from(self.width) * usize::from(self.height) * 4;
+    fn enqueue(
+        &self,
+        rgba: Vec<u8>,
+        pts_ns: i64,
+        format: RawVideoFormat,
+    ) -> Result<(), &'static str> {
+        let expected =
+            usize::from(self.width) * usize::from(self.height) * format.bytes_per_pixel();
         if rgba.len() != expected {
             return Err("RGBA frame dimensions changed");
         }
@@ -2224,6 +2325,7 @@ impl RawVideoSource {
             frames.pop_front();
         }
         frames.push_back(RawVideoFrame {
+            format,
             rgba,
             pts_ns,
             sequence,
@@ -2598,6 +2700,39 @@ wireplumber.profiles = {
     }
 
     #[test]
+    fn screencast_formats_round_trip_precision_and_color() {
+        for format in RawVideoFormat::SCREEN {
+            let pod = build_video_format_pod(64, 48, 30, format);
+            let bytes: Vec<u8> = pod.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            assert_eq!(negotiated_video_format(&bytes), Some(format));
+            let mut choices = bytes[..16].to_vec();
+            let mut at = 16;
+            while at < bytes.len() {
+                let size = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+                let kind = u32::from_le_bytes(bytes[at + 12..at + 16].try_into().unwrap());
+                if kind == SPA_TYPE_ID {
+                    choices.extend_from_slice(&bytes[at..at + 8]);
+                    for word in [20u32, 19, 0, 0, 4, SPA_TYPE_ID] {
+                        choices.extend(word.to_le_bytes());
+                    }
+                    choices.extend_from_slice(&bytes[at + 16..at + 20]);
+                    choices.extend([0; 4]);
+                } else {
+                    choices.extend_from_slice(&bytes[at..at + 16 + ((size + 7) & !7)]);
+                }
+                at += 16 + ((size + 7) & !7);
+            }
+            let size = (choices.len() - 8) as u32;
+            choices[..4].copy_from_slice(&size.to_le_bytes());
+            assert_eq!(negotiated_video_format(&choices), Some(format));
+            assert_eq!(negotiated_video_format(&bytes[..bytes.len() - 1]), None);
+        }
+        assert_eq!(negotiated_video_format(&[]), None);
+        assert_eq!(RawVideoFormat::from_spa(9999, 0, 0), None);
+        assert_eq!(RawVideoFormat::from_spa(78, 1, 7), None);
+    }
+
+    #[test]
     fn raw_video_buffers_pod_fixes_three_tightly_packed_buffers() {
         let pod = build_raw_video_buffers_pod(64 * 48 * 4, 64 * 4);
         let bytes = unsafe { std::slice::from_raw_parts(pod.as_ptr().cast::<u8>(), pod.len() * 8) };
@@ -2636,6 +2771,7 @@ wireplumber.profiles = {
     #[test]
     fn raw_video_queue_is_newest_frame_wins() {
         let frame = |value, pts_ns, sequence| RawVideoFrame {
+            format: RawVideoFormat::Srgb,
             rgba: vec![value],
             pts_ns,
             sequence,
@@ -2652,6 +2788,7 @@ wireplumber.profiles = {
     #[test]
     fn raw_video_header_carries_pts_and_sequence_or_gap() {
         let frame = RawVideoFrame {
+            format: RawVideoFormat::Srgb,
             rgba: vec![0; 4],
             pts_ns: 12_345_678,
             sequence: 7,
@@ -2705,6 +2842,70 @@ wireplumber.profiles = {
         assert_ne!(source.node_id(), PW_ID_ANY);
         assert_ne!(source.serial(), 0);
         source.push(vec![0x80; 64 * 48 * 4]).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires PipeWire, WirePlumber and YAS_PIPEWIRE_VIDEO_CONSUMER (tests/fixtures/video_consumer.c)"]
+    fn screencast_delivers_negotiated_hdr_and_p3_pixels() {
+        let daemon = TestPipeWire::spawn().expect("PipeWire is required");
+        assert!(daemon.session.is_some(), "WirePlumber is required");
+        let consumer = std::env::var("YAS_PIPEWIRE_VIDEO_CONSUMER")
+            .expect("compile tests/fixtures/video_consumer.c");
+        for (format, mode) in RawVideoFormat::SCREEN
+            .into_iter()
+            .map(|f| (f, f as u32))
+            .chain([(RawVideoFormat::Srgb, 5)])
+        {
+            let source = RawVideoSource::start(&daemon.root, 1, 1, 64, 48, 30).unwrap();
+            let path = daemon.root.join("frame.raw");
+            let mut recorder = Command::new(&consumer)
+                .args([
+                    source.node_id().to_string(),
+                    mode.to_string(),
+                    path.to_string_lossy().into_owned(),
+                ])
+                .env("XDG_RUNTIME_DIR", &daemon.root)
+                .env("PIPEWIRE_RUNTIME_DIR", &daemon.root)
+                .env("PIPEWIRE_REMOTE", daemon.root.join("pipewire-0"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let pixels = yas_compositor::PixelData::LinearRgba {
+                peak_nits: None,
+                data: Arc::new(
+                    [1000.0 / 203.0, 1000.0 / 203.0, 1000.0 / 203.0, 1.0].repeat(64 * 48),
+                ),
+                hdr: true,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let status = loop {
+                if let Some(status) = recorder.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = recorder.kill();
+                    let _ = recorder.wait();
+                    panic!("PipeWire delivery timeout: {format:?}");
+                }
+                source.push_pixels_timed(&pixels, 1, 0).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert!(status.success(), "consumer failed: {format:?}");
+            let bytes = std::fs::read(&path).unwrap();
+            let expected = format.convert(&pixels, 64, 48).unwrap();
+            assert!(
+                bytes == expected,
+                "PipeWire corrupted {format:?}: got {} bytes, expected {}",
+                bytes.len(),
+                expected.len()
+            );
+            eprintln!(
+                "PipeWire {format:?}: {} bytes delivered with correct highlights",
+                bytes.len()
+            );
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     /// A published node is not a working one.

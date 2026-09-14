@@ -12,6 +12,7 @@
 
 #![allow(non_upper_case_globals, clippy::too_many_arguments)]
 
+use crate::color::OutputColor;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -115,6 +116,7 @@ struct ShmTextureKey {
     height: u32,
     format: vk::Format,
     force_opaque: bool,
+    swap_rb: bool,
 }
 
 struct ShmTextureState {
@@ -138,6 +140,7 @@ enum PendingShmSource {
 }
 
 struct PendingShmUpload {
+    texel_bytes: usize,
     source: PendingShmSource,
     offset: vk::DeviceSize,
     stride: usize,
@@ -331,6 +334,8 @@ pub(crate) struct VulkanRenderer {
 
     // Render pipeline
     render_pass: vk::RenderPass,
+    color_render_pass: vk::RenderPass,
+    color_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     sampler: vk::Sampler,
@@ -348,6 +353,9 @@ pub(crate) struct VulkanRenderer {
     compute_image_pipeline: vk::Pipeline,
     /// BGRA→NV24 (2-plane 4:4:4).  Shares `compute_image_pipeline_layout`.
     compute_nv24_pipeline: vk::Pipeline,
+    compute_color_pipelines: [vk::Pipeline; 2],
+    compute_color_444_pipelines: [vk::Pipeline; 5],
+    compute_color_buffer_pipelines: [vk::Pipeline; 2],
     compute_image_pipeline_layout: vk::PipelineLayout,
     compute_image_descriptor_set_layout: vk::DescriptorSetLayout,
 
@@ -357,12 +365,13 @@ pub(crate) struct VulkanRenderer {
     // compositor alternated between differently sized surfaces.
     output_images: Vec<OutputImage>,
     output_idx: usize,
-    output_image_cache: HashMap<(u32, u32), (Vec<OutputImage>, usize)>,
+    output_image_cache: HashMap<(u32, u32, bool), (Vec<OutputImage>, usize)>,
     output_image_cache_switches: u64,
     output_image_cache_hits: u64,
 
     // Per-frame temporary textures (SHM uploads) — freed at start of next frame.
     frame_textures: Vec<TempTexture>,
+    color_luts: HashMap<u64, (std::sync::Weak<crate::color::ColorLut>, TempTexture, bool)>,
 
     // In-flight GPU submission — tracked so we can retire its resources
     // once the fence signals.
@@ -439,6 +448,8 @@ pub(crate) struct VulkanRenderer {
     /// `(surface_id, target_w, target_h)` to mirror `external_outputs`.
     /// The `usize` is the round-robin index.
     nv12_outputs: HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)>,
+    color_outputs: HashMap<(u32, u32, u32), Vec<ColorOutputPool>>,
+    private_encode_outputs: HashMap<(u32, u64), Nv12Output>,
     /// NV12 buffers exported as OPAQUE_FD for the NVENC zero-copy path.
     ///
     /// Deliberately not `nv12_outputs`. That map is also where the
@@ -451,11 +462,9 @@ pub(crate) struct VulkanRenderer {
 
     /// Keys in `nv12_outputs` the compositor allocated itself to feed a
     /// Vulkan Video encoder, as opposed to importing from VA-API, mapped to
-    /// the `(is_444, codec)` the image was created against.  Tracked so we
-    /// can tell "nothing is registered here" from "our own image is here",
-    /// and so a session whose profile does not match is refused rather than
-    /// handed an image the driver will reject.
-    owned_encode_nv12: HashMap<(u32, u32, u32), (bool, u8)>,
+    /// the `(is_444, codec, color)` profile used to create the image.
+    /// Matching sessions share it; other profiles use `private_encode_outputs`.
+    owned_encode_nv12: HashMap<(u32, u32, u32), (bool, u8, OutputColor)>,
 
     /// Consecutive `encode` failures per `(surface_id, client_id)`, reset by
     /// the first bitstream that comes back.
@@ -599,7 +608,85 @@ impl Nv12Export {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Yuv444Format {
+    Ayuv,
+    Y410,
+    Y416,
+    Planar8,
+    Planar16,
+}
+impl Yuv444Format {
+    // Keep shader order beside the enum whose discriminants select it.
+    const SHADERS: [&'static [u8]; 5] = [
+        include_bytes!("shaders/linear_to_packed8.comp.spv"),
+        include_bytes!("shaders/linear_to_packed10.comp.spv"),
+        include_bytes!("shaders/linear_to_packed16.comp.spv"),
+        include_bytes!("shaders/linear_to_planar8.comp.spv"),
+        include_bytes!("shaders/linear_to_planar16.comp.spv"),
+    ];
+
+    fn from_drm(fourcc: u32) -> Option<Self> {
+        match fourcc.to_le_bytes() {
+            [b'A', b'Y', b'U', b'V'] | [b'X', b'Y', b'U', b'V'] => Some(Self::Ayuv),
+            [b'Y', b'4', b'1', b'0'] => Some(Self::Y410),
+            [b'Y', b'4', b'1', b'6'] => Some(Self::Y416),
+            [b'Y', b'U', b'2', b'4'] => Some(Self::Planar8),
+            [b'Q', b'4', b'1', b'6'] => Some(Self::Planar16),
+            _ => None,
+        }
+    }
+    fn format(self) -> vk::Format {
+        match self {
+            Self::Ayuv => vk::Format::R8G8B8A8_UNORM,
+            Self::Y410 => vk::Format::A2B10G10R10_UNORM_PACK32,
+            Self::Y416 => vk::Format::R16G16B16A16_UNORM,
+            Self::Planar8 => vk::Format::G8_B8_R8_3PLANE_444_UNORM,
+            Self::Planar16 => vk::Format::G16_B16_R16_3PLANE_444_UNORM,
+        }
+    }
+    fn planar(self) -> bool {
+        matches!(self, Self::Planar8 | Self::Planar16)
+    }
+    fn bit_depth(self) -> u8 {
+        match self {
+            Self::Ayuv | Self::Planar8 => 8,
+            Self::Y410 => 10,
+            Self::Y416 | Self::Planar16 => 16,
+        }
+    }
+    fn component_format(self) -> vk::Format {
+        match self {
+            Self::Planar8 => vk::Format::R8_UNORM,
+            Self::Planar16 => vk::Format::R16_UNORM,
+            _ => self.format(),
+        }
+    }
+}
+
+struct ColorOutputPool {
+    request: crate::ColorOutputTarget,
+    outputs: Vec<Nv12Output>,
+    next: usize,
+}
+
+fn same_color_output(a: &crate::ColorOutputTarget, b: &crate::ColorOutputTarget) -> bool {
+    a.width == b.width
+        && a.height == b.height
+        && a.color == b.color
+        && a.is_444 == b.is_444
+        && a.buffers.len() == b.buffers.len()
+        && a.buffers.iter().zip(&b.buffers).all(|(a, b)| {
+            Arc::ptr_eq(&a.fd, &b.fd)
+                && a.fourcc == b.fourcc
+                && a.modifier == b.modifier
+                && a.planes == b.planes
+        })
+}
+
 struct Nv12Output {
+    format_444: Option<Yuv444Format>,
+    v_view: Option<vk::ImageView>,
     /// The DMA-BUF this plane set was imported from, or the OPAQUE_FD it was
     /// exported as, kept alive for as long as the image is.  `None` for the
     /// compositor's own encode image, which owns device-local memory and is
@@ -611,12 +698,14 @@ struct Nv12Output {
     /// and a stale cache hit would point NVENC at freed VRAM.
     buf_id: u64,
     descriptor_set: vk::DescriptorSet,
-    /// NV12 surface dimensions (encoder-padded, may be larger than source).
+    /// YUV surface dimensions (encoder-padded, may be larger than source).
     width: u32,
     height: u32,
-    /// Full-resolution chroma (`G8_B8R8_2PLANE_444_UNORM`) rather than
-    /// subsampled NV12.  Decides which compute shader fills the planes.
+    /// Full-resolution chroma, in a two-plane, planar, or packed layout.
+    /// Selects the conversion shader together with `color` and `format_444`.
     is_444: bool,
+    color: OutputColor,
+    visible: (u32, u32),
     kind: Nv12OutputKind,
     /// Which export `fd` came from — decides which `PixelData` variant this
     /// becomes, and whether the consumer needs an explicit sync_fd.
@@ -789,6 +878,9 @@ fn shm_damage_since(
 /// In-flight GPU submission.  Resources are kept alive until the fence
 /// signals so the GPU doesn't access freed memory.
 struct PendingSubmit {
+    managed: Option<bool>,
+    peak_nits: Option<f32>,
+    managed_targets: Vec<(u32, u32)>,
     fence: vk::Fence,
     cb: vk::CommandBuffer,
     textures: Vec<TempTexture>,
@@ -913,6 +1005,7 @@ fn stalled_submit_action(waited: std::time::Duration, device_lost: bool) -> Stal
 unsafe impl Send for VulkanRenderer {}
 
 struct OutputImage {
+    linear: bool,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -1036,7 +1129,26 @@ fn drm_fourcc_to_vk_format(fourcc: u32) -> Option<vk::Format> {
         0x34324241 => Some(vk::Format::R8G8B8A8_UNORM),
         // XBGR8888
         0x34324258 => Some(vk::Format::R8G8B8A8_UNORM),
+        n if n == u32::from_le_bytes(*b"AR30") || n == u32::from_le_bytes(*b"XR30") => {
+            Some(vk::Format::A2R10G10B10_UNORM_PACK32)
+        }
+        n if n == u32::from_le_bytes(*b"AB30") || n == u32::from_le_bytes(*b"XB30") => {
+            Some(vk::Format::A2B10G10R10_UNORM_PACK32)
+        }
+        n if matches!(n.to_le_bytes(), [b'A' | b'X', b'B' | b'R', b'4', b'H']) => {
+            Some(vk::Format::R16G16B16A16_SFLOAT)
+        }
+        n if matches!(n.to_le_bytes(), [b'A' | b'X', b'B' | b'R', b'4', b'8']) => {
+            Some(vk::Format::R16G16B16A16_UNORM)
+        }
         _ => None,
+    }
+}
+
+fn texel_bytes(format: vk::Format) -> usize {
+    match format {
+        vk::Format::R16G16B16A16_SFLOAT | vk::Format::R16G16B16A16_UNORM => 8,
+        _ => 4,
     }
 }
 
@@ -1218,8 +1330,30 @@ impl VulkanRenderer {
             ok
         };
 
-        let has_video_encode_av1 =
-            has_video_encode && ext_names_all.contains(&c"VK_KHR_video_encode_av1");
+        // ash 0.38 predates this feature structure; its C layout is a
+        // VkStructureType, next pointer, and VkBool32 (Vulkan-Headers).
+        #[repr(C)]
+        struct Av1Features {
+            s_type: vk::StructureType,
+            p_next: *mut std::ffi::c_void,
+            video_encode_av1: vk::Bool32,
+        }
+        let mut av1_features = Av1Features {
+            s_type: vk::StructureType::from_raw(1_000_513_004),
+            p_next: std::ptr::null_mut(),
+            video_encode_av1: 0,
+        };
+        let av1_extension = has_video_encode && ext_names_all.contains(&c"VK_KHR_video_encode_av1");
+        if av1_extension {
+            let mut features = vk::PhysicalDeviceFeatures2 {
+                p_next: (&mut av1_features as *mut Av1Features).cast(),
+                ..Default::default()
+            };
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut features);
+            }
+        }
+        let has_video_encode_av1 = av1_extension && av1_features.video_encode_av1 != 0;
         if has_video_encode_av1 {
             eprintln!("[vulkan-render] Vulkan Video AV1 encode extension available");
         }
@@ -1306,9 +1440,18 @@ impl VulkanRenderer {
             );
         }
 
-        let device_create = vk::DeviceCreateInfo::default()
+        let available_features = unsafe { instance.get_physical_device_features(physical_device) };
+        let features = vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(
+            available_features.shader_storage_image_extended_formats != 0,
+        );
+        let mut device_create = vk::DeviceCreateInfo::default()
+            .enabled_features(&features)
             .queue_create_infos(&queue_creates)
             .enabled_extension_names(&device_extensions);
+
+        if has_video_encode_av1 {
+            device_create.p_next = (&av1_features as *const Av1Features).cast();
+        }
 
         let device = match unsafe { instance.create_device(physical_device, &device_create, None) }
         {
@@ -1422,16 +1565,16 @@ impl VulkanRenderer {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(256),
+                .descriptor_count(512),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(48),
+                .descriptor_count(512),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(16),
+                .descriptor_count(256),
         ];
         let dp_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(256)
+            .max_sets(512)
             .pool_sizes(&pool_sizes)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
         let descriptor_pool = unsafe { device.create_descriptor_pool(&dp_info, None).ok()? };
@@ -1442,9 +1585,17 @@ impl VulkanRenderer {
             .offset(0)
             .size(16); // 4 floats
 
+        let push_ranges = [
+            push_range,
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .offset(16)
+                .size(64),
+        ];
+        let color_set_layouts = [descriptor_set_layout, descriptor_set_layout];
         let pl_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-            .push_constant_ranges(std::slice::from_ref(&push_range));
+            .set_layouts(&color_set_layouts)
+            .push_constant_ranges(&push_ranges);
         let pipeline_layout = unsafe { device.create_pipeline_layout(&pl_info, None).ok()? };
 
         // Render pass: single color attachment, B8G8R8A8_UNORM.
@@ -1541,6 +1692,34 @@ impl VulkanRenderer {
                 .ok()?[0]
         };
 
+        let color_attachment = attachment.format(vk::Format::R16G16B16A16_SFLOAT);
+        let color_rp_info = vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&color_attachment))
+            .subpasses(std::slice::from_ref(&subpass));
+        let color_render_pass = unsafe { device.create_render_pass(&color_rp_info, None).ok()? };
+        let color_code =
+            Self::spirv_from_bytes(include_bytes!("shaders/composite_color.frag.spv"))?;
+        let color_module = unsafe {
+            device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&color_code),
+                    None,
+                )
+                .ok()?
+        };
+        let color_stages = [stages[0], stages[1].module(color_module)];
+        let color_info = pipeline_info
+            .stages(&color_stages)
+            .render_pass(color_render_pass);
+        let color_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[color_info], None)
+                .ok()?[0]
+        };
+        unsafe {
+            device.destroy_shader_module(color_module, None);
+        }
+
         // Clean up shader modules (not needed after pipeline creation).
         unsafe {
             device.destroy_shader_module(vert_mod, None);
@@ -1550,10 +1729,8 @@ impl VulkanRenderer {
         // -----------------------------------------------------------
         // BGRA→NV12 compute pipeline
         // -----------------------------------------------------------
-        // Descriptor set layout: 3 storage images.
-        //   binding 0 = BGRA input  (rgba8)
-        //   binding 1 = Y output    (r8)
-        //   binding 1 = NV12 output  (storage buffer)
+        // Buffer-target conversion: BGRA8 or linear RGBA16F input image,
+        // with all output YUV planes in one storage buffer.
         let compute_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1575,73 +1752,26 @@ impl VulkanRenderer {
         };
 
         // Push constants: sized for the larger of the two buffer-target
-        // shaders — NV12 uses 6 × u32 (24 bytes), YUV444 7 × u32 (28).
-        // A layout range may exceed what a shader declares, so both
-        // pipelines share this layout.
+        // shaders — legacy NV12/YUV444 use 24/28 bytes, managed output
+        // uses 40. A range may exceed what a shader declares.
         let compute_push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(28);
+            .size(40);
         let compute_pl_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&compute_descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&compute_push_range));
         let compute_pipeline_layout =
             unsafe { device.create_pipeline_layout(&compute_pl_info, None).ok()? };
 
-        // Load compute shader and create pipeline.
-        let comp_code = Self::spirv_from_bytes(NV12_COMP_SPV)?;
-        let comp_shader_info = vk::ShaderModuleCreateInfo::default().code(&comp_code);
-        let comp_mod = unsafe { device.create_shader_module(&comp_shader_info, None).ok()? };
-        let comp_entry_name = c"main";
-        let comp_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(comp_mod)
-            .name(comp_entry_name);
-        let compute_pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(comp_stage)
-            .layout(compute_pipeline_layout);
-        let compute_pipeline = unsafe {
-            device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[compute_pipeline_info], None)
-                .ok()?[0]
-        };
-        unsafe {
-            device.destroy_shader_module(comp_mod, None);
-        }
+        let [compute_pipeline, compute_yuv444_pipeline] = Self::create_compute_pipelines(
+            &device,
+            compute_pipeline_layout,
+            [NV12_COMP_SPV, YUV444_COMP_SPV],
+        )?;
 
-        // BGRA→YUV444 (planar, 3 full-resolution planes) into the same
-        // buffer-target shape — the 4:4:4 flavour of the OPAQUE_FD
-        // zero-copy path.  Same descriptor layout, one extra push u32.
-        let comp_444_code = Self::spirv_from_bytes(YUV444_COMP_SPV)?;
-        let comp_444_info = vk::ShaderModuleCreateInfo::default().code(&comp_444_code);
-        let comp_444_mod = unsafe { device.create_shader_module(&comp_444_info, None).ok()? };
-        let comp_444_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(comp_444_mod)
-            .name(comp_entry_name);
-        let compute_yuv444_pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(comp_444_stage)
-            .layout(compute_pipeline_layout);
-        let compute_yuv444_pipeline = unsafe {
-            device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[compute_yuv444_pipeline_info],
-                    None,
-                )
-                .ok()?[0]
-        };
-        unsafe {
-            device.destroy_shader_module(comp_444_mod, None);
-        }
-
-        // -----------------------------------------------------------
-        // BGRA→NV12 compute pipeline — image path (tiled NV12)
-        // -----------------------------------------------------------
-        // Descriptor set layout: 3 storage images.
-        //   binding 0 = BGRA input  (rgba8, storage image)
-        //   binding 1 = Y output    (r8, storage image)
-        //   binding 2 = UV output   (rg8, storage image)
+        // Image-target conversion: input, Y (or packed YUV), UV (or U),
+        // and V for three-plane 4:4:4. Unused bindings need no descriptor.
         let compute_image_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1658,6 +1788,11 @@ impl VulkanRenderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let compute_image_ds_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&compute_image_bindings);
@@ -1667,12 +1802,12 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        // Push constants: src_width, src_height, enc_width, enc_height
-        // (4 × u32 = 16 bytes).
+        // Legacy image conversion uses 16 bytes; managed conversion uses
+        // 32 bytes for dimensions, color, tone mapping, and chroma layout.
         let compute_image_push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(16);
+            .size(32);
         let compute_image_pl_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&compute_image_descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&compute_image_push_range));
@@ -1682,63 +1817,33 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        let comp_image_code = Self::spirv_from_bytes(NV12_IMAGE_COMP_SPV)?;
-        let comp_image_shader_info = vk::ShaderModuleCreateInfo::default().code(&comp_image_code);
-        let comp_image_mod = unsafe {
-            device
-                .create_shader_module(&comp_image_shader_info, None)
-                .ok()?
-        };
-        let comp_image_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(comp_image_mod)
-            .name(c"main");
-        let compute_image_pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(comp_image_stage)
-            .layout(compute_image_pipeline_layout);
-        let compute_image_pipeline = unsafe {
-            device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[compute_image_pipeline_info],
-                    None,
-                )
-                .ok()?[0]
-        };
-        unsafe {
-            device.destroy_shader_module(comp_image_mod, None);
-        }
+        let [compute_image_pipeline, compute_nv24_pipeline] = Self::create_compute_pipelines(
+            &device,
+            compute_image_pipeline_layout,
+            [NV12_IMAGE_COMP_SPV, NV24_IMAGE_COMP_SPV],
+        )?;
+        let compute_color_pipelines = Self::create_compute_pipelines(
+            &device,
+            compute_image_pipeline_layout,
+            [
+                include_bytes!("shaders/linear_to_video8.comp.spv").as_slice(),
+                include_bytes!("shaders/linear_to_video10.comp.spv").as_slice(),
+            ],
+        )?;
+        let compute_color_444_pipelines = Self::create_compute_pipelines(
+            &device,
+            compute_image_pipeline_layout,
+            Yuv444Format::SHADERS,
+        )?;
+        let compute_color_buffer_pipelines = Self::create_compute_pipelines(
+            &device,
+            compute_pipeline_layout,
+            [
+                include_bytes!("shaders/linear_to_buffer8.comp.spv").as_slice(),
+                include_bytes!("shaders/linear_to_buffer10.comp.spv").as_slice(),
+            ],
+        )?;
 
-        // Same layout, full-resolution chroma — see NV24_IMAGE_COMP_SPV.
-        let comp_nv24_code = Self::spirv_from_bytes(NV24_IMAGE_COMP_SPV)?;
-        let comp_nv24_shader_info = vk::ShaderModuleCreateInfo::default().code(&comp_nv24_code);
-        let comp_nv24_mod = unsafe {
-            device
-                .create_shader_module(&comp_nv24_shader_info, None)
-                .ok()?
-        };
-        let comp_nv24_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(comp_nv24_mod)
-            .name(c"main");
-        let compute_nv24_pipeline = unsafe {
-            device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(comp_nv24_stage)
-                        .layout(compute_image_pipeline_layout)],
-                    None,
-                )
-                .ok()?[0]
-        };
-        unsafe {
-            device.destroy_shader_module(comp_nv24_mod, None);
-        }
-
-        // -----------------------------------------------------------
-        // BGRA→I420 compute pipeline — planar YUV for software encoders
-        // -----------------------------------------------------------
         // Report the device Vulkan actually picked alongside the one that
         // was requested — find_device falls back to a different GPU when
         // nothing reports the node, and that is worth seeing in the log.
@@ -1762,6 +1867,30 @@ impl VulkanRenderer {
                 (drm_fourcc::XRGB8888, vk::Format::B8G8R8A8_UNORM),
                 (drm_fourcc::ABGR8888, vk::Format::R8G8B8A8_UNORM),
                 (drm_fourcc::XBGR8888, vk::Format::R8G8B8A8_UNORM),
+                (
+                    drm_fourcc::ARGB2101010,
+                    vk::Format::A2R10G10B10_UNORM_PACK32,
+                ),
+                (
+                    drm_fourcc::XRGB2101010,
+                    vk::Format::A2R10G10B10_UNORM_PACK32,
+                ),
+                (
+                    drm_fourcc::ABGR2101010,
+                    vk::Format::A2B10G10R10_UNORM_PACK32,
+                ),
+                (
+                    drm_fourcc::XBGR2101010,
+                    vk::Format::A2B10G10R10_UNORM_PACK32,
+                ),
+                (drm_fourcc::ABGR16161616F, vk::Format::R16G16B16A16_SFLOAT),
+                (drm_fourcc::XBGR16161616F, vk::Format::R16G16B16A16_SFLOAT),
+                (drm_fourcc::ABGR16161616, vk::Format::R16G16B16A16_UNORM),
+                (drm_fourcc::XBGR16161616, vk::Format::R16G16B16A16_UNORM),
+                (drm_fourcc::ARGB16161616, vk::Format::R16G16B16A16_UNORM),
+                (drm_fourcc::XRGB16161616, vk::Format::R16G16B16A16_UNORM),
+                (drm_fourcc::ARGB16161616F, vk::Format::R16G16B16A16_SFLOAT),
+                (drm_fourcc::XRGB16161616F, vk::Format::R16G16B16A16_SFLOAT),
             ];
             let mut mods = Vec::new();
             for &(drm_fmt, vk_fmt) in format_pairs {
@@ -1858,6 +1987,8 @@ impl VulkanRenderer {
             external_memory_host_alignment,
             shm_host_import_mode,
             render_pass,
+            color_render_pass,
+            color_pipeline,
             pipeline_layout,
             pipeline,
             sampler,
@@ -1869,6 +2000,9 @@ impl VulkanRenderer {
             compute_descriptor_set_layout,
             compute_image_pipeline,
             compute_nv24_pipeline,
+            compute_color_pipelines,
+            compute_color_444_pipelines,
+            compute_color_buffer_pipelines,
             compute_image_pipeline_layout,
             compute_image_descriptor_set_layout,
             output_images: Vec::new(),
@@ -1877,6 +2011,7 @@ impl VulkanRenderer {
             output_image_cache_switches: 0,
             output_image_cache_hits: 0,
             frame_textures: Vec::new(),
+            color_luts: HashMap::new(),
             pending_submit: None,
             abandoned_submits: Vec::new(),
             submit_stall_warned: false,
@@ -1897,6 +2032,8 @@ impl VulkanRenderer {
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
             nv12_outputs: HashMap::new(),
+            color_outputs: HashMap::new(),
+            private_encode_outputs: HashMap::new(),
             nv12_opaque_outputs: HashMap::new(),
             owned_encode_nv12: HashMap::new(),
             vulkan_encode_failures: HashMap::new(),
@@ -2045,6 +2182,53 @@ impl VulkanRenderer {
             .map(|c| u32::from_le_bytes(*c))
             .collect();
         Some(code)
+    }
+
+    /// Build pipelines sharing a descriptor/push-constant layout. Shader
+    /// modules and any partially created pipelines are released on failure.
+    fn create_compute_pipelines<const N: usize>(
+        device: &ash::Device,
+        layout: vk::PipelineLayout,
+        shaders: [&[u8]; N],
+    ) -> Option<[vk::Pipeline; N]> {
+        let mut modules = Vec::with_capacity(N);
+        let result = (|| {
+            for bytes in shaders {
+                let code = Self::spirv_from_bytes(bytes)?;
+                let info = vk::ShaderModuleCreateInfo::default().code(&code);
+                modules.push(unsafe { device.create_shader_module(&info, None).ok()? });
+            }
+            let infos: Vec<_> = modules
+                .iter()
+                .map(|&module| {
+                    vk::ComputePipelineCreateInfo::default()
+                        .stage(
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::COMPUTE)
+                                .module(module)
+                                .name(c"main"),
+                        )
+                        .layout(layout)
+                })
+                .collect();
+            // SAFETY: The device owns the layout and modules; all inputs
+            // outlive this call. On failure Vulkan may return live pipelines.
+            match unsafe {
+                device.create_compute_pipelines(vk::PipelineCache::null(), &infos, None)
+            } {
+                Ok(pipelines) => Some(pipelines.try_into().expect("one pipeline per shader")),
+                Err((pipelines, _)) => {
+                    for pipeline in pipelines {
+                        unsafe { device.destroy_pipeline(pipeline, None) };
+                    }
+                    None
+                }
+            }
+        })();
+        for module in modules {
+            unsafe { device.destroy_shader_module(module, None) };
+        }
+        result
     }
 
     /// Memory type for staging buffers the CPU reads back from
@@ -2308,6 +2492,7 @@ impl VulkanRenderer {
         // 4:4:4 rather than 4:2:0.  Device-dependent — the caps query
         // refuses it on hardware that cannot, and the caller falls back.
         is_444: bool,
+        output: OutputColor,
     ) -> bool {
         if !self.has_video_encode {
             eprintln!("[vulkan-render] cannot create vulkan encoder: video encode not available");
@@ -2321,6 +2506,9 @@ impl VulkanRenderer {
         // Remove existing encoder if any. Its one-shot permission must not
         // survive a replacement that may fail to build: an armed key without
         // an encoder would make the render loop look up a nonexistent session.
+        if let Some(old) = self.private_encode_outputs.remove(&(surface_id, client_id)) {
+            self.destroy_nv12_vec(vec![old]);
+        }
         self.vulkan_encoder_armed.remove(&(surface_id, client_id));
         if let Some(mut old) = self.vulkan_encoders.remove(&(surface_id, client_id))
             && let Some(ref vfns) = self.video_fns
@@ -2348,6 +2536,7 @@ impl VulkanRenderer {
                     h,
                     qp,
                     is_444,
+                    output,
                 )
             },
             0x02 => {
@@ -2367,6 +2556,7 @@ impl VulkanRenderer {
                     h,
                     qp,
                     is_444,
+                    output,
                 )
             },
         };
@@ -2396,56 +2586,62 @@ impl VulkanRenderer {
         // for.
         if encoder.is_some() {
             let key = (surface_id, w, h);
-            let want = (is_444, codec);
+            let want = (is_444, codec, output);
             let owned = self.owned_encode_nv12.get(&key).copied();
             let usable = match owned {
                 // Ours and built for this session: reuse.
                 Some(have) => have == want,
-                // Someone else's (a VA-API import) already sits here; it is
-                // NV12 4:2:0 H.264-compatible and predates us.
-                None => self.nv12_outputs.contains_key(&key) && want == (false, 0x01),
+                // VA-API imports have storage usage, no Vulkan Video profile.
+                None => false,
             };
             if !usable {
                 // Replacing is only safe when no other session is reading it.
-                // A surface with two subscribers on different codecs keeps the
-                // first on Vulkan and lets the second fall back, rather than
-                // pulling the image out from under a live encoder.
+                // A different codec/color/chroma profile gets a private image
+                // while existing subscribers keep their shared conversion.
                 let in_use_by_others = self.vulkan_encoders.iter().any(|(&(sid, cid), enc)| {
                     sid == surface_id && cid != client_id && enc.source_dimensions() == (w, h)
                 });
-                if owned.is_some() && in_use_by_others {
-                    eprintln!(
-                        "[vulkan-render] surface {surface_id} already encodes with a different profile; refusing this session",
-                    );
-                    if let Some(mut enc) = encoder
-                        && let Some(ref vfns) = self.video_fns
+                if in_use_by_others || (owned.is_none() && self.nv12_outputs.contains_key(&key)) {
+                    if let Some(output) = self.create_nv12_encode_image(w, h, is_444, codec, output)
                     {
-                        unsafe { enc.destroy(&self.device, vfns) };
-                    }
-                    return false;
-                }
-                if owned.is_some() {
-                    // Replace only the compositor-owned encode image. An
-                    // NVENC subscriber may simultaneously read the separate
-                    // OPAQUE_FD allocation at this key.
-                    self.destroy_nv12_outputs_in(Nv12Export::None, surface_id, w, h);
-                }
-                if !self.nv12_outputs.contains_key(&key) {
-                    match self.create_nv12_encode_image(w, h, is_444, codec) {
-                        Some(nv12) => {
-                            self.nv12_outputs.insert(key, (vec![nv12], 0));
-                            self.owned_encode_nv12.insert(key, want);
+                        if let Some(old) = self
+                            .private_encode_outputs
+                            .insert((surface_id, client_id), output)
+                        {
+                            self.destroy_nv12_vec(vec![old]);
                         }
-                        None => {
-                            eprintln!(
-                                "[vulkan-render] no encode image for surface {surface_id} {w}x{h}; refusing vulkan encoder",
-                            );
-                            if let Some(mut enc) = encoder
-                                && let Some(ref vfns) = self.video_fns
-                            {
-                                unsafe { enc.destroy(&self.device, vfns) };
+                    } else {
+                        if let Some(mut enc) = encoder
+                            && let Some(ref vfns) = self.video_fns
+                        {
+                            unsafe { enc.destroy(&self.device, vfns) };
+                        }
+                        return false;
+                    }
+                } else {
+                    if owned.is_some() {
+                        // Replace only the compositor-owned encode image. An
+                        // NVENC subscriber may simultaneously read the separate
+                        // OPAQUE_FD allocation at this key.
+                        self.destroy_nv12_outputs_in(Nv12Export::None, surface_id, w, h);
+                    }
+                    if !self.nv12_outputs.contains_key(&key) {
+                        match self.create_nv12_encode_image(w, h, is_444, codec, output) {
+                            Some(nv12) => {
+                                self.nv12_outputs.insert(key, (vec![nv12], 0));
+                                self.owned_encode_nv12.insert(key, want);
                             }
-                            return false;
+                            None => {
+                                eprintln!(
+                                    "[vulkan-render] no encode image for surface {surface_id} {w}x{h}; refusing vulkan encoder",
+                                );
+                                if let Some(mut enc) = encoder
+                                    && let Some(ref vfns) = self.video_fns
+                                {
+                                    unsafe { enc.destroy(&self.device, vfns) };
+                                }
+                                return false;
+                            }
                         }
                     }
                 }
@@ -2457,6 +2653,11 @@ impl VulkanRenderer {
                 eprintln!(
                     "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp}",
                 );
+                if self.owned_encode_nv12.get(&(surface_id, w, h)) == Some(&(is_444, codec, output))
+                    && let Some(old) = self.private_encode_outputs.remove(&(surface_id, client_id))
+                {
+                    self.destroy_nv12_vec(vec![old]);
+                }
                 self.vulkan_encoders.insert((surface_id, client_id), enc);
                 // The opening keyframe is the one exception to server-driven
                 // rearming: there is no prior frame for the server to consume.
@@ -2518,6 +2719,10 @@ impl VulkanRenderer {
             .collect();
         let mut removed_targets = Vec::new();
         for key in keys {
+            if let Some(output) = self.private_encode_outputs.remove(&key) {
+                self.destroy_nv12_vec(vec![output]);
+            }
+
             if let Some(mut enc) = self.vulkan_encoders.remove(&key) {
                 removed_targets.push(enc.source_dimensions());
                 if let Some(ref vfns) = self.video_fns {
@@ -2587,6 +2792,153 @@ impl VulkanRenderer {
     // External output buffers (VA-API zero-copy)
     // ---------------------------------------------------------------
 
+    pub(crate) fn set_color_output_targets(
+        &mut self,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+        native: (u32, u32),
+        targets: Vec<crate::ColorOutputTarget>,
+        want_cpu: bool,
+    ) {
+        let key = (surface_id, target_w, target_h);
+        // Also retain a CPU target for failed imports and software readers.
+        self.register_downscale_target(
+            surface_id,
+            target_w,
+            target_h,
+            native,
+            false,
+            want_cpu,
+            false,
+            OutputColor::Srgb,
+        );
+        let mut previous = self.color_outputs.remove(&key).unwrap_or_default();
+        let mut pools: Vec<ColorOutputPool> = Vec::new();
+        let mut needs_cpu = want_cpu;
+        for request in targets {
+            if pools
+                .iter()
+                .any(|p| same_color_output(&p.request, &request))
+            {
+                continue;
+            }
+            if let Some(index) = previous
+                .iter()
+                .position(|p| same_color_output(&p.request, &request))
+            {
+                pools.push(previous.swap_remove(index));
+                continue;
+            }
+            let mut outputs = Vec::new();
+            if request.width >= target_w
+                && request.height >= target_h
+                && target_w <= 65535
+                && target_h <= 65535
+            {
+                if request.buffers.is_empty() {
+                    self.create_nv12_outputs(
+                        surface_id,
+                        target_w,
+                        target_h,
+                        request.width,
+                        request.height,
+                        Nv12Export::OpaqueFd,
+                        request.is_444,
+                        request.color,
+                    );
+                    if let Some((created, _)) = self.nv12_opaque_outputs.remove(&key) {
+                        outputs = created;
+                    }
+                } else if self.has_dmabuf {
+                    for buffer in &request.buffers {
+                        if let Some(mut output) = self.import_color_dma_buffer(&request, buffer) {
+                            output.visible = (target_w, target_h);
+                            outputs.push(output);
+                        }
+                    }
+                }
+            }
+            if outputs.is_empty() {
+                needs_cpu = true;
+            } else {
+                pools.push(ColorOutputPool {
+                    request,
+                    outputs,
+                    next: 0,
+                });
+            }
+        }
+        for pool in previous {
+            self.destroy_nv12_vec(pool.outputs);
+        }
+        if needs_cpu {
+            self.cpu_readback_targets.insert(key);
+        }
+        if !pools.is_empty() {
+            self.color_outputs.insert(key, pools);
+        }
+    }
+
+    fn import_color_dma_buffer(
+        &self,
+        request: &crate::ColorOutputTarget,
+        buffer: &crate::ColorDmaBuffer,
+    ) -> Option<Nv12Output> {
+        if request.is_444 {
+            let format_444 = Yuv444Format::from_drm(buffer.fourcc)?;
+            if (request.color == OutputColor::Hdr10) != (format_444.bit_depth() > 8) {
+                return None;
+            }
+            return self.import_yuv_image(
+                buffer.fd.clone(),
+                request.width,
+                request.height,
+                buffer.modifier,
+                request.color,
+                &buffer.planes,
+                Some(format_444),
+            );
+        }
+        let expected = if request.color == OutputColor::Hdr10 {
+            *b"P010"
+        } else {
+            *b"NV12"
+        };
+        if buffer.fourcc != u32::from_le_bytes(expected) || buffer.planes.len() < 2 {
+            return None;
+        }
+        let y = buffer.planes[0];
+        let uv = buffer.planes[1];
+        if buffer.modifier == 0 && y.offset == 0 && y.pitch == uv.pitch {
+            self.import_nv12_buffer(
+                buffer.fd.clone(),
+                y.pitch,
+                uv.offset,
+                request.width,
+                request.height,
+                request.color,
+            )
+        } else {
+            self.import_nv12_image(
+                buffer.fd.clone(),
+                request.width,
+                request.height,
+                buffer.modifier,
+                request.color,
+                &buffer.planes,
+            )
+        }
+    }
+
+    pub(crate) fn clear_color_outputs(&mut self, key: (u32, u32, u32)) {
+        if let Some(pools) = self.color_outputs.remove(&key) {
+            for pool in pools {
+                self.destroy_nv12_vec(pool.outputs);
+            }
+        }
+    }
+
     /// `native` is the composite size `(target_w, target_h)` was inscribed
     /// into, so the render loop can tell a target that still fits the
     /// composite from one left behind by a resize.  See {@link target_natives}.
@@ -2655,6 +3007,8 @@ impl VulkanRenderer {
                         nv12_w,
                         nv12_h,
                         b.nv12_modifier,
+                        b.nv12_color.unwrap_or_default(),
+                        b.nv12_planes.clone(),
                     ))
                 })
                 .collect();
@@ -2670,6 +3024,7 @@ impl VulkanRenderer {
                     // VA-API is the consumer here; it imports dma_bufs.
                     Nv12Export::DmaBuf,
                     false,
+                    OutputColor::Srgb,
                 );
             }
         }
@@ -2781,6 +3136,7 @@ impl VulkanRenderer {
         want_nv12_opaque: bool,
         want_cpu_pixels: bool,
         opaque_is_444: bool,
+        opaque_color: OutputColor,
     ) {
         // Encoder ownership is per client, not per surface. A Vulkan Video
         // session may read `nv12_outputs` while another client's NVENC
@@ -2810,9 +3166,9 @@ impl VulkanRenderer {
                 .and_then(|idx| {
                     self.nv12_opaque_outputs
                         .get(&(surface_id, target_w, target_h))
-                        .map(|(v, _)| v[idx].is_444)
+                        .map(|(v, _)| (v[idx].is_444, v[idx].color))
                 });
-            if want_nv12_opaque && slot_format != Some(opaque_is_444) {
+            if want_nv12_opaque && slot_format != Some((opaque_is_444, opaque_color)) {
                 if slot_format.is_some() {
                     self.destroy_nv12_outputs_in(
                         Nv12Export::OpaqueFd,
@@ -2829,6 +3185,7 @@ impl VulkanRenderer {
                     target_h,
                     Nv12Export::OpaqueFd,
                     opaque_is_444,
+                    opaque_color,
                 );
                 if self
                     .nv12_opaque_slot(surface_id, target_w, target_h)
@@ -2867,6 +3224,7 @@ impl VulkanRenderer {
                 target_h,
                 Nv12Export::OpaqueFd,
                 opaque_is_444,
+                opaque_color,
             );
             let ok = self
                 .nv12_opaque_outputs
@@ -2907,6 +3265,7 @@ impl VulkanRenderer {
 
     /// Tear down a single downscale target, if registered.
     pub(crate) fn clear_downscale_target(&mut self, surface_id: u32, target_w: u32, target_h: u32) {
+        self.clear_color_outputs((surface_id, target_w, target_h));
         self.cpu_readback_targets
             .remove(&(surface_id, target_w, target_h));
         if let Some(out) = self
@@ -2936,6 +3295,15 @@ impl VulkanRenderer {
     }
 
     fn destroy_downscale_outputs_for_surface(&mut self, surface_id: u32) {
+        let keys: Vec<_> = self
+            .color_outputs
+            .keys()
+            .filter(|k| k.0 == surface_id)
+            .copied()
+            .collect();
+        for key in keys {
+            self.clear_color_outputs(key);
+        }
         self.cpu_readback_targets.retain(|k| k.0 != surface_id);
         let keys: Vec<(u32, u32, u32)> = self
             .downscale_outputs
@@ -2951,6 +3319,10 @@ impl VulkanRenderer {
     }
 
     fn destroy_all_downscale_outputs(&mut self) {
+        let keys: Vec<_> = self.color_outputs.keys().copied().collect();
+        for key in keys {
+            self.clear_color_outputs(key);
+        }
         self.cpu_readback_targets.clear();
         let outs: Vec<DownscaleOutput> = self.downscale_outputs.drain().map(|(_, v)| v).collect();
         for out in outs {
@@ -3139,90 +3511,6 @@ impl VulkanRenderer {
         })
     }
 
-    /// Query the Vulkan driver for the plane layout it expects for a
-    /// given format + modifier + size.  Creates a temporary image with
-    /// `VkImageDrmFormatModifierListCreateInfoEXT`, queries its
-    /// subresource layout, and destroys it.  This gives us the driver's
-    /// ground truth — independent of whatever VA-API (a different mesa
-    /// frontend) reports.
-    fn query_modifier_layout(
-        &self,
-        format: vk::Format,
-        w: u32,
-        h: u32,
-        modifier: u64,
-    ) -> Vec<vk::SubresourceLayout> {
-        self.query_modifier_layout_with(
-            format,
-            w,
-            h,
-            modifier,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::STORAGE,
-            vk::ImageCreateFlags::MUTABLE_FORMAT,
-        )
-    }
-
-    fn query_modifier_layout_with(
-        &self,
-        format: vk::Format,
-        w: u32,
-        h: u32,
-        modifier: u64,
-        usage: vk::ImageUsageFlags,
-        flags: vk::ImageCreateFlags,
-    ) -> Vec<vk::SubresourceLayout> {
-        let plane_count = self.modifier_plane_count_for(format, modifier);
-        let modifiers = [modifier];
-        let mut mod_list =
-            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
-        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        // Usage flags MUST match the real import — different usage can
-        // change the driver's internal layout (pitch alignment, etc.).
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: w,
-                height: h,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(usage)
-            .flags(flags)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .push_next(&mut ext_info)
-            .push_next(&mut mod_list);
-        let image = match unsafe { self.device.create_image(&image_info, None) } {
-            Ok(i) => i,
-            Err(_) => {
-                // Modifier not supported — fall back to a basic layout.
-                return vec![vk::SubresourceLayout::default()];
-            }
-        };
-        let layouts: Vec<vk::SubresourceLayout> = (0..plane_count)
-            .map(|plane_idx| {
-                let subresource = vk::ImageSubresource {
-                    aspect_mask: if plane_count == 1 {
-                        vk::ImageAspectFlags::COLOR
-                    } else {
-                        vk::ImageAspectFlags::from_raw(0x10 << plane_idx) // MEMORY_PLANE_0..3
-                    },
-                    mip_level: 0,
-                    array_layer: 0,
-                };
-                unsafe { self.device.get_image_subresource_layout(image, subresource) }
-            })
-            .collect();
-        unsafe { self.device.destroy_image(image, None) };
-        layouts
-    }
-
     /// Query the Vulkan device for the expected plane count of a DRM
     /// modifier for the given format.  Falls back to 1.
     fn modifier_plane_count_for(&self, format: vk::Format, modifier: u64) -> u32 {
@@ -3264,21 +3552,28 @@ impl VulkanRenderer {
         let w = buf.width;
         let h = buf.height;
 
-        // Import via DRM format modifier (handles tiled AMD surfaces).
-        //
-        // VA-API (radeonsi) exports pitch/offset values for an internal
-        // DRM format (e.g. R16) that differs from the logical ARGB8888.
-        // Vulkan (radv) expects layout values matching its own accounting
-        // for the same modifier.  Both drivers use the same hardware
-        // tiling, so a temporary radv image of the same dimensions and
-        // modifier gives us the correct layout for import.
-        let plane_layouts = self.query_modifier_layout(format, w, h, buf.modifier);
+        // DMA-BUF memory already has the producer's layout. A fresh Vulkan
+        // allocation can have different padding and cannot describe these bytes.
+        if buf.planes.len() != self.modifier_plane_count_for(format, buf.modifier) as usize
+            || buf.planes.iter().any(|p| p.pitch == 0)
+        {
+            return None;
+        }
+        let plane_layouts: Vec<_> = buf
+            .planes
+            .iter()
+            .map(|p| vk::SubresourceLayout {
+                offset: p.offset as u64,
+                row_pitch: p.pitch as u64,
+                ..Default::default()
+            })
+            .collect();
         let mut drm_mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
             .drm_format_modifier(buf.modifier)
             .plane_layouts(&plane_layouts);
         let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let format_list_entry = [format];
+        let format_list_entry = [format, vk::Format::R8G8B8A8_UNORM];
         let mut format_list =
             vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entry);
 
@@ -3409,11 +3704,12 @@ impl VulkanRenderer {
     // Output image management
     // ---------------------------------------------------------------
 
-    fn ensure_output_images(&mut self, w: u32, h: u32) {
+    fn ensure_output_images(&mut self, w: u32, h: u32, linear: bool) {
         // Check if current images match.
         if !self.output_images.is_empty()
             && self.output_images[0].width == w
             && self.output_images[0].height == h
+            && self.output_images[0].linear == linear
         {
             return;
         }
@@ -3436,7 +3732,7 @@ impl VulkanRenderer {
             self.free_frame_textures();
         }
         if let Some(current) = self.output_images.first() {
-            let key = (current.width, current.height);
+            let key = (current.width, current.height, current.linear);
             let images = std::mem::take(&mut self.output_images);
             let index = std::mem::replace(&mut self.output_idx, 0);
             if let Some((replaced, _)) = self.output_image_cache.insert(key, (images, index)) {
@@ -3445,14 +3741,14 @@ impl VulkanRenderer {
         }
 
         self.output_image_cache_switches += 1;
-        if let Some((images, index)) = self.output_image_cache.remove(&(w, h)) {
+        if let Some((images, index)) = self.output_image_cache.remove(&(w, h, linear)) {
             self.output_image_cache_hits += 1;
             self.output_idx = index % images.len().max(1);
             self.output_images = images;
         } else {
             // Double-buffered: one being rendered to, one being read back.
             for _ in 0..2 {
-                if let Some(img) = self.create_output_image(w, h) {
+                if let Some(img) = self.create_output_image(w, h, linear) {
                     self.output_images.push(img);
                 }
             }
@@ -3496,6 +3792,9 @@ impl VulkanRenderer {
             self.device
                 .free_descriptor_sets(self.descriptor_pool, &[n.descriptor_set])
                 .ok();
+            if let Some(v) = n.v_view {
+                self.device.destroy_image_view(v, None);
+            }
             match n.kind {
                 Nv12OutputKind::Buffer { buffer, memory, .. } => {
                     self.device.destroy_buffer(buffer, None);
@@ -3571,6 +3870,12 @@ impl VulkanRenderer {
     }
 
     fn destroy_all_nv12_outputs(&mut self) {
+        let private: Vec<_> = self
+            .private_encode_outputs
+            .drain()
+            .map(|(_, o)| o)
+            .collect();
+        self.destroy_nv12_vec(private);
         let all: Vec<Vec<Nv12Output>> = self
             .nv12_outputs
             .drain()
@@ -3630,6 +3935,7 @@ impl VulkanRenderer {
         h: u32,
         export: Nv12Export,
         is_444: bool,
+        color: OutputColor,
     ) {
         // DMA-BUF export needs the dma_buf extensions; OPAQUE_FD does not,
         // and must not be gated on them — an NVIDIA-only host is exactly
@@ -3687,7 +3993,7 @@ impl VulkanRenderer {
         // UV at half height.  YUV444: three full planes, U at stride*h and
         // V at 2*stride*h — `uv_offset` names the first chroma plane in
         // both layouts, which is also where NVENC expects it.
-        let stride = (w + 63) & !63;
+        let stride = (w * if color == OutputColor::Hdr10 { 2 } else { 1 } + 63) & !63;
         let uv_offset = stride * h;
         let buf_size = if is_444 {
             (stride * h * 3) as u64
@@ -3814,12 +4120,16 @@ impl VulkanRenderer {
                 unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
                 Some(Nv12Output {
+                    format_444: None,
+                    v_view: None,
                     fd: Some(fd),
                     buf_id: next_nv12_buf_id(),
                     descriptor_set,
                     width: w,
                     height: h,
                     is_444,
+                    color,
+                    visible: (target_w, target_h),
                     kind: Nv12OutputKind::Buffer {
                         buffer,
                         memory,
@@ -3865,7 +4175,16 @@ impl VulkanRenderer {
         surface_id: u32,
         target_w: u32,
         target_h: u32,
-        fds: &[(Arc<OwnedFd>, u32, u32, u32, u32, u64)],
+        fds: &[(
+            Arc<OwnedFd>,
+            u32,
+            u32,
+            u32,
+            u32,
+            u64,
+            OutputColor,
+            Vec<crate::ExternalOutputPlane>,
+        )],
     ) {
         if !self.has_dmabuf {
             return;
@@ -3875,20 +4194,21 @@ impl VulkanRenderer {
         // same target.
         self.destroy_nv12_outputs_in(Nv12Export::DmaBuf, surface_id, target_w, target_h);
 
-        for (fd, stride, uv_offset, w, h, modifier) in fds {
+        for (fd, stride, uv_offset, w, h, modifier, color, planes) in fds {
             let (fd, stride, uv_offset, w, h, modifier) =
                 (fd.clone(), *stride, *uv_offset, *w, *h, *modifier);
 
             let nv12 = if modifier == 0 {
                 // Linear: import as VkBuffer.
-                self.import_nv12_buffer(fd, stride, uv_offset, w, h)
+                self.import_nv12_buffer(fd, stride, uv_offset, w, h, *color)
             } else {
                 // Tiled: import as multi-plane VkImage.
-                self.import_nv12_image(fd, w, h, modifier)
+                self.import_nv12_image(fd, w, h, modifier, *color, planes)
             };
 
             match nv12 {
-                Some(n) => {
+                Some(mut n) => {
+                    n.visible = (target_w, target_h);
                     self.nv12_outputs
                         .entry((surface_id, target_w, target_h))
                         .or_insert_with(|| (Vec::new(), 0))
@@ -3929,6 +4249,7 @@ impl VulkanRenderer {
         uv_offset: u32,
         w: u32,
         h: u32,
+        color: OutputColor,
     ) -> Option<Nv12Output> {
         // Use uv_offset to compute the full buffer size: Y plane is
         // uv_offset bytes, UV plane is stride * ceil(h/2).
@@ -3996,12 +4317,16 @@ impl VulkanRenderer {
         );
 
         Some(Nv12Output {
+            format_444: None,
+            v_view: None,
             fd: Some(fd),
             buf_id: next_nv12_buf_id(),
             descriptor_set,
             width: w,
             height: h,
             is_444: false,
+            color,
+            visible: (w, h),
             // Imported from a VA-API-exported dma_buf.
             export: Nv12Export::DmaBuf,
             kind: Nv12OutputKind::Buffer {
@@ -4015,40 +4340,78 @@ impl VulkanRenderer {
         })
     }
 
-    /// Import a tiled NV12 DMA-BUF as a multi-plane VkImage
-    /// (G8_B8R8_2PLANE_420_UNORM with DISJOINT planes).
+    /// Import tiled NV12/P010 with the producer's explicit modifier planes.
+    /// One non-disjoint allocation holds the luma, chroma, and metadata.
     fn import_nv12_image(
         &self,
         fd: Arc<OwnedFd>,
         w: u32,
         h: u32,
         modifier: u64,
+        color: OutputColor,
+        planes: &[crate::ExternalOutputPlane],
     ) -> Option<Nv12Output> {
-        let nv12_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+        self.import_yuv_image(fd, w, h, modifier, color, planes, None)
+    }
 
-        // Add VIDEO_ENCODE_SRC usage when video encode is available so the
-        // Vulkan Video encoder can read from this NV12 image directly.
-        let mut usage = vk::ImageUsageFlags::STORAGE;
-        if self.has_video_encode {
-            usage |= vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+    fn import_yuv_image(
+        &self,
+        fd: Arc<OwnedFd>,
+        w: u32,
+        h: u32,
+        modifier: u64,
+        color: OutputColor,
+        planes: &[crate::ExternalOutputPlane],
+        format_444: Option<Yuv444Format>,
+    ) -> Option<Nv12Output> {
+        let hdr = color == OutputColor::Hdr10;
+        let nv12_format = if hdr {
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+        } else {
+            vk::Format::G8_B8R8_2PLANE_420_UNORM
+        };
+        let y_format = if hdr {
+            vk::Format::R16_UNORM
+        } else {
+            vk::Format::R8_UNORM
+        };
+        let uv_format = if hdr {
+            vk::Format::R16G16_UNORM
+        } else {
+            vk::Format::R8G8_UNORM
+        };
+
+        let nv12_format = format_444.map_or(nv12_format, Yuv444Format::format);
+        let y_format = format_444.map_or(y_format, Yuv444Format::component_format);
+        let uv_format = format_444.map_or(uv_format, Yuv444Format::component_format);
+        let planar = format_444.is_some_and(Yuv444Format::planar);
+        let usage = vk::ImageUsageFlags::STORAGE;
+        if planes.len()
+            < if planar {
+                3
+            } else if format_444.is_some() {
+                1
+            } else {
+                2
+            }
+        {
+            return None;
         }
-
-        // Query expected plane layouts from the driver.
-        let plane_layouts = self.query_modifier_layout_with(
-            nv12_format,
-            w,
-            h,
-            modifier,
-            usage,
-            vk::ImageCreateFlags::MUTABLE_FORMAT,
-        );
+        let plane_layouts: Vec<_> = planes
+            .iter()
+            .map(|p| vk::SubresourceLayout {
+                offset: p.offset as u64,
+                row_pitch: p.pitch as u64,
+                ..Default::default()
+            })
+            .collect();
 
         let mut drm_mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
             .drm_format_modifier(modifier)
             .plane_layouts(&plane_layouts);
         let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let format_list_entries = [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM];
+        let format_list_entries = [y_format, uv_format];
         let mut format_list =
             vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entries);
 
@@ -4065,7 +4428,7 @@ impl VulkanRenderer {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
             .usage(usage)
-            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut ext_info)
             .push_next(&mut drm_mod_info)
@@ -4081,11 +4444,34 @@ impl VulkanRenderer {
             }
         };
 
-        // Non-disjoint: single memory for both planes.
+        // Non-disjoint: one memory allocation for every color/metadata plane.
         let raw_fd = fd.as_raw_fd();
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
-        let mem_type =
-            self.find_memory_type(mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())?;
+        let memory_fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        if unsafe {
+            memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                raw_fd,
+                &mut fd_properties,
+            )
+        }
+        .is_err()
+        {
+            unsafe {
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        }
+        let Some(mem_type) = self.find_memory_type(
+            mem_reqs.memory_type_bits & fd_properties.memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        ) else {
+            unsafe {
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        };
         let dup_fd = unsafe { libc::dup(raw_fd) };
         if dup_fd < 0 {
             unsafe { self.device.destroy_image(image, None) };
@@ -4122,14 +4508,18 @@ impl VulkanRenderer {
         let uv_memory = vk::DeviceMemory::null();
 
         // Create per-plane views.
-        let y_view = unsafe {
+        let y_view = match unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8_UNORM)
+                    .format(y_format)
                     .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                        aspect_mask: if format_444.is_some() && !planar {
+                            vk::ImageAspectFlags::COLOR
+                        } else {
+                            vk::ImageAspectFlags::PLANE_0
+                        },
                         base_mip_level: 0,
                         level_count: 1,
                         base_array_layer: 0,
@@ -4137,17 +4527,29 @@ impl VulkanRenderer {
                     }),
                 None,
             )
-        }
-        .ok()?;
+        } {
+            Ok(view) => view,
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(y_memory, None);
+                }
+                return None;
+            }
+        };
 
         let uv_view = match unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8_UNORM)
+                    .format(uv_format)
                     .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                        aspect_mask: if format_444.is_some() && !planar {
+                            vk::ImageAspectFlags::COLOR
+                        } else {
+                            vk::ImageAspectFlags::PLANE_1
+                        },
                         base_mip_level: 0,
                         level_count: 1,
                         base_array_layer: 0,
@@ -4167,13 +4569,59 @@ impl VulkanRenderer {
             }
         };
 
+        let v_view = if planar {
+            match unsafe {
+                self.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(y_format)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_2,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+            } {
+                Ok(view) => Some(view),
+                Err(_) => {
+                    unsafe {
+                        self.device.destroy_image_view(y_view, None);
+                        self.device.destroy_image_view(uv_view, None);
+                        self.device.destroy_image(image, None);
+                        self.device.free_memory(y_memory, None);
+                    }
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
         // Allocate descriptor set from compute_image layout.
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(std::slice::from_ref(
                 &self.compute_image_descriptor_set_layout,
             ));
-        let descriptor_set = unsafe { self.device.allocate_descriptor_sets(&ds_alloc).ok()?[0] };
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&ds_alloc) } {
+            Ok(sets) => sets[0],
+            Err(_) => {
+                unsafe {
+                    if let Some(view) = v_view {
+                        self.device.destroy_image_view(view, None);
+                    }
+                    self.device.destroy_image_view(y_view, None);
+                    self.device.destroy_image_view(uv_view, None);
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(y_memory, None);
+                }
+                return None;
+            }
+        };
 
         // Write bindings 1 (Y) and 2 (UV) as STORAGE_IMAGE.
         let y_info = vk::DescriptorImageInfo::default()
@@ -4196,45 +4644,34 @@ impl VulkanRenderer {
         ];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
 
-        // Create a full-image COLOR view for Vulkan Video encode source.
-        let encode_view = if self.has_video_encode {
+        if let Some(view) = v_view {
+            let info = vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::GENERAL);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&info));
             unsafe {
-                self.device
-                    .create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
-                            .subresource_range(vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                base_mip_level: 0,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            }),
-                        None,
-                    )
-                    .ok()
+                self.device.update_descriptor_sets(&[write], &[]);
             }
-        } else {
-            None
-        };
-
-        eprintln!(
-            "[vulkan-render] imported NV12 image {w}x{h} modifier=0x{modifier:016x} planes={} encode_view={}",
-            plane_layouts.len(),
-            encode_view.is_some(),
-        );
+        }
+        let encode_view = None;
 
         Some(Nv12Output {
+            format_444,
+            v_view,
             fd: Some(fd),
             buf_id: next_nv12_buf_id(),
             descriptor_set,
             width: w,
             height: h,
-            // VA-API exports NV12 planes; 4:4:4 is the compositor-owned path.
-            is_444: false,
-            // Tiled NV12 imported from a VA-API-exported dma_buf.
+            // Imported VA-API surfaces can carry either 4:2:0 or 4:4:4.
+            is_444: format_444.is_some(),
+            color,
+            visible: (w, h),
+            // YUV image imported from a VA-API-exported DMA-BUF.
             export: Nv12Export::DmaBuf,
             kind: Nv12OutputKind::Image {
                 image,
@@ -4276,12 +4713,19 @@ impl VulkanRenderer {
         h: u32,
         is_444: bool,
         codec: u8,
+        output: OutputColor,
     ) -> Option<Nv12Output> {
         let is_av1 = codec == 0x02;
-        let nv12_format = if is_444 {
-            vk::Format::G8_B8R8_2PLANE_444_UNORM
+        let nv12_format = crate::vulkan_encode::av1_picture_format_color(is_444, output);
+        let y_format = if output == OutputColor::Hdr10 {
+            vk::Format::R16_UNORM
         } else {
-            vk::Format::G8_B8R8_2PLANE_420_UNORM
+            vk::Format::R8_UNORM
+        };
+        let uv_format = if output == OutputColor::Hdr10 {
+            vk::Format::R16G16_UNORM
+        } else {
+            vk::Format::R8G8_UNORM
         };
         // The compute shader writes a storage image; the session reads a
         // separate `VIDEO_ENCODE_SRC` image the storage image is copied
@@ -4306,7 +4750,7 @@ impl VulkanRenderer {
             std_profile: 0,
         };
         let profiles = [if is_av1 {
-            crate::vulkan_encode::av1_encode_profile(&mut av1_leaf, is_444)
+            crate::vulkan_encode::av1_encode_profile(&mut av1_leaf, is_444, output)
         } else {
             vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
@@ -4323,7 +4767,7 @@ impl VulkanRenderer {
 
         // MUTABLE_FORMAT + the plane format list is what lets the compute
         // shader bind each plane as its own storage image.
-        let format_list_entries = [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM];
+        let format_list_entries = [y_format, uv_format];
         let mut format_list =
             vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entries);
 
@@ -4483,14 +4927,11 @@ impl VulkanRenderer {
             self.device.destroy_image(image, None);
         };
 
-        let Some(y_view) = plane_view(image, vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM)
-        else {
+        let Some(y_view) = plane_view(image, vk::ImageAspectFlags::PLANE_0, y_format) else {
             cleanup(&[]);
             return None;
         };
-        let Some(uv_view) =
-            plane_view(image, vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM)
-        else {
+        let Some(uv_view) = plane_view(image, vk::ImageAspectFlags::PLANE_1, uv_format) else {
             cleanup(&[y_view]);
             return None;
         };
@@ -4537,12 +4978,16 @@ impl VulkanRenderer {
         );
 
         Some(Nv12Output {
+            format_444: None,
+            v_view: None,
             fd: None,
             buf_id: next_nv12_buf_id(),
             descriptor_set,
             width: w,
             height: h,
             is_444,
+            color: output,
+            visible: (w, h),
             // Compositor-owned memory read by Vulkan Video on this same
             // device — never exported, so no importer and no handle type.
             export: Nv12Export::None,
@@ -4566,12 +5011,29 @@ impl VulkanRenderer {
     fn dispatch_nv12_compute(
         &self,
         cb: vk::CommandBuffer,
+        image: vk::Image,
+        outputs: &[Nv12Output],
+        index: usize,
+        width: u32,
+        height: u32,
+        transition: bool,
+    ) -> Option<vk::ImageView> {
+        self.dispatch_video_compute_buffer(
+            cb, image, outputs, index, width, height, transition, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_video_compute_buffer(
+        &self,
+        cb: vk::CommandBuffer,
         bgra_image: vk::Image,
         nv12_vec: &[Nv12Output],
         nv12_idx: usize,
         src_w: u32,
         src_h: u32,
         transition_bgra: bool,
+        color: Option<(OutputColor, crate::color::ToneMapping)>,
     ) -> Option<vk::ImageView> {
         let nv12 = &nv12_vec[nv12_idx];
         let enc_w = nv12.width;
@@ -4594,7 +5056,11 @@ impl VulkanRenderer {
                 &vk::ImageViewCreateInfo::default()
                     .image(bgra_image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(if color.is_some() {
+                        vk::Format::R16G16B16A16_SFLOAT
+                    } else {
+                        vk::Format::R8G8B8A8_UNORM
+                    })
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -4686,7 +5152,9 @@ impl VulkanRenderer {
             self.device.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                if nv12.is_444 {
+                if let Some((output, _)) = color {
+                    self.compute_color_buffer_pipelines[(output == OutputColor::Hdr10) as usize]
+                } else if nv12.is_444 {
                     self.compute_yuv444_pipeline
                 } else {
                     self.compute_pipeline
@@ -4703,7 +5171,20 @@ impl VulkanRenderer {
             // YUV444 takes (…, u_offset, v_offset, …); NV12 a single
             // uv_offset.  The planes share one stride, so V follows U by
             // exactly one plane.
-            let push: Vec<u32> = if nv12.is_444 {
+            let push: Vec<u32> = if let Some((output, hdr)) = color {
+                vec![
+                    src_w,
+                    src_h,
+                    enc_w,
+                    enc_h,
+                    output as u32,
+                    hdr.shader_parameter(),
+                    nv12.is_444 as u32,
+                    nv12.visible.0 | (nv12.visible.1 << 16),
+                    *stride,
+                    *uv_offset,
+                ]
+            } else if nv12.is_444 {
                 vec![
                     src_w,
                     src_h,
@@ -4747,6 +5228,30 @@ impl VulkanRenderer {
         src_h: u32,
         transition_bgra: bool,
     ) -> Option<vk::ImageView> {
+        self.dispatch_video_compute_image(
+            cb,
+            bgra_image,
+            nv12_vec,
+            nv12_idx,
+            src_w,
+            src_h,
+            transition_bgra,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_video_compute_image(
+        &self,
+        cb: vk::CommandBuffer,
+        bgra_image: vk::Image,
+        nv12_vec: &[Nv12Output],
+        nv12_idx: usize,
+        src_w: u32,
+        src_h: u32,
+        transition_bgra: bool,
+        color: Option<(OutputColor, crate::color::ToneMapping)>,
+    ) -> Option<vk::ImageView> {
         let nv12 = &nv12_vec[nv12_idx];
         let enc_w = nv12.width;
         let enc_h = nv12.height;
@@ -4759,13 +5264,17 @@ impl VulkanRenderer {
             return None;
         };
 
-        // Create a temporary R8G8B8A8 storage view for the BGRA image.
+        // The temporary storage view must match the composite's precision.
         let bgra_view = match unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(bgra_image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(if color.is_some() {
+                        vk::Format::R16G16B16A16_SFLOAT
+                    } else {
+                        vk::Format::R8G8B8A8_UNORM
+                    })
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -4791,10 +5300,11 @@ impl VulkanRenderer {
             .image_info(std::slice::from_ref(&bgra_info));
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
-        // NV12 image barrier always runs (UNDEFINED→GENERAL is a no-op
-        // after the first frame but correctly sets up writes).  BGRA
-        // barrier only on the first dispatch for this render.
+        // Discard the previous YUV image contents before overwriting them.
+        // Transition the input only on the first dispatch for this render.
         let bgra_barrier = vk::ImageMemoryBarrier::default()
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(bgra_image)
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .new_layout(vk::ImageLayout::GENERAL)
@@ -4808,13 +5318,15 @@ impl VulkanRenderer {
                 layer_count: 1,
             });
         let nv12_barrier = vk::ImageMemoryBarrier::default()
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(*image)
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::GENERAL)
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1,
+                aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -4847,9 +5359,13 @@ impl VulkanRenderer {
             self.device.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                // Same bindings and push constants either way — only the
-                // chroma plane's resolution differs.
-                if nv12.is_444 {
+                // The shader selects component layout, precision, and chroma
+                // resolution within the shared image descriptor layout.
+                if let Some(format_444) = nv12.format_444 {
+                    self.compute_color_444_pipelines[format_444 as usize]
+                } else if let Some((output, _)) = color {
+                    self.compute_color_pipelines[(output == OutputColor::Hdr10) as usize]
+                } else if nv12.is_444 {
                     self.compute_nv24_pipeline
                 } else {
                     self.compute_image_pipeline
@@ -4863,13 +5379,22 @@ impl VulkanRenderer {
                 &[nv12.descriptor_set],
                 &[],
             );
-            let push = [src_w, src_h, enc_w, enc_h];
+            let push = [
+                src_w,
+                src_h,
+                enc_w,
+                enc_h,
+                color.map_or(0, |(o, _)| o as u32),
+                color.map_or(0, |(_, tone)| tone.shader_parameter()),
+                nv12.is_444 as u32,
+                nv12.visible.0 | (nv12.visible.1 << 16),
+            ];
             self.device.cmd_push_constants(
                 cb,
                 self.compute_image_pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                std::slice::from_raw_parts(push.as_ptr() as *const u8, 16),
+                std::slice::from_raw_parts(push.as_ptr() as *const u8, 32),
             );
             self.device
                 .cmd_dispatch(cb, enc_w.div_ceil(16), enc_h.div_ceil(16), 1);
@@ -4894,6 +5419,8 @@ impl VulkanRenderer {
                     layer_count: 1,
                 };
                 let src_barrier = vk::ImageMemoryBarrier::default()
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(*image)
                     .old_layout(vk::ImageLayout::GENERAL)
                     .new_layout(vk::ImageLayout::GENERAL)
@@ -4903,6 +5430,8 @@ impl VulkanRenderer {
                 // Fully overwritten every frame, so the previous contents
                 // are discardable: UNDEFINED → GENERAL.
                 let dst_barrier = vk::ImageMemoryBarrier::default()
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(*enc_img)
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::GENERAL)
@@ -4975,6 +5504,8 @@ impl VulkanRenderer {
                 // follows this submission (same fence-ordered handoff the
                 // storage image relied on before the split).
                 let avail = vk::ImageMemoryBarrier::default()
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(*enc_img)
                     .old_layout(vk::ImageLayout::GENERAL)
                     .new_layout(vk::ImageLayout::GENERAL)
@@ -4999,8 +5530,12 @@ impl VulkanRenderer {
         Some(bgra_view)
     }
 
-    fn create_output_image(&self, w: u32, h: u32) -> Option<OutputImage> {
-        let format = vk::Format::B8G8R8A8_UNORM;
+    fn create_output_image(&self, w: u32, h: u32, linear: bool) -> Option<OutputImage> {
+        let format = if linear {
+            vk::Format::R16G16B16A16_SFLOAT
+        } else {
+            vk::Format::B8G8R8A8_UNORM
+        };
 
         // STORAGE + MUTABLE_FORMAT let the BGRA→NV12 compute shader read
         // this image via an R8G8B8A8 storage view on the self-alloc path.
@@ -5095,7 +5630,11 @@ impl VulkanRenderer {
                 .ok()?
         };
         let fb_info = vk::FramebufferCreateInfo::default()
-            .render_pass(self.render_pass)
+            .render_pass(if linear {
+                self.color_render_pass
+            } else {
+                self.render_pass
+            })
             .attachments(std::slice::from_ref(&view))
             .width(w)
             .height(h)
@@ -5114,7 +5653,7 @@ impl VulkanRenderer {
         // truncates to a zero-sized buffer while the copy below is still
         // issued with the full extent. `create_downscale_output` gets this
         // right; this path did not.
-        let staging_size = u64::from(w) * u64::from(h) * 4;
+        let staging_size = u64::from(w) * u64::from(h) * if linear { 8 } else { 4 };
         let buf_info = vk::BufferCreateInfo::default()
             .size(staging_size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
@@ -5165,6 +5704,7 @@ impl VulkanRenderer {
         } as *mut u8;
 
         Some(OutputImage {
+            linear,
             image,
             memory,
             view,
@@ -5290,13 +5830,18 @@ impl VulkanRenderer {
                 } else {
                     // No DMA-BUF extensions — go straight to the mmap
                     // fallback which does a CPU copy into an SHM texture.
-                    let _result = self.import_linear_dmabuf_mmap(
-                        fd.as_raw_fd(),
-                        *fourcc,
-                        *stride,
-                        width,
-                        height,
-                    );
+                    let _result = if *modifier == 0 {
+                        self.import_linear_dmabuf_mmap(
+                            fd.as_raw_fd(),
+                            *fourcc,
+                            *stride,
+                            *offset,
+                            width,
+                            height,
+                        )
+                    } else {
+                        None
+                    };
                     if _result.is_some() {
                         let temp = self.frame_textures.pop().unwrap();
                         Some(CachedSurfaceTexture {
@@ -5401,14 +5946,21 @@ impl VulkanRenderer {
         stride: usize,
         width: u32,
         height: u32,
-        source_bgra: bool,
+        source_format: u32,
         force_opaque: bool,
         damage: &[ShmDamageRect],
     ) -> Option<ShmUploadResult> {
         if width == 0 || height == 0 {
             return None;
         }
-        let row_bytes = width as usize * 4;
+        let fmt = match source_format {
+            0 | 1 => vk::Format::B8G8R8A8_UNORM,
+            f => drm_fourcc_to_vk_format(f)?,
+        };
+        let row_bytes = width as usize * texel_bytes(fmt);
+        if stride < row_bytes {
+            return None;
+        }
         let needed = stride
             .checked_mul(height as usize - 1)
             .and_then(|body| body.checked_add(offset))
@@ -5421,16 +5973,12 @@ impl VulkanRenderer {
         // the matching Vulkan format makes the whole update a row memcpy;
         // X formats force alpha through the image-view swizzle instead of a
         // scalar per-pixel loop.
-        let fmt = if source_bgra {
-            vk::Format::B8G8R8A8_UNORM
-        } else {
-            vk::Format::R8G8B8A8_UNORM
-        };
         let key = ShmTextureKey {
             width,
             height,
             format: fmt,
             force_opaque,
+            swap_rb: texel_bytes(fmt) == 8 && source_format.to_le_bytes()[1] == b'R',
         };
         let current_damage = coalesce_shm_damage(damage.iter().copied(), key);
         let generation = {
@@ -5510,7 +6058,9 @@ impl VulkanRenderer {
         // the client's mapping directly on the GPU and avoid our CPU memcpy.
         // A forced NVIDIA import remains full-upload-only because that driver
         // shadows the complete allocation before every transfer.
-        let try_external_host = self.shm_host_import_mode.should_try(full_upload)
+        let try_external_host = stride.is_multiple_of(texel_bytes(fmt))
+            && offset.is_multiple_of(texel_bytes(fmt))
+            && self.shm_host_import_mode.should_try(full_upload)
             && self.external_memory_host_fn.is_some()
             && !self.shm_host_import_failures.contains(buffer_id);
         let external_host = try_external_host
@@ -5536,6 +6086,7 @@ impl VulkanRenderer {
         self.pending_shm_uploads.insert(
             texture.image,
             PendingShmUpload {
+                texel_bytes: texel_bytes(fmt),
                 source: match external_host {
                     Some(host) => PendingShmSource::External {
                         host,
@@ -5567,7 +6118,7 @@ impl VulkanRenderer {
         self.shm_upload_counters.damaged_pixels += damaged_pixels;
         self.shm_upload_counters.total_pixels += total_pixels;
         self.shm_upload_counters.staged_copy_bytes += if result == ShmUploadResult::Staged {
-            damaged_pixels.saturating_mul(4)
+            damaged_pixels.saturating_mul(texel_bytes(fmt) as u64)
         } else {
             0
         };
@@ -5661,7 +6212,7 @@ impl VulkanRenderer {
             return None;
         }
 
-        let row_pitch = key.width as usize * 4;
+        let row_pitch = key.width as usize * texel_bytes(key.format);
         let Some(staging_size) = row_pitch.checked_mul(key.height as usize) else {
             unsafe {
                 self.device.free_memory(memory, None);
@@ -5747,9 +6298,17 @@ impl VulkanRenderer {
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(key.format)
             .components(vk::ComponentMapping {
-                r: vk::ComponentSwizzle::IDENTITY,
+                r: if key.swap_rb {
+                    vk::ComponentSwizzle::B
+                } else {
+                    vk::ComponentSwizzle::IDENTITY
+                },
                 g: vk::ComponentSwizzle::IDENTITY,
-                b: vk::ComponentSwizzle::IDENTITY,
+                b: if key.swap_rb {
+                    vk::ComponentSwizzle::R
+                } else {
+                    vk::ComponentSwizzle::IDENTITY
+                },
                 a: if key.force_opaque {
                     vk::ComponentSwizzle::ONE
                 } else {
@@ -5847,10 +6406,11 @@ impl VulkanRenderer {
             if end_x > state.key.width || end_y > state.key.height {
                 return false;
             }
-            let Some(x_bytes) = (rect.x as usize).checked_mul(4) else {
+            let Some(x_bytes) = (rect.x as usize).checked_mul(texel_bytes(state.key.format)) else {
                 return false;
             };
-            let Some(row_bytes) = (rect.width as usize).checked_mul(4) else {
+            let Some(row_bytes) = (rect.width as usize).checked_mul(texel_bytes(state.key.format))
+            else {
                 return false;
             };
             let rows = rect.height as usize;
@@ -6219,6 +6779,8 @@ impl VulkanRenderer {
         const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
 
         let vk_format = drm_fourcc_to_vk_format(fourcc)?;
+        let opaque = fourcc.to_le_bytes()[0] == b'X';
+        let swap_rb = texel_bytes(vk_format) == 8 && fourcc.to_le_bytes()[1] == b'R';
 
         // Try DRM modifier path for non-linear tiled buffers (zero
         // GPU-CPU crossings).  LINEAR (0) skips this — the DRM modifier
@@ -6226,17 +6788,25 @@ impl VulkanRenderer {
         if modifier != DRM_FORMAT_MOD_INVALID
             && modifier != 0
             && let Some(result) = self.try_import_dmabuf_drm_modifier(
-                fd, vk_format, modifier, stride, offset, width, height,
+                fd, vk_format, modifier, stride, offset, width, height, opaque, swap_rb,
             )
         {
             return Some(result);
         }
         // DRM modifier path failed or modifier is INVALID — try LINEAR.
-        if let Some(result) = self.try_import_dmabuf_linear(fd, vk_format, stride, width, height) {
+        if offset == 0
+            && (modifier == 0 || modifier == DRM_FORMAT_MOD_INVALID)
+            && let Some(result) =
+                self.try_import_dmabuf_linear(fd, vk_format, stride, width, height, opaque, swap_rb)
+        {
             return Some(result);
         }
         // LINEAR stride mismatch — mmap fallback (safe for linear data).
-        self.import_linear_dmabuf_mmap(fd, fourcc, stride, width, height)
+        if modifier == 0 {
+            self.import_linear_dmabuf_mmap(fd, fourcc, stride, offset, width, height)
+        } else {
+            None
+        }
     }
 
     /// Import a DMA-BUF via VK_EXT_image_drm_format_modifier with an
@@ -6250,6 +6820,8 @@ impl VulkanRenderer {
         offset: u32,
         width: u32,
         height: u32,
+        opaque: bool,
+        swap_rb: bool,
     ) -> Option<(vk::DescriptorSet, vk::Image)> {
         let buf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
         unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
@@ -6293,7 +6865,7 @@ impl VulkanRenderer {
             .push_next(&mut format_list);
 
         let image = unsafe { self.device.create_image(&image_info, None).ok()? };
-        self.finish_dmabuf_import(fd, image, vk_format, true)
+        self.finish_dmabuf_import(fd, image, vk_format, true, opaque, swap_rb)
     }
 
     /// Import a DMA-BUF via VK_IMAGE_TILING_LINEAR.  Returns None on
@@ -6305,6 +6877,8 @@ impl VulkanRenderer {
         stride: u32,
         width: u32,
         height: u32,
+        opaque: bool,
+        swap_rb: bool,
     ) -> Option<(vk::DescriptorSet, vk::Image)> {
         let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -6336,7 +6910,7 @@ impl VulkanRenderer {
             unsafe { self.device.destroy_image(image, None) };
             return None;
         }
-        self.finish_dmabuf_import(fd, image, vk_format, false)
+        self.finish_dmabuf_import(fd, image, vk_format, false, opaque, swap_rb)
     }
 
     /// Shared tail for DMA-BUF import: allocate+import memory, create
@@ -6347,6 +6921,8 @@ impl VulkanRenderer {
         image: vk::Image,
         vk_format: vk::Format,
         use_dedicated: bool,
+        opaque: bool,
+        swap_rb: bool,
     ) -> Option<(vk::DescriptorSet, vk::Image)> {
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
@@ -6394,6 +6970,24 @@ impl VulkanRenderer {
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(vk_format)
+            .components(vk::ComponentMapping {
+                r: if swap_rb {
+                    vk::ComponentSwizzle::B
+                } else {
+                    vk::ComponentSwizzle::IDENTITY
+                },
+                b: if swap_rb {
+                    vk::ComponentSwizzle::R
+                } else {
+                    vk::ComponentSwizzle::IDENTITY
+                },
+                a: if opaque {
+                    vk::ComponentSwizzle::ONE
+                } else {
+                    vk::ComponentSwizzle::IDENTITY
+                },
+                ..Default::default()
+            })
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -6452,170 +7046,285 @@ impl VulkanRenderer {
         Some((descriptor_set, image))
     }
 
-    /// mmap a LINEAR DMA-BUF, strip stride padding, convert BGRA→RGBA
-    /// if needed, and upload via the SHM texture path.  Only valid for
+    /// mmap a LINEAR DMA-BUF, strip stride padding, and upload without
+    /// reducing precision. Channel order is set on the image view. Only valid for
     /// LINEAR (modifier=0) buffers — tiled VRAM must NOT be mmap'd.
     fn import_linear_dmabuf_mmap(
         &mut self,
         fd: RawFd,
         fourcc: u32,
         stride: u32,
+        offset: u32,
         width: u32,
         height: u32,
     ) -> Option<(vk::DescriptorSet, vk::Image)> {
-        let buf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-        if buf_size <= 0 {
+        let format = drm_fourcc_to_vk_format(fourcc)?;
+        let row_bytes = (width as usize).checked_mul(texel_bytes(format))?;
+        let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        let required = (stride as usize)
+            .checked_mul(height.checked_sub(1)? as usize)?
+            .checked_add(offset as usize)?
+            .checked_add(row_bytes)?;
+        if size <= 0 || required > size as usize || (stride as usize) < row_bytes {
             return None;
         }
-        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-
-        let ptr = unsafe {
+        let packed_len = row_bytes.checked_mul(height as usize)?;
+        // Infer the request type: glibc uses c_ulong, musl uses c_int.
+        let sync_request = 0x40086200; // DMA_BUF_IOCTL_SYNC
+        let start_flags = 1u64; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+        let synced = unsafe { libc::ioctl(fd, sync_request, &start_flags) == 0 };
+        let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                buf_size as usize,
+                size as usize,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 fd,
                 0,
             )
         };
-        if ptr == libc::MAP_FAILED {
+        if mapped == libc::MAP_FAILED {
+            if synced {
+                let end_flags = 5u64;
+                unsafe {
+                    libc::ioctl(fd, sync_request, &end_flags);
+                }
+            }
             return None;
         }
-        let plane_data = unsafe { std::slice::from_raw_parts(ptr as *const u8, buf_size as usize) };
-        let src_row = stride as usize;
-        let dst_row = width as usize * 4;
-        let mut packed = vec![0u8; dst_row * height as usize];
-        for row in 0..height as usize {
-            let src_off = row * src_row;
-            let dst_off = row * dst_row;
-            if src_off + dst_row <= plane_data.len() {
-                packed[dst_off..dst_off + dst_row]
-                    .copy_from_slice(&plane_data[src_off..src_off + dst_row]);
+        let mut packed = vec![0; packed_len];
+        // SAFETY: the complete source range was checked against the DMA-BUF
+        // size; each destination row is a checked slice of owned storage.
+        unsafe {
+            for (y, row) in packed.chunks_exact_mut(row_bytes).enumerate() {
+                row.copy_from_slice(std::slice::from_raw_parts(
+                    mapped
+                        .cast::<u8>()
+                        .add(offset as usize + y * stride as usize),
+                    row_bytes,
+                ));
+            }
+            libc::munmap(mapped, size as usize);
+            if synced {
+                let end_flags = 5u64;
+                libc::ioctl(fd, sync_request, &end_flags);
             }
         }
-        unsafe { libc::munmap(ptr, buf_size as usize) };
-
-        // DRM ARGB/XRGB is BGRA in memory; upload_rgba_texture expects RGBA.
-        if fourcc == super::imp::drm_fourcc::ARGB8888 || fourcc == super::imp::drm_fourcc::XRGB8888
-        {
-            for px in packed.as_chunks_mut::<4>().0 {
-                px.swap(0, 2);
-            }
-        }
-        self.upload_rgba_texture(&packed, width, height)
+        let opaque = fourcc.to_le_bytes()[0] == b'X';
+        self.upload_color_texture(
+            &packed,
+            width,
+            height,
+            format,
+            opaque,
+            texel_bytes(format) == 8 && fourcc.to_le_bytes()[1] == b'R',
+        )
     }
 
-    fn upload_rgba_texture(
+    fn color_lut_texture(
+        &mut self,
+        lut: &std::sync::Arc<crate::color::ColorLut>,
+    ) -> Option<(vk::DescriptorSet, vk::Image)> {
+        if let Some((_, texture, _)) = self.color_luts.get(&lut.id) {
+            return Some((texture.descriptor_set, texture.image));
+        }
+        let n = lut.size as usize;
+        let width = n * 8;
+        let height = n * n.div_ceil(8);
+        let mut bytes = vec![0; width * height * 8];
+        for b in 0..n {
+            for g in 0..n {
+                for r in 0..n {
+                    let source = ((b * n + g) * n + r) * 4;
+                    let target = (((b / 8 * n + g) * width) + (b % 8 * n + r)) * 8;
+                    for c in 0..4 {
+                        bytes[target + c * 2..target + c * 2 + 2].copy_from_slice(
+                            &half::f16::from_f32(lut.pixels[source + c])
+                                .to_bits()
+                                .to_le_bytes(),
+                        );
+                    }
+                }
+            }
+        }
+        let result = self.upload_color_texture(
+            &bytes,
+            width as u32,
+            height as u32,
+            vk::Format::R16G16B16A16_SFLOAT,
+            false,
+            false,
+        )?;
+        let texture = self.frame_textures.pop()?;
+        self.color_luts
+            .insert(lut.id, (std::sync::Arc::downgrade(lut), texture, true));
+        Some(result)
+    }
+
+    fn upload_color_texture(
         &mut self,
         data: &[u8],
         width: u32,
         height: u32,
+        format: vk::Format,
+        opaque: bool,
+        swap_rb: bool,
     ) -> Option<(vk::DescriptorSet, vk::Image)> {
-        let format = vk::Format::R8G8B8A8_UNORM;
-        let _size = (width * height * 4) as u64;
+        let row_bytes = (width as usize).checked_mul(texel_bytes(format))?;
+        if width == 0 || height == 0 || data.len() != row_bytes.checked_mul(height as usize)? {
+            return None;
+        }
+        let mut image = vk::Image::null();
+        let mut memory = vk::DeviceMemory::null();
+        let mut view = vk::ImageView::null();
+        let mut descriptor_set = vk::DescriptorSet::null();
+        let result = (|| {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::PREINITIALIZED);
 
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            image = unsafe { self.device.create_image(&image_info, None).ok()? };
+            let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
-        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
-        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
+            let mem_type = self.find_memory_type(
+                mem_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
 
-        let mem_type = self.find_memory_type(
-            mem_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_reqs.size)
+                .memory_type_index(mem_type);
 
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type);
+            memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
+            unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
 
-        let memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
-        unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
+            // Query the actual row pitch — GPU may pad rows for alignment.
+            let subresource = vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            };
+            let layout = unsafe { self.device.get_image_subresource_layout(image, subresource) };
+            let dst_row_pitch = layout.row_pitch as usize;
+            let src_row_bytes = row_bytes;
 
-        // Query the actual row pitch — GPU may pad rows for alignment.
-        let subresource = vk::ImageSubresource {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            mip_level: 0,
-            array_layer: 0,
-        };
-        let layout = unsafe { self.device.get_image_subresource_layout(image, subresource) };
-        let dst_row_pitch = layout.row_pitch as usize;
-        let src_row_bytes = width as usize * 4;
+            let needed = (height as u64 - 1)
+                .checked_mul(layout.row_pitch)?
+                .checked_add(layout.offset)?
+                .checked_add(row_bytes as u64)?;
+            if needed > mem_reqs.size || layout.row_pitch < row_bytes as u64 {
+                return None;
+            }
+            // Map and upload row-by-row.
+            let ptr = unsafe {
+                self.device
+                    .map_memory(memory, 0, mem_reqs.size, vk::MemoryMapFlags::empty())
+                    .ok()?
+            } as *mut u8;
+            unsafe {
+                let dst = ptr.add(layout.offset as usize);
+                for row in 0..height as usize {
+                    let src_off = row * src_row_bytes;
+                    let dst_off = row * dst_row_pitch;
+                    if src_off + src_row_bytes <= data.len() {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(src_off),
+                            dst.add(dst_off),
+                            src_row_bytes,
+                        );
+                    }
+                }
+                self.device.unmap_memory(memory);
+            }
 
-        // Map and upload row-by-row.
-        let ptr = unsafe {
-            self.device
-                .map_memory(memory, 0, layout.size, vk::MemoryMapFlags::empty())
-                .ok()?
-        } as *mut u8;
-        unsafe {
-            let dst = ptr.add(layout.offset as usize);
-            for row in 0..height as usize {
-                let src_off = row * src_row_bytes;
-                let dst_off = row * dst_row_pitch;
-                if src_off + src_row_bytes <= data.len() {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(src_off),
-                        dst.add(dst_off),
-                        src_row_bytes,
-                    );
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .components(vk::ComponentMapping {
+                    r: if swap_rb {
+                        vk::ComponentSwizzle::B
+                    } else {
+                        vk::ComponentSwizzle::IDENTITY
+                    },
+                    b: if swap_rb {
+                        vk::ComponentSwizzle::R
+                    } else {
+                        vk::ComponentSwizzle::IDENTITY
+                    },
+                    a: if opaque {
+                        vk::ComponentSwizzle::ONE
+                    } else {
+                        vk::ComponentSwizzle::IDENTITY
+                    },
+                    ..Default::default()
+                })
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
+
+            let layouts = [self.descriptor_set_layout];
+            let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&layouts);
+            descriptor_set = unsafe { self.device.allocate_descriptor_sets(&ds_alloc).ok()?[0] };
+
+            let img_info = vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&img_info));
+            unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+
+            // Track for cleanup at start of next render_tree call.
+            self.frame_textures.push(TempTexture {
+                image,
+                memory,
+                view,
+                descriptor_set,
+            });
+            Some((descriptor_set, image))
+        })();
+        if result.is_none() {
+            unsafe {
+                if descriptor_set != vk::DescriptorSet::null() {
+                    let _ = self
+                        .device
+                        .free_descriptor_sets(self.descriptor_pool, &[descriptor_set]);
+                }
+                if view != vk::ImageView::null() {
+                    self.device.destroy_image_view(view, None);
+                }
+                if image != vk::Image::null() {
+                    self.device.destroy_image(image, None);
+                }
+                if memory != vk::DeviceMemory::null() {
+                    self.device.free_memory(memory, None);
                 }
             }
-            self.device.unmap_memory(memory);
         }
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
-
-        let layouts = [self.descriptor_set_layout];
-        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        let descriptor_set = unsafe { self.device.allocate_descriptor_sets(&ds_alloc).ok()?[0] };
-
-        let img_info = vk::DescriptorImageInfo::default()
-            .sampler(self.sampler)
-            .image_view(view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&img_info));
-        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
-
-        // Track for cleanup at start of next render_tree call.
-        self.frame_textures.push(TempTexture {
-            image,
-            memory,
-            view,
-            descriptor_set,
-        });
-        Some((descriptor_set, image))
+        result
     }
 
     // ---------------------------------------------------------------
@@ -6952,7 +7661,10 @@ impl VulkanRenderer {
         match pending.native_readback {
             NativeReadback::Skip => {}
             NativeReadback::GpuOnly => {
-                results.push((pending.phys_w, pending.phys_h, PixelData::GpuOnly, true));
+                let pixels = pending
+                    .managed
+                    .map_or(PixelData::GpuOnly, |hdr| PixelData::GpuOnlyColor { hdr });
+                results.push((pending.phys_w, pending.phys_h, pixels, true));
             }
             NativeReadback::Readback { encoder_skip } => {
                 let output_len = self.output_images.len();
@@ -6965,7 +7677,9 @@ impl VulkanRenderer {
                     } else {
                         // Widen before multiplying, matching the allocation
                         // in `create_output_image`.
-                        let size = pending.phys_w as usize * pending.phys_h as usize * 4;
+                        let size = pending.phys_w as usize
+                            * pending.phys_h as usize
+                            * if img.linear { 8 } else { 4 };
                         let mut bgra = pooled_pixel_buf(&mut img.pixel_pool, size);
                         Arc::get_mut(&mut bgra)
                             .expect("pooled_pixel_buf returns a uniquely owned buffer")
@@ -6973,12 +7687,54 @@ impl VulkanRenderer {
                                 std::slice::from_raw_parts(img.staging_ptr, size)
                             });
                         pool_pixel_buf(&mut img.pixel_pool, &bgra);
-                        results.push((
-                            pending.phys_w,
-                            pending.phys_h,
-                            PixelData::Bgra(bgra),
-                            encoder_skip,
-                        ));
+                        if let Some(hdr) = pending.managed {
+                            let linear: Vec<f32> = bgra
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|b| {
+                                    half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32()
+                                })
+                                .collect();
+                            for &(tw, th) in &pending.managed_targets {
+                                if (tw, th) != (pending.phys_w, pending.phys_h) {
+                                    let scaled = crate::color::resize_linear(
+                                        &linear,
+                                        pending.phys_w,
+                                        pending.phys_h,
+                                        tw,
+                                        th,
+                                    );
+                                    results.push((
+                                        tw,
+                                        th,
+                                        PixelData::LinearRgba {
+                                            peak_nits: pending.peak_nits,
+                                            data: Arc::new(scaled),
+                                            hdr,
+                                        },
+                                        false,
+                                    ));
+                                }
+                            }
+                            results.push((
+                                pending.phys_w,
+                                pending.phys_h,
+                                PixelData::LinearRgba {
+                                    peak_nits: pending.peak_nits,
+                                    data: Arc::new(linear),
+                                    hdr,
+                                },
+                                false,
+                            ));
+                        } else {
+                            results.push((
+                                pending.phys_w,
+                                pending.phys_h,
+                                PixelData::Bgra(bgra),
+                                encoder_skip,
+                            ));
+                        }
                     }
                 } else {
                     eprintln!(
@@ -7124,6 +7880,18 @@ impl VulkanRenderer {
     }
 
     fn free_frame_textures(&mut self) {
+        let unused: Vec<_> = self
+            .color_luts
+            .iter()
+            .filter(|(_, (owner, _, _))| owner.strong_count() == 0)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in unused {
+            if let Some((_, texture, _)) = self.color_luts.remove(&id) {
+                self.frame_textures.push(texture);
+            }
+        }
+
         for t in self.frame_textures.drain(..) {
             unsafe {
                 self.device
@@ -7244,6 +8012,28 @@ impl VulkanRenderer {
             return (None, results);
         }
 
+        let managed = all_layers
+            .iter()
+            .filter_map(|l| surfaces.get(&l.surface_id))
+            .any(|s| s.color_description != crate::color::ImageDescription::default());
+        let hdr_source = all_layers
+            .iter()
+            .filter_map(|l| surfaces.get(&l.surface_id))
+            .any(|s| s.color_description.is_hdr());
+
+        let peak_nits = all_layers
+            .iter()
+            .filter_map(|l| surfaces.get(&l.surface_id))
+            .filter(|s| s.color_description.is_hdr())
+            .try_fold(0.0f32, |peak, s| {
+                Some(peak.max(s.color_description.tone_mapping_peak()?))
+            })
+            .filter(|peak| *peak > 203.0);
+        let tone_mapping = crate::color::ToneMapping {
+            hdr: hdr_source,
+            peak_nits,
+        };
+
         // Compute output dimensions.
         let (crop_x, crop_y, log_w, log_h) = surfaces
             .get(root_id)
@@ -7361,10 +8151,17 @@ impl VulkanRenderer {
         external_targets_keys.sort_unstable();
 
         // Resolve each external target to (target_w, target_h, idx).
-        let external_targets: Vec<(u32, u32, usize)> = external_targets_keys
+        let mut external_targets: Vec<(u32, u32, usize)> = external_targets_keys
             .iter()
             .filter_map(|&key| {
                 let (ext_vec, ext_idx) = self.external_outputs.get(&key)?;
+                if !managed
+                    && self.nv12_outputs.get(&key).is_some_and(|(v, _)| {
+                        v.first().is_some_and(|n| n.color != OutputColor::Srgb)
+                    })
+                {
+                    return None;
+                }
                 if ext_vec.is_empty() {
                     return None;
                 }
@@ -7389,7 +8186,7 @@ impl VulkanRenderer {
             .copied()
             .collect();
         downscale_target_keys.sort_unstable();
-        let downscale_targets: Vec<(u32, u32)> = downscale_target_keys
+        let mut downscale_targets: Vec<(u32, u32)> = downscale_target_keys
             .iter()
             .filter(|&&key| {
                 let has_reader = self.cpu_readback_targets.contains(&key)
@@ -7435,15 +8232,68 @@ impl VulkanRenderer {
         let native_key = (sid, phys_w, phys_h);
         let has_native_cpu_target = self.downscale_outputs.contains_key(&native_key)
             && self.cpu_readback_targets.contains(&native_key);
-        let native_readback = native_readback_plan(
-            self.publish_native_bgra_once,
-            has_native_cpu_target,
-            !external_targets.is_empty() || !downscale_targets.is_empty(),
-            self.vulkan_video_owns(sid),
-        );
+        let managed_external_targets = if managed {
+            external_targets.clone()
+        } else {
+            Vec::new()
+        };
+        let managed_opaque_targets: Vec<(u32, u32)> = if managed {
+            downscale_targets
+                .iter()
+                .copied()
+                .filter(|&(w, h)| self.nv12_opaque_slot(sid, w, h).is_some())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut managed_targets = Vec::new();
+        if managed {
+            managed_targets.extend(external_targets.iter().map(|&(w, h, _)| (w, h)));
+            managed_targets.extend(
+                downscale_targets
+                    .iter()
+                    .copied()
+                    .filter(|&(w, h)| self.cpu_readback_targets.contains(&(sid, w, h))),
+            );
+            managed_targets.sort_unstable();
+            managed_targets.dedup();
+            external_targets.clear();
+            downscale_targets.clear();
+        }
+        let profile_targets: Vec<_> = if managed {
+            self.color_outputs
+                .keys()
+                .filter(|&&(s, w, h)| s == sid && fits_composite(&self.target_natives, w, h))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let native_readback = if managed {
+            if (self.vulkan_video_owns(sid)
+                || !managed_opaque_targets.is_empty()
+                || !profile_targets.is_empty())
+                && !self.publish_native_bgra_once
+                && !has_native_cpu_target
+                && managed_targets.is_empty()
+            {
+                NativeReadback::GpuOnly
+            } else {
+                NativeReadback::Readback {
+                    encoder_skip: false,
+                }
+            }
+        } else {
+            native_readback_plan(
+                self.publish_native_bgra_once,
+                has_native_cpu_target,
+                !external_targets.is_empty() || !downscale_targets.is_empty(),
+                self.vulkan_video_owns(sid),
+            )
+        };
 
         // Self-allocated native output image — always present.
-        self.ensure_output_images(phys_w, phys_h);
+        self.ensure_output_images(phys_w, phys_h, managed);
         if self.output_images.is_empty() {
             eprintln!("[render_tree_sized] output_images empty after ensure ({phys_w}x{phys_h})");
             return (None, results);
@@ -7492,11 +8342,13 @@ impl VulkanRenderer {
 
         // Pre-process layers: import/upload textures and collect draw info.
         struct DrawCmd {
+            lut: Option<(vk::DescriptorSet, vk::Image)>,
             descriptor_set: vk::DescriptorSet,
             image: vk::Image,
             old_layout: vk::ImageLayout,
             sample_layout: vk::ImageLayout,
             geom: [f32; 4],
+            color: [f32; 16],
             /// Framebuffer-space rectangle this layer may write, when a
             /// `wp_viewport` source crop means the quad deliberately
             /// overhangs it.  `None` = the whole render area.
@@ -7582,12 +8434,22 @@ impl VulkanRenderer {
                 clip_h = -clip_h;
             }
 
+            let lut = if let Some(lut) = &surfaces[&l.surface_id].color_description.lut {
+                match self.color_lut_texture(lut) {
+                    Some(texture) => Some(texture),
+                    None => continue,
+                }
+            } else {
+                None
+            };
             draws.push(DrawCmd {
+                lut,
                 descriptor_set: ds,
                 image: img,
                 old_layout,
                 sample_layout,
                 geom: [clip_x, clip_y, clip_w, clip_h],
+                color: surfaces[&l.surface_id].color_description.shader_params(),
                 scissor,
             });
         }
@@ -7670,9 +8532,10 @@ impl VulkanRenderer {
                             .buffer_offset(
                                 upload.offset
                                     + rect.y as vk::DeviceSize * upload.stride as vk::DeviceSize
-                                    + rect.x as vk::DeviceSize * 4,
+                                    + rect.x as vk::DeviceSize
+                                        * upload.texel_bytes as vk::DeviceSize,
                             )
-                            .buffer_row_length((upload.stride / 4) as u32)
+                            .buffer_row_length((upload.stride / upload.texel_bytes) as u32)
                             .buffer_image_height(0)
                             .image_subresource(vk::ImageSubresourceLayers {
                                 aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -7747,6 +8610,41 @@ impl VulkanRenderer {
             }
         }
 
+        for d in &draws {
+            if let Some((_, image)) = d.lut {
+                let first = self
+                    .color_luts
+                    .values_mut()
+                    .find(|(_, t, _)| t.image == image)
+                    .map(|(_, _, first)| std::mem::replace(first, false))
+                    .unwrap_or(false);
+                if first {
+                    let barrier = vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .old_layout(vk::ImageLayout::PREINITIALIZED)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            level_count: 1,
+                            layer_count: 1,
+                            ..Default::default()
+                        });
+                    unsafe {
+                        self.device.cmd_pipeline_barrier(
+                            cb,
+                            vk::PipelineStageFlags::HOST,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[barrier],
+                        );
+                    }
+                }
+            }
+        }
         // The transfer commands above must be outside the render pass.
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -7754,7 +8652,11 @@ impl VulkanRenderer {
             },
         };
         let rp_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(self.render_pass)
+            .render_pass(if managed {
+                self.color_render_pass
+            } else {
+                self.render_pass
+            })
             .framebuffer(out_framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -7767,8 +8669,15 @@ impl VulkanRenderer {
         unsafe {
             self.device
                 .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
-            self.device
-                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                if managed {
+                    self.color_pipeline
+                } else {
+                    self.pipeline
+                },
+            );
             self.device.cmd_set_viewport(
                 cb,
                 0,
@@ -7818,7 +8727,7 @@ impl VulkanRenderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     0,
-                    &[d.descriptor_set],
+                    &[d.descriptor_set, d.lut.map_or(d.descriptor_set, |v| v.0)],
                     &[],
                 );
                 self.device.cmd_push_constants(
@@ -7828,6 +8737,15 @@ impl VulkanRenderer {
                     0,
                     bytemuck_cast_slice(&d.geom),
                 );
+                if managed {
+                    self.device.cmd_push_constants(
+                        cb,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        16,
+                        bytemuck_cast_slice(&d.color),
+                    );
+                }
                 self.device.cmd_draw(cb, 4, 1, 0, 0);
             }
         }
@@ -8057,13 +8975,18 @@ impl VulkanRenderer {
 
             let key = (sid, tw, th);
             let vulkan_dispatch = armed_vulkan_targets.contains(&(tw, th))
-                && self.owned_encode_nv12.contains_key(&key);
+                && self
+                    .owned_encode_nv12
+                    .get(&key)
+                    .is_some_and(|&(_, _, output)| output == OutputColor::Srgb);
             let opaque_dispatch = self
                 .nv12_opaque_outputs
                 .get(&key)
                 .filter(|(v, _)| !v.is_empty())
                 .map(|(v, i)| (v, *i % v.len()))
-                .filter(|(v, i)| v[*i].export == Nv12Export::OpaqueFd);
+                .filter(|(v, i)| {
+                    v[*i].export == Nv12Export::OpaqueFd && v[*i].color == OutputColor::Srgb
+                });
             let wants_cpu = self.cpu_readback_targets.contains(&key);
 
             if vulkan_dispatch || opaque_dispatch.is_some() {
@@ -8226,14 +9149,216 @@ impl VulkanRenderer {
             }
         }
 
+        let mut prepared_profiles = Vec::new();
+        let mut prepared_color_targets = HashSet::new();
+        let mut prepared_opaque_targets = Vec::new();
+        let mut prepared_external_targets = Vec::new();
+        if managed {
+            for &(tw, th) in &armed_vulkan_targets {
+                if (tw, th) != (phys_w, phys_h) && !fits_composite(&self.target_natives, tw, th) {
+                    continue;
+                }
+                let key = (sid, tw, th);
+                if let Some(&(_, _, output)) = self.owned_encode_nv12.get(&key)
+                    && let Some((nv12, _)) = self.nv12_outputs.get(&key)
+                    && let Some(view) = self.dispatch_video_compute_image(
+                        cb,
+                        out_image,
+                        nv12,
+                        0,
+                        phys_w,
+                        phys_h,
+                        prepared_color_targets.is_empty(),
+                        Some((output, tone_mapping)),
+                    )
+                {
+                    compute_image_views.push(view);
+                    prepared_color_targets.insert((tw, th));
+                }
+            }
+            for &(tw, th) in &managed_opaque_targets {
+                let Some(idx) = self.nv12_opaque_slot(sid, tw, th) else {
+                    continue;
+                };
+                let outputs = &self.nv12_opaque_outputs[&(sid, tw, th)].0;
+                if let Some(view) = self.dispatch_video_compute_buffer(
+                    cb,
+                    out_image,
+                    outputs,
+                    idx,
+                    phys_w,
+                    phys_h,
+                    prepared_color_targets.is_empty() && prepared_opaque_targets.is_empty(),
+                    Some((outputs[idx].color, tone_mapping)),
+                ) {
+                    compute_image_views.push(view);
+                    prepared_opaque_targets.push((tw, th));
+                }
+            }
+            for &(tw, th, external_index) in &managed_external_targets {
+                let Some((outputs, next)) = self
+                    .nv12_outputs
+                    .get(&(sid, tw, th))
+                    .filter(|(v, _)| !v.is_empty())
+                else {
+                    continue;
+                };
+                let index = next % outputs.len();
+                if outputs[index].fd.is_none() {
+                    continue;
+                }
+                let transition = prepared_color_targets.is_empty()
+                    && prepared_opaque_targets.is_empty()
+                    && prepared_external_targets.is_empty();
+                let color = Some((outputs[index].color, tone_mapping));
+                let view = match outputs[index].kind {
+                    Nv12OutputKind::Buffer { .. } => self.dispatch_video_compute_buffer(
+                        cb, out_image, outputs, index, phys_w, phys_h, transition, color,
+                    ),
+                    Nv12OutputKind::Image { .. } => self.dispatch_video_compute_image(
+                        cb, out_image, outputs, index, phys_w, phys_h, transition, color,
+                    ),
+                };
+                if let Some(view) = view {
+                    compute_image_views.push(view);
+                    prepared_external_targets.push((tw, th, external_index));
+                }
+            }
+            for &key in &profile_targets {
+                for (pool_index, pool) in self.color_outputs[&key].iter().enumerate() {
+                    let index = pool.next % pool.outputs.len();
+                    let transition = prepared_color_targets.is_empty()
+                        && prepared_opaque_targets.is_empty()
+                        && prepared_external_targets.is_empty()
+                        && prepared_profiles.is_empty();
+                    let color = Some((pool.request.color, tone_mapping));
+                    let view = match pool.outputs[index].kind {
+                        Nv12OutputKind::Buffer { .. } => self.dispatch_video_compute_buffer(
+                            cb,
+                            out_image,
+                            &pool.outputs,
+                            index,
+                            phys_w,
+                            phys_h,
+                            transition,
+                            color,
+                        ),
+                        Nv12OutputKind::Image { .. } => self.dispatch_video_compute_image(
+                            cb,
+                            out_image,
+                            &pool.outputs,
+                            index,
+                            phys_w,
+                            phys_h,
+                            transition,
+                            color,
+                        ),
+                    };
+                    if let Some(view) = view {
+                        compute_image_views.push(view);
+                        prepared_profiles.push((key, pool_index));
+                    } else {
+                        self.cpu_readback_targets.insert(key);
+                    }
+                }
+            }
+            if !prepared_profiles.is_empty()
+                || !prepared_color_targets.is_empty()
+                || !prepared_opaque_targets.is_empty()
+                || !prepared_external_targets.is_empty()
+            {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .image(out_image)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier],
+                    );
+                }
+            }
+        }
+
         // Fill our own NV12 encode image from the native composite, for
         // Vulkan Video sessions that are not riding on a VA-API external.
         // This runs after the staging copy so `out_image` is still a valid
         // TRANSFER_SRC when that copy needs it, and restores the layout
         // afterwards so the frame ends exactly as the rest of the code
         // expects to find it.
-        let owns_encode_nv12 = armed_vulkan_targets.contains(&(phys_w, phys_h))
-            && self.owned_encode_nv12.contains_key(&(sid, phys_w, phys_h));
+        let mut prepared_private = HashSet::new();
+        for (&(surface, cid), output) in &self.private_encode_outputs {
+            if surface != sid
+                || !self.vulkan_encoder_armed.contains(&(surface, cid))
+                || (!managed && output.color != OutputColor::Srgb)
+            {
+                continue;
+            }
+            let (w, h) = output.visible;
+            if (w, h) != (phys_w, phys_h) && !fits_composite(&self.target_natives, w, h) {
+                continue;
+            }
+            if let Some(view) = self.dispatch_video_compute_image(
+                cb,
+                out_image,
+                std::slice::from_ref(output),
+                0,
+                phys_w,
+                phys_h,
+                prepared_private.is_empty(),
+                managed.then_some((output.color, tone_mapping)),
+            ) {
+                compute_image_views.push(view);
+                prepared_private.insert(cid);
+            }
+        }
+        if !prepared_private.is_empty() {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(out_image)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        }
+
+        let owns_encode_nv12 = !managed
+            && armed_vulkan_targets.contains(&(phys_w, phys_h))
+            && self
+                .owned_encode_nv12
+                .get(&(sid, phys_w, phys_h))
+                .is_some_and(|&(_, _, output)| output == OutputColor::Srgb);
         if owns_encode_nv12 {
             let to_general = vk::ImageMemoryBarrier::default()
                 .image(out_image)
@@ -8315,15 +9440,20 @@ impl VulkanRenderer {
         // against our writes, and an OPAQUE_FD allocation carries none. If
         // the export fails there we must not publish the buffer at all —
         // see the emit below.
-        let has_sync_fd_consumer = external_targets.iter().any(|&(tw, th, _)| {
-            self.nv12_outputs
-                .get(&(sid, tw, th))
-                .is_some_and(|(v, idx)| {
-                    !v.is_empty() && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
-                })
-        }) || downscale_targets
-            .iter()
-            .any(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some());
+        let has_sync_fd_consumer = !prepared_profiles.is_empty()
+            || !prepared_opaque_targets.is_empty()
+            || !prepared_external_targets.is_empty()
+            || external_targets.iter().any(|&(tw, th, _)| {
+                self.nv12_outputs
+                    .get(&(sid, tw, th))
+                    .is_some_and(|(v, idx)| {
+                        !v.is_empty()
+                            && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
+                    })
+            })
+            || downscale_targets
+                .iter()
+                .any(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some());
         let can_export_semaphore = !self.sync_fd_export_broken
             && self.sync_fd_semaphore_exportable
             && self.external_semaphore_fd_fn.is_some();
@@ -8511,35 +9641,45 @@ impl VulkanRenderer {
             }
             for cid in encoder_cids {
                 let (enc_w, enc_h) = self.vulkan_encoders[&(sid, cid)].source_dimensions();
-                let source_prepared = (enc_w, enc_h) == (phys_w, phys_h)
-                    || downscale_targets.contains(&(enc_w, enc_h))
-                    || external_targets
-                        .iter()
-                        .any(|&(w, h, _)| (w, h) == (enc_w, enc_h));
+                if !managed
+                    && self
+                        .owned_encode_nv12
+                        .get(&(sid, enc_w, enc_h))
+                        .is_some_and(|&(_, _, output)| output != OutputColor::Srgb)
+                {
+                    continue;
+                }
+                let source_prepared = if self.private_encode_outputs.contains_key(&(sid, cid)) {
+                    prepared_private.contains(&cid)
+                } else if managed {
+                    prepared_color_targets.contains(&(enc_w, enc_h))
+                } else {
+                    (enc_w, enc_h) == (phys_w, phys_h)
+                        || downscale_targets.contains(&(enc_w, enc_h))
+                        || external_targets
+                            .iter()
+                            .any(|&(w, h, _)| (w, h) == (enc_w, enc_h))
+                };
                 if !source_prepared {
                     // The target was stamped against the previous native
                     // aspect. The server will restamp or rebuild it; retain
                     // the one-frame token so that recovery needs no rearm.
                     continue;
                 }
-                let nv12_image_and_view =
+                let output = self.private_encode_outputs.get(&(sid, cid)).or_else(|| {
                     self.nv12_outputs
                         .get(&(sid, enc_w, enc_h))
-                        .and_then(|(v, idx)| {
-                            let n = v.get(idx % v.len().max(1))?;
-                            match &n.kind {
-                                Nv12OutputKind::Image {
-                                    image,
-                                    encode_view,
-                                    encode_image,
-                                    ..
-                                } => {
-                                    let img = encode_image.map_or(*image, |(ei, _)| ei);
-                                    encode_view.map(|ev| (img, ev))
-                                }
-                                _ => None,
-                            }
-                        });
+                        .and_then(|(v, idx)| v.get(idx % v.len().max(1)))
+                });
+                let nv12_image_and_view = output.and_then(|n| match &n.kind {
+                    Nv12OutputKind::Image {
+                        image,
+                        encode_view,
+                        encode_image,
+                        ..
+                    } => encode_view.map(|ev| (encode_image.map_or(*image, |(ei, _)| ei), ev)),
+                    _ => None,
+                });
                 let Some((nv12_img, ev)) = nv12_image_and_view else {
                     let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
                     *n += 1;
@@ -8604,10 +9744,13 @@ impl VulkanRenderer {
         // immediately with the exported fence, while CPU pixels publish
         // after the staging copy retires.
         type Targets = Vec<(u32, u32)>;
-        let nv12_opaque_targets: Targets = downscale_targets
-            .iter()
-            .copied()
-            .filter(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some())
+        let nv12_opaque_targets: Targets = prepared_opaque_targets
+            .into_iter()
+            .chain(downscale_targets.iter().copied().filter(|&(tw, th)| {
+                self.nv12_opaque_outputs
+                    .get(&(sid, tw, th))
+                    .is_some_and(|(v, _)| v.first().is_some_and(|n| n.color == OutputColor::Srgb))
+            }))
             .collect();
         let staging_targets: Targets = downscale_targets
             .iter()
@@ -8616,6 +9759,9 @@ impl VulkanRenderer {
             .collect();
 
         let submit_info = PendingSubmit {
+            managed: managed.then_some(hdr_source),
+            peak_nits,
+            managed_targets,
             fence,
             cb,
             textures: std::mem::take(&mut self.frame_textures),
@@ -8726,6 +9872,61 @@ impl VulkanRenderer {
             None
         };
 
+        if external_output_is_synchronized(shared_sync_fd.is_some(), host_waited_for_external) {
+            let mut variants: HashMap<(u32, u32), Vec<PixelData>> = HashMap::new();
+            for (key, pool_index) in prepared_profiles {
+                let pool = &mut self.color_outputs.get_mut(&key).unwrap()[pool_index];
+                let output = &pool.outputs[pool.next % pool.outputs.len()];
+                let Some(fd) = output.fd.clone() else {
+                    continue;
+                };
+                let pixels = if output.export == Nv12Export::OpaqueFd {
+                    let Nv12OutputKind::Buffer {
+                        stride,
+                        uv_offset,
+                        allocation_size,
+                        ..
+                    } = output.kind
+                    else {
+                        continue;
+                    };
+                    PixelData::Nv12OpaqueFd {
+                        fd,
+                        buf_id: output.buf_id,
+                        allocation_size,
+                        stride,
+                        uv_offset,
+                        width: output.width,
+                        height: output.height,
+                        is_444: output.is_444,
+                        color: output.color,
+                        sync_fd: shared_sync_fd.clone(),
+                    }
+                } else {
+                    PixelData::Nv12DmaBuf {
+                        fd,
+                        stride: 0,
+                        uv_offset: 0,
+                        width: key.1,
+                        height: key.2,
+                        color: Some(output.color),
+                        sync_fd: shared_sync_fd.clone(),
+                    }
+                };
+                variants.entry((key.1, key.2)).or_default().push(pixels);
+                pool.next = (pool.next + 1) % pool.outputs.len();
+            }
+            for ((w, h), pixels) in variants {
+                results.push((
+                    toplevel_sid,
+                    w,
+                    h,
+                    PixelData::GpuVariants(Arc::new(pixels)),
+                    false,
+                ));
+            }
+        }
+
         // NVENC zero-copy targets. Prefer publishing immediately with a
         // sync_fd so the encoder worker can wait. Drivers such as Modal's
         // containerized NVIDIA stack expose OPAQUE_FD memory but cannot
@@ -8774,6 +9975,7 @@ impl VulkanRenderer {
                     width: nv12.width,
                     height: nv12.height,
                     is_444: nv12.is_444,
+                    color: nv12.color,
                     sync_fd: sync,
                 },
                 false,
@@ -8790,7 +9992,15 @@ impl VulkanRenderer {
         // immediately without waiting for the fence (the encoder VPP
         // synchronises via DMA-BUF implicit fencing or the exported
         // sync_fd we attach below).
-        for &(tw, th, ext_idx) in &external_targets {
+        for &(tw, th, ext_idx) in external_targets.iter().chain(&prepared_external_targets) {
+            if managed
+                && !external_output_is_synchronized(
+                    shared_sync_fd.is_some(),
+                    host_waited_for_external,
+                )
+            {
+                continue;
+            }
             let (ext_va, ext_va_display, ext_fd, ext_fourcc, ext_mod, ext_stride) = {
                 let (ext_vec, _) = &self.external_outputs[&(sid, tw, th)];
                 let ext = &ext_vec[ext_idx];
@@ -8831,6 +10041,7 @@ impl VulkanRenderer {
                         width: tw,
                         height: th,
                         sync_fd: None,
+                        color: managed.then_some(nv12.color),
                     },
                     Nv12OutputKind::Image { .. } => PixelData::Nv12DmaBuf {
                         fd: nv12_fd,
@@ -8839,6 +10050,7 @@ impl VulkanRenderer {
                         width: tw,
                         height: th,
                         sync_fd: None,
+                        color: managed.then_some(nv12.color),
                     },
                 }
             } else {
@@ -9068,6 +10280,8 @@ impl Drop for VulkanRenderer {
             self.destroy_all_external_outputs();
             self.drain_pending_destroy_targets_if_idle();
             // Destroy per-frame temp textures.
+            self.frame_textures
+                .extend(self.color_luts.drain().map(|(_, (_, texture, _))| texture));
             for t in self.frame_textures.drain(..) {
                 self.device.destroy_image_view(t.view, None);
                 self.device.destroy_image(t.image, None);
@@ -9114,11 +10328,22 @@ impl Drop for VulkanRenderer {
                 .destroy_pipeline(self.compute_image_pipeline, None);
             self.device
                 .destroy_pipeline(self.compute_nv24_pipeline, None);
+            for pipeline in self
+                .compute_color_pipelines
+                .into_iter()
+                .chain(self.compute_color_buffer_pipelines)
+                .chain(self.compute_color_444_pipelines)
+            {
+                self.device.destroy_pipeline(pipeline, None);
+            }
             self.device
                 .destroy_pipeline_layout(self.compute_image_pipeline_layout, None);
             self.device
                 .destroy_descriptor_set_layout(self.compute_image_descriptor_set_layout, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.color_pipeline, None);
+            self.device
+                .destroy_render_pass(self.color_render_pass, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
@@ -9215,6 +10440,7 @@ mod tests {
             height: 80,
             format: vk::Format::B8G8R8A8_UNORM,
             force_opaque: true,
+            swap_rb: false,
         }
     }
 

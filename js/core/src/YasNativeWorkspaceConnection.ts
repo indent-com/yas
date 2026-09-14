@@ -1,3 +1,8 @@
+import {
+  detectSurfaceColorCapabilities,
+  surfaceColorExtensions,
+  onSurfaceColorChange,
+} from "./surfaceColor";
 import { plannedDropExtension, plannedDropName } from "./surfaceDrop";
 import { AudioPlayer } from "./AudioPlayer";
 import { serverPlatform, type YasPlatform } from "./yas/core";
@@ -509,6 +514,7 @@ export class YasNativeWorkspaceConnection {
   private removeSessionReady: (() => void) | null = null;
   private removeSessionInvalidation: (() => void) | null = null;
   private removeSessionCatalogChange: (() => void) | null = null;
+  private removeSurfaceColorChange: (() => void) | null = null;
   private removeReceiveBudgetCapacity: (() => void) | null = null;
   private familyInitializationEpoch = 0;
   private familyInitializationPending = false;
@@ -550,6 +556,14 @@ export class YasNativeWorkspaceConnection {
     wasm: YasWasmModule | Promise<YasWasmModule>,
     private readonly autoConnect = true,
   ) {
+    this.removeSurfaceColorChange = onSurfaceColorChange(() => {
+      for (const surfaceId of this.surfaceMounts.keys()) {
+        void this.closeSurfaceView(surfaceId).then(() => {
+          if (!this.disposed)
+            this.requestNativeSurfaceViewRefresh(surfaceId, true);
+        });
+      }
+    });
     this.transport = session.transport;
     this.native = new YasNativeProductFamilies(session);
     this.workspaceFs = new YasNativeWorkspaceFs(session, {
@@ -774,6 +788,8 @@ export class YasNativeWorkspaceConnection {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.removeSurfaceColorChange?.();
+    this.removeSurfaceColorChange = null;
     this.stopLatencyProbe();
     this.removeCatalog?.();
     this.removeSelectionCatalog?.();
@@ -1257,10 +1273,6 @@ export class YasNativeWorkspaceConnection {
     sizes?.delete(viewId);
     if (sizes?.size === 0) this.viewSizes.delete(handle);
     this.applyEffectiveViewSize(handle);
-  }
-
-  resetViewSizes(): void {
-    this.viewSizes.clear();
   }
 
   metricsGeneration(): number {
@@ -3274,6 +3286,7 @@ export class YasNativeWorkspaceConnection {
               maxFps: parameters.maxFps,
               decoderCapacity: NATIVE_SURFACE_DECODER_CAPACITY,
               latencyTargetNs: 0n,
+              extensions: surfaceColorExtensions(),
             })
             .then(() => {
               if (
@@ -3349,7 +3362,18 @@ export class YasNativeWorkspaceConnection {
       }
       if (pending.cancelled || generation !== pending.generation) return;
     }
-    const codecVersions = nativeSurfaceCodecs(getCodecSupport());
+    const colorCapabilities = await detectSurfaceColorCapabilities();
+    if (pending.cancelled || this.disposed || generation !== pending.generation)
+      return;
+    let codecVersions = nativeSurfaceCodecs(getCodecSupport());
+    // The codec is fixed for a view's lifetime. Reserve AV1 before an SDR
+    // window switches to HDR, which requires 10-bit AV1. P3 also supports H.264.
+    if (
+      colorCapabilities & yasGenerated.YAS_SURFACE_COLOR_CAP_HDR10_AV1 &&
+      codecVersions.includes(YAS_SURFACE_CODEC_AV1_V1)
+    ) {
+      codecVersions = [YAS_SURFACE_CODEC_AV1_V1];
+    }
     const view = await surface.openView({
       surfaceHandle: surfaceId,
       width: parameters.width,
@@ -3357,6 +3381,7 @@ export class YasNativeWorkspaceConnection {
       maxFps: parameters.maxFps,
       decoderCapacity: NATIVE_SURFACE_DECODER_CAPACITY,
       codecVersions: [...codecVersions],
+      extensions: surfaceColorExtensions(),
     });
     if (
       pending.cancelled ||
@@ -3443,6 +3468,7 @@ export class YasNativeWorkspaceConnection {
         state.height,
         packed.logicalDimensions ?? this.surfaceLogicalSize(surfaceId),
         ackToken,
+        packed.colorSpace,
       );
     } catch (error) {
       this.surfaceStore.sendAckFallback(surfaceId, ackToken);

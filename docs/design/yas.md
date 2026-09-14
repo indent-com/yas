@@ -2227,6 +2227,18 @@ AV1, according to the configured encoder list. CONFIGURE_VIEW replaces the
 supplied values without resubscription. CAPTURE returns an inline image up to
 32 KiB or a byte Transfer carrying the selected PNG or AVIF object.
 
+OPEN_VIEW and CONFIGURE_VIEW accept optional Surface extension tag 8: one
+capability byte: bit 0 for Display-P3 SDR, bit 1 for 10-bit AV1 BT.2020/PQ,
+bit 2 additionally permitting 10-bit AV1 4:4:4, bit 3 permitting 8-bit AV1
+4:4:4, and bit 4 permitting H.264 4:4:4.
+Absence means SDR; unknown bits, duplicate tags, and non-unit lengths are
+invalid. The existing packed COLOR_SPACE metadata carries CICP primaries,
+transfer, matrix, and full-range flag. HDR uses 10-bit AV1 Main (4:2:0) or
+High (4:4:4); P3 SDR uses 8-bit H.264 or AV1. Codec strings reflect the
+actual profile and depth. A change of output color requires a keyframe and decoder
+reconfiguration. [Surface color](../color.md) describes implementation and
+fallback behavior.
+
 Before OPEN_VIEW succeeds, the server reserves
 `decoder_capacity * max_decoded_frame` from the same aggregate peer-receive
 budget used by State and Transfer. CONFIGURE_VIEW growth succeeds only after

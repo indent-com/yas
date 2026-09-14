@@ -1225,6 +1225,93 @@ describe("SurfaceStore decoder recovery", () => {
     store.destroy();
   });
 
+  it("rebuilds the decoder on color keyframes and preserves 10-bit HDR configuration", async () => {
+    const store = newStore();
+    const send = (
+      flags: number,
+      color?: {
+        primaries: number;
+        transfer: number;
+        matrix: number;
+        range: number;
+      },
+    ) =>
+      store.handleSurfaceFrame(
+        1,
+        0,
+        flags,
+        1280,
+        720,
+        frame,
+        0,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        color,
+      );
+    send(KEY_AV1);
+    const sdr = FakeDecoder.instances[0];
+    const p3 = { primaries: 12, transfer: 13, matrix: 1, range: 0 };
+    send(DELTA_AV1, p3);
+    expect(sdr.decoded).toBe(1); // New color requires a random-access boundary.
+    send(KEY_AV1, p3);
+    await Promise.resolve();
+    expect(sdr.state).toBe("closed");
+    const wide = FakeDecoder.instances.at(-1)!;
+    expect(wide.colorSpaces[0]).toEqual({
+      primaries: "smpte432",
+      transfer: "iec61966-2-1",
+      matrix: "bt709",
+      fullRange: false,
+    });
+    send(KEY_AV1, { primaries: 9, transfer: 16, matrix: 9, range: 0 });
+    const hdr = FakeDecoder.instances.at(-1)!;
+    expect(hdr.configured[0]).toMatch(/M\.10$/);
+    expect(hdr.colorSpaces[0]).toEqual({
+      primaries: "bt2020",
+      transfer: "pq",
+      matrix: "bt2020-ncl",
+      fullRange: false,
+    });
+    send(KEY_AV1);
+    const restored = FakeDecoder.instances.at(-1)!;
+    expect(restored.configured[0]).toMatch(/M\.08$/);
+    await Promise.resolve();
+    expect(hdr.state).toBe("closed");
+    store.destroy();
+  });
+
+  it("reads native AV1 High profile and changes chroma on a keyframe", async () => {
+    const store = newStore();
+    const hdr = { primaries: 9, transfer: 16, matrix: 9, range: 0 };
+    const send = (profile: number) =>
+      store.handleSurfaceFrame(
+        1,
+        0,
+        KEY_AV1,
+        1280,
+        720,
+        new Uint8Array([0x12, 0, 0x0a, 1, profile << 5]),
+        0,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hdr,
+      );
+    send(1);
+    const high = FakeDecoder.instances.at(-1)!;
+    expect(high.configured[0]).toMatch(/^av01\.1\..*M\.10$/);
+    send(0);
+    await Promise.resolve();
+    expect(high.state).toBe("closed");
+    expect(FakeDecoder.instances.at(-1)!.configured[0]).toMatch(
+      /^av01\.0\..*M\.10$/,
+    );
+    store.destroy();
+  });
+
   it("configures decoded surfaces as limited-range BT.601", () => {
     const store = newStore();
     store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);

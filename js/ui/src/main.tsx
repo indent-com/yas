@@ -4,20 +4,10 @@ import { App } from "./App";
 import { t } from "./i18n";
 import { preferredPalette } from "./storage";
 import { applySystemChrome } from "./systemChrome";
-import { traceTouchFocus } from "./touchFocusTrace";
 
 // Paint standalone/browser chrome from the saved palette before asynchronous
 // WASM startup. Workspace keeps it synchronized when the choice changes.
 applySystemChrome(preferredPalette());
-
-if (import.meta.hot && navigator.maxTouchPoints > 0) {
-  const stop = traceTouchFocus();
-  const timeout = setTimeout(stop, 180_000);
-  import.meta.hot.dispose(() => {
-    clearTimeout(timeout);
-    stop();
-  });
-}
 
 // The mark from the repository's logo.svg, spelled for a data URI: "#"
 // percent-encoded, and the three spokes written out rather than referenced
@@ -146,8 +136,6 @@ function markPng(size: number): string {
   const blob = new Blob([JSON.stringify(manifest)], {
     type: "application/json",
   });
-  // Idempotent for the same reason the mount below is: appending a second
-  // manifest link would leave the document with two.
   const link =
     document.head.querySelector<HTMLLinkElement>('link[rel="manifest"]') ??
     document.head.appendChild(document.createElement("link"));
@@ -167,24 +155,7 @@ function markPng(size: number): string {
   }
 }
 
-let entryDisposed = false;
-import.meta.hot?.dispose(() => {
-  entryDisposed = true;
-  (import.meta.hot?.data?.dispose as (() => void) | undefined)?.();
-  if (import.meta.hot) delete import.meta.hot.data.dispose;
-});
-
 initWasm().then((wasm) => {
-  // An invalidated entry must never mount a second app when WASM finishes.
-  if (entryDisposed) return;
-  // Mount idempotently. `render()` appends and never clears, so a second
-  // execution of this module body would leave two whole app trees in
-  // `#root` — two docks, two layout containers fighting over the same
-  // workspace's visible sessions, and a document twice the viewport tall.
-  // Nothing should re-execute the entry (see installPrompt.ts on why the
-  // entry must stay importer-free), but the guard is cheap and the failure
-  // mode is not.
-  (import.meta.hot?.data?.dispose as (() => void) | undefined)?.();
   // Not `getElementById("root")!` — that assertion turned a missing mount
   // point into "Uncaught (in promise) Error: The `element` passed to
   // render(...) doesn't exist", which names the symptom and not the cause.
@@ -197,6 +168,5 @@ initWasm().then((wasm) => {
         "page that hosts the app; a stale or hand-written entry will not work",
     );
   }
-  const dispose = render(() => <App wasm={wasm} />, root);
-  if (import.meta.hot) import.meta.hot.data.dispose = dispose;
+  render(() => <App wasm={wasm} />, root);
 });

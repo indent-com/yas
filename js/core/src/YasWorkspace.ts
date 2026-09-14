@@ -231,13 +231,6 @@ export class YasWorkspace {
     return this.connections.get(connectionId) ?? null;
   }
 
-  /** Drop terminal view-size registrations while keeping connections alive. */
-  resetViewSizes(): void {
-    for (const connection of this.connections.values()) {
-      connection.resetViewSizes();
-    }
-  }
-
   getConnectionSnapshot(
     connectionId: ConnectionId,
   ): YasConnectionSnapshot | null {

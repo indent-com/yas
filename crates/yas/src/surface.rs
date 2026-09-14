@@ -843,6 +843,30 @@ impl Decode for ReleaseAppEndpoint {
     }
 }
 
+/// Validate the opt-in color capabilities of a Surface viewer.
+pub fn color_capabilities(extensions: &Extensions) -> Result<u8> {
+    let mut found = None;
+    for extension in &extensions.0 {
+        if extension.tag != crate::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16 {
+            continue;
+        }
+        if found.is_some()
+            || extension.value.len() != 1
+            || extension.value[0]
+                & !(crate::schema::surface::COLOR_CAP_DISPLAY_P3 as u8
+                    | crate::schema::surface::COLOR_CAP_HDR10_AV1 as u8
+                    | crate::schema::surface::COLOR_CAP_HDR10_AV1_444 as u8
+                    | crate::schema::surface::COLOR_CAP_AV1_444 as u8
+                    | crate::schema::surface::COLOR_CAP_H264_444 as u8)
+                != 0
+        {
+            return Err(Error::Invalid("Surface color capabilities"));
+        }
+        found = Some(extension.value[0]);
+    }
+    Ok(found.unwrap_or(0))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenView {
     pub surface_handle: u64,
@@ -856,6 +880,7 @@ pub struct OpenView {
 
 impl Encode for OpenView {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        color_capabilities(&self.extensions)?;
         handle(self.surface_handle, "zero surface handle")?;
         validate_view_geometry(self.width, self.height, self.max_fps)?;
         if self.decoder_capacity == 0
@@ -974,6 +999,7 @@ pub struct ConfigureView {
 
 impl Encode for ConfigureView {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        color_capabilities(&self.extensions)?;
         view(self.view_id)?;
         validate_view_geometry(self.width, self.height, self.max_fps)?;
         if self.decoder_capacity == 0 {
@@ -1883,6 +1909,26 @@ pub fn surface_from_state_record(record: &Record) -> Result<SurfaceRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_capability_extensions_are_opt_in_and_bounded() {
+        assert_eq!(color_capabilities(&Extensions::default()).unwrap(), 0);
+        let make = |value| Extension {
+            tag: crate::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16,
+            required: false,
+            value,
+        };
+        for mask in 0..=31 {
+            assert_eq!(
+                color_capabilities(&Extensions(vec![make(vec![mask])])).unwrap(),
+                mask
+            );
+        }
+        for value in [vec![], vec![32], vec![1, 2]] {
+            assert!(color_capabilities(&Extensions(vec![make(value)])).is_err());
+        }
+        assert!(color_capabilities(&Extensions(vec![make(vec![1]), make(vec![2])])).is_err());
+    }
 
     #[test]
     fn minimum_size_extension_round_trips_and_validates() {

@@ -37,6 +37,9 @@ export function installExtensions(directory, run = runYas) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
   installExtensions(process.argv[2] ?? "/opt/yas/extensions");
 }

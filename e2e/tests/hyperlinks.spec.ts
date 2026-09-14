@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { createTerminal } from "./workspace-auth";
 
 /**
  * OSC 8 hyperlinks, end to end: escape sequence out of a real PTY, through the
@@ -53,9 +54,8 @@ async function authenticateAndCreateTerminal(page: Page) {
   // events; the canvas beneath it is not hit-testable.
   const surface = page.locator(".yas-scroll-surface").first();
   if (!(await surface.isVisible().catch(() => false))) {
-    // The empty state's button opens a target/command prompt rather than
-    // creating a terminal outright, so the Enter is load-bearing.
-    await page.getByRole("button", { name: "New terminal" }).first().click();
+    // Confirm a destination if the shortcut opens the remote picker.
+    await createTerminal(page);
     await page.waitForTimeout(500);
     await page.keyboard.press("Enter");
     await page.waitForTimeout(1000);

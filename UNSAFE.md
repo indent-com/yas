@@ -173,3 +173,82 @@ Peer-controlled packets are capped at 4 MiB before any decoder. Negotiated dimen
 - **DMA-BUF import lifetime** — imported Vulkan memory from DMA-BUF fds must not outlive the client buffer; evicted persistent textures are deferred to `pending_destroy_textures` until the in-flight GPU submission completes.
 - **Staging pointer lifetime** — the raw `vkMapMemory` pointer in `OutputImage::staging_ptr` is valid for one frame cycle (double-buffered output images). The encoder must consume the `PixelData::Bgra` before `retire_pending` is called again for the same output image.
 - **`PR_SET_PDEATHSIG` on service children** — every long-lived child spawned by `AudioPipeline` or `DesktopBus` must use `pre_exec(pdeathsig_hook())`. Missing it means the child survives server restarts and leaks.
+
+## Managed surface color
+
+`crates/compositor/src/vulkan_render.rs` additionally owns RGBA16F render
+passes and output rings for managed trees. Their staging allocation and read
+length are eight bytes per pixel, against four for BGRA8; the ring cache key
+includes that format. A submission retains the format and color class until
+its fence completes. Only then are half floats read and expanded into owned
+`Vec<f32>` pixels; resizing and transfer/gamut encoding use safe Rust. New
+2:10:10:10 and 16-bit integer/float SHM and DMA-BUF formats use matching
+Vulkan formats. SHM staging offsets, row lengths, and bounds use each format's
+texel size. Linear DMA-BUF mmap fallback checks the complete range including
+plane offset, brackets CPU access with DMA-BUF sync when supported, and
+retains precision. Tiled buffers never enter that fallback. X formats force
+alpha to one; 16-bit ARGB/XRGB views swap red and blue. Failed temporary
+texture allocations release every resource acquired before failure.
+
+`surface_color_encoder.rs` tests use rav1d's C-compatible API to independently
+decode 8/10-bit output. Initialized context/data/picture objects own their
+storage until explicit close/unref. Plane reads use the returned byte stride,
+bit depth, and validated 64×64 extent and finish before picture unref. The
+production managed encoder uses rav1e's safe API and writes from each padded
+plane's visible origin.
+
+Managed NVENC uploads use pitch-checked host buffers, NV12/P010 or planar
+4:4:4, and register the matching format before encoding. SDK 12.1 AV1 depth
+bitfields and H.264/AV1 color fields are verified against `nvEncodeAPI.h`;
+10-bit support is queried before session creation. VA-API derives images and
+checks every written plane against `VAImage.data_size`, pitches, and offsets
+before mapping. Packed AYUV, Y410, and Y416 use little-endian component order
+validated against mapped VA images; each map is paired with unmap. AV1 RT
+formats, depth flags, and packed headers must
+agree. CPU fallback conversion and packing run in safe Rust before these FFI
+boundaries. GPU conversion uses the same equations in the shared shader.
+NVENC OPAQUE_FD input validates color, chroma, bit depth, byte pitch, allocation
+size, and chroma offset before CUDA import; a pending/failed fence drops the
+frame. VA-API GPU exports validate the format and single-object plane layout,
+retain all modifier plane offsets/pitches, and attach explicit synchronization.
+Managed DMA-BUF pixels are consumed only by the encoder owning that surface;
+CPU conversion never treats tiled/P010 memory as 8-bit linear NV12.
+
+ICC transform construction is safe Rust. GPU LUT uploads use bounded 65³
+RGBA16F tables packed into a 2D image. Weak cache entries are destroyed only
+after the frame fence, and surface descriptions retain their LUT through
+commit and rendering. Vulkan Video color conversion uses format-matched
+8/10-bit plane views, device-local copies, ignored queue-family indices for
+concurrent images, and fence ordering before encode. AV1's queried feature
+structure stays alive through device creation. Setup DPB resources are bound
+without claiming an already-active slot. Each coding scope declares the
+persisted rate-control mode before issuing constant-QP encodes. GPU-only managed commits carry a
+color class without exposing staging memory.
+
+PipeWire format callbacks read only the declared, bounded POD and accept
+plain IDs or fixated Choice(None, Id) values. Negotiated precision determines
+checked frame size and stride. The process callback drops frames whose format
+no longer matches the current negotiation before copying within buffer capacity.
+
+Managed output pools retain their Vulkan allocations across subscriber changes.
+NVENC pools are keyed by dimensions, color, and chroma; VA-API pools additionally
+use the identities of the exporting encoder's owned DMA-BUF descriptors. A GPU
+frame bundles these variants and each consumer selects only a matching profile
+or its own surface. Pool replacement defers destruction until tracked GPU work
+has retired. Conflicting Vulkan Video profiles use separate source images with
+their own matching video profile lists.
+
+VA-API 4:4:4 imports preserve the producer's explicit DRM modifier and every
+plane offset/pitch. Planar outputs use separate Y/U/V storage views; packed
+AYUV/XYUV, Y410, and Y416 use matching Vulkan formats and little-endian channel
+layouts. GPU conversion and CPU uploads are compared against mapped VA images
+in hardware tests. Managed exports allocate VA surfaces directly without VPP
+contexts or intermediate RGB buffers; their sentinel IDs are never destroyed
+as live VA resources. On import failure, the color image importer releases
+partially allocated images, views, memory, and descriptors before falling back
+to float readback.
+
+Compute pipeline creation keeps shader modules alive through the Vulkan call
+and destroys them on success or failure. A failed batch also destroys every
+non-null pipeline handle returned by Vulkan. The caller owns successful
+pipelines; renderer teardown destroys them before the device.

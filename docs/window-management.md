@@ -165,11 +165,6 @@ The sidebar is never absorbed into, occluded by, or resized with the container
 tree. Hiding it changes only client chrome; parked resources remain recoverable
 from the overview and reopen when the sidebar returns.
 
-Development hot reloads retain the latest layout and surface arrival history,
-including an empty layout, so already-parked windows stay on the shelf.
-Home connections close on module disposal as well as component cleanup, so a
-missed cleanup cannot leave an old browser session constraining window sizes.
-
 Parking remembers each view's tiled or floating placement by stable resource
 identity. Restoring a floating view restores its frame, including position and
 size; its reference viewport preserves pixel geometry when the shelf changes

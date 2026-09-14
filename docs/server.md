@@ -11,8 +11,8 @@ relayed streams. After ten seconds the server probes the peer; a valid reply
 keeps the session alive and schedules the next probe. An unanswered probe
 closes the session after another twenty seconds, releasing its views and size
 claims. The deadline covers blocked writers and application handlers. Pings
-preserve healthy idle sessions; HMR must explicitly retire superseded clients
-even when those clients still answer pings.
+preserve healthy idle sessions; browser component cleanup explicitly closes
+connections that are no longer needed.
 
 ## Configuration
 
@@ -346,7 +346,7 @@ Each compositor starts a private D-Bus session whose activation environment poin
 ### Surface lifecycle
 
 1. The app creates an `xdg_toplevel` surface; the server publishes an opaque native Surface handle.
-2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value — NV12 DMA-BUF data or BGRA pixels for server-side encoding. When a client has a Vulkan Video session it also sends that client a `SurfaceEncoded` event carrying a finished bitstream.
+2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value — NV12 DMA-BUF data, BGRA pixels, or linear float RGBA for managed color. When a client has a Vulkan Video session it also sends that client a `SurfaceEncoded` event carrying a finished bitstream.
 3. The server either forwards a client's own pre-encoded bitstream directly (Vulkan Video) or encodes the pixel data via the configured encoder chain (VA-API / NVENC / software).
 4. The compositor event pushes the catalogue change to every Surface watcher; discovery is not polled. Each `OPEN_VIEW` creates an independently negotiated stream of Surface `FRAME` Events.
 5. Native Surface `KEY`, `TEXT`, `POINTER`, `AXIS`, and `TOUCH` Events are translated to Wayland input through the compositor.
@@ -356,6 +356,18 @@ If `OPEN_VIEW` needs a first encoded frame to select its codec, that wait runs
 without blocking the session's other requests or input. Resizes proceed while
 the encoder starts, and cancellation or disconnect releases the provisional
 view immediately. The successful Result precedes its first Frame.
+
+### Color management
+
+[YAS surface color](color.md) covers Display-P3, DCI-P3 input, PQ/HLG and
+Windows-scRGB, ICC profiles, and all rendering intents. Managed trees use linear
+BT.2020 float composition with software, NVENC, VA-API, or Vulkan Video encoding
+per viewer: P3 SDR, 10-bit AV1 PQ HDR, or tone/gamut mapped sRGB. Vulkan Video
+scales and converts managed frames on the GPU; GPU-only streams avoid CPU
+readback. NVENC and VA-API also accept GPU-converted buffers, with CPU
+conversion and upload when direct sharing is unavailable.
+PipeWire negotiates P3 and PQ formats with an sRGB default for older consumers.
+Captures and thumbnails preserve managed color and precision.
 
 ### Frame production pipeline
 

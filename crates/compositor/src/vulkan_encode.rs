@@ -19,6 +19,7 @@
     clippy::manual_div_ceil
 )]
 
+use crate::color::OutputColor;
 use std::ptr;
 
 use ash::vk;
@@ -365,6 +366,7 @@ pub(crate) struct VulkanVideoEncoder {
     frame_num: u32,
     idr_num: u32,
     force_idr: bool,
+    rate_control_initialized: bool,
     qp: u8,
     /// AV1 only: the order hint each decoder-side reference slot holds,
     /// mirrored here so frame headers can state them (`ref_order_hint`).
@@ -444,7 +446,13 @@ impl VulkanVideoEncoder {
         height: u32,
         qp: u8,
         is_444: bool,
+        output: OutputColor,
     ) -> Option<Self> {
+        let cicp = output.cicp();
+        if output == OutputColor::Hdr10 {
+            return None;
+        }
+
         // ---------------------------------------------------------------
         // 1. Video profile
         // ---------------------------------------------------------------
@@ -603,6 +611,10 @@ impl VulkanVideoEncoder {
         let mut vui: StdVideoH264SequenceParameterSetVui = unsafe { std::mem::zeroed() };
         vui.flags = vui_flags;
         vui.video_format = 5; // unspecified
+        vui.flags.set_color_description_present_flag(1);
+        vui.colour_primaries = cicp[0];
+        vui.transfer_characteristics = cicp[1];
+        vui.matrix_coefficients = cicp[2];
 
         // Crop offsets are expressed in CropUnitX/CropUnitY, which depend on
         // the chroma format: 2x2 for 4:2:0, but 1x1 for 4:4:4 (and for
@@ -820,6 +832,7 @@ impl VulkanVideoEncoder {
             frame_num: 0,
             idr_num: 0,
             force_idr: false,
+            rate_control_initialized: false,
             qp,
             params_bytes,
             poisoned: false,
@@ -1123,7 +1136,10 @@ impl VulkanVideoEncoder {
 
         let mut begin_ref_slots: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = Vec::new();
         // Always include the setup slot in begin coding.
-        begin_ref_slots.push(setup_slot);
+        begin_ref_slots.push(vk::VideoReferenceSlotInfoKHR {
+            slot_index: -1,
+            ..setup_slot
+        });
 
         if !is_idr {
             ref_ref_info.FrameNum = prev_frame_num;
@@ -1153,7 +1169,14 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // Begin video coding scope
         // ---------------------------------------------------------------
+        let mut begin_rate_control = vk::VideoEncodeRateControlInfoKHR::default()
+            .rate_control_mode(if self.rate_control_initialized {
+                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
+            } else {
+                vk::VideoEncodeRateControlModeFlagsKHR::DEFAULT
+            });
         let begin_coding = vk::VideoBeginCodingInfoKHR::default()
+            .push_next(&mut begin_rate_control)
             .video_session(self.video_session)
             .video_session_parameters(self.session_params)
             .reference_slots(&begin_ref_slots);
@@ -1284,6 +1307,7 @@ impl VulkanVideoEncoder {
         if is_idr {
             self.idr_num = self.idr_num.wrapping_add(1);
         }
+        self.rate_control_initialized = true;
         self.frame_num = self.frame_num.wrapping_add(1);
         self.cur_dpb_idx = 1 - self.cur_dpb_idx;
 
@@ -1310,7 +1334,15 @@ impl VulkanVideoEncoder {
         height: u32,
         qp: u8,
         is_444: bool,
+        output: OutputColor,
     ) -> Option<Self> {
+        let cicp = output.cicp();
+        let depth = if output == OutputColor::Hdr10 {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_10
+        } else {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_8
+        };
+
         // The source size is used as the coded extent directly, like the
         // H.264 path: the driver pads to whole superblocks internally, and
         // its frame headers then declare the true size — AV1 has no
@@ -1335,8 +1367,8 @@ impl VulkanVideoEncoder {
                 VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
             ))
             .chroma_subsampling(av1_chroma_subsampling(is_444))
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+            .luma_bit_depth(depth)
+            .chroma_bit_depth(depth);
         unsafe { push_next_raw(&mut profile, &mut av1_profile_info as *mut _) };
         let profile = profile;
 
@@ -1425,9 +1457,9 @@ impl VulkanVideoEncoder {
         let mut session_create = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(video_queue_family)
             .video_profile(&profile)
-            .picture_format(av1_picture_format(is_444))
+            .picture_format(av1_picture_format_color(is_444, output))
             .max_coded_extent(coded_extent)
-            .reference_picture_format(av1_picture_format(is_444))
+            .reference_picture_format(av1_picture_format_color(is_444, output))
             .max_dpb_slots(2)
             .max_active_reference_pictures(1)
             .std_header_version(&std_header_version);
@@ -1468,7 +1500,7 @@ impl VulkanVideoEncoder {
             // a matrix (commonly BT.709 for HD), even though yas's shaders
             // produced limited-range BT.601 YUV.
             flags: 1 << 3, // description_present; color_range stays studio swing
-            bit_depth: 8,
+            bit_depth: if output == OutputColor::Hdr10 { 10 } else { 8 },
             // 0/0 is 4:4:4, 1/1 is 4:2:0.  These are not free choices: the
             // profile above fixes them (High implies 0/0, Main implies
             // 1/1), and the serialized sequence header leaves them out
@@ -1476,9 +1508,9 @@ impl VulkanVideoEncoder {
             subsampling_x: (!is_444) as u8,
             subsampling_y: (!is_444) as u8,
             _reserved1: 0,
-            color_primaries: AV1_COLOR_PRIMARIES_BT709,
-            transfer_characteristics: AV1_TRANSFER_CHARACTERISTICS_SRGB,
-            matrix_coefficients: AV1_MATRIX_COEFFICIENTS_SMPTE170M,
+            color_primaries: cicp[0] as u32,
+            transfer_characteristics: cicp[1] as u32,
+            matrix_coefficients: cicp[2] as u32,
             chroma_sample_position: 0, // Unknown
         };
 
@@ -1557,14 +1589,15 @@ impl VulkanVideoEncoder {
                 coded_h,
                 video_queue_family,
                 &profile,
-                av1_picture_format(is_444),
+                av1_picture_format_color(is_444, output),
             )
         }?;
 
         // ---------------------------------------------------------------
         // 7. Bitstream buffer
         // ---------------------------------------------------------------
-        let bitstream_capacity = bitstream_capacity_for(coded_w, coded_h, is_444);
+        let bitstream_capacity = bitstream_capacity_for(coded_w, coded_h, is_444)
+            * if output == OutputColor::Hdr10 { 2 } else { 1 };
         let (bitstream_buffer, bitstream_memory, bitstream_ptr) = unsafe {
             allocate_bitstream_buffer(
                 device,
@@ -1591,8 +1624,8 @@ impl VulkanVideoEncoder {
                 VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
             ))
             .chroma_subsampling(av1_chroma_subsampling(is_444))
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+            .luma_bit_depth(depth)
+            .chroma_bit_depth(depth);
         unsafe {
             push_next_raw(
                 &mut video_profile_for_query,
@@ -1628,12 +1661,15 @@ impl VulkanVideoEncoder {
             frame_num: 0,
             idr_num: 0,
             force_idr: false,
+            rate_control_initialized: false,
             qp,
             // The driver emits frame OBUs only; the sequence header is ours
             // to serialize (from the same values `seq_header` was built
             // with) and gets prepended to every keyframe, mirroring how
             // H.264 prepends its SPS/PPS.
-            params_bytes: av1_sequence_header_obu(level, w_bits, h_bits, coded_w, coded_h, is_444),
+            params_bytes: av1_sequence_header_obu_color(
+                level, w_bits, h_bits, coded_w, coded_h, is_444, output,
+            ),
             poisoned: false,
         })
     }
@@ -1709,7 +1745,10 @@ impl VulkanVideoEncoder {
         unsafe { push_next_raw(&mut setup_slot, &setup_dpb_info as *const _ as *mut ()) };
 
         let mut begin_ref_slots: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = Vec::new();
-        begin_ref_slots.push(setup_slot);
+        begin_ref_slots.push(vk::VideoReferenceSlotInfoKHR {
+            slot_index: -1,
+            ..setup_slot
+        });
 
         // Reference slot for previous frame (P-frame reference).
         let ref_ref_info;
@@ -1750,7 +1789,14 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // Begin video coding scope
         // ---------------------------------------------------------------
+        let mut begin_rate_control = vk::VideoEncodeRateControlInfoKHR::default()
+            .rate_control_mode(if self.rate_control_initialized {
+                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
+            } else {
+                vk::VideoEncodeRateControlModeFlagsKHR::DEFAULT
+            });
         let begin_coding = vk::VideoBeginCodingInfoKHR::default()
+            .push_next(&mut begin_rate_control)
             .video_session(self.video_session)
             .video_session_parameters(self.session_params)
             .reference_slots(&begin_ref_slots);
@@ -1945,6 +1991,7 @@ impl VulkanVideoEncoder {
         } else {
             self.ref_order_hints[setup_dpb_idx & 7] = order_hint;
         }
+        self.rate_control_initialized = true;
         self.frame_num = self.frame_num.wrapping_add(1);
         self.cur_dpb_idx = 1 - self.cur_dpb_idx;
 
@@ -2183,6 +2230,11 @@ fn h264_parameter_sets(
             w.u(3, vui.video_format as u32);
             w.u(1, vui.flags.video_full_range_flag());
             w.u(1, vui.flags.color_description_present_flag());
+            if vui.flags.color_description_present_flag() != 0 {
+                w.u(8, vui.colour_primaries as u32);
+                w.u(8, vui.transfer_characteristics as u32);
+                w.u(8, vui.matrix_coefficients as u32);
+            }
         }
         w.u(1, vui.flags.chroma_loc_info_present_flag());
         w.u(1, vui.flags.timing_info_present_flag());
@@ -2231,6 +2283,7 @@ fn h264_parameter_sets(
 ///
 /// `seq_level_idx` is the `StdVideoAV1Level` value, which is numerically
 /// the bitstream's `seq_level_idx` (2.0 = 0 … 6.0 = 16).
+#[cfg(test)]
 fn av1_sequence_header_obu(
     seq_level_idx: u32,
     frame_width_bits: u32,
@@ -2239,6 +2292,28 @@ fn av1_sequence_header_obu(
     coded_h: u32,
     is_444: bool,
 ) -> Vec<u8> {
+    av1_sequence_header_obu_color(
+        seq_level_idx,
+        frame_width_bits,
+        frame_height_bits,
+        coded_w,
+        coded_h,
+        is_444,
+        OutputColor::Srgb,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn av1_sequence_header_obu_color(
+    seq_level_idx: u32,
+    frame_width_bits: u32,
+    frame_height_bits: u32,
+    coded_w: u32,
+    coded_h: u32,
+    is_444: bool,
+    output: OutputColor,
+) -> Vec<u8> {
+    let cicp = output.cicp();
     // Big-endian bit packer, AV1 f(n) semantics.
     struct BitWriter {
         bytes: Vec<u8>,
@@ -2304,14 +2379,14 @@ fn av1_sequence_header_obu(
     //    are set, i.e. for 4:2:0 alone.
     // The subsampling flags themselves are never coded here: seq_profile
     // determines them (0 -> 4:2:0, 1 -> 4:4:4).
-    w.put(1, 0); // high_bitdepth
+    w.put(1, (output == OutputColor::Hdr10) as u32); // high_bitdepth
     if !is_444 {
         w.put(1, 0); // mono_chrome
     }
     w.put(1, 1); // color_description_present_flag
-    w.put(8, AV1_COLOR_PRIMARIES_BT709);
-    w.put(8, AV1_TRANSFER_CHARACTERISTICS_SRGB);
-    w.put(8, AV1_MATRIX_COEFFICIENTS_SMPTE170M);
+    w.put(8, cicp[0] as u32);
+    w.put(8, cicp[1] as u32);
+    w.put(8, cicp[2] as u32);
     w.put(1, 0); // color_range: studio swing
     if !is_444 {
         w.put(2, 0); // chroma_sample_position: unknown
@@ -2798,9 +2873,6 @@ struct StdVideoAV1ColorConfig {
 // YAS's BGRA inputs are sRGB (BT.709 primaries and sRGB transfer), while
 // the AV1 Vulkan and NVENC conversion paths use the limited-range BT.601 matrix.
 // Keep these numeric AV1 enum values in sync with the NVENC configuration.
-const AV1_COLOR_PRIMARIES_BT709: u32 = 1;
-const AV1_TRANSFER_CHARACTERISTICS_SRGB: u32 = 13;
-const AV1_MATRIX_COEFFICIENTS_SMPTE170M: u32 = 6;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3071,6 +3143,7 @@ pub(crate) struct VideoEncodeAV1ProfileInfoKHR {
 pub(crate) fn av1_encode_profile(
     leaf: &mut VideoEncodeAV1ProfileInfoKHR,
     is_444: bool,
+    output: OutputColor,
 ) -> vk::VideoProfileInfoKHR<'_> {
     *leaf = VideoEncodeAV1ProfileInfoKHR {
         s_type: vk::StructureType::from_raw(VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR),
@@ -3082,8 +3155,16 @@ pub(crate) fn av1_encode_profile(
             VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
         ))
         .chroma_subsampling(av1_chroma_subsampling(is_444))
-        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+        .luma_bit_depth(if output == OutputColor::Hdr10 {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_10
+        } else {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_8
+        })
+        .chroma_bit_depth(if output == OutputColor::Hdr10 {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_10
+        } else {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_8
+        });
     unsafe { push_next_raw(&mut profile, leaf as *mut VideoEncodeAV1ProfileInfoKHR) };
     profile
 }
@@ -3116,6 +3197,17 @@ pub(crate) fn av1_picture_format(is_444: bool) -> vk::Format {
         vk::Format::G8_B8R8_2PLANE_444_UNORM
     } else {
         vk::Format::G8_B8R8_2PLANE_420_UNORM
+    }
+}
+
+pub(crate) fn av1_picture_format_color(is_444: bool, output: OutputColor) -> vk::Format {
+    if output != OutputColor::Hdr10 {
+        return av1_picture_format(is_444);
+    }
+    if is_444 {
+        vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16
+    } else {
+        vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
     }
 }
 
@@ -3396,8 +3488,20 @@ mod tests {
             }
         }
 
-        for is_444 in [false, true] {
-            let obu = av1_sequence_header_obu(8, 11, 11, 1920, 1080, is_444);
+        for (is_444, output) in [false, true].into_iter().flat_map(|chroma| {
+            [
+                OutputColor::Srgb,
+                OutputColor::DisplayP3,
+                OutputColor::Hdr10,
+            ]
+            .map(|color| (chroma, color))
+        }) {
+            let obu = av1_sequence_header_obu_color(8, 11, 11, 1920, 1080, is_444, output);
+            let cicp = match output {
+                OutputColor::Srgb => [1, 13, 6],
+                OutputColor::DisplayP3 => [12, 13, 1],
+                OutputColor::Hdr10 => [9, 16, 9],
+            };
             let payload = &obu[2..];
             let mut r = Reader {
                 bytes: payload,
@@ -3422,22 +3526,18 @@ mod tests {
             assert_eq!(r.f(1), 1, "enable_cdef");
             assert_eq!(r.f(1), 0, "enable_restoration");
             // color_config()
-            assert_eq!(r.f(1), 0, "high_bitdepth");
+            assert_eq!(
+                r.f(1),
+                (output == OutputColor::Hdr10) as u32,
+                "high_bitdepth"
+            );
             if !is_444 {
                 assert_eq!(r.f(1), 0, "mono_chrome, not coded for High");
             }
             assert_eq!(r.f(1), 1, "color_description_present_flag");
-            assert_eq!(r.f(8), AV1_COLOR_PRIMARIES_BT709, "color_primaries");
-            assert_eq!(
-                r.f(8),
-                AV1_TRANSFER_CHARACTERISTICS_SRGB,
-                "transfer_characteristics"
-            );
-            assert_eq!(
-                r.f(8),
-                AV1_MATRIX_COEFFICIENTS_SMPTE170M,
-                "matrix_coefficients"
-            );
+            assert_eq!(r.f(8), cicp[0], "color_primaries");
+            assert_eq!(r.f(8), cicp[1], "transfer_characteristics");
+            assert_eq!(r.f(8), cicp[2], "matrix_coefficients");
             assert_eq!(r.f(1), 0, "color_range: studio swing");
             if !is_444 {
                 assert_eq!(r.f(2), 0, "chroma_sample_position, 4:2:0 only");
