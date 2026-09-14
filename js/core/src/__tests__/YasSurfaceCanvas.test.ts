@@ -507,7 +507,7 @@ describe("YasSurfaceCanvas layout", () => {
     },
   );
 
-  it("fits an oversized live frame without changing its backing pixels", () => {
+  it("keeps an oversized live frame at its intended scale", () => {
     const { surface, canvas } = attachCanvas({ resizable: true });
     const source = document.createElement("canvas");
     source.width = 1600;
@@ -523,16 +523,16 @@ describe("YasSurfaceCanvas layout", () => {
     internal.ctx = { drawImage } as unknown as CanvasRenderingContext2D;
 
     // The stale source is twice an 800×600-device-pixel pane. At 2x it
-    // remains a 1600×1200 backing canvas but fits the 400×300 CSS pane;
-    // the live path must not halve the backing pixels first.
+    // remains an 800×600 CSS picture clipped by the 400×300 CSS pane;
+    // the live path must not halve the backing pixels or shrink its CSS box.
     surface.setDisplaySize(800, 600, 240);
     internal.presentFromStore({ getCanvas: () => source });
 
     expect(internal._presentHalvings).toBe(0);
     expect(canvas.width).toBe(1600);
     expect(canvas.height).toBe(1200);
-    expect(canvas.style.width).toBe("400px");
-    expect(canvas.style.height).toBe("300px");
+    expect(canvas.style.width).toBe("800px");
+    expect(canvas.style.height).toBe("600px");
     expect(canvas.style.left).toBe("0px");
     expect(canvas.style.top).toBe("0px");
     expect(drawImage).toHaveBeenCalledWith(
@@ -645,16 +645,16 @@ describe("YasSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  it("fits an oversized mismatched frame uniformly at the top-left", () => {
+  it("anchors an oversized mismatched frame at the top-left without shrinking", () => {
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 2000, height: 480, lw: 640, lh: 480 });
     canvas.width = 2000;
     canvas.height = 480;
     surface.setDisplaySize(1280, 960, 240);
-    // The 2000×480 frame fits inside the 640×480 CSS pane at 2x.
+    // The 2000×480 frame overflows the 640×480 CSS pane at 2x.
     // Its aspect remains 2000/480, independent of the latest catalogue.
-    expect(canvas.style.width).toBe("640px");
-    expect(canvas.style.height).toBe("153.6px");
+    expect(canvas.style.width).toBe("1000px");
+    expect(canvas.style.height).toBe("240px");
     expect(canvas.style.left).toBe("0px");
     expect(canvas.style.top).toBe("0px");
     expect(canvas.style.objectPosition).toBe("left top");
@@ -675,6 +675,7 @@ describe("YasSurfaceCanvas layout", () => {
       // The application refuses to go below 500×700 logical pixels. Neither
       // phone orientation can show it at natural scale, unlike the desktop.
       setSurfaceInfo(surface, { width: 1500, height: 2100, lw: 500, lh: 700 });
+      internal.surface.minimumSize = { width: 500, height: 700 };
       surface.setDisplaySize(
         paneWidth * dpr,
         paneHeight * dpr,
@@ -751,6 +752,41 @@ describe("YasSurfaceCanvas layout", () => {
     },
   );
 
+  it("uses only the committed minimum to zoom out a stale oversized frame", () => {
+    const { surface, canvas } = attachCanvas({ resizable: true });
+    const source = document.createElement("canvas");
+    source.width = 1000;
+    source.height = 800;
+    const internal = surface as any;
+    internal.ctx = { drawImage: vi.fn() };
+    setSurfaceInfo(surface, { width: 1000, height: 800, lw: 1000, lh: 800 });
+    internal.surface.minimumSize = { width: 500, height: 0 };
+    surface.setDisplaySize(360, 780, 120);
+    internal.presentFromStore({
+      getCanvas: () => source,
+      getCanvasPresentationSize: () => ({
+        width: 360,
+        height: 288,
+        logicalWidth: 1000,
+        logicalHeight: 800,
+      }),
+    });
+
+    // The minimum requires 72% zoom. The old 1000px-wide frame must not
+    // force another zoom-out to 36% just to fit the newly split pane.
+    expect(canvas.style.width).toBe("720px");
+    expect(canvas.style.height).toBe("576px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
+
+    // Releasing the minimum restores intended scale even before new pixels.
+    internal.surface.minimumSize = null;
+    internal.applyLayout();
+    expect(canvas.style.width).toBe("1000px");
+    expect(canvas.style.height).toBe("800px");
+    surface.dispose();
+  });
+
   it.each([
     { scale: 120, cssScale: 120, cssWidth: 400, cssHeight: 300 },
     { scale: 360, cssScale: 360, cssWidth: 400, cssHeight: 300 },
@@ -807,17 +843,12 @@ describe("YasSurfaceCanvas layout", () => {
           y: 0.5,
         });
       }
-      // A new catalogue cannot reinterpret this old frame. Shrinking the pane
-      // only applies a uniform fit to its original logical rectangle.
+      // A new catalogue or smaller pane cannot reinterpret this old frame.
+      // Keep its original logical rectangle at the viewer's intended scale.
       setSurfaceInfo(surface, { width: 1200, height: 900, lw: 1200, lh: 900 });
       surface.setDisplaySize(800, 600, scale, cssScale);
-      const fit = Math.min(
-        1,
-        800 / ((cssWidth * cssScale) / 120),
-        600 / ((cssHeight * cssScale) / 120),
-      );
-      expect(parseFloat(canvas.style.width)).toBeCloseTo(cssWidth * fit);
-      expect(parseFloat(canvas.style.height)).toBeCloseTo(cssHeight * fit);
+      expect(parseFloat(canvas.style.width)).toBeCloseTo(cssWidth);
+      expect(parseFloat(canvas.style.height)).toBeCloseTo(cssHeight);
       surface.setDisplaySize(null);
       expect(canvas.style.objectFit).toBe("contain");
       surface.dispose();
@@ -965,7 +996,7 @@ describe("YasSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  it("fits the old frame while an unzoomed pane shrinks", () => {
+  it("keeps the old frame at 1:1 while an unzoomed pane shrinks", () => {
     const { surface, canvas, acknowledgements, update } = attachResizableCanvas(
       { width: 1200, height: 900 },
     );
@@ -978,13 +1009,16 @@ describe("YasSurfaceCanvas layout", () => {
     surface.requestResize(400, 300, 120);
     const shrink = acknowledgements.find(({ width }) => width === 400)!;
 
-    // Contain the complete old frame while RESIZE is in flight, without
-    // replacing its backing pixels or adopting the new catalogue geometry.
-    expect(canvas.style.width).toBe("400px");
-    expect(canvas.style.height).toBe("300px");
+    // Clip the old frame while RESIZE is in flight, without changing its
+    // scale, replacing its backing pixels or adopting new catalogue geometry.
+    expect(canvas.style.width).toBe("1200px");
+    expect(canvas.style.height).toBe("900px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
     update({ width: 400, height: 300 });
     shrink.applied();
-    expect(canvas.style.width).toBe("400px");
+    expect(canvas.style.width).toBe("1200px");
+    expect(canvas.style.height).toBe("900px");
     expect(canvas.width).toBe(1200);
 
     // Only an actual replacement frame changes the backing pixels.
@@ -998,7 +1032,7 @@ describe("YasSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  it("fits the old frame while a zoomed HiDPI pane shrinks", () => {
+  it("keeps the old frame's scale while a zoomed HiDPI pane shrinks", () => {
     const { surface, canvas, acknowledgements, update } = attachResizableCanvas(
       { width: 1280, height: 960, lw: 512, lh: 384 },
     );
@@ -1011,12 +1045,14 @@ describe("YasSurfaceCanvas layout", () => {
     surface.requestResize(640, 480, 300);
     const shrink = acknowledgements.find(({ width }) => width === 640)!;
 
-    // The old 640×480 CSS picture fits the new 320×240 CSS pane.
+    // The old 640×480 CSS picture overflows the new 320×240 CSS pane.
     // Surface zoom (300/120) must not conflate CSS DPI with application scale.
-    expect(canvas.style.width).toBe("320px");
-    expect(canvas.style.height).toBe("240px");
+    expect(canvas.style.width).toBe("640px");
+    expect(canvas.style.height).toBe("480px");
     update({ width: 640, height: 480, lw: 256, lh: 192 });
     shrink.applied();
+    expect(canvas.style.width).toBe("640px");
+    expect(canvas.style.height).toBe("480px");
     canvas.width = 640;
     canvas.height = 480;
     (surface as unknown as { applyLayout(): void }).applyLayout();

@@ -891,6 +891,7 @@ export class SurfaceStore {
       height: number;
       logicalWidth: number;
       logicalHeight: number;
+      minimumSize?: YasSurface["minimumSize"];
     }
   >();
   /**
@@ -1596,6 +1597,7 @@ export class SurfaceStore {
         pending.height,
         pending.logicalWidth,
         pending.logicalHeight,
+        pending.minimumSize,
       );
     }
     // Don't create a canvas yet — canvases are per-subscription now,
@@ -2236,6 +2238,7 @@ export class SurfaceStore {
     height: number,
     logicalWidth = 0,
     logicalHeight = 0,
+    minimumSize?: YasSurface["minimumSize"],
   ): void {
     const surface = this.surfaces.get(surfaceId);
     if (!surface) {
@@ -2248,6 +2251,7 @@ export class SurfaceStore {
           height,
           logicalWidth,
           logicalHeight,
+          minimumSize,
         });
       }
       return;
@@ -2261,16 +2265,22 @@ export class SurfaceStore {
       logicalHeight > 0 &&
       (surface.logicalWidth !== logicalWidth ||
         surface.logicalHeight !== logicalHeight);
+    const minimumChanged =
+      minimumSize !== undefined &&
+      ((surface.minimumSize?.width ?? 0) !== (minimumSize?.width ?? 0) ||
+        (surface.minimumSize?.height ?? 0) !== (minimumSize?.height ?? 0));
     if (
       surface.width !== width ||
       surface.height !== height ||
-      logicalChanged
+      logicalChanged ||
+      minimumChanged
     ) {
       // Only emit a change for significant resizes (> 1px) to avoid
       // triggering a layout re-render → ResizeObserver → resize feedback loop
       // from sub-pixel rounding in the compositor's physical↔logical
       // conversion.  The initial 0x0 → real size always emits.
       const significant =
+        minimumChanged ||
         surface.width === 0 ||
         surface.height === 0 ||
         Math.abs(surface.width - width) > 1 ||
@@ -2295,6 +2305,8 @@ export class SurfaceStore {
         ...surface,
         width,
         height,
+        minimumSize:
+          minimumSize === undefined ? surface.minimumSize : minimumSize,
         // An omitted or invalid logical size leaves the last known value in
         // place rather than clobbering it with a bogus 0.
         logicalWidth:

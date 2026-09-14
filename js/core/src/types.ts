@@ -407,4 +407,6 @@ export type YasSurface = {
    */
   logicalWidth: number;
   logicalHeight: number;
+  /** Committed application minimum in logical pixels; absent means no hint. */
+  minimumSize?: { width: number; height: number } | null;
 };

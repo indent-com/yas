@@ -1403,8 +1403,8 @@ export class YasSurfaceCanvas {
    * size and a server-side resize is requested.  The canvas backing buffer
    * always mirrors the decoded frame. applyLayout() normally maps those pixels
    * 1:1, but a deliberately lower-resolution adaptive stream is scaled to the
-   * view extent carried alongside it. Oversized windows (including stale
-   * frames during resize) are uniformly reduced to fit the pane.
+   * view extent carried alongside it. Stale frames retain their scale during
+   * resize; only committed application minima can force a uniform zoom-out.
    */
   private _displaySize: {
     width: number;
@@ -2183,7 +2183,7 @@ export class YasSurfaceCanvas {
     if (!wasSized) this.refreshScaledTarget();
     // Canvas backing buffer is intentionally NOT resized here. It tracks the
     // decoded frame size (set in presentFromStore). A stale frame retains its
-    // geometry; only its CSS footprint is fitted while a replacement is in flight.
+    // geometry and scale while a replacement is in flight.
     this.applyLayout();
     this.restoreRemoteFocus();
   }
@@ -2192,8 +2192,8 @@ export class YasSurfaceCanvas {
    * Size and position the canvas's CSS box for the current frame.
    *
    * A live frame is anchored at the top-left at this viewer's scale, including
-   * adaptive streams. If the app's minimum size or a stale frame exceeds the
-   * pane, shrink both axes by the same factor so the entire window fits.
+   * adaptive streams. Only the app's committed minimum can force zoom-out;
+   * stale frames overflow the pane until the resized pixels arrive.
    *
    * Non-resizable views (thumbnails, the React binding) keep the
    * fill-and-contain CSS from attach() and let the box drive the size.  They
@@ -2277,12 +2277,19 @@ export class YasSurfaceCanvas {
       w = fw;
       h = fh;
     }
-    // The shared window fits every viewer where app size hints permit it.
-    // When a minimum prevents that (or a resize is still in flight), contain
-    // the complete frame instead of clipping it. Never enlarge smaller
-    // windows, and never fit the axes independently: that distorts the UI.
+    // Match the zoom-out used by size mediation for committed app minima.
+    // Never derive this from the frame extent: splitting a pane must clip the
+    // old picture at its intended scale while the server's resize is in flight.
+    // A large stale frame can still overflow after this minimum-based zoom.
     if (ds) {
-      const fit = Math.min(1, ds.width / w, ds.height / h);
+      const minimum = this.surface?.minimumSize;
+      const fit =
+        1 /
+        Math.max(
+          1,
+          ((minimum?.width ?? 0) * surfaceScale) / ds.width,
+          ((minimum?.height ?? 0) * surfaceScale) / ds.height,
+        );
       w *= fit;
       h *= fit;
     }

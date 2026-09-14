@@ -2679,6 +2679,14 @@ describe("YasNativeWorkspaceConnection", () => {
     // Minima can arrive without any change to the currently rendered size.
     lifecycle.applySurfaceCatalog([constrained]);
     await vi.waitFor(() => expect(lifecycle.pendingSurfaceViews.size).toBe(0));
+    expect(internal.surfaceStore.handleSurfaceResized).toHaveBeenLastCalledWith(
+      1n,
+      1200,
+      2400,
+      400,
+      800,
+      { width: 500, height: 0 },
+    );
     expect(internal.surface.resize).toHaveBeenLastCalledWith(
       1n,
       expect.any(Uint8Array),
@@ -2701,6 +2709,14 @@ describe("YasNativeWorkspaceConnection", () => {
     expect(internal.surface.resize).not.toHaveBeenCalled();
     lifecycle.applySurfaceCatalog([{ ...record, revision: 4n }]);
     await vi.waitFor(() => expect(lifecycle.pendingSurfaceViews.size).toBe(0));
+    expect(internal.surfaceStore.handleSurfaceResized).toHaveBeenLastCalledWith(
+      1n,
+      1200,
+      2400,
+      400,
+      800,
+      null,
+    );
     expect(internal.surface.resize).toHaveBeenLastCalledWith(
       1n,
       expect.any(Uint8Array),
@@ -2966,7 +2982,14 @@ describe("YasNativeWorkspaceConnection", () => {
       "title",
       "app",
     );
-    expect(handleSurfaceResized).toHaveBeenCalledWith(1n, 1598, 1198, 800, 600);
+    expect(handleSurfaceResized).toHaveBeenCalledWith(
+      1n,
+      1598,
+      1198,
+      800,
+      600,
+      null,
+    );
 
     handleSurfaceResized.mockClear();
     lifecycle.applySurfaceCatalog([
@@ -2978,7 +3001,14 @@ describe("YasNativeWorkspaceConnection", () => {
       },
     ]);
     expect(handleSurfaceParent).toHaveBeenCalledWith(1n, 7n);
-    expect(handleSurfaceResized).toHaveBeenCalledWith(1n, 800, 600, 800, 600);
+    expect(handleSurfaceResized).toHaveBeenCalledWith(
+      1n,
+      800,
+      600,
+      800,
+      600,
+      null,
+    );
   });
 
   it("opens a desired Surface view at composite size before its pane is measured", async () => {
@@ -3142,6 +3172,7 @@ describe("YasNativeWorkspaceConnection", () => {
       3200,
       500,
       400,
+      null,
     );
     expect(view.configure).not.toHaveBeenCalled();
     expect(lifecycle.surfaceViews.get(1n)).toMatchObject({
@@ -3157,6 +3188,7 @@ describe("YasNativeWorkspaceConnection", () => {
       1000,
       150,
       125,
+      null,
     );
     expect(view.configure).not.toHaveBeenCalled();
     expect(resize).not.toHaveBeenCalled();

@@ -2753,6 +2753,7 @@ export class YasNativeWorkspaceConnection {
       // pixels currently visible in the canvas.
       const width = record.compositeWidth;
       const height = record.compositeHeight;
+      const minimum = surfaceMinimumSize(record);
       if (!previous) {
         this.surfaceStore.handleSurfaceCreated(
           record.surfaceHandle,
@@ -2773,6 +2774,7 @@ export class YasNativeWorkspaceConnection {
           height,
           logicalWidth,
           logicalHeight,
+          minimum ?? null,
         );
         // A canvas can mount from restored layout state before the Surface
         // catalogue's initial snapshot arrives. sendSurfaceSubscribe keeps
@@ -2798,7 +2800,6 @@ export class YasNativeWorkspaceConnection {
             record.surfaceHandle,
             record.applicationId,
           );
-        const minimum = surfaceMinimumSize(record);
         const oldMinimum = surfaceMinimumSize(previous);
         const minimumChanged =
           (minimum?.width ?? 0) !== (oldMinimum?.width ?? 0) ||
@@ -2808,13 +2809,14 @@ export class YasNativeWorkspaceConnection {
           previous.logicalHeight32_32 !== record.logicalHeight32_32 ||
           previous.compositeWidth !== record.compositeWidth ||
           previous.compositeHeight !== record.compositeHeight;
-        if (geometryChanged) {
+        if (geometryChanged || minimumChanged) {
           this.surfaceStore.handleSurfaceResized(
             record.surfaceHandle,
             width,
             height,
             logicalWidth,
             logicalHeight,
+            minimum ?? null,
           );
         }
         if (geometryChanged || minimumChanged) {

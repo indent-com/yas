@@ -998,6 +998,40 @@ describe("SurfaceStore surface dimensions", () => {
     store.destroy();
   });
 
+  it("publishes minimum changes independently of rendered geometry", () => {
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1n, 0n, 800, 600, "t", "a");
+    store.handleSurfaceResized(1n, 800, 600, 800, 600);
+    const before = store.getSurface(1n);
+    const changed = vi.fn();
+    store.onChange(changed);
+
+    store.handleSurfaceResized(1n, 800, 600, 800, 600, {
+      width: 500,
+      height: 0,
+    });
+    expect(store.getSurface(1n)).not.toBe(before);
+    expect(store.getSurface(1n)).toMatchObject({
+      width: 800,
+      height: 600,
+      minimumSize: { width: 500, height: 0 },
+    });
+    expect(changed).toHaveBeenCalledTimes(1);
+
+    // Repeated geometry without hints preserves the committed minimum.
+    store.handleSurfaceResized(1n, 800, 600, 800, 600);
+    expect(store.getSurface(1n)?.minimumSize).toEqual({
+      width: 500,
+      height: 0,
+    });
+    expect(changed).toHaveBeenCalledTimes(1);
+
+    store.handleSurfaceResized(1n, 800, 600, 800, 600, null);
+    expect(store.getSurface(1n)?.minimumSize).toBeNull();
+    expect(changed).toHaveBeenCalledTimes(2);
+    store.destroy();
+  });
+
   it("replaces the surface object when resize changes input geometry", () => {
     const store = new SurfaceStore();
     store.handleSurfaceCreated(1, 0, 800, 600, "t", "a");

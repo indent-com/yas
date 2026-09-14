@@ -175,8 +175,10 @@ frame within two device pixels of its intended size on both axes. This avoids
 an extra browser resize on lower-DPI viewers sharing a HiDPI surface; a small
 gap at the right or bottom is preferable to filtering the text again.
 Adaptive frames with substantially lower resolution still fill their logical
-window size. When the window exceeds the pane (an application minimum or an
-in-flight resize), it is uniformly scaled down to fit, never cropped or distorted.
+window size, anchored at the top-left. While a resize is in flight, the old
+frame keeps its intended scale and is clipped by the pane until the resized
+frame arrives. Only a committed application minimum forces uniform zoom-out;
+an oversized frame alone never does.
 Smaller windows stay at their intended scale rather than filling unused space.
 Minimum-forced zoom-out also expands the logical size offered to the application:
 if width forces a 360×780 pane to fit a 500px-wide window, it offers approximately
