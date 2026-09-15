@@ -22,6 +22,7 @@ const { workspace, frames, frameListeners } = vi.hoisted(() => {
         logicalHeight: 300,
       }),
       getCanvas: (id: bigint) => frames.get(id) ?? null,
+      getSurfaces: () => new Map(),
       getCursor: () => "default",
       canDecodeVideo: true,
       generation: 0,
@@ -215,4 +216,117 @@ it("never displays another window's pixels after C-b Shift-Up swaps tiled surfac
     presentFrame(9n);
     check();
   }
+});
+
+it("moves through the tiled tree without geometry and leaves floating frames untouched", async () => {
+  const frame = {
+    node: { type: "leaf" as const },
+    weight: 1,
+    rect: { x: 20, y: 10, width: 40, height: 50 },
+  };
+  const [layout, setLayout] = createSignal<WorkspaceLayout>({
+    name: "Mixed movement",
+    root: {
+      type: "split",
+      direction: "workspace",
+      children: [
+        frame,
+        {
+          weight: 1,
+          node: {
+            type: "split",
+            direction: "horizontal",
+            children: [
+              { node: { type: "leaf" }, weight: 1 },
+              {
+                node: {
+                  type: "split",
+                  direction: "vertical",
+                  children: [
+                    { node: { type: "leaf" }, weight: 1 },
+                    { node: { type: "leaf" }, weight: 1 },
+                  ],
+                },
+                weight: 1,
+              },
+            ],
+          },
+        },
+      ],
+    },
+  });
+  let assignments: LayoutAssignments | undefined;
+  let refs: Readonly<Record<string, string>> = {};
+  let focus: string | null = null;
+  let focusPane: (id: string) => void;
+  dispose = render(
+    () => (
+      <YasWorkspaceProvider workspace={workspace as unknown as YasWorkspace}>
+        <LayoutContainer
+          layout={layout()}
+          onLayoutChange={(next) => next && setLayout(next)}
+          connectionId="dev"
+          palette={PALETTES[0]}
+          fontFamily="monospace"
+          fontSize={14}
+          focusedSessionId={null}
+          lruSessionIds={[]}
+          liveSurfaceKeys={["dev:7", "dev:9", "dev:11", "dev:13"]}
+          storedAssignments={{
+            "0": surfaceWorkspaceRef("dev", 7n),
+            "1.0": surfaceWorkspaceRef("dev", 9n),
+            "1.1.0": surfaceWorkspaceRef("dev", 11n),
+            "1.1.1": surfaceWorkspaceRef("dev", 13n),
+          }}
+          storedFocusedPaneId="1.1.1"
+          onAssignmentsChange={(value) => {
+            assignments = value;
+          }}
+          onUnresolvedAssignmentsChange={(value) => {
+            refs = value;
+          }}
+          onFocusedPaneChange={(value) => {
+            focus = value;
+          }}
+          onFocusPane={(fn) => {
+            focusPane = fn;
+          }}
+          onFocusSession={() => {}}
+        />
+      </YasWorkspaceProvider>
+    ),
+    document.body,
+  );
+  await Promise.resolve();
+  const moveLeft = () => {
+    handlePrefixKey(new KeyboardEvent("keydown", { key: "b", ctrlKey: true }));
+    handlePrefixKey(
+      new KeyboardEvent("keydown", { key: "ArrowLeft", shiftKey: true }),
+    );
+  };
+  moveLeft();
+  expect(assignments!.assignments).toEqual({
+    "0": "surface:dev:7",
+    "1.0": "surface:dev:9",
+    "1.1": "surface:dev:13",
+    "1.2": "surface:dev:11",
+  });
+  expect(refs).toEqual(assignments!.assignments);
+  expect(focus).toBe("1.1");
+  const root = layout().root;
+  if (root.type !== "split") throw new Error("Missing mixed workspace");
+  expect(root.direction).toBe("workspace");
+  expect(root.children[0]).toBe(frame);
+  moveLeft();
+  expect(focus).toBe("1.0");
+  expect(assignments!.assignments[focus!]).toBe("surface:dev:13");
+  expect(refs).toEqual(assignments!.assignments);
+  const edge = layout();
+  moveLeft();
+  expect(layout()).toBe(edge);
+  // A floating move with no usable viewport is a no-op, never a tiled edit.
+  focusPane!("0");
+  moveLeft();
+  expect(layout()).toBe(edge);
+  expect(assignments!.assignments[focus!]).toBe("surface:dev:7");
 });

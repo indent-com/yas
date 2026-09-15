@@ -135,6 +135,7 @@ import {
 import { balanceLayout, resizePaneInDirection } from "./directionalResize";
 import { moveViewIntoStack, type ViewMovement } from "./viewMovement";
 import {
+  movePaneBeside,
   movePaneInDirection,
   nextTiledLayout,
   paneParentLayout,
@@ -1827,6 +1828,10 @@ export function LayoutContainer(props: {
     batch(() => {
       pendingRefs = nextPending;
       touchPendingRefs();
+      recentPaneIds = recentPaneIds.flatMap((paneId) => {
+        const mapped = movement.paneIdMap.get(paneId);
+        return mapped ? [mapped] : [];
+      });
       setLayoutState((previous) => ({
         ...previous,
         assignments: movement.assignments,
@@ -1978,13 +1983,14 @@ export function LayoutContainer(props: {
   function moveViewInDirection(direction: SpatialDirection) {
     const sourcePaneId = focusedPaneId();
     if (!sourcePaneId) return;
-    if (moveFloatingInDirection(sourcePaneId, direction)) return;
-    const targetPaneId = directionalNeighbor(direction);
+    if (paneIsFloating(root(), sourcePaneId)) {
+      moveFloatingInDirection(sourcePaneId, direction);
+      return;
+    }
     const movement = movePaneInDirection(
       root(),
       layoutState().assignments,
       sourcePaneId,
-      targetPaneId,
       direction,
     );
     if (movement) applyLayoutMutation(movement);
@@ -1998,14 +2004,12 @@ export function LayoutContainer(props: {
   ) {
     const assignments = layoutState().assignments;
     const recoveredSource =
-      sourcePaneId ??
-      paneIds().find(
-        (paneId) =>
-          paneId !== targetPaneId && assignments[paneId] === assignment,
-      );
+      sourcePaneId && assignments[sourcePaneId] === assignment
+        ? sourcePaneId
+        : paneIds().find((paneId) => assignments[paneId] === assignment);
     const mutation =
       recoveredSource && assignments[recoveredSource] === assignment
-        ? movePaneInDirection(
+        ? movePaneBeside(
             root(),
             assignments,
             recoveredSource,

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LayoutNode, LayoutSplit } from "@yas-run/core/layout";
-import { enumeratePanes } from "@yas-run/core/layout";
-import { moveViewIntoStack, moveViewToEdge } from "../layout/viewMovement";
+import { moveViewIntoStack } from "../layout/viewMovement";
 
 const leaf = (): LayoutNode => ({ type: "leaf" });
 
@@ -50,28 +49,5 @@ describe("view movement", () => {
       "move",
     ]);
     expect(moved?.assignments[moved.focusedPaneId]).toBe("move");
-  });
-
-  it("creates a populated stack at an empty edge", () => {
-    const root: LayoutSplit = {
-      type: "split",
-      direction: "horizontal",
-      children: [
-        { node: leaf(), weight: 1 },
-        { node: leaf(), weight: 1 },
-      ],
-    };
-    const moved = moveViewToEdge(root, { "0": "a", "1": "b" }, "1", "left");
-    expect(moved?.root).toMatchObject({
-      type: "split",
-      direction: "horizontal",
-    });
-    expect(moved?.assignments).toEqual({ "0": "b", "1": "a" });
-    expect(moved?.focusedPaneId).toBe("0");
-    expect(enumeratePanes(moved!.root)).toHaveLength(2);
-  });
-
-  it("does not manufacture an edge stack for the only view", () => {
-    expect(moveViewToEdge(leaf(), { "0": "a" }, "0", "right")).toBeNull();
   });
 });

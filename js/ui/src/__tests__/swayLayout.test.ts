@@ -2,6 +2,7 @@ import type { LayoutNode, WorkspaceLayout } from "@yas-run/core/layout";
 import { describe, expect, it } from "vitest";
 import {
   movePaneInDirection,
+  movePaneBeside,
   setPaneLayout,
   splitPaneWithAssignment,
   togglePaneSplit,
@@ -225,7 +226,6 @@ describe("sway-like layout engine", () => {
       root,
       { "0": "a", "1": "b", "2": "c" },
       "1",
-      "0",
       "left",
     );
 
@@ -242,7 +242,7 @@ describe("sway-like layout engine", () => {
     expect(result!.focusedPaneId).toBe("0");
   });
 
-  it("moves across nested containers without turning the target into tabs", () => {
+  it("drops beside a nested target while preserving unrelated allocations", () => {
     const root = (
       {
         name: "Test layout",
@@ -266,7 +266,7 @@ describe("sway-like layout engine", () => {
         } as LayoutNode,
       } as WorkspaceLayout
     ).root;
-    const result = movePaneInDirection(
+    const result = movePaneBeside(
       root,
       { "0.0": "a", "0.1": "b", "1": "c" },
       "0.1",
@@ -279,8 +279,8 @@ describe("sway-like layout engine", () => {
       direction: "horizontal",
       children: [
         { node: { type: "leaf" }, weight: 1 },
-        { node: { type: "leaf" }, weight: 1 },
-        { node: { type: "leaf" }, weight: 1 },
+        { node: { type: "leaf" }, weight: 0.5 },
+        { node: { type: "leaf" }, weight: 0.5 },
       ],
     } as LayoutNode);
     expect(result!.assignments).toEqual({ "0": "a", "1": "c", "2": "b" });
@@ -305,7 +305,6 @@ describe("sway-like layout engine", () => {
       root,
       { "0": "a", "1": "b" },
       "1",
-      null,
       "right",
     );
 
@@ -345,7 +344,7 @@ describe("sway-like layout engine", () => {
         } as LayoutNode,
       } as WorkspaceLayout
     ).root;
-    const result = movePaneInDirection(
+    const result = movePaneBeside(
       root,
       { "0.0": "a", "0.1": "b", "1": "c" },
       "0.0",

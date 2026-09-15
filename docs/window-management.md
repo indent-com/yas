@@ -119,18 +119,33 @@ tabbed, and stacking without changing child identity or order.
 
 ### Moving
 
-Directional movement changes the tree:
+Directional movement follows the container tree, independently of browser
+geometry or which neighboring tab is visible:
 
-- adjacent siblings on the requested axis exchange positions;
-- across nested containers, the source is removed and inserted beside the
-  geometric target;
-- at an outer edge, the source becomes a new leading or trailing root child;
-- empty ancestors collapse;
-- the moved resource remains focused.
+- On the parent's axis, exchange the focused leaf with one adjacent sibling.
+  A sibling group moves as a whole, with its children and ratios intact.
+- At a nested boundary or on the perpendicular axis, extract the leaf beside
+  its containing branch in the nearest ancestor with the requested axis.
+  Divide that branch's allocation equally between the extracted leaf and its
+  remaining group; unrelated siblings keep their allocation.
+- If no ancestor has the requested axis, create one split around the tiled
+  root. Once the leaf reaches the root boundary, further moves are no-ops.
+- Left/right reorder tabs; up/down reorder stacked views. The perpendicular
+  directions extract a view into a split.
+- Collapse emptied ancestors and retain the moved resource's focus and
+  durable reference at its new tree path.
+- Keep tiled moves inside the tiled base. Floating windows retain their frames;
+  Shift+Arrow on a floating window moves its frame by 10 CSS pixels.
 
-This is container movement, not assignment swapping and not implicit tab
-grouping. Dropping a card on a container's center is still an explicit pointer
-operation for grouping it as a tab.
+For example, moving B right from a column containing A above B beside C first
+produces `A | B | C`. Another right move produces `A | C | B`; further right
+moves leave the layout and ratios unchanged.
+
+An edge drop places the dragged view on that specific side of its target,
+preserving the other siblings' order. Dropping an already-adjacent view on its
+current side is a no-op. Extracting an active tab to its own content edge puts
+it beside the remaining tab group. A center drop explicitly groups views as
+tabs.
 
 ### Resizing
 

@@ -1,8 +1,7 @@
-import type { LayoutLeaf, LayoutNode, LayoutSplit } from "@yas-run/core/layout";
+import type { LayoutLeaf, LayoutNode } from "@yas-run/core/layout";
 import { enumeratePanes } from "@yas-run/core/layout";
 import { removePaneFromLayout } from "./paneRemoval";
 import { insertTabAtPane } from "./tabGrouping";
-import type { SpatialDirection } from "./spatialNavigation";
 
 export interface ViewMovement {
   root: LayoutNode;
@@ -79,41 +78,6 @@ export function moveViewIntoStack(
   if (!movedSourceId) return null;
   const nextRoot = removePaneFromLayout(inserted.root, movedSourceId);
   if (!nextRoot) return null;
-  return finishMovement(
-    root,
-    nextRoot,
-    assignments,
-    sourceLeaf,
-    destinationLeaf,
-  );
-}
-
-/** Move one active view to a newly-created stack at the workspace edge. */
-export function moveViewToEdge(
-  root: LayoutNode,
-  assignments: Readonly<Record<string, string | null>>,
-  sourcePaneId: string,
-  direction: SpatialDirection,
-): ViewMovement | null {
-  const sourceLeaf = enumeratePanes(root).find(
-    ({ id }) => id === sourcePaneId,
-  )?.leaf;
-  if (!sourceLeaf || !assignments[sourcePaneId]) return null;
-  const remaining = removePaneFromLayout(root, sourcePaneId);
-  // Moving the only view would manufacture a second structural object without
-  // changing what the user can see, so keep the single stack intact.
-  if (!remaining) return null;
-
-  const destinationLeaf: LayoutLeaf = { type: "leaf" };
-  const destination = { node: destinationLeaf, weight: 1 };
-  const rest = { node: remaining, weight: 1 };
-  const leading = direction === "left" || direction === "up";
-  const nextRoot: LayoutSplit = {
-    type: "split",
-    direction:
-      direction === "left" || direction === "right" ? "horizontal" : "vertical",
-    children: leading ? [destination, rest] : [rest, destination],
-  };
   return finishMovement(
     root,
     nextRoot,
