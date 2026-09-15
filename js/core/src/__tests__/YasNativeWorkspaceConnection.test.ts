@@ -199,6 +199,85 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
 }
 
 describe("YasNativeWorkspaceConnection", () => {
+  it.each(["terminal", "surface"])(
+    "retains %s presentation during catalogue invalidation and rewatch",
+    async (family) => {
+      const snapshot = deferred<void>();
+      let publish!: (state: {
+        revision: bigint;
+        terminals: [];
+        surfaces: [];
+      }) => void;
+      const catalogue = {
+        subscribe: vi.fn((listener: typeof publish) => {
+          publish = listener;
+          listener({ revision: 0n, terminals: [], surfaces: [] });
+          return vi.fn();
+        }),
+        firstSnapshot: () => snapshot.promise,
+        unwatch: vi.fn().mockResolvedValue(undefined),
+      };
+      const terminal = { state: "running" };
+      const sessions = new Map([["home:terminal:1", terminal]]);
+      const records = new Map([[1n, { handle: 1n }]]);
+      const surfaceRecords = new Map([[1n, { surfaceHandle: 1n }]]);
+      const freeTerminal = vi.fn();
+      const handleSurfaceDestroyed = vi.fn();
+      const connection = Object.assign(
+        Object.create(YasNativeWorkspaceConnection.prototype),
+        {
+          id: "home",
+          disposed: false,
+          familyInitializationEpoch: 1,
+          session: { ready: true },
+          supportsTerminalCatalogue: () => family === "terminal",
+          supportsSurfaceCatalogue: () => family === "surface",
+          terminalClient: family === "terminal" ? { catalog: catalogue } : null,
+          surface:
+            family === "surface"
+              ? { catalog: catalogue, onRemoteInput: () => vi.fn() }
+              : null,
+          records,
+          sessions,
+          surfaceRecords,
+          focusedSessionId: "home:terminal:1",
+          focusedSurfaceId: 1n,
+          store: { freeTerminal },
+          surfaceStore: { handleSurfaceDestroyed },
+          closeView: vi.fn(),
+          closeSurfaceView: vi.fn(),
+          cancelNativeSurfaceViewRetry: vi.fn(),
+          noteSurfaceCatalogRevision: vi.fn(),
+          refreshSnapshot: vi.fn(),
+          emit: vi.fn(),
+        },
+      );
+      const initializing = connection.initializeFamilies(1, false);
+      for (let i = 0; i < 2; i++) {
+        publish({ revision: 0n, terminals: [], surfaces: [] });
+        expect(sessions.get("home:terminal:1")).toBe(terminal);
+        expect(records.has(1n)).toBe(true);
+        expect(surfaceRecords.has(1n)).toBe(true);
+        expect(freeTerminal).not.toHaveBeenCalled();
+        expect(handleSurfaceDestroyed).not.toHaveBeenCalled();
+        expect(connection.focusedSessionId).toBe("home:terminal:1");
+        expect(connection.focusedSurfaceId).toBe(1n);
+      }
+      // A complete empty snapshot really does remove the old resources.
+      publish({ revision: 1n, terminals: [], surfaces: [] });
+      if (family === "terminal") {
+        expect(sessions.get("home:terminal:1")?.state).toBe("closed");
+        expect(freeTerminal).toHaveBeenCalledWith(1n);
+      } else {
+        expect(surfaceRecords.has(1n)).toBe(false);
+        expect(handleSurfaceDestroyed).toHaveBeenCalledWith(1n);
+      }
+      connection.disposed = true;
+      snapshot.resolve();
+      await initializing;
+    },
+  );
+
   it("releases browser stream resources only when the last mount closes", async () => {
     const view = surfaceTestView(YAS_SURFACE_CODEC_H264_V1);
     const closed = deferred<void>();

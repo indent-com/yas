@@ -52,31 +52,39 @@ export class YasNativeRelayTransport implements YasTransport {
   connect(): void {
     if (this.disposed || this.connecting || this.active) return;
     this.connecting = true;
-    this.setStatus("connecting");
     const generation = ++this.generation;
-    void this.relay.connect(this.route).then(
-      (link) => {
-        if (this.disposed || generation !== this.generation) {
-          link.transport.close();
-          void this.relay.disconnect(link.relayHandle, "stale browser link");
-          return;
-        }
-        this.connecting = false;
-        this.attach(link);
-      },
-      (error) => {
-        if (this.disposed || generation !== this.generation) return;
-        this.connecting = false;
-        this._lastError =
-          error instanceof Error ? error.message : String(error);
-        this.setStatus("error");
-      },
-    );
+    this.setStatus("connecting");
+    void Promise.resolve()
+      .then(() => {
+        if (this.disposed || generation !== this.generation)
+          throw new Error("stale browser link attempt");
+        return this.relay.connect(this.route);
+      })
+      .then(
+        (link) => {
+          if (this.disposed || generation !== this.generation) {
+            link.transport.close();
+            void this.relay
+              .disconnect(link.relayHandle, "stale browser link")
+              .catch(() => undefined);
+            return;
+          }
+          this.connecting = false;
+          this.attach(link);
+        },
+        (error) => {
+          if (this.disposed || generation !== this.generation) return;
+          this.connecting = false;
+          this._lastError =
+            error instanceof Error ? error.message : String(error);
+          this.setStatus("error");
+        },
+      );
   }
 
   reconnect(): void {
     if (this.disposed) return;
-    this.stop("browser reconnect");
+    this.suspend();
     this.connect();
   }
 
@@ -130,8 +138,10 @@ export class YasNativeRelayTransport implements YasTransport {
     const onStatus = (status: ConnectionStatus) => {
       if (this.active !== active) return;
       this._lastError = active.lastError;
-      this.setStatus(status);
       if (status === "closed" || status === "error") this.detach();
+      // The tunnel has ended, but this reconnectable transport still owns the
+      // workspace. Reserve `closed` for disposing this outer transport.
+      this.setStatus(status === "closed" ? "disconnected" : status);
     };
     active.addEventListener("message", onMessage);
     active.addEventListener("statuschange", onStatus);

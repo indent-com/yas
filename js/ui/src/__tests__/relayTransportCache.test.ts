@@ -32,7 +32,7 @@ class TestTransport implements YasTransport {
   >();
 
   connect(): void {}
-  reconnect(): void {}
+  reconnect = vi.fn(() => this.emit("connecting"));
   suspend(): void {}
   send(): void {}
 
@@ -93,6 +93,7 @@ class TestTransport implements YasTransport {
 function connection(transport: TestTransport): YasWorkspaceConnection {
   return {
     transport,
+    reconnect: () => transport.reconnect(),
     close: () => transport.close(),
     dispose: vi.fn(),
   } as unknown as YasWorkspaceConnection;
@@ -108,7 +109,7 @@ describe("RelayConnectionCache", () => {
     const first = new TestTransport();
     cache.set("work", "1:1", connection(first));
 
-    first.emit("error");
+    first.emit("closed");
     await vi.advanceTimersByTimeAsync(499);
     expect(retry).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
@@ -144,13 +145,13 @@ describe("RelayConnectionCache", () => {
     const cache = new RelayConnectionCache(retry, 500, 10_000);
     const first = new TestTransport();
     cache.set("work", "1:1", connection(first));
-    first.emit("error");
+    first.emit("closed");
     await vi.advanceTimersByTimeAsync(500);
 
     const second = new TestTransport();
     cache.set("work", "1:1", connection(second));
     second.emit("connected");
-    second.emit("error");
+    second.emit("closed");
     await vi.advanceTimersByTimeAsync(499);
     expect(retry).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
@@ -162,12 +163,55 @@ describe("RelayConnectionCache", () => {
     for (let i = 0; i < 100; i++) {
       const transport = new TestTransport();
       cache.set(`route-${i}`, "1:1", connection(transport));
-      transport.emit("error");
+      transport.emit("closed");
       await vi.advanceTimersByTimeAsync(1);
     }
     expect(cache.stats()).toEqual({ entries: 0, retryDelays: 100 });
     cache.retain(new Set());
     expect(cache.stats()).toEqual({ entries: 0, retryDelays: 0 });
+  });
+
+  it("keeps the same workspace through disconnects and failed retries", async () => {
+    const replacement = vi.fn();
+    const cache = new RelayConnectionCache(replacement, 500, 10_000);
+    const transport = new TestTransport();
+    const workspace = connection(transport);
+    cache.set("work", "1:1", workspace);
+
+    transport.emit("disconnected");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(transport.reconnect).toHaveBeenCalledTimes(1);
+    expect(cache.get("work")?.connection).toBe(workspace);
+    transport.emit("error");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(transport.reconnect).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(transport.reconnect).toHaveBeenCalledTimes(2);
+    expect(cache.get("work")?.connection).toBe(workspace);
+    expect(workspace.dispose).not.toHaveBeenCalled();
+    expect(transport.close).not.toHaveBeenCalled();
+    expect(replacement).not.toHaveBeenCalled();
+
+    transport.emit("connected");
+    transport.emit("disconnected");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(transport.reconnect).toHaveBeenCalledTimes(3);
+    cache.clear();
+  });
+
+  it("cancels a pending retry when the connection recovers independently", async () => {
+    const replacement = vi.fn();
+    const cache = new RelayConnectionCache(replacement);
+    const transport = new TestTransport();
+    const workspace = connection(transport);
+    cache.set("work", "1:1", workspace);
+    transport.emit("error");
+    transport.emit("connected");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(cache.get("work")?.connection).toBe(workspace);
+    expect(transport.reconnect).not.toHaveBeenCalled();
+    expect(replacement).not.toHaveBeenCalled();
+    cache.clear();
   });
 });
 

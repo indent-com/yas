@@ -52,8 +52,9 @@ const DEFAULT_RECONNECT_MAX_MS = 10_000;
 
 /**
  * Own typed relayed product connections by stable route name. A nested Relay
- * stream and its YAS session share one lifetime; retry replaces both instead
- * of replaying HELLO/catalogue state into a second protocol consumer.
+ * stream can reconnect inside the same product connection, keeping its last
+ * workspace presentation while the next HELLO and catalogues are received.
+ * Only a permanently closed transport needs a replacement protocol consumer.
  */
 export class RelayConnectionCache {
   private readonly entriesByName = new Map<string, RelayConnectionCacheEntry>();
@@ -108,11 +109,24 @@ export class RelayConnectionCache {
     };
     const onStatus = (status: ConnectionStatus) => {
       if (this.entriesByName.get(name) !== entry) return;
+      if (
+        status === "connected" ||
+        status === "connecting" ||
+        status === "authenticating"
+      ) {
+        if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
+        entry.retryTimer = null;
+      }
       if (status === "connected") {
         this.retryDelays.delete(name);
         return;
       }
-      if ((status !== "closed" && status !== "error") || entry.retryTimer) {
+      if (
+        (status !== "closed" &&
+          status !== "error" &&
+          status !== "disconnected") ||
+        entry.retryTimer !== null
+      ) {
         return;
       }
       const delay = this.retryDelays.get(name) ?? this.reconnectMinMs;
@@ -120,8 +134,12 @@ export class RelayConnectionCache {
       entry.retryTimer = setTimeout(() => {
         entry.retryTimer = null;
         if (this.entriesByName.get(name) !== entry) return;
-        this.delete(name, false);
-        this.onRetry();
+        if (connection.transport.status === "closed") {
+          this.delete(name, false);
+          this.onRetry();
+        } else {
+          connection.reconnect();
+        }
       }, delay);
     };
     connection.transport.addEventListener("statuschange", onStatus);

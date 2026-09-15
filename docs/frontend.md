@@ -13,6 +13,14 @@ Workspace layouts are restored from the attached backend session, or local
 storage for embedded workspaces. Development source changes require a manual
 page reload.
 
+Transient disconnects retain the last terminal and surface catalogues, pane
+assignments, and mounted canvases while the status indicator shows recovery.
+Wire subscriptions and decoders are released; complete catalogues after
+reconnect reconcile actual additions and removals. Revision-zero invalidations
+are not empty server snapshots. Relay routes and product connections also stay
+in place during retries, so a home-link interruption does not rebuild every
+remote workspace.
+
 On iOS/iPadOS, Safari and installed apps share a fixed opaque top strip to
 suppress the system scroll-edge blur. It follows the palette, sits above
 workspace overlays, and is at least 11 CSS pixels tall: WebKit samples a 2px

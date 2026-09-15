@@ -2524,9 +2524,13 @@ export class YasNativeWorkspaceConnection {
       const terminal = (this.terminalClient ??= new YasTerminalClient(
         this.session,
       ));
-      this.removeCatalog = terminal.catalog.subscribe((catalog) =>
-        this.applyTerminalCatalog(catalog.terminals),
-      );
+      this.removeCatalog = terminal.catalog.subscribe((catalog) => {
+        // Revision zero invalidates wire state; it does not say the server
+        // deleted its terminals. Keep the last presentation through reconnect
+        // until a complete authoritative snapshot replaces it.
+        if (catalog.revision !== 0n)
+          this.applyTerminalCatalog(catalog.terminals);
+      });
       // Installing WATCH is not hydration. Its Result can arrive before the
       // initial STATE snapshot, and publishing `ready` in that gap lets the UI
       // decide every restored terminal ref is gone and persist the compacted
@@ -2551,9 +2555,10 @@ export class YasNativeWorkspaceConnection {
       // one, so no acknowledgement may compare against the previous epoch.
       this.surfaceCatalogRevision = 0n;
       this.pendingSurfaceResizeApplied = [];
-      this.removeSurfaceCatalog = surface.catalog.subscribe((catalog) =>
-        this.applySurfaceCatalog(catalog.surfaces, catalog.revision),
-      );
+      this.removeSurfaceCatalog = surface.catalog.subscribe((catalog) => {
+        if (catalog.revision !== 0n)
+          this.applySurfaceCatalog(catalog.surfaces, catalog.revision);
+      });
       this.removeSurfaceRemoteInput?.();
       this.removeSurfaceRemoteInput = surface.onRemoteInput((event) => {
         this.surfaceStore.handleRemoteInput(

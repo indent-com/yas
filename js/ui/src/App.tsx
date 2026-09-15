@@ -9,6 +9,7 @@ import {
 } from "solid-js";
 import {
   YAS_WEBSOCKET_SUBPROTOCOL,
+  YAS_FAMILY_RELAY,
   YasConnection,
   YasEdgeWebSocketTransport,
   YasNativeRelayTransport,
@@ -363,11 +364,12 @@ function ConnectedApp(props: {
       try {
         await homeYas.connect();
         if (stopped) return;
-        const relay = new YasRelayClient(homeYas);
+        const relay = relayClient() ?? new YasRelayClient(homeYas);
         setRelayClient(relay);
         stopRouteWatch = relay.routes.subscribe((state) => {
           if (state.revision === 0n) {
-            setRelayRoutes([]);
+            // A reset is not an empty route catalogue. Removing these routes
+            // would dispose every remote workspace before reconnect completes.
             if (hasRouteSnapshot) scheduleWatchRetry();
             return;
           }
@@ -380,8 +382,8 @@ function ConnectedApp(props: {
       } catch {
         if (stopped) return;
         stopWatching();
-        setRelayClient(null);
-        setRelayRoutes([]);
+        if (homeYas.ready && !homeYas.families.has(YAS_FAMILY_RELAY))
+          setRelayRoutes([]);
         // Relay may be temporarily unavailable or administratively omitted.
         // The local home connection stays usable while bounded retries watch
         // for a later catalogue/family update; there is no second protocol.
@@ -477,6 +479,7 @@ function ConnectedApp(props: {
     sessionDeviceStore.dispose();
     sessionStore.dispose();
     relayCache.clear();
+    relayClient()?.dispose();
   };
 
   return (
