@@ -2000,6 +2000,7 @@ export class YasSurfaceCanvas {
   }
 
   setConnectionId(connectionId: ConnectionId): void {
+    if (this._connectionId !== connectionId) this.clearPresentation();
     this._connectionId = connectionId;
     this.refreshConnection();
   }
@@ -2013,6 +2014,7 @@ export class YasSurfaceCanvas {
     this.remoteFocusGeneration = null;
     this.textInputCursorRect = null;
     this._imeSyncedEpoch = -1;
+    this.clearPresentation();
     this._surfaceId = surfaceId;
     this.resendDisplaySize();
     this.resubscribe();
@@ -2761,6 +2763,20 @@ export class YasSurfaceCanvas {
     const r = String(REMOTE_CONTACT_RADIUS * cursorScale);
     for (const circle of this.remoteContacts) circle.setAttribute("r", r);
     return this.remoteContacts;
+  }
+
+  /** A reused pane must not display pixels belonging to its previous window. */
+  private clearPresentation(): void {
+    this.hdrPresenter?.dispose();
+    this.hdrPresenter = null;
+    if (this.canvas) {
+      this.canvas.style.opacity = "";
+      this.ctx?.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+    this._lastFrameSize = null;
+    this._framePresentationSize = null;
+    this._presentHalvings = 0;
+    this.scrollGeometry = null;
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */

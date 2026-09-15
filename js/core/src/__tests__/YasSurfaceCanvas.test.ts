@@ -389,6 +389,43 @@ describe("YasSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
+  it.each(["surface", "connection"] as const)(
+    "clears retained SDR/HDR pixels when the %s identity changes without a cached frame",
+    (identity) => {
+      const { surface, canvas } = attachCanvas();
+      const clearRect = vi.fn();
+      const disposeHdr = vi.fn();
+      const internal = surface as unknown as {
+        ctx: CanvasRenderingContext2D;
+        hdrPresenter: { dispose(): void } | null;
+        presentFromStore(store: { getCanvas(): HTMLCanvasElement }): void;
+      };
+      internal.ctx = {
+        drawImage: vi.fn(),
+        clearRect,
+      } as unknown as CanvasRenderingContext2D;
+      const source = document.createElement("canvas");
+      source.width = 900;
+      source.height = 600;
+      internal.presentFromStore({ getCanvas: () => source });
+      internal.hdrPresenter = { dispose: disposeHdr };
+      canvas.style.opacity = "0";
+
+      // Reapplying the same identity must retain its frame.
+      surface.setSurfaceId(7n);
+      surface.setConnectionId("conn-1");
+      expect(clearRect).not.toHaveBeenCalled();
+      expect(disposeHdr).not.toHaveBeenCalled();
+
+      if (identity === "surface") surface.setSurfaceId(8n);
+      else surface.setConnectionId("conn-2");
+      expect(clearRect).toHaveBeenCalledWith(0, 0, 900, 600);
+      expect(disposeHdr).toHaveBeenCalledOnce();
+      expect(canvas.style.opacity).toBe("");
+      surface.dispose();
+    },
+  );
+
   it("keeps an arriving resizable window 1:1 before its first measurement", () => {
     vi.stubGlobal("devicePixelRatio", 2);
     const { surface, canvas } = attachCanvas({ resizable: true });

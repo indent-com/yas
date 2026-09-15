@@ -47,6 +47,11 @@ therefore re-keyed by leaf identity in the same atomic update as the tree.
 Terminals and surfaces never briefly acquire two visual owners, disappear, or
 receive a transient 1×1 resize during a transformation.
 
+When a pane canvas is reassigned to another graphical window, its previous
+SDR/HDR frame and presentation geometry are cleared before subscribing to the
+new window. If that window has no cached frame yet, the canvas stays empty
+until its first frame arrives; it cannot display the previous occupant.
+
 ## Workspace tabs
 
 Workspace tabs are durable shared workspaces. Attaching a tab is client-local;
