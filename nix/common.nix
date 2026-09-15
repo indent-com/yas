@@ -98,12 +98,17 @@ let
   };
 
   # Common args shared by all crane builds.
+  # opus 0.4 builds bundled Opus through opusic-sys, so CMake is required
+  # even when a system libopus is available.
   commonArgs = {
     inherit src version;
     strictDeps = true;
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.cmake
+    ];
     buildInputs = [
-      pkgs.libopus # system Opus for audiopus_sys (avoids cmake source build)
+      pkgs.libopus
     ]
     # System x264 for x264-sys (H.264 software surface encoder). The
     # dependency is Linux-only in crates/server/Cargo.toml.
@@ -115,6 +120,7 @@ let
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     nativeBuildInputs = [
       pkgs.pkg-config
+      pkgs.cmake
       pkgs.llvmPackages.libclang
     ];
   };
@@ -189,7 +195,10 @@ let
   commonArgsStatic = {
     inherit src version;
     strictDeps = true;
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.cmake
+    ];
     buildInputs = [
       staticLibopus
     ]
@@ -209,6 +218,7 @@ let
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     nativeBuildInputs = [
       pkgs.pkg-config
+      pkgs.cmake
       pkgs.llvmPackages.libclang
     ];
     # Rustc hardcodes `-lgcc_s` for dynamic-musl targets.  With the
