@@ -70,6 +70,7 @@ mod server_name;
 #[cfg(target_os = "linux")]
 mod software_decode;
 mod surface_color_encoder;
+mod surface_creation;
 mod surface_encoder;
 pub mod thread_name;
 #[cfg(target_os = "linux")]
@@ -11884,560 +11885,545 @@ async fn tick(state: &AppState) -> TickOutcome {
         // task lands, the main loop installs the encoder into the sub's
         // `encoder` slot, forwards the GBM buffers to the compositor
         // (`SetExternalOutputBuffers`), and sends a Surface Encoder event
-        // to the client.  Encoding starts on the NEXT tick — once the
-        // compositor has committed a frame through the new buffers.
+        // to the client. Install each finished encoder immediately: a slow
+        // sibling must not delay its target registration and first frame.
         let state2 = state.clone();
         tokio::spawn(async move {
-            // Track (cid, sid) for each job so we can clear
-            // `creation_in_flight` if a task panics or times out.
-            let job_ids: Vec<(u64, u16)> = create_jobs.iter().map(|j| (j.cid, j.sid)).collect();
-
-            let handles: Vec<_> = create_jobs
-                .into_iter()
-                .map(|job| {
-                    tokio::task::spawn_blocking(move || {
-                        let params = job.params;
-                        #[allow(unused_mut)]
-                        let creation = if let Some(hdr) = params.managed {
-                            SurfaceEncoder::new_color_ranked(
-                                &params.preferences,
-                                job.target_w,
-                                job.target_h,
-                                &params.vaapi_device,
-                                params.encoding,
-                                params.verbose,
-                                params.codec_support,
-                                params.color_capabilities,
-                                hdr,
-                                params.chroma,
-                                !params.probing_vulkan_predecessors,
-                            )
-                        } else {
-                            SurfaceEncoder::new_or_resize(
-                                job.previous,
-                                &params.preferences,
-                                job.target_w,
-                                job.target_h,
-                                &params.vaapi_device,
-                                params.encoding,
-                                params.verbose,
-                                params.codec_support,
-                                params.chroma,
-                            )
-                        };
-                        let mut encoder = match creation {
-                            Ok(enc) => enc,
-                            Err(err) => {
-                                if params.verbose {
-                                    eprintln!(
-                                        "[surface-encoder] cid={} sid={} {}x{}: {err}",
-                                        job.cid, job.sid, job.target_w, job.target_h,
-                                    );
-                                }
-                                // Families are eliminated at 4:2:0, the chroma
-                                // every attempt falls back to, so one missing
-                                // there is missing outright.
-                                let oversized = refused_for_size(
-                                    &params.preferences,
-                                    params.codec_support,
-                                    job.target_w,
-                                    job.target_h,
-                                    |p| {
-                                        !surface_encoder::known_unavailable(
-                                            p,
-                                            surface_encoder::ChromaSubsampling::Cs420,
-                                        )
-                                    },
+            const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
+            let mut creations = surface_creation::SurfaceCreations::new(CREATE_TIMEOUT);
+            for job in create_jobs {
+                creations.spawn((job.cid, job.sid), move || {
+                    let params = job.params;
+                    let creation = if let Some(hdr) = params.managed {
+                        SurfaceEncoder::new_color_or_resize(
+                            job.previous,
+                            &params.preferences,
+                            job.target_w,
+                            job.target_h,
+                            &params.vaapi_device,
+                            params.encoding,
+                            params.verbose,
+                            params.codec_support,
+                            params.color_capabilities,
+                            hdr,
+                            params.chroma,
+                            !params.probing_vulkan_predecessors,
+                        )
+                    } else {
+                        SurfaceEncoder::new_or_resize(
+                            job.previous,
+                            &params.preferences,
+                            job.target_w,
+                            job.target_h,
+                            &params.vaapi_device,
+                            params.encoding,
+                            params.verbose,
+                            params.codec_support,
+                            params.chroma,
+                        )
+                    };
+                    let encoder = match creation {
+                        Ok(enc) => enc,
+                        Err(err) => {
+                            if params.verbose {
+                                eprintln!(
+                                    "[surface-encoder] cid={} sid={} {}x{}: {err}",
+                                    job.cid, job.sid, job.target_w, job.target_h,
                                 );
-                                return CreateResult {
-                                    cid: job.cid,
-                                    sid: job.sid,
-                                    native_w: job.native_w,
-                                    native_h: job.native_h,
-                                    encoder: None,
-                                    fresh: None,
-                                    oversized,
-                                    vulkan_predecessors_exhausted: params
-                                        .probing_vulkan_predecessors
-                                        .then_some((job.target_w, job.target_h)),
-                                };
                             }
-                        };
-
-                        #[cfg(target_os = "linux")]
-                        let external_bufs = {
-                            {
-                                let drm_fd = encoder.drm_fd_raw();
-                                let count = if encoder.managed {
-                                    5
-                                } else {
-                                    encoder.gbm_buffers().len()
-                                };
-                                if count > 0 {
-                                    encoder.allocate_nv12_buffers(drm_fd, count);
-                                }
-                            }
-                            let gbm_bufs = encoder.gbm_buffers();
-                            if gbm_bufs.is_empty() {
-                                Vec::new()
-                            } else {
-                                let nv12_bufs = encoder.gbm_nv12_buffers();
-                                let (enc_w, enc_h) = encoder.encoder_dimensions();
-                                let bufs: Result<Vec<_>, std::io::Error> = gbm_bufs
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, b)| {
-                                        let nv12 = nv12_bufs.get(i);
-                                        Ok(yas_compositor::ExternalOutputBuffer {
-                                            fd: std::sync::Arc::new(b.fd.try_clone()?),
-                                            fourcc: 0x34325241,
-                                            modifier: 0,
-                                            stride: b.stride,
-                                            offset: 0,
-                                            width: b.width,
-                                            height: b.height,
-                                            va_surface_id: 0,
-                                            va_display: 0,
-                                            planes: vec![yas_compositor::ExternalOutputPlane {
-                                                offset: 0,
-                                                pitch: b.stride,
-                                            }],
-                                            nv12_fd: nv12.map(|n| n.fd.clone()),
-                                            nv12_stride: nv12.map_or(0, |n| n.stride),
-                                            nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
-                                            nv12_modifier: nv12.map_or(0, |n| n.modifier),
-                                            nv12_width: enc_w,
-                                            nv12_height: enc_h,
-                                            nv12_color: encoder
-                                                .managed
-                                                .then_some(encoder.output_color),
-                                            nv12_planes: nv12
-                                                .map(|n| n.planes.clone())
-                                                .unwrap_or_default(),
-                                        })
-                                    })
-                                    .collect();
-                                match bufs {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        eprintln!("[encode] dup gbm fd failed: {e}");
-                                        Vec::new()
-                                    }
-                                }
-                            }
-                        };
-                        let fresh = FreshEncoder {
-                            name: encoder.encoder_name(),
-                            codec_string: encoder.webcodecs_codec_string(),
-                            #[cfg(target_os = "linux")]
-                            external_bufs,
-                        };
-                        CreateResult {
-                            cid: job.cid,
-                            sid: job.sid,
-                            native_w: job.native_w,
-                            native_h: job.native_h,
-                            encoder: Some(encoder),
-                            fresh: Some(fresh),
-                            oversized: false,
-                            vulkan_predecessors_exhausted: None,
+                            // Families are eliminated at 4:2:0, the chroma
+                            // every attempt falls back to, so one missing
+                            // there is missing outright.
+                            let oversized = refused_for_size(
+                                &params.preferences,
+                                params.codec_support,
+                                job.target_w,
+                                job.target_h,
+                                |p| {
+                                    !surface_encoder::known_unavailable(
+                                        p,
+                                        surface_encoder::ChromaSubsampling::Cs420,
+                                    )
+                                },
+                            );
+                            return CreateResult {
+                                cid: job.cid,
+                                sid: job.sid,
+                                native_w: job.native_w,
+                                native_h: job.native_h,
+                                encoder: None,
+                                fresh: None,
+                                oversized,
+                                vulkan_predecessors_exhausted: params
+                                    .probing_vulkan_predecessors
+                                    .then_some((job.target_w, job.target_h)),
+                            };
                         }
-                    })
-                })
-                .collect();
+                    };
 
-            const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-            let mut results: Vec<CreateResult> = Vec::with_capacity(handles.len());
-            let mut failed: Vec<(u64, u16)> = Vec::new();
-            for (i, h) in handles.into_iter().enumerate() {
-                let wrapper =
-                    tokio::spawn(async move { tokio::time::timeout(CREATE_TIMEOUT, h).await });
-                match wrapper.await {
-                    Ok(Ok(Ok(r))) => results.push(r),
-                    Ok(Ok(Err(_))) | Ok(Err(_)) => {
-                        let (cid, sid) = job_ids[i];
-                        eprintln!("[surface-encoder] create task failed: cid={cid} sid={sid}",);
-                        failed.push(job_ids[i]);
+                    #[cfg(target_os = "linux")]
+                    let mut encoder = encoder;
+                    #[cfg(target_os = "linux")]
+                    let external_bufs = {
+                        {
+                            let drm_fd = encoder.drm_fd_raw();
+                            let count = if encoder.managed {
+                                5
+                            } else {
+                                encoder.gbm_buffers().len()
+                            };
+                            if count > 0 {
+                                encoder.allocate_nv12_buffers(drm_fd, count);
+                            }
+                        }
+                        let gbm_bufs = encoder.gbm_buffers();
+                        if gbm_bufs.is_empty() {
+                            Vec::new()
+                        } else {
+                            let nv12_bufs = encoder.gbm_nv12_buffers();
+                            let (enc_w, enc_h) = encoder.encoder_dimensions();
+                            let bufs: Result<Vec<_>, std::io::Error> = gbm_bufs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, b)| {
+                                    let nv12 = nv12_bufs.get(i);
+                                    Ok(yas_compositor::ExternalOutputBuffer {
+                                        fd: std::sync::Arc::new(b.fd.try_clone()?),
+                                        fourcc: 0x34325241,
+                                        modifier: 0,
+                                        stride: b.stride,
+                                        offset: 0,
+                                        width: b.width,
+                                        height: b.height,
+                                        va_surface_id: 0,
+                                        va_display: 0,
+                                        planes: vec![yas_compositor::ExternalOutputPlane {
+                                            offset: 0,
+                                            pitch: b.stride,
+                                        }],
+                                        nv12_fd: nv12.map(|n| n.fd.clone()),
+                                        nv12_stride: nv12.map_or(0, |n| n.stride),
+                                        nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
+                                        nv12_modifier: nv12.map_or(0, |n| n.modifier),
+                                        nv12_width: enc_w,
+                                        nv12_height: enc_h,
+                                        nv12_color: encoder.managed.then_some(encoder.output_color),
+                                        nv12_planes: nv12
+                                            .map(|n| n.planes.clone())
+                                            .unwrap_or_default(),
+                                    })
+                                })
+                                .collect();
+                            match bufs {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("[encode] dup gbm fd failed: {e}");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    };
+                    let fresh = FreshEncoder {
+                        name: encoder.encoder_name(),
+                        codec_string: encoder.webcodecs_codec_string(),
+                        #[cfg(target_os = "linux")]
+                        external_bufs,
+                    };
+                    CreateResult {
+                        cid: job.cid,
+                        sid: job.sid,
+                        native_w: job.native_w,
+                        native_h: job.native_h,
+                        encoder: Some(encoder),
+                        fresh: Some(fresh),
+                        oversized: false,
+                        vulkan_predecessors_exhausted: None,
                     }
-                    Err(_) => return,
-                }
+                });
             }
 
-            let mut sess = state2.session.lock().await;
-            let now = Instant::now();
+            while let Some(completion) = creations.next().await {
+                let (results, failed) = match completion {
+                    Ok(result) => (vec![result], Vec::new()),
+                    Err(failed) => (Vec::new(), failed),
+                };
+                let mut sess = state2.session.lock().await;
+                let now = Instant::now();
 
-            // Clear creation_in_flight for failed tasks; latch a brief
-            // backoff so the next tick doesn't immediately retry.
-            for (cid, sid) in failed {
-                if let Some(client) = sess.clients.get_mut(&cid)
-                    && let Some(s) = client.surface_subs.get_mut(&sid)
-                {
-                    s.creation_in_flight = false;
-                    s.nal_none_streak = 10;
-                    s.nal_none_latched_at = Some(now);
-                }
-            }
-
-            // Surfaces whose ceiling moved as a result of these creations —
-            // either a backend resolved to something other than what sizing
-            // assumed, or a request was refused for size.  Re-mediated after
-            // the loop, because the composite was sized against a guess: left
-            // alone it renders every frame at a resolution no subscriber can
-            // actually be sent.
-            let mut receilinged_surfaces: Vec<u16> = Vec::new();
-
-            for result in results {
-                // The compositor took this (surface, client) over while the
-                // encoder was being built: a Vulkan Video session now owns
-                // delivery, and installing this one would run two encoders
-                // against one decoder — the enc_msg below would reconfigure
-                // the client back to the server-side codec, and the target
-                // registration would redirect the composite the Vulkan
-                // session encodes from.  Drop the freshly built encoder.
-                if sess
-                    .clients
-                    .get(&result.cid)
-                    .is_some_and(|c| c.vulkan_video_surfaces.contains_key(&result.sid))
-                {
-                    if let Some(client) = sess.clients.get_mut(&result.cid)
-                        && let Some(s) = client.surface_subs.get_mut(&result.sid)
+                // Clear creation_in_flight for failed tasks; latch a brief
+                // backoff so the next tick doesn't immediately retry.
+                for (cid, sid) in failed {
+                    if let Some(client) = sess.clients.get_mut(&cid)
+                        && let Some(s) = client.surface_subs.get_mut(&sid)
                     {
                         s.creation_in_flight = false;
-                        s.encoder_invalidated = false;
-                    }
-                    continue;
-                }
-
-                // Reject a creation invalidated by a resubscribe before it
-                // changes compositor targets or pixel caches.  The final
-                // target will be built on the next delivery tick.
-                let accepted = if let Some(client) = sess.clients.get_mut(&result.cid)
-                    && let Some(state) = client.surface_subs.get_mut(&result.sid)
-                {
-                    accept_completed_creation(state)
-                } else {
-                    false
-                };
-                if !accepted {
-                    continue;
-                }
-
-                let Some(encoder) = result.encoder else {
-                    if let Some(client) = sess.clients.get_mut(&result.cid)
-                        && let Some(s) = client.surface_subs.get_mut(&result.sid)
-                    {
-                        if let Some(extent) = result.vulkan_predecessors_exhausted {
-                            s.vulkan_predecessors_exhausted_extent = Some(extent);
-                            s.nal_none_streak = 0;
-                            s.nal_none_latched_at = None;
-                            continue;
-                        }
-                        s.create_failures = s.create_failures.saturating_add(1);
-                        // Bring the surface down to what the whole chain
-                        // clears when the size is what stands in the way.
-                        // Either it plainly is — nothing eligible could have
-                        // carried the frame — or the backends that could have
-                        // keep failing, and after enough tries a smaller
-                        // picture beats none.  The counter is what separates
-                        // the two from a momentary failure, which must not
-                        // cost the viewer its resolution: this only clears on
-                        // a resubscribe.
-                        let narrow =
-                            result.oversized || s.create_failures >= CREATE_FAILURES_BEFORE_DEGRADE;
-                        if narrow && !s.encoder_cap_degraded {
-                            // Retry at once rather than serving the backoff:
-                            // the smaller size may simply work, and waiting
-                            // stalls the first picture by seconds on every
-                            // AV1-less host with a >4K display.
-                            s.encoder_cap_degraded = true;
-                            receilinged_surfaces.push(result.sid);
-                        } else {
-                            s.nal_none_streak = 10;
-                            s.nal_none_latched_at = Some(now);
-                        }
-                    }
-                    continue;
-                };
-
-                // Move the external buffers (and register them with the
-                // compositor) BEFORE stashing the encoder, so subsequent
-                // ticks see the encoder only once its buffers are live.
-                let fresh = result.fresh;
-                #[cfg(target_os = "linux")]
-                {
-                    if let Some(f) = &fresh
-                        && !f.external_bufs.is_empty()
-                        && let Some(cs) = sess.compositor.as_mut()
-                    {
-                        // Drop every cached snapshot for this surface so
-                        // the next compositor frame re-fills with the
-                        // newly-registered NV12 DMA-BUF target.  Stale
-                        // entries (e.g. native BGRA from a previous
-                        // tick) will be re-added by SurfaceCommit.
-                        last_pixels_remove_for_sid(&mut cs.last_pixels, result.sid);
-                        last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, result.sid);
-                        cs.mark_pixel_snapshot_dirty();
+                        s.nal_none_streak = 10;
+                        s.nal_none_latched_at = Some(now);
                     }
                 }
-                #[cfg(target_os = "linux")]
-                let (fresh_meta, external_bufs) = match fresh {
-                    Some(f) => (Some((f.name, f.codec_string)), Some(f.external_bufs)),
-                    None => (None, None),
-                };
-                #[cfg(not(target_os = "linux"))]
-                let fresh_meta = fresh.map(|f| (f.name, f.codec_string));
 
-                #[cfg(target_os = "linux")]
-                {
-                    let (tw, th) = encoder.source_dimensions();
-                    // Clear the previously-registered downscale target
-                    // for this client/surface (if any) so stale entries
-                    // don't accumulate when the per-client target dims
-                    // change.  Externals replace by key in the renderer
-                    // (`set_external_output_buffers`) so they don't
-                    // need an explicit clear, but downscale targets do.
-                    let prev_target = sess
+                // Surfaces whose ceiling moved as a result of these creations —
+                // either a backend resolved to something other than what sizing
+                // assumed, or a request was refused for size.  Re-mediated after
+                // the loop, because the composite was sized against a guess: left
+                // alone it renders every frame at a resolution no subscriber can
+                // actually be sent.
+                let mut receilinged_surfaces: Vec<u16> = Vec::new();
+
+                for result in results {
+                    // The compositor took this (surface, client) over while the
+                    // encoder was being built: a Vulkan Video session now owns
+                    // delivery, and installing this one would run two encoders
+                    // against one decoder — the enc_msg below would reconfigure
+                    // the client back to the server-side codec, and the target
+                    // registration would redirect the composite the Vulkan
+                    // session encodes from.  Drop the freshly built encoder.
+                    if sess
                         .clients
                         .get(&result.cid)
-                        .and_then(|c| c.surface_subs.get(&result.sid))
-                        .and_then(|s| s.last_registered_target);
-                    if let Some((pw, ph)) = prev_target
-                        && (pw, ph) != (tw, th)
+                        .is_some_and(|c| c.vulkan_video_surfaces.contains_key(&result.sid))
                     {
-                        // Ownership is shared by target key, not by client.
-                        // Remove this subscriber from the old key first, then
-                        // let the surviving subscribers decide whether it is
-                        // re-registered or actually cleared. Clearing it
-                        // directly strands every survivor on BGRA while
-                        // their state still says the opaque target exists.
-                        if let Some(s) = sess
-                            .clients
-                            .get_mut(&result.cid)
-                            .and_then(|c| c.surface_subs.get_mut(&result.sid))
+                        if let Some(client) = sess.clients.get_mut(&result.cid)
+                            && let Some(s) = client.surface_subs.get_mut(&result.sid)
                         {
-                            s.last_registered_target = None;
-                            s.last_registered_native = None;
+                            s.creation_in_flight = false;
+                            s.encoder_invalidated = false;
                         }
-                        sess.resettle_downscale_target(result.sid, pw, ph);
+                        continue;
                     }
-                    // Resolve both representations for this target. Mixed
-                    // CPU/NVENC subscribers get BGRA and opaque NV12/NV24;
-                    // matching NVENC-only subscribers keep the no-readback
-                    // path. A 4:2:0/4:4:4 split still falls back to BGRA
-                    // because one opaque allocation cannot have both shapes.
-                    //
-                    // Computed before the compositor borrow below, which
-                    // takes `sess` mutably.
-                    let encoder_is_nvenc = encoder.wants_nv12_opaque_fd();
-                    let compositor_uuid = sess
-                        .compositor
-                        .as_ref()
-                        .and_then(|cs| cs.handle.vulkan_device_uuid);
-                    let encoder_wants_nv12_opaque = encoder_is_nvenc
-                        && nvenc_matches_compositor(
-                            &state2.config.compositor_device,
-                            compositor_uuid,
-                        );
-                    if encoder_is_nvenc && !encoder_wants_nv12_opaque && state2.config.verbose {
-                        eprintln!(
-                            "[surface-encoder] NVENC device identity differs from compositor {}; using CPU upload",
-                            state2.config.compositor_device,
-                        );
-                    }
-                    let encoder_opaque_444 = encoder.opaque_wants_444();
-                    if encoder.managed {
-                        let buffers: Vec<_> = encoder
-                            .gbm_nv12_buffers()
-                            .iter()
-                            .map(|b| yas_compositor::ColorDmaBuffer {
-                                fd: b.fd.clone(),
-                                fourcc: b.fourcc,
-                                modifier: b.modifier,
-                                planes: b.planes.clone(),
-                            })
-                            .collect();
-                        let (width, height) = encoder.encoder_dimensions();
-                        let target =
-                            (encoder_wants_nv12_opaque || !buffers.is_empty()).then(|| {
-                                yas_compositor::ColorOutputTarget {
-                                    width,
-                                    height,
-                                    color: encoder.output_color,
-                                    is_444: encoder.opaque_wants_444(),
-                                    buffers,
-                                }
-                            });
-                        if let Some(client) = sess.clients.get_mut(&result.cid) {
-                            let s = client.surface_subs.entry(result.sid).or_default();
-                            s.managed_color = true;
-                            s.managed_color_target = target;
-                            s.last_registered_target = Some((tw, th));
-                            s.last_registered_native = Some((result.native_w, result.native_h));
-                            s.wants_nv12_opaque = encoder_wants_nv12_opaque;
-                            s.wants_opaque_444 = encoder_opaque_444;
-                            s.wants_opaque_color = encoder.output_color;
-                            s.color_dma_fds = encoder
-                                .gbm_nv12_buffers()
-                                .iter()
-                                .map(|b| b.fd.clone())
-                                .collect();
-                        }
-                        sess.resettle_downscale_target(result.sid, tw, th);
+
+                    // Reject a creation invalidated by a resubscribe before it
+                    // changes compositor targets or pixel caches.  The final
+                    // target will be built on the next delivery tick.
+                    let accepted = if let Some(client) = sess.clients.get_mut(&result.cid)
+                        && let Some(state) = client.surface_subs.get_mut(&result.sid)
+                    {
+                        accept_completed_creation(state)
                     } else {
-                        if let Some(s) = sess
-                            .clients
-                            .get_mut(&result.cid)
-                            .and_then(|c| c.surface_subs.get_mut(&result.sid))
+                        false
+                    };
+                    if !accepted {
+                        continue;
+                    }
+
+                    let Some(encoder) = result.encoder else {
+                        if let Some(client) = sess.clients.get_mut(&result.cid)
+                            && let Some(s) = client.surface_subs.get_mut(&result.sid)
                         {
-                            s.managed_color = false;
-                            s.managed_color_target = None;
+                            if let Some(extent) = result.vulkan_predecessors_exhausted {
+                                s.vulkan_predecessors_exhausted_extent = Some(extent);
+                                s.nal_none_streak = 0;
+                                s.nal_none_latched_at = None;
+                                continue;
+                            }
+                            s.create_failures = s.create_failures.saturating_add(1);
+                            // Bring the surface down to what the whole chain
+                            // clears when the size is what stands in the way.
+                            // Either it plainly is — nothing eligible could have
+                            // carried the frame — or the backends that could have
+                            // keep failing, and after enough tries a smaller
+                            // picture beats none.  The counter is what separates
+                            // the two from a momentary failure, which must not
+                            // cost the viewer its resolution: this only clears on
+                            // a resubscribe.
+                            let narrow = result.oversized
+                                || s.create_failures >= CREATE_FAILURES_BEFORE_DEGRADE;
+                            if narrow && !s.encoder_cap_degraded {
+                                // Retry at once rather than serving the backoff:
+                                // the smaller size may simply work, and waiting
+                                // stalls the first picture by seconds on every
+                                // AV1-less host with a >4K display.
+                                s.encoder_cap_degraded = true;
+                                receilinged_surfaces.push(result.sid);
+                            } else {
+                                s.nal_none_streak = 10;
+                                s.nal_none_latched_at = Some(now);
+                            }
                         }
-                        let target_mode = downscale_target_color_mode(
-                            encoder_wants_nv12_opaque,
-                            encoder_opaque_444,
-                            !encoder_wants_nv12_opaque,
-                            encoder.output_color,
-                            (tw, th),
-                            sess.clients
-                                .iter()
-                                .filter(|(cid, _)| **cid != result.cid)
-                                .map(|(_, c)| {
-                                    c.surface_subs
-                                        .get(&result.sid)
-                                        .map(|s| {
-                                            let is_vulkan =
-                                                c.vulkan_video_surfaces.contains_key(&result.sid);
-                                            (
-                                                s.last_registered_target,
-                                                s.wants_nv12_opaque,
-                                                s.wants_opaque_444,
-                                                !is_vulkan && !s.wants_nv12_opaque,
-                                                s.wants_opaque_color,
-                                            )
-                                        })
-                                        .unwrap_or((
-                                            None,
-                                            true,
-                                            encoder_opaque_444,
-                                            false,
-                                            encoder.output_color,
-                                        ))
-                                }),
-                        );
-                        if let Some(bufs) = external_bufs
-                            && !bufs.is_empty()
+                        continue;
+                    };
+
+                    // Move the external buffers (and register them with the
+                    // compositor) BEFORE stashing the encoder, so subsequent
+                    // ticks see the encoder only once its buffers are live.
+                    let fresh = result.fresh;
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(f) = &fresh
+                            && !f.external_bufs.is_empty()
                             && let Some(cs) = sess.compositor.as_mut()
                         {
-                            let _ = cs.handle.command_tx.try_send(
-                                yas_compositor::CompositorCommand::SetExternalOutputBuffers {
-                                    surface_id: result.sid as u32,
-                                    target_w: tw,
-                                    target_h: th,
-                                    native_w: result.native_w,
-                                    native_h: result.native_h,
-                                    buffers: bufs,
-                                },
-                            );
-                            cs.handle.wake();
-                        } else if let Some(cs) = sess.compositor.as_mut() {
-                            // No GBM externals — register a server-allocated
-                            // downscale target so the compositor can GPU-copy
-                            // the native composite into target-sized pixels for
-                            // this encoder.  Idempotent in the renderer.
-                            //
-                            // NVENC additionally asks for the NV12 OPAQUE_FD
-                            // shape, which converts on the GPU and hands over a
-                            // handle CUDA can import — skipping the readback
-                            // into staging and the Vec that used to carry it.
-                            // Every other backend needs pixels on the CPU and
-                            // takes the BGRA path. The renderer falls back to
-                            // BGRA on its own if the export fails, so this
-                            // stays a request rather than a commitment, and it
-                            // reconciles a `false` here by dropping an NV12
-                            // target it had already built.
-                            // The command can replace the opaque allocation
-                            // (layout change, failed export, or Vulkan takeover).
-                            // Its cached fd must not outlive that allocation.
-                            cs.last_opaque_pixels.remove(&(result.sid, tw, th));
+                            // Drop every cached snapshot for this surface so
+                            // the next compositor frame re-fills with the
+                            // newly-registered NV12 DMA-BUF target.  Stale
+                            // entries (e.g. native BGRA from a previous
+                            // tick) will be re-added by SurfaceCommit.
+                            last_pixels_remove_for_sid(&mut cs.last_pixels, result.sid);
+                            last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, result.sid);
                             cs.mark_pixel_snapshot_dirty();
-                            let _ = cs.handle.command_tx.try_send(
-                                yas_compositor::CompositorCommand::RegisterDownscaleTarget {
-                                    surface_id: result.sid as u32,
-                                    target_w: tw,
-                                    target_h: th,
-                                    native_w: result.native_w,
-                                    native_h: result.native_h,
-                                    want_nv12_opaque: target_mode.want_nv12_opaque,
-                                    want_cpu_pixels: target_mode.want_cpu_pixels,
-                                    opaque_is_444: target_mode.opaque_is_444,
-                                    opaque_color: target_mode.opaque_color,
-                                },
-                            );
-                            cs.handle.wake();
                         }
-                        if let Some(client) = sess.clients.get_mut(&result.cid) {
-                            let s = client.surface_subs.entry(result.sid).or_default();
-                            s.last_registered_target = Some((tw, th));
-                            s.last_registered_native = Some((result.native_w, result.native_h));
-                            // This encoder's own capability, not the resolved
-                            // decision above: a later subscriber asks whether
-                            // *we* could take NV12, and must not inherit a
-                            // "no" we only arrived at because of a third party
-                            // that has since gone away.
-                            s.wants_nv12_opaque = encoder_wants_nv12_opaque;
-                            s.wants_opaque_444 = encoder_opaque_444;
-                            s.wants_opaque_color = encoder.output_color;
-                            s.color_dma_fds = if encoder.managed {
-                                encoder
+                    }
+                    #[cfg(target_os = "linux")]
+                    let (fresh_meta, external_bufs) = match fresh {
+                        Some(f) => (Some((f.name, f.codec_string)), Some(f.external_bufs)),
+                        None => (None, None),
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let fresh_meta = fresh.map(|f| (f.name, f.codec_string));
+
+                    #[cfg(target_os = "linux")]
+                    {
+                        let (tw, th) = encoder.source_dimensions();
+                        // Clear the previously-registered downscale target
+                        // for this client/surface (if any) so stale entries
+                        // don't accumulate when the per-client target dims
+                        // change.  Externals replace by key in the renderer
+                        // (`set_external_output_buffers`) so they don't
+                        // need an explicit clear, but downscale targets do.
+                        let prev_target = sess
+                            .clients
+                            .get(&result.cid)
+                            .and_then(|c| c.surface_subs.get(&result.sid))
+                            .and_then(|s| s.last_registered_target);
+                        if let Some((pw, ph)) = prev_target
+                            && (pw, ph) != (tw, th)
+                        {
+                            // Ownership is shared by target key, not by client.
+                            // Remove this subscriber from the old key first, then
+                            // let the surviving subscribers decide whether it is
+                            // re-registered or actually cleared. Clearing it
+                            // directly strands every survivor on BGRA while
+                            // their state still says the opaque target exists.
+                            if let Some(s) = sess
+                                .clients
+                                .get_mut(&result.cid)
+                                .and_then(|c| c.surface_subs.get_mut(&result.sid))
+                            {
+                                s.last_registered_target = None;
+                                s.last_registered_native = None;
+                            }
+                            sess.resettle_downscale_target(result.sid, pw, ph);
+                        }
+                        // Resolve both representations for this target. Mixed
+                        // CPU/NVENC subscribers get BGRA and opaque NV12/NV24;
+                        // matching NVENC-only subscribers keep the no-readback
+                        // path. A 4:2:0/4:4:4 split still falls back to BGRA
+                        // because one opaque allocation cannot have both shapes.
+                        //
+                        // Computed before the compositor borrow below, which
+                        // takes `sess` mutably.
+                        let encoder_is_nvenc = encoder.wants_nv12_opaque_fd();
+                        let compositor_uuid = sess
+                            .compositor
+                            .as_ref()
+                            .and_then(|cs| cs.handle.vulkan_device_uuid);
+                        let encoder_wants_nv12_opaque = encoder_is_nvenc
+                            && nvenc_matches_compositor(
+                                &state2.config.compositor_device,
+                                compositor_uuid,
+                            );
+                        if encoder_is_nvenc && !encoder_wants_nv12_opaque && state2.config.verbose {
+                            eprintln!(
+                                "[surface-encoder] NVENC device identity differs from compositor {}; using CPU upload",
+                                state2.config.compositor_device,
+                            );
+                        }
+                        let encoder_opaque_444 = encoder.opaque_wants_444();
+                        if encoder.managed {
+                            let buffers: Vec<_> = encoder
+                                .gbm_nv12_buffers()
+                                .iter()
+                                .map(|b| yas_compositor::ColorDmaBuffer {
+                                    fd: b.fd.clone(),
+                                    fourcc: b.fourcc,
+                                    modifier: b.modifier,
+                                    planes: b.planes.clone(),
+                                })
+                                .collect();
+                            let (width, height) = encoder.encoder_dimensions();
+                            let target =
+                                (encoder_wants_nv12_opaque || !buffers.is_empty()).then(|| {
+                                    yas_compositor::ColorOutputTarget {
+                                        width,
+                                        height,
+                                        color: encoder.output_color,
+                                        is_444: encoder.opaque_wants_444(),
+                                        buffers,
+                                    }
+                                });
+                            if let Some(client) = sess.clients.get_mut(&result.cid) {
+                                let s = client.surface_subs.entry(result.sid).or_default();
+                                s.managed_color = true;
+                                s.managed_color_target = target;
+                                s.last_registered_target = Some((tw, th));
+                                s.last_registered_native = Some((result.native_w, result.native_h));
+                                s.wants_nv12_opaque = encoder_wants_nv12_opaque;
+                                s.wants_opaque_444 = encoder_opaque_444;
+                                s.wants_opaque_color = encoder.output_color;
+                                s.color_dma_fds = encoder
                                     .gbm_nv12_buffers()
                                     .iter()
                                     .map(|b| b.fd.clone())
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
+                                    .collect();
+                            }
+                            sess.resettle_downscale_target(result.sid, tw, th);
+                        } else {
+                            if let Some(s) = sess
+                                .clients
+                                .get_mut(&result.cid)
+                                .and_then(|c| c.surface_subs.get_mut(&result.sid))
+                            {
+                                s.managed_color = false;
+                                s.managed_color_target = None;
+                            }
+                            let target_mode = downscale_target_color_mode(
+                                encoder_wants_nv12_opaque,
+                                encoder_opaque_444,
+                                !encoder_wants_nv12_opaque,
+                                encoder.output_color,
+                                (tw, th),
+                                sess.clients
+                                    .iter()
+                                    .filter(|(cid, _)| **cid != result.cid)
+                                    .map(|(_, c)| {
+                                        c.surface_subs
+                                            .get(&result.sid)
+                                            .map(|s| {
+                                                let is_vulkan = c
+                                                    .vulkan_video_surfaces
+                                                    .contains_key(&result.sid);
+                                                (
+                                                    s.last_registered_target,
+                                                    s.wants_nv12_opaque,
+                                                    s.wants_opaque_444,
+                                                    !is_vulkan && !s.wants_nv12_opaque,
+                                                    s.wants_opaque_color,
+                                                )
+                                            })
+                                            .unwrap_or((
+                                                None,
+                                                true,
+                                                encoder_opaque_444,
+                                                false,
+                                                encoder.output_color,
+                                            ))
+                                    }),
+                            );
+                            if let Some(bufs) = external_bufs
+                                && !bufs.is_empty()
+                                && let Some(cs) = sess.compositor.as_mut()
+                            {
+                                let _ = cs.handle.command_tx.try_send(
+                                    yas_compositor::CompositorCommand::SetExternalOutputBuffers {
+                                        surface_id: result.sid as u32,
+                                        target_w: tw,
+                                        target_h: th,
+                                        native_w: result.native_w,
+                                        native_h: result.native_h,
+                                        buffers: bufs,
+                                    },
+                                );
+                                cs.handle.wake();
+                            } else if let Some(cs) = sess.compositor.as_mut() {
+                                // No GBM externals — register a server-allocated
+                                // downscale target so the compositor can GPU-copy
+                                // the native composite into target-sized pixels for
+                                // this encoder.  Idempotent in the renderer.
+                                //
+                                // NVENC additionally asks for the NV12 OPAQUE_FD
+                                // shape, which converts on the GPU and hands over a
+                                // handle CUDA can import — skipping the readback
+                                // into staging and the Vec that used to carry it.
+                                // Every other backend needs pixels on the CPU and
+                                // takes the BGRA path. The renderer falls back to
+                                // BGRA on its own if the export fails, so this
+                                // stays a request rather than a commitment, and it
+                                // reconciles a `false` here by dropping an NV12
+                                // target it had already built.
+                                // The command can replace the opaque allocation
+                                // (layout change, failed export, or Vulkan takeover).
+                                // Its cached fd must not outlive that allocation.
+                                cs.last_opaque_pixels.remove(&(result.sid, tw, th));
+                                cs.mark_pixel_snapshot_dirty();
+                                let _ = cs.handle.command_tx.try_send(
+                                    yas_compositor::CompositorCommand::RegisterDownscaleTarget {
+                                        surface_id: result.sid as u32,
+                                        target_w: tw,
+                                        target_h: th,
+                                        native_w: result.native_w,
+                                        native_h: result.native_h,
+                                        want_nv12_opaque: target_mode.want_nv12_opaque,
+                                        want_cpu_pixels: target_mode.want_cpu_pixels,
+                                        opaque_is_444: target_mode.opaque_is_444,
+                                        opaque_color: target_mode.opaque_color,
+                                    },
+                                );
+                                cs.handle.wake();
+                            }
+                            if let Some(client) = sess.clients.get_mut(&result.cid) {
+                                let s = client.surface_subs.entry(result.sid).or_default();
+                                s.last_registered_target = Some((tw, th));
+                                s.last_registered_native = Some((result.native_w, result.native_h));
+                                // This encoder's own capability, not the resolved
+                                // decision above: a later subscriber asks whether
+                                // *we* could take NV12, and must not inherit a
+                                // "no" we only arrived at because of a third party
+                                // that has since gone away.
+                                s.wants_nv12_opaque = encoder_wants_nv12_opaque;
+                                s.wants_opaque_444 = encoder_opaque_444;
+                                s.wants_opaque_color = encoder.output_color;
+                                s.color_dma_fds = if encoder.managed {
+                                    encoder
+                                        .gbm_nv12_buffers()
+                                        .iter()
+                                        .map(|b| b.fd.clone())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            }
                         }
                     }
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = &encoder;
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = &encoder;
 
-                if let Some(client) = sess.clients.get_mut(&result.cid) {
-                    let state = client.surface_subs.entry(result.sid).or_default();
-                    // Sizing has been guessing which backend would win; now it
-                    // knows.  A surface that came up on AV1 can grow past the
-                    // H.264 ceiling, and one that came up on H.264 stops
-                    // being composited as if it might not — but only after a
-                    // re-mediation, so note it when the answer is new.
-                    //
-                    // `encoder_cap_degraded` is deliberately *not* cleared
-                    // here.  It latches only when a request was refused for
-                    // size, and clearing it on the smaller creation that
-                    // followed would let the next winner's wider ceiling
-                    // raise the surface straight back into the size that was
-                    // just refused.  A resubscribe clears it; that is the
-                    // point at which retrying is a fresh question.
-                    let winner = Some(encoder.preference());
-                    if state.selected_encoder != winner {
-                        state.selected_encoder = winner;
-                        receilinged_surfaces.push(result.sid);
+                    if let Some(client) = sess.clients.get_mut(&result.cid) {
+                        let state = client.surface_subs.entry(result.sid).or_default();
+                        // Sizing has been guessing which backend would win; now it
+                        // knows.  A surface that came up on AV1 can grow past the
+                        // H.264 ceiling, and one that came up on H.264 stops
+                        // being composited as if it might not — but only after a
+                        // re-mediation, so note it when the answer is new.
+                        //
+                        // `encoder_cap_degraded` is deliberately *not* cleared
+                        // here.  It latches only when a request was refused for
+                        // size, and clearing it on the smaller creation that
+                        // followed would let the next winner's wider ceiling
+                        // raise the surface straight back into the size that was
+                        // just refused.  A resubscribe clears it; that is the
+                        // point at which retrying is a fresh question.
+                        let winner = Some(encoder.preference());
+                        if state.selected_encoder != winner {
+                            state.selected_encoder = winner;
+                            receilinged_surfaces.push(result.sid);
+                        }
+                        state.encoder = Some(encoder);
+                        state.nal_none_streak = 0;
+                        state.nal_none_latched_at = None;
+                        state.create_failures = 0;
+                        let _ = fresh_meta;
                     }
-                    state.encoder = Some(encoder);
-                    state.nal_none_streak = 0;
-                    state.nal_none_latched_at = None;
-                    state.create_failures = 0;
-                    let _ = fresh_meta;
                 }
+                if !receilinged_surfaces.is_empty() {
+                    sess.resize_surfaces_to_mediated_sizes(
+                        receilinged_surfaces,
+                        &state2.config.surface_encoders,
+                        state2.config.verbose,
+                    );
+                }
+                drop(sess);
+                state2.delivery_notify.notify_one();
             }
-            if !receilinged_surfaces.is_empty() {
-                sess.resize_surfaces_to_mediated_sizes(
-                    receilinged_surfaces,
-                    &state2.config.surface_encoders,
-                    state2.config.verbose,
-                );
-            }
-            drop(sess);
-            state2.delivery_notify.notify_one();
         });
     }
 

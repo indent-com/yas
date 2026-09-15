@@ -808,7 +808,7 @@ enum SurfaceEncoderKind {
 
 impl SurfaceEncoder {
     #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub fn new_color(
         preferences: &[SurfaceEncoderPreference],
         width: u32,
@@ -821,7 +821,8 @@ impl SurfaceEncoder {
         hdr: bool,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
-        Self::new_color_ranked(
+        Self::new_color_or_resize(
+            None,
             preferences,
             width,
             height,
@@ -837,7 +838,8 @@ impl SurfaceEncoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_color_ranked(
+    pub fn new_color_or_resize(
+        previous: Option<Self>,
         preferences: &[SurfaceEncoderPreference],
         width: u32,
         height: u32,
@@ -851,6 +853,11 @@ impl SurfaceEncoder {
         software_fallback: bool,
     ) -> Result<Self, String> {
         let output = Self::negotiate_color(codec_support, capabilities, hdr);
+        // Color metadata and the speed preset are fixed for a session's
+        // lifetime. Release incompatible sessions before allocating another.
+        let mut previous = previous.filter(|old| {
+            old.managed && old.output_color == output && old.encoding.speed == encoding.speed
+        });
         let mut last_error = "no compatible color encoder configured".to_string();
         let mut chain = preferences.to_vec();
         for fallback in [
@@ -891,6 +898,18 @@ impl SurfaceEncoder {
                     continue;
                 }
                 let result = validate_surface_dimensions(width, height, pref).and_then(|()| {
+                    // Attempt reuse at its original rank, so a newly eligible
+                    // codec or chroma format still gets the first attempt.
+                    if let Some(old) = previous.as_mut()
+                        && old.preference() == pref
+                        && old.chroma == c
+                    {
+                        if old.resize(width, height) && old.set_bandwidth(encoding.bandwidth) {
+                            old.request_keyframe();
+                            return Ok(previous.take().unwrap());
+                        }
+                        previous.take();
+                    }
                     Self::try_one_inner_color(
                         pref,
                         width,
@@ -938,7 +957,7 @@ impl SurfaceEncoder {
     /// the same preference/chroma chain as a fresh build: a fallback selected
     /// for a small frame must not mask a better backend at the new size.
     pub fn new_or_resize(
-        mut previous: Option<Self>,
+        previous: Option<Self>,
         preferences: &[SurfaceEncoderPreference],
         width: u32,
         height: u32,
@@ -948,6 +967,8 @@ impl SurfaceEncoder {
         codec_support: u8,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
+        let mut previous =
+            previous.filter(|old| !old.managed && old.encoding.speed == encoding.speed);
         let source_width = width;
         let source_height = height;
         let mut last_err = String::from("no encoders configured");
@@ -955,7 +976,6 @@ impl SurfaceEncoder {
             if let Some(old) = previous.as_mut()
                 && old.preference() == pref
                 && old.chroma == chroma
-                && old.encoding.speed == encoding.speed
             {
                 if old.resize(width, height) && old.set_bandwidth(encoding.bandwidth) {
                     old.request_keyframe();
@@ -3403,6 +3423,120 @@ mod tests {
             660,
         );
         assert_eq!(encoder.preference(), SurfaceEncoderPreference::NvencAV1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires NVIDIA NVENC"]
+    fn nvenc_color_resize_selection_reuses_and_rebuilds() {
+        use ChromaSubsampling::{Cs420, Cs444};
+        use OutputColor::{DisplayP3, Hdr10, Srgb};
+        use SurfaceEncoderPreference::{NvencAV1, NvencH264};
+        use yas_wire::schema::surface as caps;
+
+        let build = |previous, prefs: &[_], w, h, color, chroma, encoding| {
+            SurfaceEncoder::new_color_or_resize(
+                previous,
+                prefs,
+                w,
+                h,
+                "",
+                encoding,
+                true,
+                0,
+                if color == Srgb {
+                    0
+                } else {
+                    (caps::COLOR_CAP_DISPLAY_P3
+                        | caps::COLOR_CAP_HDR10_AV1
+                        | caps::COLOR_CAP_H264_444) as u8
+                },
+                color == Hdr10,
+                chroma,
+                false,
+            )
+            .expect("select managed NVENC encoder")
+        };
+        for (pref, color, chroma) in [
+            (NvencH264, Srgb, Cs420),
+            (NvencH264, DisplayP3, Cs420),
+            (NvencH264, DisplayP3, Cs444),
+            (NvencAV1, Hdr10, Cs420),
+        ] {
+            let settings = SurfaceEncoding::default();
+            let encoder = build(None, &[pref], 800, 600, color, chroma, settings);
+            let settings = SurfaceEncoding {
+                bandwidth: SurfaceBandwidth::High,
+                ..settings
+            };
+            let mut encoder = build(Some(encoder), &[pref], 900, 660, color, chroma, settings);
+            assert_eq!(encoder.source_dimensions(), (900, 660));
+            assert!(encoder.managed);
+            assert_eq!(encoder.output_color, color);
+            assert_eq!(encoder.chroma, chroma);
+            assert_eq!(encoder.encoding, settings);
+            // Retaining the original 1000px ceiling proves we reused the
+            // 800px session instead of opening one with 1124px capacity.
+            assert!(!encoder.resize(1002, 660));
+            let encoder = build(Some(encoder), &[pref], 1002, 660, color, chroma, settings);
+            assert_eq!(encoder.source_dimensions(), (1002, 660));
+            let mut encoder = build(Some(encoder), &[pref], 192, 128, color, chroma, settings);
+            assert!(!encoder.resize(800, 600), "large shrinks release capacity");
+        }
+
+        let settings = SurfaceEncoding::default();
+        let encoder = build(None, &[NvencH264], 800, 600, DisplayP3, Cs420, settings);
+        let encoder = build(
+            Some(encoder),
+            &[NvencH264],
+            900,
+            660,
+            DisplayP3,
+            Cs444,
+            settings,
+        );
+        assert_eq!(encoder.chroma, Cs444, "chroma upgrades rebuild");
+        let encoder = build(
+            Some(encoder),
+            &[NvencAV1, NvencH264],
+            800,
+            600,
+            DisplayP3,
+            Cs444,
+            settings,
+        );
+        assert_eq!(encoder.preference(), NvencAV1, "respect preference order");
+        let encoder = build(Some(encoder), &[NvencAV1], 800, 600, Hdr10, Cs420, settings);
+        assert_eq!(encoder.output_color, Hdr10);
+        let settings = SurfaceEncoding {
+            speed: SurfaceSpeed::Fast,
+            ..settings
+        };
+        let encoder = build(Some(encoder), &[NvencAV1], 900, 660, Hdr10, Cs420, settings);
+        assert_eq!(encoder.encoding, settings, "speed changes rebuild");
+        let encoder = build(Some(encoder), &[NvencAV1], 800, 600, Srgb, Cs420, settings);
+        assert_eq!(encoder.output_color, Srgb, "color changes rebuild");
+        let encoder = SurfaceEncoder::new_or_resize(
+            Some(encoder),
+            &[NvencAV1],
+            900,
+            660,
+            "",
+            settings,
+            true,
+            0,
+            Cs420,
+        )
+        .unwrap();
+        assert!(
+            !encoder.managed,
+            "unmanaged output cannot retain managed metadata"
+        );
+        let encoder = build(Some(encoder), &[NvencAV1], 800, 600, Srgb, Cs420, settings);
+        assert!(
+            encoder.managed,
+            "managed output cannot retain unmanaged metadata"
+        );
     }
 
     #[test]

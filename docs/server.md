@@ -424,6 +424,21 @@ sequenceDiagram
 
 `RequestFrame` is only sent for surfaces that have subscribers and no pending request, preventing busy-loops when the app hasn't painted yet.
 
+Server-side encoders initialize concurrently on blocking workers. Each finished
+encoder registers its compositor targets and wakes frame delivery immediately;
+a slow initialization for another surface or viewer does not delay its first
+frame. Creation has a ten-second deadline measured from dispatch. Panics and
+timeouts release only the affected subscriptions for retry, and timed-out
+workers cannot install late results over a replacement encoder.
+
+Surface resizes reuse compatible NVENC sessions, including managed sRGB,
+Display P3, and HDR10 output. Reuse follows the encoder preference order and
+requires the same codec, color metadata, chroma, and speed preset; the first
+frame at the new size carries fresh headers and a keyframe. Growth remains
+limited to the session's existing 25% headroom per axis. Shrinking below a
+quarter of its reserved pixel area rebuilds the session to release memory.
+Other backends and incompatible changes use the ordinary creation path.
+
 ### GPU rendering and encoding
 
 The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `ash` (dlopen `libvulkan.so`). Client surface buffers (SHM or DMA-BUF) are uploaded as persistent GPU textures at `wl_surface.commit` time and reused across frames until the surface commits a new buffer. SHM normally copies only accumulated damaged rows into a reusable mapped staging buffer. When `VK_EXT_external_memory_host` exposes the client mapping as coherent device-local memory, Vulkan reads those damaged rows directly and the compositor retains the `wl_buffer` until the submission fence signals. NVIDIA host import remains opt-in because its driver currently shadows the full allocation, which is slower than the damage-aware staging path.

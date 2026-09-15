@@ -54,30 +54,47 @@ fn direct_gpu_color_pixels_and_metadata() {
     }
     for (pref, color, chroma, tone_map) in cases {
         let mut source = client::ColorClient::new(&device, if tone_map { O::Hdr10 } else { color });
-        for size in [256, 192] {
-            let mut encoder = SurfaceEncoder::new_color(
-                &[pref],
-                size,
-                size,
-                &device,
-                SurfaceEncoding::default(),
-                true,
-                if matches!(pref, P::NvencAV1 | P::AV1Vaapi) {
-                    2
-                } else {
-                    1
-                },
-                if color == O::Srgb {
-                    0
-                } else if color == O::DisplayP3 {
-                    25
-                } else {
-                    31
-                },
-                color == O::Hdr10 || tone_map,
-                chroma,
-            )
-            .unwrap();
+        let mut previous = None;
+        let mut resize_time = std::time::Duration::ZERO;
+        let mut recreate_time = std::time::Duration::ZERO;
+        for size in [256, 192, 256] {
+            let create = |previous| {
+                SurfaceEncoder::new_color_or_resize(
+                    previous,
+                    &[pref],
+                    size,
+                    size,
+                    &device,
+                    SurfaceEncoding::default(),
+                    true,
+                    if matches!(pref, P::NvencAV1 | P::AV1Vaapi) {
+                        2
+                    } else {
+                        1
+                    },
+                    if color == O::Srgb {
+                        0
+                    } else if color == O::DisplayP3 {
+                        25
+                    } else {
+                        31
+                    },
+                    color == O::Hdr10 || tone_map,
+                    chroma,
+                    false,
+                )
+                .unwrap()
+            };
+            let resizing = previous.is_some();
+            let start = std::time::Instant::now();
+            let mut encoder = create(previous.take());
+            if resizing {
+                resize_time += start.elapsed();
+                let start = std::time::Instant::now();
+                let fresh = create(None);
+                recreate_time += start.elapsed();
+                drop(fresh);
+            }
             assert_eq!(encoder.preference(), pref, "hardware fallback");
             assert_eq!(encoder.output_color, color);
             let buffers = if vaapi {
@@ -122,7 +139,10 @@ fn direct_gpu_color_pixels_and_metadata() {
             for _ in 0..12 {
                 source.repaint();
                 let pixels = source.gpu_frame(size, vaapi);
-                if let Some((packet, _)) = encoder.encode_pixels(&pixels) {
+                if let Some((packet, keyframe)) = encoder.encode_pixels(&pixels) {
+                    if packets == 0 {
+                        assert!(keyframe, "first frame after resize must be a keyframe");
+                    }
                     bytes.extend(packet);
                     packets += 1;
                 }
@@ -161,7 +181,11 @@ fn direct_gpu_color_pixels_and_metadata() {
             };
             source.handle.command_tx.send(command).unwrap();
             source.handle.wake();
+            previous = Some(encoder);
         }
+        eprintln!(
+            "{pref:?} {color:?} {chroma:?} tone_map={tone_map}: resize setup {resize_time:?}; fresh setup {recreate_time:?} (2 sizes)"
+        );
     }
 }
 
