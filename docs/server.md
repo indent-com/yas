@@ -262,6 +262,27 @@ both feed outbox backpressure, so a couple of tiny Terminal frames do not stall
 a large Surface or Media frame. Bulk Transfers are chunked so audio can
 interleave while large terminal or video payloads are draining.
 
+Native Terminal views keep their own last-written grid baseline. Ordinary
+updates carry only changed cells and metadata; cursor-only changes contain no
+cell patches and unchanged snapshots emit no frame. The encoder chooses the
+smallest of contiguous runs, sparse lists, and cropped bitmaps. Full-width
+scrolls of up to eight rows use COPY_RECT when it reduces the decoded frame
+size, preserving copied Unicode overflow and hyperlink associations.
+
+A baseline advances only after the complete logical frame is written.
+Discarded writes retain the previous baseline and return their sequence and
+credit. Reset, resize, scroll, and backend restart invalidate the baseline via
+the view's presentation epoch and force a keyframe. Each view has an
+independent baseline.
+
+Terminal frames use codec 1's lossless LZ4 grid wrapper when it saves at least
+eight bytes; otherwise they retain raw grid bytes. Decoded-frame credit is
+checked before compression. The outer FRAME/FRAME_CHUNK compression bit stays
+disabled. If optional state exceeds the declared decoded bound, a keyframe
+omits it, replacing unrepresentable overflow glyphs with an inline replacement
+character and clearing hyperlink markers. The next delta uses that transmitted
+state as its baseline, so omitted metadata can be restored when it fits.
+
 Terminal and Surface feedback remain separate. Terminal queue depth is the
 browser's applied-but-unpainted frame count and falls when a terminal actually
 paints. Surface `FRAME_ACK` carries its own decoder depth and credit. Video

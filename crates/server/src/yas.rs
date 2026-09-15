@@ -5,6 +5,7 @@
 //! backend APIs rather than translating through a retired packet endpoint.
 
 mod heartbeat;
+mod terminal_delta;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
@@ -4852,6 +4853,7 @@ struct TerminalView {
     // The writer preserves FIFO within the Data lane. A receipt for the
     // newest queued frame therefore covers every older frame for this view.
     last_frame_written: Option<TerminalFrameReceipt>,
+    frame_base: Option<Arc<terminal_delta::FrameBase>>,
 }
 
 #[derive(Clone)]
@@ -4860,6 +4862,7 @@ struct TerminalFrameReceipt {
     sequence: u32,
     final_state: bool,
     completion: Arc<TerminalFrameWriteCompletion>,
+    frame_base: Arc<terminal_delta::FrameBase>,
 }
 
 impl TerminalRuntime {
@@ -6039,130 +6042,51 @@ fn terminal_view_note_owed_frame(
     view.frame_owed_final_guard = final_state.then(|| guard.clone());
 }
 
+fn terminal_frame_written(
+    view: &mut TerminalView,
+    receipt: &TerminalFrameReceipt,
+    outcome: TerminalFrameWriteOutcome,
+) -> Result<(), ()> {
+    match outcome {
+        TerminalFrameWriteOutcome::Written => {
+            view.frame_base = Some(Arc::clone(&receipt.frame_base));
+        }
+        TerminalFrameWriteOutcome::Discarded => {
+            if view.next_sequence != receipt.sequence.wrapping_add(1) {
+                return Err(());
+            }
+            view.next_sequence = receipt.sequence;
+            view.available_frame_slots = view.available_frame_slots.checked_add(1).ok_or(())?;
+            view.final_state = false;
+        }
+    }
+    Ok(())
+}
+
 fn terminal_frame_from_state(
     view: &mut TerminalView,
     state: &yas_terminal_model::FrameState,
-) -> Option<yas_terminal::TerminalFrame> {
-    let source_cells = state
-        .cells()
-        .as_chunks::<{ yas_terminal_model::CELL_SIZE }>()
-        .0
-        .to_vec();
-    let source_rows = usize::from(state.rows());
-    let source_cols = usize::from(state.cols());
-    // View dimensions are an offer, not a separate terminal grid. Publish
-    // the shared PTY dimensions so cursor, scrollback and page navigation
-    // describe the same rows; padding to a larger viewer invents blank rows.
-    let rows = usize::from(view.rows.min(state.rows()));
-    let cols = usize::from(view.cols.min(state.cols()));
-    let mut cells = vec![[0; yas_terminal_model::CELL_SIZE]; rows.checked_mul(cols)?];
-    for row in 0..rows.min(source_rows) {
-        let copy_cols = cols.min(source_cols);
-        let source = row.checked_mul(source_cols)?;
-        let target = row.checked_mul(cols)?;
-        cells[target..target + copy_cols]
-            .copy_from_slice(&source_cells[source..source + copy_cols]);
+    guard: &super::yas_terminal_backend::FrameGuard,
+) -> Option<(yas_terminal::TerminalFrame, Arc<terminal_delta::FrameBase>)> {
+    terminal_delta::encode(view, state, guard)
+}
+
+// Terminal forbids outer-frame compression, but codec 1 has a bounded LZ4
+// wrapper of its own. Use it only when its size clears the codec's required
+// saving; decoded credit is checked before compression by the wire encoder.
+fn encode_terminal_grid_codec1(
+    grid: &yas_terminal::Grid,
+    frame_flags: &mut u16,
+    frame_bound: u32,
+    base_dimensions: Option<(u16, u16)>,
+) -> Result<Vec<u8>, ()> {
+    let compressed = *frame_flags | yas_wire::schema::terminal::FRAME_CODEC_COMPRESSED as u16;
+    if let Ok(payload) = grid.encode_codec1(compressed, frame_bound, base_dimensions) {
+        *frame_flags = compressed;
+        return Ok(payload);
     }
-    let mut line_flags = vec![0; rows];
-    let line_count = rows.min(state.line_flags().len());
-    line_flags[..line_count].copy_from_slice(&state.line_flags()[..line_count]);
-    let mut overflow = BTreeMap::new();
-    for (&index, value) in state.overflow() {
-        let row = index / source_cols.max(1);
-        let col = index % source_cols.max(1);
-        if row < rows && col < cols {
-            overflow.insert(row * cols + col, value.clone());
-        }
-    }
-    let mut cell_links = vec![0; rows.checked_mul(cols)?];
-    for row in 0..rows.min(source_rows) {
-        let copy_cols = cols.min(source_cols);
-        let source = row.checked_mul(source_cols)?;
-        let target = row.checked_mul(cols)?;
-        let available = state
-            .cell_links()
-            .len()
-            .saturating_sub(source)
-            .min(copy_cols);
-        if available != 0 {
-            cell_links[target..target + available]
-                .copy_from_slice(&state.cell_links()[source..source + available]);
-        }
-    }
-    let mut components = Vec::new();
-    if line_flags.iter().any(|flags| *flags != 0) {
-        components.push(yas_terminal::Component {
-            kind: yas_wire::schema::terminal::COMPONENT_LINE_FLAGS as u8,
-            required: false,
-            body: terminal_line_flags_component(&line_flags),
-        });
-    }
-    if !overflow.is_empty() {
-        components.push(yas_terminal::Component {
-            kind: yas_wire::schema::terminal::COMPONENT_OVERFLOW_STRINGS as u8,
-            required: false,
-            body: terminal_overflow_component(&overflow),
-        });
-    }
-    if cell_links.iter().any(|link| *link != 0) {
-        components.push(yas_terminal::Component {
-            kind: yas_wire::schema::terminal::COMPONENT_HYPERLINKS as u8,
-            required: false,
-            body: terminal_hyperlink_component(&cell_links, state.link_uris()),
-        });
-    }
-    let mut frame_flags = yas_wire::schema::terminal::FRAME_KEYFRAME as u16
-        | yas_wire::schema::terminal::FRAME_DIMENSIONS as u16
-        | yas_wire::schema::terminal::FRAME_CURSOR as u16
-        | yas_wire::schema::terminal::FRAME_MODES as u16
-        | yas_wire::schema::terminal::FRAME_SCROLLBACK as u16
-        | yas_wire::schema::terminal::FRAME_VIEW_OFFSET as u16
-        | yas_wire::schema::terminal::FRAME_TITLE as u16;
-    if !components.is_empty() {
-        frame_flags |= yas_wire::schema::terminal::FRAME_COMPONENTS as u16;
-    }
-    if view.final_state {
-        frame_flags |= yas_wire::schema::terminal::FRAME_FINAL_STATE as u16;
-    }
-    let mut grid = yas_terminal::Grid {
-        dimensions: Some((rows as u16, cols as u16)),
-        cursor: Some((
-            state.cursor_row().min((rows as u16).saturating_sub(1)),
-            state.cursor_col().min((cols as u16).saturating_sub(1)),
-        )),
-        modes: Some(state.mode()),
-        scrollback_lines: Some(state.scrollback_lines()),
-        scroll_offset: Some(view.scroll_offset),
-        title: Some(state.title().to_owned()),
-        operations: vec![yas_terminal::GridOperation::PatchRun {
-            start_cell: 0,
-            cells,
-        }],
-        components,
-    };
-    // The view declared `frame_bound` at OPEN_VIEW and its peer reserved
-    // exactly that much; a frame that does not fit must shrink rather than
-    // overrun the reservation. Every component here is optional, and the
-    // grid without them is bounded by the cells the declaration was sized on.
-    let grid_payload = match grid.encode_codec1(frame_flags, view.frame_bound, None) {
-        Ok(payload) => payload,
-        Err(_) if !grid.components.is_empty() => {
-            grid.components.clear();
-            frame_flags &= !(yas_wire::schema::terminal::FRAME_COMPONENTS as u16);
-            grid.encode_codec1(frame_flags, view.frame_bound, None)
-                .ok()?
-        }
-        Err(_) => return None,
-    };
-    let sequence = view.next_sequence;
-    view.next_sequence = sequence.wrapping_add(1);
-    Some(yas_terminal::TerminalFrame {
-        view_id: view_id_nonzero(view),
-        frame_sequence: sequence,
-        frame_flags,
-        base_sequence: None,
-        grid_payload,
-    })
+    grid.encode_codec1(*frame_flags, frame_bound, base_dimensions)
+        .map_err(|_| ())
 }
 
 fn encode_terminal_frame_wire_events(
@@ -6298,12 +6222,6 @@ fn terminal_view_required_frame_bound(rows: u16, cols: u16) -> u32 {
         .saturating_mul(TERMINAL_CELL_BYTES)
         .saturating_add(TERMINAL_FRAME_PREFIX_BYTES)
         .saturating_add(TERMINAL_FRAME_TITLE_ALLOWANCE)
-}
-
-fn view_id_nonzero(view: &TerminalView) -> u32 {
-    // Views are keyed by their ID in `TerminalRuntime`; preserve it in the
-    // value as well once the bridge starts emitting frames.
-    view.view_id
 }
 
 fn put_terminal_uleb(out: &mut Vec<u8>, mut value: u32) {
@@ -15288,6 +15206,7 @@ impl Session {
                     final_state: false,
                     _outbound_credit: outbound_credit,
                     last_frame_written: None,
+                    frame_base: None,
                 },
             );
         Ok(yas_terminal::OpenViewResult {
@@ -27599,7 +27518,7 @@ impl Session {
             view.frame_owed = false;
             view.frame_owed_final_guard = None;
             view.final_state = frame.final_state;
-            let encoded = terminal_frame_from_state(view, &frame.state)?;
+            let encoded = terminal_frame_from_state(view, &frame.state, &frame.guard)?;
             view.available_frame_slots = view.available_frame_slots.checked_sub(1)?;
             Some(encoded)
         });
@@ -27610,8 +27529,8 @@ impl Session {
         {
             probe.final_frame.notify_one();
         }
-        if let Some(encoded) = encoded {
-            let receipt = match self.send_terminal_frame(encoded, guard).await {
+        if let Some((encoded, frame_base)) = encoded {
+            let receipt = match self.send_terminal_frame(encoded, guard, frame_base).await {
                 Ok(Some(receipt)) => receipt,
                 Ok(None) => return Ok(()),
                 Err(()) => return Err(()),
@@ -27682,14 +27601,7 @@ impl Session {
                 return Ok(());
             }
             let mut rearm = None;
-            if outcome == TerminalFrameWriteOutcome::Discarded {
-                if view.next_sequence != receipt.sequence.wrapping_add(1) {
-                    return Err(());
-                }
-                view.next_sequence = receipt.sequence;
-                view.available_frame_slots = view.available_frame_slots.checked_add(1).ok_or(())?;
-                view.final_state = false;
-            }
+            terminal_frame_written(view, receipt, outcome)?;
             if rearm_owed && view.frame_owed && terminal_view_has_frame_credit(view) {
                 let owed_final_guard = view.frame_owed_final_guard.take();
                 view.frame_owed = false;
@@ -27715,6 +27627,7 @@ impl Session {
         &self,
         frame: yas_terminal::TerminalFrame,
         guard: super::yas_terminal_backend::FrameGuard,
+        frame_base: Arc<terminal_delta::FrameBase>,
     ) -> Result<Option<TerminalFrameReceipt>, ()> {
         let view_id = frame.view_id;
         let sequence = frame.frame_sequence;
@@ -27743,6 +27656,7 @@ impl Session {
             sequence,
             final_state,
             completion,
+            frame_base,
         }))
     }
 
@@ -41000,16 +40914,15 @@ mod tests {
         mut frame: yas_terminal::TerminalFrame,
         frames: &mut Vec<yas_terminal::TerminalFrame>,
         title: &str,
+        mut dimensions: (u16, u16),
     ) -> yas_terminal::TerminalFrame {
         timeout(TEST_TIMEOUT, async {
             loop {
-                if frame
-                    .decode_grid_codec1(SERVER_MAX_DECODED, None)
-                    .unwrap()
-                    .title
-                    .as_deref()
-                    == Some(title)
-                {
+                let grid = frame
+                    .decode_grid_codec1(SERVER_MAX_DECODED, Some(dimensions))
+                    .unwrap();
+                dimensions = grid.dimensions.unwrap_or(dimensions);
+                if grid.title.as_deref() == Some(title) {
                     return frame;
                 }
                 // Shell startup and PTY echo can arrive in separate frames.
@@ -43243,6 +43156,143 @@ mod tests {
         })
         .await
         .expect("outbound frames entered their lanes");
+    }
+
+    pub(super) fn terminal_encoding_view(rows: u16, cols: u16) -> TerminalView {
+        let credit = Arc::new(CreditBudget::new(1)).try_lease_exact(1).unwrap();
+        TerminalView {
+            view_id: 1,
+            terminal_handle: 1,
+            pty_id: 1,
+            backend_view: 1,
+            rows,
+            cols,
+            max_fps: 60,
+            frame_bound: terminal_view_frame_bound(rows, cols),
+            presentation_metrics: None,
+            max_inflight_frames: 3,
+            queue_target: 3,
+            decoder_queue_depth: 0,
+            available_frame_slots: 3,
+            frame_owed: false,
+            frame_owed_final_guard: None,
+            next_sequence: 1,
+            acknowledged_sequence: 0,
+            scroll_offset: 0,
+            focused: false,
+            final_state: false,
+            _outbound_credit: credit,
+            last_frame_written: None,
+            frame_base: None,
+        }
+    }
+
+    #[test]
+    fn native_terminal_large_keyframes_use_lossless_codec_compression() {
+        let mut view = terminal_encoding_view(150, 182);
+        let mut state = yas_terminal_model::FrameState::new(150, 182);
+        state.set_title("YAS terminal compression regression");
+        state.set_cursor(149, 37);
+        state.set_wrapped(2, true);
+        // A full terminal of text, not just a highly compressible blank grid.
+        let text = b"src/server.rs:123: terminal output with styles and numbers 0123456789 ";
+        for (index, cell) in state
+            .cells_mut()
+            .as_chunks_mut::<12>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            cell[0] = (index / 182 % 2) as u8;
+            cell[1] = 8;
+            cell[2] = 7;
+            cell[8] = text[index % text.len()];
+        }
+        let guard = super::super::yas_terminal_backend::FrameGuard::current_for_test();
+        let (frame, _) = terminal_frame_from_state(&mut view, &state, &guard).unwrap();
+        let grid = frame.decode_grid_codec1(view.frame_bound, None).unwrap();
+        let raw_flags =
+            frame.frame_flags & !(yas_wire::schema::terminal::FRAME_CODEC_COMPRESSED as u16);
+        let raw = grid
+            .encode_codec1(raw_flags, view.frame_bound, None)
+            .unwrap();
+        eprintln!(
+            "182x150 Terminal grid: {} raw bytes, {} wire grid bytes",
+            raw.len(),
+            frame.grid_payload.len()
+        );
+        assert!(
+            frame.grid_payload.len() < 16 * 1024,
+            "ordinary terminal text monopolizes the reliable stream"
+        );
+        assert_ne!(
+            frame.frame_flags & yas_wire::schema::terminal::FRAME_CODEC_COMPRESSED as u16,
+            0
+        );
+        assert!(frame.grid_payload.len() + 8 <= raw.len());
+        assert_eq!(grid.dimensions, Some((150, 182)));
+        assert_eq!(grid.cursor, Some((149, 37)));
+        assert_eq!(grid.title.as_deref(), Some(state.title()));
+        assert_eq!(
+            grid.operations,
+            vec![yas_terminal::GridOperation::PatchRun {
+                start_cell: 0,
+                cells: state.cells().as_chunks::<12>().0.to_vec(),
+            }]
+        );
+        assert_eq!(
+            grid.components[0].body,
+            terminal_line_flags_component(state.line_flags())
+        );
+        assert_eq!(
+            encode_terminal_frame_wire_events(&frame, SERVER_MAX_FRAME, SERVER_MAX_DECODED)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Compression must not permit a frame that exceeds decoded credit.
+        state.set_wrapped(2, false);
+        let mut required_grid = grid.clone();
+        required_grid.components.clear();
+        let required_flags = raw_flags & !(yas_wire::schema::terminal::FRAME_COMPONENTS as u16);
+        let required = required_grid
+            .encode_codec1(required_flags, view.frame_bound, None)
+            .unwrap();
+        view.frame_bound = required.len() as u32 - 1;
+        assert!(terminal_frame_from_state(&mut view, &state, &guard).is_none());
+    }
+
+    #[test]
+    fn native_terminal_unprofitable_compression_keeps_the_raw_grid() {
+        let mut view = terminal_encoding_view(1, 1);
+        view.scroll_offset = 0x1234_5678_9abc_def0;
+        let mut state = yas_terminal_model::FrameState::new(1, 1);
+        state.scrollback_lines = 0x7654_3210;
+        state.mode = 9;
+        state.set_title((b'!'..=b'~').map(char::from).collect::<String>());
+        state
+            .cells_mut()
+            .copy_from_slice(&[0x22, 8, 1, 2, 3, 4, 5, 6, b'x', 0, 0, 0]);
+        let guard = super::super::yas_terminal_backend::FrameGuard::current_for_test();
+        let (frame, _) = terminal_frame_from_state(&mut view, &state, &guard).unwrap();
+        let grid = frame.decode_grid_codec1(view.frame_bound, None).unwrap();
+        let compressed =
+            frame.frame_flags | yas_wire::schema::terminal::FRAME_CODEC_COMPRESSED as u16;
+        assert!(
+            grid.encode_codec1(compressed, view.frame_bound, None)
+                .is_err(),
+            "fixture should not save eight bytes with compression"
+        );
+        assert_eq!(
+            frame.frame_flags & yas_wire::schema::terminal::FRAME_CODEC_COMPRESSED as u16,
+            0
+        );
+        assert_eq!(
+            frame.grid_payload,
+            grid.encode_codec1(frame.frame_flags, view.frame_bound, None)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -52041,6 +52091,7 @@ mod tests {
         let mut saw_new_frame = false;
         let mut expected_sequence = opened.first_sequence;
         let mut last_title = None;
+        let mut dimensions = None;
         let received = timeout(TEST_TIMEOUT, async {
             while !saw_new_state || !saw_new_frame {
                 let frame = next_frame(&mut observer, &observer_codec).await;
@@ -52086,8 +52137,9 @@ mod tests {
                 );
                 expected_sequence = expected_sequence.wrapping_add(1);
                 let grid = terminal_frame
-                    .decode_grid_codec1(SERVER_MAX_DECODED, None)
+                    .decode_grid_codec1(SERVER_MAX_DECODED, dimensions)
                     .unwrap();
+                dimensions = grid.dimensions.or(dimensions);
                 assert_ne!(grid.title.as_deref(), Some("old-generation"));
                 if grid.title.as_deref() == Some("new-generation") {
                     saw_new_frame = true;
@@ -53557,12 +53609,18 @@ mod tests {
         let second =
             next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
         assert_eq!(second.frame_sequence, first.frame_sequence.wrapping_add(1),);
+        assert_eq!(
+            second.frame_flags & yas_wire::schema::terminal::FRAME_KEYFRAME as u16,
+            0,
+            "ordinary output must use the written first frame as its delta base",
+        );
         let mut second = terminal_frame_with_title(
             &mut client,
             &codec,
             second,
             &mut pending_frames,
             "blocked-latest",
+            (12, 40),
         )
         .await;
 
@@ -53686,7 +53744,7 @@ mod tests {
                 assert_eq!(frame.frame_sequence, previous.wrapping_add(1));
                 previous = frame.frame_sequence;
                 if frame
-                    .decode_grid_codec1(SERVER_MAX_DECODED, None)
+                    .decode_grid_codec1(SERVER_MAX_DECODED, Some((12, 40)))
                     .unwrap()
                     .title
                     .as_deref()
@@ -54106,6 +54164,7 @@ mod tests {
             first_frame,
             &mut pending_frames,
             "ready",
+            (12, 40),
         )
         .await;
         acknowledge_terminal_frame(&mut client, &codec, &first_frame).await;
@@ -54115,8 +54174,40 @@ mod tests {
             second_frame,
             &mut pending_frames,
             "ready",
+            (6, 20),
         )
         .await;
+        acknowledge_terminal_frame(&mut client, &codec, &second_frame).await;
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::RESET_VIEW,
+            120,
+            &yas_terminal::ResetView {
+                view_id: second.view_id,
+            },
+        )
+        .await;
+        let reset = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::RESET_VIEW,
+            120,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(reset.status, Status::Ok);
+        // Frames collected before the RESET Result belong to the old epoch.
+        // The requested keyframe follows that result boundary.
+        pending_frames.retain(|frame| frame.view_id != second.view_id);
+        let second_frame =
+            next_terminal_frame_for(&mut client, &codec, second.view_id, &mut pending_frames).await;
+        assert_ne!(
+            second_frame.frame_flags & yas_wire::schema::terminal::FRAME_KEYFRAME as u16,
+            0
+        );
         acknowledge_terminal_frame(&mut client, &codec, &second_frame).await;
 
         // Both views share a PTY. The smaller view must include output at its

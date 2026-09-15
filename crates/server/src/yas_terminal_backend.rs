@@ -57,6 +57,19 @@ impl FrameWriteGuard {
 }
 
 impl FrameGuard {
+    #[cfg(test)]
+    pub(crate) fn current_for_test() -> Self {
+        Self {
+            epoch: Arc::new(AtomicU64::new(1)),
+            expected: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_test(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         self.epoch.load(Ordering::Acquire) == self.expected
     }
@@ -283,9 +296,9 @@ impl Session {
         self.native_terminal_views.ptys_due(now)
     }
 
-    /// Publish one typed full state per due native view. Full native states
-    /// deliberately do not inherit the terminal model's per-client delta
-    /// baseline.
+    /// Publish full snapshots to the native adapter. It computes per-view
+    /// deltas against its last written frame, since snapshots can be coalesced
+    /// here and discarded by the writer during presentation cutovers.
     pub(crate) fn publish_native_terminal_frames(
         &mut self,
         snapshots: &FxHashMap<u16, FrameState>,
