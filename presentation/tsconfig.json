@@ -6,8 +6,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["vite/client", "webmidi"]
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "ESNext.Float16"],
+    "types": ["vite/client"]
   },
   "include": ["src"]
 }

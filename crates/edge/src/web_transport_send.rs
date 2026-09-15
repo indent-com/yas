@@ -43,6 +43,7 @@ impl ControllerFactory for Factory {
         Box::new(Tracked {
             inner: Arc::new(CubicConfig::default()).build(now, mtu),
             flight: Arc::new(Flight::default()),
+            max_flight: QUEUE_BYTES,
         })
     }
 }
@@ -50,10 +51,14 @@ impl ControllerFactory for Factory {
 // Preserve Quinn's congestion controller; observe its transmission callbacks
 // to size application admission. The exact in-flight count is refreshed after
 // each ACK batch. Between batches on_sent includes packet headers/ACKs, so this
-// is a conservative allowance, also capped at the congestion window.
+// is a conservative allowance, also capped at the congestion window. Permit
+// at most one queue of growth between ACKs: retransmissions during a stalled
+// path must not keep increasing admission under Quinn's retained-buffer
+// send-window accounting.
 struct Tracked {
     inner: Box<dyn Controller>,
     flight: Arc<Flight>,
+    max_flight: u64,
 }
 
 impl Controller for Tracked {
@@ -64,7 +69,8 @@ impl Controller for Tracked {
                 .bytes
                 .load(Ordering::Acquire)
                 .saturating_add(bytes)
-                .min(self.inner.window()),
+                .min(self.inner.window())
+                .min(self.max_flight),
         );
     }
 
@@ -87,11 +93,13 @@ impl Controller for Tracked {
         largest: Option<u64>,
     ) {
         self.inner.on_end_acks(now, in_flight, app_limited, largest);
+        self.max_flight = in_flight.saturating_add(QUEUE_BYTES);
         self.flight.set(in_flight.min(self.inner.window()));
     }
 
     fn on_congestion_event(&mut self, now: Instant, sent: Instant, persistent: bool, lost: u64) {
         self.inner.on_congestion_event(now, sent, persistent, lost);
+        self.max_flight = self.max_flight.saturating_sub(lost);
         self.flight.set(
             self.flight
                 .bytes
@@ -117,6 +125,7 @@ impl Controller for Tracked {
         Box::new(Self {
             inner: self.inner.clone_box(),
             flight: self.flight.clone(),
+            max_flight: self.max_flight,
         })
     }
 

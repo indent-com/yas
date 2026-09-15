@@ -12,8 +12,8 @@ axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 futures-util = "0.3"
 notify = "8"
-brotli = "8"
-argon2 = { version = "0.5", features = ["std"] }
+brotli = "9"
+argon2 = "0.6"
 blake3 = { version = "1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]

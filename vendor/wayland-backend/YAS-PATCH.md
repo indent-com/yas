@@ -1,7 +1,9 @@
-# YAS's delta against wayland-backend 0.3.15
+# YAS's delta against wayland-backend 0.3.17
 
-Unmodified crates.io 0.3.15 apart from one hunk in
-`src/rs/server_impl/registry.rs`, in `Registry::disable_global`.
+Based on crates.io 0.3.17, with updated dependency requirements and one source
+hunk in `src/rs/server_impl/registry.rs`, in `Registry::disable_global`.
+The optional raw-window-handle 0.5 dependency remains for upstream API
+compatibility; the separate `rwh_06` dependency uses the current API.
 
 ## What
 
@@ -28,7 +30,7 @@ told.
 
 ## Upstream status
 
-Present in 0.3.15 through 0.3.17 (latest at the time of writing); a version bump
+Present through 0.3.17 (latest at the time of writing); a version bump
 does not fix it. Not yet reported upstream.
 
 ## Re-applying on upgrade

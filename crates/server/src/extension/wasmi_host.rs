@@ -599,7 +599,7 @@ impl PreparedRunner {
     fn new(spec: &AttemptSpec, io: Arc<HostIo>) -> Result<Self, AttemptFailure> {
         let (engine, module) = compile_module(&spec.module, &spec.config)?;
         // Repeat the raw no-start/shape scan immediately before instantiation.
-        // Wasmi 1.0 combines instantiation and start execution in its public
+        // Wasmi combines instantiation and start execution in its public
         // Linker API, so this check is the safety fence which makes that call
         // incapable of executing guest code.
         validate_binary_shape(&spec.module)?;
@@ -685,9 +685,9 @@ struct StoreData {
 }
 
 fn configured_engine(config: &WasmiHostConfig) -> Engine {
+    // Wasmi 2 disables memory64 at compile time unless its feature is enabled.
     let mut engine_config = Config::default();
     engine_config
-        .wasm_memory64(false)
         .wasm_multi_memory(false)
         .compilation_mode(CompilationMode::Eager)
         .ignore_custom_sections(true)
@@ -731,7 +731,7 @@ fn validate_binary_shape(wasm: &[u8]) -> Result<(), AttemptFailure> {
         })?;
         match payload {
             Payload::ImportSection(reader) => {
-                for import in reader {
+                for import in reader.into_imports() {
                     let import = import.map_err(|error| {
                         failure(FailureKind::Validation, "parse module import", error)
                     })?;

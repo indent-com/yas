@@ -245,8 +245,18 @@ impl client::Handler for SshHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &keys::PublicKey,
+        server_public_key: &keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        let keys::PublicKeyOrCertificate::PublicKey {
+            key: server_public_key,
+            ..
+        } = server_public_key
+        else {
+            // YAS pins raw host keys; it does not maintain trusted SSH CAs.
+            return Err(Error::Other(
+                "SSH host certificates are not supported".into(),
+            ));
+        };
         let path = known_hosts_path().ok_or_else(|| {
             Error::Other(
                 "cannot verify host keys: no home directory for ~/.ssh/known_hosts. \
@@ -874,7 +884,7 @@ mod tests {
             host: "example.test".into(),
             port: 22,
         };
-        futures_lite_block_on(h.check_server_key(&key(presented)))
+        futures_lite_block_on(h.check_server_key(&key(presented).into()))
     }
 
     /// Minimal executor: `check_server_key` never yields, so polling once is

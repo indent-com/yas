@@ -15,8 +15,8 @@ path = "src/lib.rs"
 rustls-native-certs = "0.8"
 tokio = { version = "1", features = ["full"] }
 rustls = { version = "0.23", features = ["ring"] }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
-web-transport-quinn = { version = "0.11", features = ["ring"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+web-transport-quinn = { version = "0.12", features = ["ring"] }
 futures-util = "0.3"
 bytes = "1"
 rand = "0.10"

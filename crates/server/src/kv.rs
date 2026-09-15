@@ -12,9 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-use redb::ReadableTable;
 #[cfg(test)]
 use redb::TableHandle;
+use redb::{ReadableDatabase, ReadableTable};
 use tokio::sync::{broadcast, oneshot};
 
 /// The standalone YAS table is byte-keyed, so keys never pass through UTF-8
@@ -228,7 +228,6 @@ struct WriteJob {
     mutations: Vec<PersistedMutation>,
     operation: Option<([u8; 16], Arc<Vec<u8>>)>,
     evicted_operations: Vec<[u8; 16]>,
-    durable: bool,
     native_reply: Option<oneshot::Sender<bool>>,
     /// Admission is released only after the writer has committed or failed the
     /// complete ordered batch, not when a client cancels its durable wait.
@@ -893,25 +892,20 @@ fn prune_persisted_operation_replays(
 }
 
 /// The writer thread: drains queued mutations into one transaction per
-/// wakeup, `Immediate` (fsynced) when any job in the batch is `DURABLE`,
-/// `Eventual` otherwise — so a `DURABLE` commit also hardens everything
-/// ordered before it. Failures degrade (memory truth holds, durability is
-/// lost) and are reported to the native mutation waiter.
+/// wakeup, always using `Immediate` (fsynced). redb 4 removed `Eventual`;
+/// background writes also sync so they still survive a normal restart.
+/// A `DURABLE` commit also hardens everything ordered before it. Failures
+/// degrade to memory-only state and are reported to the native mutation waiter.
 fn writer_loop(db: redb::Database, rx: std::sync::mpsc::Receiver<WriteJob>) {
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while let Ok(job) = rx.try_recv() {
             batch.push(job);
         }
-        let durable = batch.iter().any(|j| j.durable);
         #[allow(clippy::result_large_err)] // redb::Error is big; local + immediately consumed
         let run = || -> Result<(), redb::Error> {
             let mut txn = db.begin_write()?;
-            txn.set_durability(if durable {
-                redb::Durability::Immediate
-            } else {
-                redb::Durability::Eventual
-            });
+            txn.set_durability(redb::Durability::Immediate)?;
             {
                 let mut table = txn.open_table(TABLE)?;
                 for job in &batch {
@@ -1257,7 +1251,6 @@ pub(crate) fn native_mutate(
                 mutations: Vec::new(),
                 operation: Some((operation_id, encoded)),
                 evicted_operations: replay_plan.evicted,
-                durable,
                 native_reply: reply,
                 _permit: permit,
             })
@@ -1365,7 +1358,6 @@ pub(crate) fn native_mutate(
             mutations: persisted,
             operation: Some((operation_id, encoded)),
             evicted_operations: replay_plan.evicted,
-            durable,
             native_reply: reply,
             _permit: permit,
         })
@@ -1415,7 +1407,6 @@ mod tests {
             mutations: Vec::new(),
             operation: None,
             evicted_operations: Vec::new(),
-            durable: false,
             native_reply: None,
             _permit: permit,
         }
@@ -1566,7 +1557,6 @@ mod tests {
                 }],
                 operation: None,
                 evicted_operations: Vec::new(),
-                durable: true,
                 native_reply: Some(reply),
                 _permit: permit,
             })
@@ -1746,7 +1736,6 @@ mod tests {
                     mutations: Vec::new(),
                     operation: Some((new_id, encoded)),
                     evicted_operations: vec![old_id],
-                    durable: true,
                     native_reply: Some(reply),
                     _permit: permit,
                 })

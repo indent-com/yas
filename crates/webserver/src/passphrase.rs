@@ -6,8 +6,7 @@
 //! passphrase.
 
 use argon2::Argon2;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 
 /// PHC strings produced by the argon2 crate always start with this marker
 /// (covers `$argon2id$`, `$argon2i$`, and `$argon2d$`).
@@ -74,9 +73,8 @@ impl AuthPassphrase {
 /// Hash `passphrase` with argon2id and a fresh random salt, returning a PHC
 /// string suitable for `YAS_PASSPHRASE`.
 pub fn hash(passphrase: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(passphrase.as_bytes(), &salt)
+        .hash_password(passphrase.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|e| format!("cannot hash passphrase: {e}"))
 }

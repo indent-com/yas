@@ -924,13 +924,16 @@ impl RepoHandle {
 
         // gix takes a 1-based inclusive range; a viewport blame is the
         // cheap case and the whole point of the field.
-        let ranges = gix::blame::BlameRanges::from_range(start..=end);
+        let Ok(ranges) = gix::blame::BlameRanges::from_one_based_inclusive_range(start..=end)
+        else {
+            return fail(GIT_STATUS_OTHER);
+        };
         let Ok(mut resource_cache) = repo.diff_resource_cache_for_tree_diff() else {
             return fail(GIT_STATUS_OTHER);
         };
         let options = gix::blame::Options {
             diff_algorithm: gix::diff::blob::Algorithm::Histogram,
-            range: ranges,
+            ranges,
             since: None,
             rewrites: (req.flags & GIT_BLAME_FOLLOW_RENAMES != 0).then(|| {
                 let mut rewrites = gix::diff::Rewrites::default();
@@ -945,7 +948,7 @@ impl RepoHandle {
         }
         let outcome = gix::blame::file(
             &repo.objects,
-            suspect,
+            gix::blame::Start::Commit(suspect),
             repo.commit_graph_if_enabled().ok().flatten(),
             &mut resource_cache,
             path.as_slice().into(),

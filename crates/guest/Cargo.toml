@@ -12,8 +12,8 @@ default = []
 
 [dependencies]
 yas-wire = { workspace = true }
-getrandom = { version = "=0.2.17", default-features = false, features = ["custom"] }
-hashbrown = { version = "0.16", default-features = false }
+getrandom = { version = "0.4", default-features = false }
+hashbrown = { version = "0.17", default-features = false }
 siphasher = { version = "1", default-features = false }
 blake3 = { version = "1", default-features = false }
 

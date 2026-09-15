@@ -893,8 +893,9 @@ fn append_commit(
     let Ok(commit_ref) = commit.decode() else {
         return false;
     };
-    let author = commit_ref.author();
-    let committer = commit_ref.committer();
+    let (Ok(author), Ok(committer)) = (commit_ref.author(), commit_ref.committer()) else {
+        return false;
+    };
     // The commit's declared encoding applies to all its text.
     let enc: Option<&[u8]> = commit_ref.encoding.map(|e| e.as_ref());
     let (author_name, l1) = commit_text(author.name, enc);

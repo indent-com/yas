@@ -1,6 +1,6 @@
 //! Durable desired-state catalog for persistent extensions.
 
-use redb::{ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -239,7 +239,9 @@ impl ExtensionCatalog {
         let mut write = db
             .begin_write()
             .map_err(|error| CatalogError::Storage(error.to_string()))?;
-        write.set_durability(redb::Durability::Immediate);
+        write
+            .set_durability(redb::Durability::Immediate)
+            .map_err(|error| CatalogError::Storage(format!("set database durability: {error}")))?;
         let key = replay_key(operation_kind, operation_id);
         {
             let mut table = write
@@ -593,7 +595,9 @@ impl ExtensionCatalog {
         let mut write = db
             .begin_write()
             .map_err(|error| CatalogError::Storage(error.to_string()))?;
-        write.set_durability(redb::Durability::Immediate);
+        write
+            .set_durability(redb::Durability::Immediate)
+            .map_err(|error| CatalogError::Storage(format!("set database durability: {error}")))?;
         {
             let mut table = write
                 .open_table(DEFINITIONS)
@@ -633,7 +637,9 @@ impl ExtensionCatalog {
         let mut write = db
             .begin_write()
             .map_err(|error| CatalogError::Storage(error.to_string()))?;
-        write.set_durability(redb::Durability::Immediate);
+        write
+            .set_durability(redb::Durability::Immediate)
+            .map_err(|error| CatalogError::Storage(format!("set database durability: {error}")))?;
         {
             let mut table = write
                 .open_table(DEFINITIONS)
@@ -652,7 +658,9 @@ impl ExtensionCatalog {
         let mut write = db
             .begin_write()
             .map_err(|error| CatalogError::Storage(error.to_string()))?;
-        write.set_durability(redb::Durability::Immediate);
+        write
+            .set_durability(redb::Durability::Immediate)
+            .map_err(|error| CatalogError::Storage(format!("set database durability: {error}")))?;
         {
             let mut table = write
                 .open_table(DEFINITIONS)

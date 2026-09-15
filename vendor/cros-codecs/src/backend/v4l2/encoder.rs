@@ -288,7 +288,7 @@ impl BufferHandles for DmabufFrame {
 
         plane.m.fd = fd.as_raw_fd();
         plane.data_offset = plane_layout.offset as u32;
-        plane.length = fstat(fd.as_raw_fd()).map(|stat| stat.st_size as u32).unwrap_or(0);
+        plane.length = fstat(fd).map(|stat| stat.st_size as u32).unwrap_or(0);
 
         if plane.length == 0 {
             log::warn!("Failed to fstat proper plane size index={index}");
@@ -1296,7 +1296,7 @@ pub(crate) mod tests {
 
             for plane in 0..(bo.plane_count().unwrap() as i32) {
                 let fd = bo.fd_for_plane(plane).unwrap();
-                let stat = fstat(fd.as_raw_fd()).unwrap();
+                let stat = fstat(&fd).unwrap();
                 let offset = bo.offset(plane as _).unwrap() as usize;
                 let stride = bo.stride_for_plane(plane as _).unwrap() as usize;
                 let buffer_index;

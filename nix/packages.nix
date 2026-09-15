@@ -121,19 +121,19 @@
       # ------------------------------------------------------------------
 
       # wasm-bindgen requires the CLI version to match the crate version
-      # exactly (shared schema). Cargo.lock pins wasm-bindgen 0.2.121, but
+      # exactly (shared schema). Cargo.lock pins wasm-bindgen 0.2.128, but
       # nixpkgs can lag behind — build the matching CLI here.
       wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
         src = pkgs.fetchCrate {
           pname = "wasm-bindgen-cli";
-          version = "0.2.121";
+          version = "0.2.128";
           registryDl = "https://static.crates.io/crates";
-          hash = "sha256-ZOMgFNOcGkO66Jz/Z83eoIu+DIzo3Z/vq6Z5g6BDY/w=";
+          hash = "sha256-a7lcXJnnZkYReja+iUO7NqqrWyv3toxnUgQb8s4IS5s=";
         };
         cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
           inherit src;
           inherit (src) pname version;
-          hash = "sha256-DPdCDPTAPBrbqLUqnCwQu1dePs9lGg85JCJOCIr9qjU=";
+          hash = "sha256-R1Tas33Ursy8kqsxguAkG0ZhNed2n5uFTAhw1l2qlLY=";
         };
       };
 
@@ -458,7 +458,7 @@
         postPatch = setupBrowserPkgForDeps + ''
           cd js
         '';
-        hash = "sha256-SK09VElUMuRYDUGvYnkmhx0uuAb4tpyvYaKUAnSTLwk=";
+        hash = "sha256-po4Gk3TLY5kIe9Y6rhil4UpGhhicQWP6KBn5x6ll324=";
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {
@@ -547,6 +547,7 @@
           version
           browserWasm
           browserWasmNode
+          wasmBindgenCli
           yas
           yas-release
           webAppDist
@@ -611,7 +612,7 @@
           # bin/modal-sbx is a PEP 723 script; uv resolves its Modal SDK range.
           pkgs.python3
           pkgs.uv
-          pkgs.wasm-bindgen-cli
+          wasmBindgenCli
           pkgs.wasm-pack
           # Language servers, so `yas lsp` (docs/design/lsp.md) is
           # dogfoodable across this polyglot repo. rust-analyzer is

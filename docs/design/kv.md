@@ -90,10 +90,11 @@ client disconnect but not a reboot; durable KV mutations survive both:
   illegal filename, and a storage layer that can refuse a legal key is
   a bug wearing a design's clothes. redb has no key-encoding problem
   to solve.
-- **`DURABLE`** maps to an immediate (fsynced) commit; the default
-  commit is eventual-durability — the same latency-over-durability
-  default as fs-write, here as a per-commit redb knob rather than a
-  temp-file fsync.
+- **`DURABLE`** waits for an immediate (fsynced) commit. Default mutations
+  acknowledge the in-memory update before the background writer commits.
+  redb 4 removed eventual durability, so the writer now fsyncs every batch.
+  The redb 4 upgrade requires fresh database files; legacy v2 files are
+  not migrated.
 - **An in-memory map** (key → value, hash, mtime) is loaded once at
   startup — hashes are not persisted; BLAKE3-256 recomputes at memory
   speed over a ≤ 256 MiB store — and is the source of truth for CAS

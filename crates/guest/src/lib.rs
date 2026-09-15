@@ -33,7 +33,7 @@ pub use host::{WaitOutcome, random as fill_random};
 pub use yas::{Client, EXIT_BOOTSTRAP_FAILURE, Error, MonotonicInstant, Realtime};
 
 #[doc(hidden)]
-pub use getrandom::register_custom_getrandom as __register_getrandom_02;
+pub use getrandom::Error as __GetrandomError;
 
 /// Result types accepted by [`entry!`].
 pub trait EntryResult {
@@ -88,25 +88,34 @@ where
     }
 }
 
-/// Fill a buffer for the pinned `getrandom` 0.2 custom backend.
+/// Fill a buffer from YAS's entropy source.
 #[doc(hidden)]
-pub fn __getrandom_v02(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
-    host::random(bytes).map_err(|_| {
-        let code = core::num::NonZeroU32::new(getrandom::Error::CUSTOM_START + 1)
-            .expect("custom getrandom code is non-zero");
-        getrandom::Error::from(code)
-    })
+pub fn __getrandom(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
+    host::random(bytes).map_err(|_| getrandom::Error::new_custom(1))
 }
 
-/// Install YAS's entropy source as the `getrandom` 0.2 custom backend.
+/// Install YAS's entropy source as the `getrandom` 0.4 custom backend.
 ///
 /// Expand this once in the root guest crate if it does not use [`entry!`].
-/// The SDK pins `getrandom` 0.2.17; `rand` 0.8 uses this backend without a JS
-/// adapter. Newer `getrandom` major versions use a different selection model.
+/// Build Wasm guests with `--cfg getrandom_backend="custom"` in their target
+/// rustflags (see the SDK README). Native builds use the operating system.
 #[macro_export]
 macro_rules! register_getrandom {
     () => {
-        $crate::__register_getrandom_02!($crate::__getrandom_v02);
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        unsafe extern "Rust" fn __getrandom_v03_custom(
+            dest: *mut u8,
+            len: usize,
+        ) -> Result<(), $crate::__GetrandomError> {
+            // SAFETY: getrandom supplies a valid writable buffer. Initialize it
+            // before making a slice, as getrandom may pass uninitialized bytes.
+            let bytes = unsafe {
+                core::ptr::write_bytes(dest, 0, len);
+                core::slice::from_raw_parts_mut(dest, len)
+            };
+            $crate::__getrandom(bytes)
+        }
     };
 }
 

@@ -12,7 +12,7 @@ futures-util = "0.3"
 data-url = "0.3"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 png = "0.18"
-resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 url = "2"
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }

@@ -114,13 +114,13 @@
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^26.5.1",
+    "@vitest/coverage-v8": "^5.0.0",
     "@yas-run/browser": "file:../../crates/browser/pkg",
-    "@types/bun": "^1.3.14",
-    "@types/node": "^25.8.0",
-    "@vitest/coverage-v8": "^4.1.6",
-    "jsdom": "^29.1.1",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "jsdom": "^30.0.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   },
   "license": "MIT"
 }

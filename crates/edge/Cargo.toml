@@ -22,7 +22,7 @@ yas-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
-web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
 quinn-proto = { version = "0.11", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14"

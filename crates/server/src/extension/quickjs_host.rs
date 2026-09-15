@@ -1258,9 +1258,13 @@ fn install_bindings<'js>(
             name,
             Func::from(move |ctx: Ctx<'js>, data: TypedArray<'js, u8>| {
                 let result = if operation == 0 {
-                    output_client.borrow_mut().command_stdout(data.as_ref())
+                    output_client
+                        .borrow_mut()
+                        .command_stdout(&typed_array_bytes(&data)?)
                 } else {
-                    output_client.borrow_mut().command_stderr(data.as_ref())
+                    output_client
+                        .borrow_mut()
+                        .command_stderr(&typed_array_bytes(&data)?)
                 };
                 result.map_err(|error| js_error(&ctx, name, error))
             }),
@@ -1274,7 +1278,7 @@ fn install_bindings<'js>(
             move |ctx: Ctx<'js>, content_type: String, data: TypedArray<'js, u8>| {
                 result_client
                     .borrow_mut()
-                    .command_result(&content_type, data.as_ref())
+                    .command_result(&content_type, &typed_array_bytes(&data)?)
                     .map_err(|error| js_error(&ctx, "commandResult", error))
             },
         ),
@@ -1416,7 +1420,7 @@ fn install_bindings<'js>(
                     .map_err(|error| js_error(&ctx, "fsWrite", error))?;
                 fs_write_client
                     .borrow_mut()
-                    .fs_write(operation_id, &root, &relative, data.as_ref())
+                    .fs_write(operation_id, &root, &relative, &typed_array_bytes(&data)?)
                     .map_err(|error| js_error(&ctx, "fsWrite", error))
             },
         ),
@@ -1425,7 +1429,10 @@ fn install_bindings<'js>(
     yas.set(
         "blake3",
         Func::from(move |ctx: Ctx<'js>, data: TypedArray<'js, u8>| {
-            TypedArray::new(ctx, blake3::hash(data.as_ref()).as_bytes().to_vec())
+            TypedArray::new(
+                ctx,
+                blake3::hash(&typed_array_bytes(&data)?).as_bytes().to_vec(),
+            )
         }),
     )?;
 
@@ -1471,7 +1478,7 @@ fn install_bindings<'js>(
                         port,
                         tls,
                         server_name,
-                        request.as_ref(),
+                        &typed_array_bytes(&request)?,
                         maximum_response as usize,
                         deadline,
                     )
@@ -1612,6 +1619,14 @@ fn wait_code(outcome: WaitOutcome) -> i32 {
         WaitOutcome::Packet => 1,
         WaitOutcome::Closed => 2,
     }
+}
+
+fn typed_array_bytes(data: &TypedArray<'_, u8>) -> rquickjs::Result<Vec<u8>> {
+    // SAFETY: copy immediately without calling into JS while the borrowed
+    // bytes are alive. The owned copy survives JS reentry and buffer detachment.
+    unsafe { data.as_bytes() }
+        .map(|bytes| bytes.to_vec())
+        .ok_or_else(|| rquickjs::Exception::throw_type(data.ctx(), "detached Uint8Array"))
 }
 
 fn js_error(ctx: &Ctx<'_>, operation: &str, error: impl fmt::Display) -> rquickjs::Error {
@@ -1812,6 +1827,23 @@ mod tests {
         )
         .await;
         bridge
+    }
+
+    #[test]
+    fn typed_array_copy_respects_views_and_rejects_detached_buffers() {
+        let runtime = Runtime::new().unwrap();
+        let context = JsContext::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let data: TypedArray<u8> = ctx
+                .eval("globalThis.bytes = new Uint8Array([1, 2, 3, 4]); bytes.subarray(1, 3)")
+                .unwrap();
+            let copy = typed_array_bytes(&data).unwrap();
+            ctx.eval::<(), _>("bytes[1] = 9").unwrap();
+            assert_eq!(copy, [2, 3]);
+            assert_eq!(typed_array_bytes(&data).unwrap(), [9, 3]);
+            data.arraybuffer().unwrap().detach();
+            assert!(typed_array_bytes(&data).is_err());
+        });
     }
 
     #[test]

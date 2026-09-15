@@ -14,3 +14,7 @@ source provenance recorded above are retained. Cargo's registry-unpack marker,
 generated VCS file, and original manifest stay in this vendor directory for
 auditability but are excluded from the republished crate payload because Cargo
 reserves those filenames.
+
+Dependency requirements and the lockfile are updated by YAS independently of
+the retained upstream source archive.
+The Windows child-exit callback uses `bool` to match windows-sys 0.61.

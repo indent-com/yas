@@ -9,14 +9,13 @@
     "deploy": "pnpm build && xmit yastalk.pcarrier.com"
   },
   "dependencies": {
-    "marked": "^18.0.7",
-    "mermaid": "^11.17.2"
+    "marked": "^18.0.13",
+    "mermaid": "^12.0.0"
   },
   "devDependencies": {
-    "@types/webmidi": "^2.0.13",
     "@xmit-co/xmit": "npm:@xmit.co/xmit@0.5.2-0",
-    "type-fest": "^5.8.0",
-    "typescript": "^6.0.3",
-    "vite": "^8.0.16"
+    "type-fest": "^5.9.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
   }
 }

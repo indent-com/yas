@@ -10,7 +10,7 @@ homepage.workspace = true
 [dependencies]
 yas-fssync = { workspace = true }
 blake3 = { version = "1", default-features = false }
-lz4_flex = { version = "0.13", default-features = false, features = ["safe-encode", "safe-decode"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-encode", "safe-decode"] }
 notify = "8"
 serde_json = "1"
 

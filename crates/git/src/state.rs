@@ -1762,7 +1762,8 @@ fn global_excludes_file(repo: &gix::Repository) -> Option<PathBuf> {
     if let Some(configured) = repo
         .config_snapshot()
         .trusted_path("core.excludesFile")
-        .and_then(|path| path.ok().map(|path| path.into_owned()))
+        .ok()
+        .flatten()
     {
         return Some(configured);
     }
@@ -1894,7 +1895,7 @@ fn refs_records(
                 ref_flags |= GIT_REF_SYMBOLIC;
                 target = crate::escape_bstr(name.as_bstr());
                 reference
-                    .peel_to_id_in_place()
+                    .peel_to_id()
                     .map(|id| oid_bytes(id.as_ref()))
                     .unwrap_or(GIT_OID_NONE)
             }
@@ -1902,7 +1903,7 @@ fn refs_records(
         // Annotated tags peel to their target commit.
         let mut peeled = GIT_OID_NONE;
         if name.starts_with("refs/tags/")
-            && let Ok(id) = reference.peel_to_id_in_place()
+            && let Ok(id) = reference.peel_to_id()
         {
             let peeled_bytes = oid_bytes(id.as_ref());
             if peeled_bytes != oid {
@@ -2136,7 +2137,7 @@ fn upstream_records(
         let tip = repo
             .find_reference(&name)
             .ok()
-            .and_then(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()));
+            .and_then(|mut r| r.peel_to_id().ok().map(|id| id.detach()));
         let Some(tip) = tip else {
             continue;
         };
@@ -2306,7 +2307,7 @@ fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<(String, Option<g
     let escaped = crate::escape_bstr(tracking.as_bstr());
     match repo.find_reference(tracking.as_bstr()) {
         Ok(mut reference) => {
-            let id = reference.peel_to_id_in_place().ok().map(|id| id.detach());
+            let id = reference.peel_to_id().ok().map(|id| id.detach());
             Some((escaped, id))
         }
         Err(_) => Some((escaped, None)),

@@ -11,7 +11,7 @@ use crate::DecodedFormat;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 
-#[cfg(feature = "v4l2")]
+#[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
 use std::arch::aarch64::*;
 
 pub const MM21_TILE_WIDTH: usize = 16;
@@ -201,10 +201,15 @@ pub unsafe fn detile_row(
 ) {
     let mut w = width;
     while w > 0 {
-        let v0: uint8x16_t = vld1q_u8(src);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let v0: uint8x16_t = vld1q_u8(src);
+            vst1q_u8(dst, v0);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        std::ptr::copy_nonoverlapping(src, dst, MM21_TILE_WIDTH);
         src = src.offset(src_tile_stride as isize);
         w = w - MM21_TILE_WIDTH;
-        vst1q_u8(dst, v0);
         dst = dst.offset(MM21_TILE_WIDTH as isize);
     }
 }

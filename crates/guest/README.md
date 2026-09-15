@@ -34,11 +34,23 @@ bound; raw credit-bearing Request and Transfer primitives stay internal to the
 SDK.
 
 The crate is `no_std` and uses `alloc`; native test shims enable `std` behind a
-target gate. `register_getrandom!` installs `yas_v1.random` for the pinned
-`getrandom` 0.2 custom backend, including `rand` 0.8 consumers. A crate that
+target gate. `register_getrandom!` installs `yas_v1.random` for the
+`getrandom` 0.4 custom backend. A crate that
 exports its own entry point must expand it exactly once. For
 attacker-controlled keys, use `yas_guest::collections::HashMap` or `HashSet`;
 their SipHash state is keyed from host entropy.
+
+Wasm guest builds must select the custom entropy backend in `.cargo/config.toml`
+(the YAS repository already does this):
+
+```toml
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="custom"']
+```
+
+If setting `RUSTFLAGS` explicitly, include `--cfg getrandom_backend="custom"`
+there too, since it overrides the Cargo target flags. Native builds use the OS
+entropy source.
 
 The host accepts at most 16 MiB per stream chunk and 64 KiB per entropy request.
 The safe wrappers validate sizes, split arbitrary stream writes, grow receives

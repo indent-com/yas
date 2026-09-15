@@ -8,11 +8,11 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 ring = "0.17"
 zeroize = "1"
 snow = { version = "0.10", features = ["ring-accelerated"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 tokio = { version = "1", features = ["io-util", "time"] }
 
 [dev-dependencies]

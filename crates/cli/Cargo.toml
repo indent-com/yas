@@ -44,7 +44,7 @@ yas-ssh = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
-web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
 url = "2"
 rustls-native-certs = "0.8"
 ring = "0.17"
@@ -67,7 +67,7 @@ windows-sys = { version = "0.61", features = [
 tempfile = "3"
 rcgen = "0.14"
 tokio-rustls = "0.26"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 [[example]]
 name = "uplink-e2e-fixture"

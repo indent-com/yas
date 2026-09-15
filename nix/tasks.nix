@@ -3,6 +3,7 @@
   version,
   browserWasm,
   browserWasmNode,
+  wasmBindgenCli,
   yas,
   yas-release,
   yas-release-musl ? null,
@@ -662,7 +663,7 @@ in
       # no reason a reader could ever see.
       cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
       repo_root=$(cd .. && pwd)
-      export RUSTFLAGS="--remap-path-prefix=$repo_root=/yas --remap-path-prefix=$cargo_home=/cargo''${RUSTFLAGS:+ $RUSTFLAGS}"
+      export RUSTFLAGS="--cfg getrandom_backend=\"custom\" --remap-path-prefix=$repo_root=/yas --remap-path-prefix=$cargo_home=/cargo''${RUSTFLAGS:+ $RUSTFLAGS}"
 
       cargo build --release --target "$target"
 
@@ -928,7 +929,7 @@ in
       # pnpm's generated POSIX command shims resolve symlinks with sed.
       pkgs.gnused
       pkgs.wasm-pack
-      pkgs.wasm-bindgen-cli
+      wasmBindgenCli
       pkgs.python3
       pkgs.bun
       pkgs.typescript

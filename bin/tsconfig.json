@@ -5,7 +5,8 @@
     "strict": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["node"]
   },
   "include": ["tensorlake-*.ts", "tensorlake/*.ts"]
 }

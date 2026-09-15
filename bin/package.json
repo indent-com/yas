@@ -5,8 +5,8 @@
     "tensorlake": "0.5.132"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "typescript": "^5.9.3"
+    "@types/node": "^26.5.1",
+    "typescript": "^7.0.2"
   },
   "scripts": {
     "test": "node --test tensorlake/*.test.*",

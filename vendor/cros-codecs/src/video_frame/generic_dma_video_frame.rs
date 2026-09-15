@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::iter::zip;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::ptr::NonNull;
 #[cfg(feature = "vaapi")]
 use std::rc::Rc;
@@ -340,14 +340,11 @@ pub struct GenericDmaVideoFrame {
 impl Clone for GenericDmaVideoFrame {
     fn clone(&self) -> Self {
         Self {
-            // SAFETY: This is safe because we are dup'ing the fd, giving the clone'd
-            // GenericDmaVideoFrame ownership of the new fd.
+            // Each duplicate owns its descriptor independently.
             dma_handles: self
                 .dma_handles
                 .iter()
-                .map(|x| unsafe {
-                    File::from_raw_fd(dup(x.as_raw_fd()).expect("Could not dup DMAbuf FD!"))
-                })
+                .map(|x| File::from(dup(x).expect("Could not dup DMAbuf FD!")))
                 .collect(),
             layout: self.layout.clone(),
         }
