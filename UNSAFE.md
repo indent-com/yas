@@ -41,6 +41,14 @@ the master fd. Ordinary exit cleanup must wait for its ordered EOF before
 closing the fd; emptying the Rust channel alone does not prove the reader or
 kernel buffer is empty.
 
+The reader owns a duplicated master descriptor, acquired before fork and
+released when its thread exits. Terminal close/restart can close and reuse
+the writer's descriptor while the reader is still polling or publishing a
+chunk; sharing that descriptor number would let an old reader consume another
+terminal's output. Closing the byte receiver stops even an idle reader and
+releases its descriptor. Stop-then-start closes that receiver before stopping
+the old child, including when starting the replacement fails.
+
 ## Compositor child spawn
 
 `spawn_compositor_child` in [`crates/server/src/lib.rs`](crates/server/src/lib.rs) is a simpler fork/exec path used to launch Wayland GUI commands (e.g. `foot`). The child calls `chdir()`, mutates the environment (`set_var`/`remove_var` for `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `DISPLAY`), then `execvp`. Unlike the PTY spawn path, it does not call `setsid`, `TIOCSCTTY`, or `close_fds_except` — the child inherits the parent's fd table. This is acceptable because compositor children don't need a controlling terminal and don't interact with PTYs.

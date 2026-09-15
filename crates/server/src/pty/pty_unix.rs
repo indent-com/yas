@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -865,11 +866,15 @@ pub fn respond_to_queries(
 }
 
 pub fn pty_reader(
-    fd: PtyWriteTarget,
+    reader_fd: OwnedFd,
     tx: mpsc::Sender<PtyInput>,
     notify: Arc<Notify>,
     finish: Arc<AtomicBool>,
 ) {
+    // Closing/restarting a terminal may recycle the writer's descriptor while
+    // this thread is polling or publishing a chunk. Keep an independent owned
+    // descriptor until the reader exits, so it cannot read another terminal.
+    let fd = reader_fd.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
@@ -878,7 +883,7 @@ pub fn pty_reader(
     let mut sync_scan_tail = Vec::new();
     let mut drain_remaining = None;
 
-    loop {
+    while !tx.is_closed() {
         if drain_remaining.is_none() && finish.load(Ordering::Acquire) {
             // Take a finite cutoff: a surviving descendant may keep writing.
             // The previous read's entire chunk has already been sent.
@@ -1044,6 +1049,16 @@ pub fn spawn_pty(
         }
     };
 
+    let reader_fd = match unsafe { BorrowedFd::borrow_raw(master) }.try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(_) => {
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return None;
+        }
+    };
     let pid = fork_child();
     if pid < 0 {
         eprintln!("fork failed for pty {id}");
@@ -1096,7 +1111,7 @@ pub fn spawn_pty(
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_handle = crate::PtyReaderHandle::spawn(id, {
         let notify = state.delivery_notify.clone();
-        move |finish| pty_reader(master, byte_tx, notify, finish)
+        move |finish| pty_reader(reader_fd, byte_tx, notify, finish)
     });
     let handle = PtyHandle {
         master_fd: master,
@@ -1211,6 +1226,16 @@ pub fn respawn_child(
         }
     };
 
+    let reader_fd = match unsafe { BorrowedFd::borrow_raw(master) }.try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(_) => {
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return None;
+        }
+    };
     let pid = fork_child();
     if pid < 0 {
         unsafe {
@@ -1252,7 +1277,7 @@ pub fn respawn_child(
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_handle = crate::PtyReaderHandle::spawn(pty_id, {
         let notify = state.delivery_notify.clone();
-        move |finish| pty_reader(master, byte_tx, notify, finish)
+        move |finish| pty_reader(reader_fd, byte_tx, notify, finish)
     });
     let handle = PtyHandle {
         master_fd: master,
@@ -1273,9 +1298,92 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[tokio::test]
+    async fn retired_reader_cannot_consume_reused_descriptor_output() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use tokio::sync::{Notify, mpsc};
+
+        let (old_read, mut old_write) = os_pipe::pipe().unwrap();
+        let (mut new_read, mut new_write) = os_pipe::pipe().unwrap();
+        let expected = b"\x1b[?2026hold-1\x1b[?2026l\x1b[?2026hold-2\x1b[?2026l";
+        old_write.write_all(expected).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let reader_fd = old_read.as_fd().try_clone_to_owned().unwrap();
+        let reader = std::thread::spawn(move || {
+            super::pty_reader(
+                reader_fd,
+                tx,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // The reader is blocked publishing its old chunk. Replace the original
+        // descriptor atomically to model close followed by descriptor reuse,
+        // without letting another test acquire the descriptor in between.
+        assert_eq!(
+            unsafe { libc::dup2(new_read.as_raw_fd(), old_read.as_raw_fd()) },
+            old_read.as_raw_fd(),
+        );
+        drop(old_write);
+        new_write.write_all(b"new-generation").unwrap();
+        drop(new_write);
+        let actual = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut actual = Vec::new();
+            loop {
+                match rx.recv().await.expect("ordered EOF before channel close") {
+                    crate::PtyInput::Data(data) => actual.extend_from_slice(&data),
+                    crate::PtyInput::SyncBoundary { before } => actual.extend_from_slice(&before),
+                    crate::PtyInput::Eof => return actual,
+                }
+            }
+        })
+        .await
+        .expect("retired reader reached EOF");
+        reader.join().unwrap();
+        assert_eq!(actual, expected);
+        let mut untouched = String::new();
+        new_read.read_to_string(&mut untouched).unwrap();
+        assert_eq!(untouched, "new-generation");
+    }
+
+    #[tokio::test]
+    async fn reader_releases_its_descriptor_when_receiver_closes() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        use tokio::sync::{Notify, mpsc, oneshot};
+
+        let (read, _write) = os_pipe::pipe().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (done, finished) = oneshot::channel();
+        let reader = std::thread::spawn(move || {
+            super::pty_reader(
+                read.into(),
+                tx,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let _ = done.send(());
+        });
+        rx.close();
+        tokio::time::timeout(Duration::from_secs(5), finished)
+            .await
+            .expect("reader exits even while the writer stays open")
+            .unwrap();
+        reader.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn exit_drain_preserves_reader_chunk_and_pending_kernel_bytes() {
         use std::io::Write;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::{FromRawFd, OwnedFd};
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1297,7 +1405,7 @@ mod tests {
         let finish = Arc::new(AtomicBool::new(false));
         let request = finish.clone();
         let reader = std::thread::spawn(move || {
-            super::pty_reader(read_fd.as_raw_fd(), tx, Arc::new(Notify::new()), request);
+            super::pty_reader(read_fd, tx, Arc::new(Notify::new()), request);
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             while rx.is_empty() {

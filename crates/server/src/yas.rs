@@ -14656,6 +14656,9 @@ impl Session {
             if was_running && request.cutover_mode == yas_terminal::CutoverMode::StopThenStart {
                 let current = session.ptys.get_mut(&pty_id).ok_or(())?;
                 state.pty_fds.write().unwrap().remove(&pty_id);
+                // Release the reader's master even if replacement spawning
+                // fails and this stopped PTY remains in the catalogue.
+                current.byte_rx.close();
                 super::pty::close_pty(&current.handle);
                 super::pty::abandon_pty_pid(
                     &current.handle,
@@ -51939,7 +51942,8 @@ mod tests {
         let mut saw_new_state = false;
         let mut saw_new_frame = false;
         let mut expected_sequence = opened.first_sequence;
-        timeout(TEST_TIMEOUT, async {
+        let mut last_title = None;
+        let received = timeout(TEST_TIMEOUT, async {
             while !saw_new_state || !saw_new_frame {
                 let frame = next_frame(&mut observer, &observer_codec).await;
                 if frame.header
@@ -51990,11 +51994,17 @@ mod tests {
                 if grid.title.as_deref() == Some("new-generation") {
                     saw_new_frame = true;
                 }
+                last_title = grid.title;
                 acknowledge_terminal_frame(&mut observer, &observer_codec, &terminal_frame).await;
             }
         })
-        .await
-        .expect("observer received the new-generation State and keyframe");
+        .await;
+        assert!(
+            received.is_ok(),
+            "observer did not receive the new-generation State and keyframe: \
+             saw_new_state={saw_new_state}, saw_new_frame={saw_new_frame}, \
+             expected_sequence={expected_sequence}, last_title={last_title:?}",
+        );
 
         write_request(
             &mut owner,
