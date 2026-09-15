@@ -3072,9 +3072,9 @@ impl X264Encoder {
             par.i_threads = 1;
             par.i_fps_num = 30;
             par.i_fps_den = 1;
-            // The reliable ordered stream requests IDRs explicitly for
-            // startup and recovery. Keep x264's scene-cut placement, but do
-            // not impose a refresh-rate-dependent periodic keyframe.
+            // The server requests IDRs for startup, recovery, and periodic
+            // refresh by elapsed time. Keep x264's scene-cut placement without
+            // adding a refresh-rate-dependent keyframe interval.
             par.i_keyint_max = X264_KEYINT_MAX_INFINITE as i32;
             par.i_log_level = X264_LOG_NONE;
             par.rc.i_rc_method = X264_RC_ABR as i32;
@@ -3286,7 +3286,7 @@ impl SoftwareAV1Encoder {
             ..Default::default()
         };
         // Preserve scene-change keyframes while removing the fixed interval.
-        // Startup and decoder recovery arrive through request_keyframe().
+        // Startup, recovery, and timed refresh arrive through request_keyframe().
         enc.set_key_frame_interval(0, 0);
         let cfg = Config::new().with_encoder_config(enc);
         let ctx = cfg

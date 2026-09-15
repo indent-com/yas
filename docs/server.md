@@ -593,6 +593,17 @@ new bitstream is published, but the identical pixels are not. Republishing
 them would burn a generation and make every other viewer of the surface
 re-encode the frame it is already showing.
 
+Each surface subscription also requests a fresh keyframe two seconds after
+its last successfully queued keyframe if it has sent deltas since then.
+After motion stops, one final keyframe settles that delta chain; the idle
+surface then stays quiet. Startup, recovery, scene-change, and refinement
+keyframes also clear the pending refresh. Explicit decoder recovery and
+still-image quality refinement can still request further keyframes.
+The interval uses elapsed time, so low frame rates do not delay recovery.
+Periodic refresh preserves still-image quality and obeys the normal pacing,
+transport, and decoder credit gates; backpressure can delay it. Vulkan Video
+requests a fresh encode rather than replaying a cached keyframe.
+
 `YAS_SURFACE_SPEED`: `slow`, `medium`, `fast`, `realtime` (default), or a raw
 `10`–`255` (10 = slowest, 255 = fastest). Controls how much encoder time a
 frame may cost: rav1e speed preset, x264 preset, openh264 complexity, NVENC

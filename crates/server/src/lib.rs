@@ -2486,6 +2486,18 @@ fn source_generation_is_still(sub: &mut SurfaceSubState, generation: u64, now: I
 /// the resulting keyframe.
 const SURFACE_KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Bound how long a delta chain can persist. Once its final image has been
+/// refreshed, an idle surface stays quiet. Use elapsed time, not a frame
+/// count, so throttled subscriptions get the same recovery cadence as fast ones.
+const SURFACE_KEYFRAME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+fn surface_keyframe_refresh_due(sub: &SurfaceSubState, now: Instant) -> bool {
+    sub.sent_delta_since_keyframe
+        && sub
+            .last_keyframe_sent_at
+            .is_some_and(|at| now.duration_since(at) >= SURFACE_KEYFRAME_REFRESH_INTERVAL)
+}
+
 /// Record a new keyframe episode for one subscription.
 ///
 /// `force` is used for first subscriptions and preference changes, which
@@ -2629,6 +2641,12 @@ struct SurfaceSubState {
     /// created keyframe debt.  Same-preference repeats are coalesced against
     /// this so a broken client cannot turn every frame into an IDR.
     last_keyframe_request_at: Option<Instant>,
+    /// Last keyframe accepted by the delivery path. Only successful sends
+    /// restart periodic refresh, including startup and quality-refinement keys.
+    last_keyframe_sent_at: Option<Instant>,
+    /// A delivered delta arms periodic refresh. A successful key clears it
+    /// so unchanged pixels do not keep costing keyframes while idle.
+    sent_delta_since_keyframe: bool,
     /// Pixel generation that was last encoded; used to skip re-
     /// encoding identical pixel data on subsequent ticks.
     last_encoded_gen: Option<u64>,
@@ -5129,6 +5147,10 @@ fn record_surface_frame_sent(
             started_empty,
         });
     if let Some(sub) = client.surface_subs.get_mut(&surface_id) {
+        sub.sent_delta_since_keyframe = !is_keyframe;
+        if is_keyframe {
+            sub.last_keyframe_sent_at = Some(now);
+        }
         // Keyframes are 5-10× a P-frame; budgeting against them would
         // starve the steady stream.  Seed from one anyway (÷4) so an
         // all-intra encoder doesn't leave the estimate at zero forever.
@@ -10531,6 +10553,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     px_gen
                 };
                 let owes_keyframe = owes_keyframe(client, sid);
+                let periodic_refresh = client
+                    .surface_subs
+                    .get(&sid)
+                    .is_some_and(|sub| surface_keyframe_refresh_due(sub, now));
                 let already_encoded = !owes_keyframe
                     && client
                         .surface_subs
@@ -10541,7 +10567,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     let sub = client.surface_subs.entry(sid).or_default();
                     source_generation_is_still(sub, px_gen, now)
                 };
-                let actually_still = already_encoded && source_is_still;
+                // Vulkan refreshes advance the bitstream generation without
+                // changing the source pixels. Receiving that refreshed key
+                // must not look like resumed motion and undo its quality.
+                let actually_still =
+                    source_is_still && (already_encoded || (has_vulkan_enc && !owes_keyframe));
 
                 // Adaptive bandwidth: one step per surface per tick, after
                 // the pacing gate so an idle surface neither steps nor is
@@ -10597,18 +10627,26 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // step above bought an improvement, spend it; otherwise
                 // there is nothing to gain.
                 let still_refresh = actually_still && step.quantizer.is_some();
+                // A scheduled refresh retains stillness and decoder pressure:
+                // it does not invalidate the client's existing reference chain.
+                // Gate compositor-side requests too, before they spend GPU work.
+                if periodic_refresh {
+                    let reserved_bytes = estimated_surface_frame_bytes(client, sid, true);
+                    if !surface_frame_credit_open_or_mark(client, sid, reserved_bytes) {
+                        client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
+                        continue;
+                    }
+                }
                 if already_encoded {
-                    if !still_refresh {
+                    if !still_refresh && !periodic_refresh {
                         client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
                         continue;
                     }
                     if has_vulkan_enc {
                         // Nothing to re-send here: the bitstream in hand is
-                        // the one the client already has.  The qp update
-                        // above is staged, and the keyframe request forces
-                        // the recomposite that makes the compositor encode
-                        // at it.  Delivery happens next tick, on the new
-                        // generation.
+                        // the one the client already has. Stage any qp update
+                        // above, then request a fresh encode. Delivery happens
+                        // next tick, on the new generation.
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         continue;
                     }
@@ -10660,7 +10698,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // then had no SPS/PPS and no recovery point, so the
                         // whole stream was undecodable until something else
                         // happened to force an IDR.  Ask for one and wait.
-                        if owes_keyframe && !is_keyframe {
+                        if (owes_keyframe || periodic_refresh) && !is_keyframe {
                             pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                             client.skip_vulkan_await_count =
                                 client.skip_vulkan_await_count.saturating_add(1);
@@ -10743,7 +10781,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         continue;
                     }
                     // The session exists but has not produced a frame yet.
-                    if owes_keyframe {
+                    if owes_keyframe || periodic_refresh {
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                     }
                     client.skip_vulkan_await_count =
@@ -10803,7 +10841,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // zero-copy frame this subscriber is missing.
                 let logical_size = cached.as_ref().and_then(|(_, _, size)| *size);
                 let mut cached = match cached {
-                    Some((_, true, _)) if !owes_keyframe => continue,
+                    Some((_, true, _)) if !owes_keyframe && !periodic_refresh => continue,
                     Some((_, true, _)) => None,
                     other => other.map(|(p, _, _)| p),
                 };
@@ -10897,7 +10935,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             target_w: enc_w,
                             target_h: enc_h,
                             pixels: cached.take().unwrap(),
-                            needs_keyframe: owes_keyframe || still_refresh,
+                            needs_keyframe: owes_keyframe || still_refresh || periodic_refresh,
                             force_quality_refresh: still_refresh,
                             generation: px_gen,
                             timestamp_ms: px_timestamp_ms,
@@ -11327,7 +11365,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // A refresh has to be an IDR: a P-frame against an identical
                 // reference codes as skip blocks and refines nothing, however
                 // much finer the quantizer is.
-                let needs_kf = owes_keyframe || needs_new_encoder || still_refresh;
+                let needs_kf =
+                    owes_keyframe || needs_new_encoder || still_refresh || periodic_refresh;
                 let reserved_bytes = estimated_surface_frame_bytes(client, sid, needs_kf);
                 if !surface_frame_credit_open_or_mark(client, sid, reserved_bytes) {
                     client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
@@ -17447,6 +17486,51 @@ mod tests {
             &mut sub,
             start + SURFACE_KEYFRAME_REQUEST_INTERVAL,
             false,
+        ));
+    }
+
+    #[test]
+    fn periodic_surface_keyframes_follow_successful_keys_per_subscription() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        let start = Instant::now();
+        client.surface_subs.entry(1).or_default();
+        client.surface_subs.entry(2).or_default();
+        assert!(!surface_keyframe_refresh_due(
+            &client.surface_subs[&1],
+            start
+        ));
+        record_surface_frame_sent(&mut client, 1, 1024, true, start);
+        let due = start + SURFACE_KEYFRAME_REFRESH_INTERVAL;
+        assert!(!surface_keyframe_refresh_due(
+            &client.surface_subs[&1],
+            due - Duration::from_millis(1),
+        ));
+        assert!(
+            !surface_keyframe_refresh_due(&client.surface_subs[&1], due),
+            "an idle keyframe does not need repeating",
+        );
+        // Deltas and another subscription's keys must not postpone refresh.
+        record_surface_frame_sent(&mut client, 1, 1024, false, due);
+        record_surface_frame_sent(&mut client, 2, 1024, true, due);
+        assert!(surface_keyframe_refresh_due(&client.surface_subs[&1], due));
+        assert!(!surface_keyframe_refresh_due(&client.surface_subs[&2], due));
+        assert!(surface_keyframe_refresh_due(
+            &client.surface_subs[&1],
+            due + Duration::from_secs(10),
+        ));
+        // Any successfully queued key, including scene cuts/refinement,
+        // starts a full new interval.
+        record_surface_frame_sent(&mut client, 1, 1024, true, due);
+        assert!(!surface_keyframe_refresh_due(&client.surface_subs[&1], due));
+        let later = due + Duration::from_secs(10);
+        assert!(
+            !surface_keyframe_refresh_due(&client.surface_subs[&1], later),
+            "the final refresh leaves an idle surface quiet",
+        );
+        record_surface_frame_sent(&mut client, 1, 1024, false, later);
+        assert!(surface_keyframe_refresh_due(
+            &client.surface_subs[&1],
+            later
         ));
     }
 

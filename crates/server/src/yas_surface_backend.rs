@@ -1381,6 +1381,314 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    async fn surface_refresh_fixture() -> (
+        AppState,
+        mpsc::Receiver<Event>,
+        std::sync::mpsc::Receiver<CompositorCommand>,
+    ) {
+        let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
+        let (events, received) = mpsc::channel(32);
+        let (commands, requests) = std::sync::mpsc::sync_channel(128);
+        {
+            let mut session = state.session.lock().await;
+            session.ensure_compositor(false, Arc::new(|| {}), "");
+            let cs = session.compositor.as_mut().unwrap();
+            // Observe compositor requests without requiring a GPU encoder.
+            cs.handle.command_tx = commands;
+            cs.native_sizes.insert(7, (64, 64));
+            cache_surface_commit(
+                &mut cs.last_pixels,
+                &mut cs.pixel_generation,
+                (7, 64, 64),
+                Some((64, 64)),
+                yas_compositor::PixelData::Bgra(Arc::new(vec![128; 64 * 64 * 4])),
+                16,
+                0,
+                false,
+            );
+            cs.mark_pixel_snapshot_dirty();
+            let generation = cs.last_pixels[&(7, 64, 64)].generation;
+            let mut client = hidden_client(
+                1,
+                events,
+                ViewConfig {
+                    width: 64,
+                    height: 64,
+                    max_fps: 60,
+                    decoder_capacity: 1,
+                    codec_support: CODEC_SUPPORT_H264,
+                    color_capabilities: 0,
+                },
+                Arc::new(AtomicU64::new(0)),
+            );
+            let now = Instant::now();
+            client.surface_subscriptions.insert(7);
+            client.surface_view_sizes.insert(7, (64, 64, 120));
+            let ceiling = state.config.surface_encoding.bandwidth.av1_quantizer() as u8;
+            client.surface_subs.insert(
+                7,
+                SurfaceSubState {
+                    has_keyframe: true,
+                    last_keyframe_sent_at: Some(now),
+                    sent_delta_since_keyframe: true,
+                    last_encoded_gen: Some(generation),
+                    observed_source_generation: Some(generation),
+                    source_generation_changed_at: Some(now - STILL_REFRESH_INTERVAL),
+                    max_inflight_frames: Some(1),
+                    adaptive_quantizer: Some(ceiling),
+                    motion_quantizer: Some(ceiling.saturating_add(40)),
+                    still_quality_override: true,
+                    ..Default::default()
+                },
+            );
+            session.clients.insert(1, client);
+        }
+        (state, received, requests)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn periodic_vulkan_refresh_requires_fresh_key_and_delivery_credit() {
+        for new_generation in [false, true] {
+            let (state, mut received, requests) = surface_refresh_fixture().await;
+            let old = Instant::now() - SURFACE_KEYFRAME_REFRESH_INTERVAL;
+            {
+                let mut session = state.session.lock().await;
+                let client = session.clients.get_mut(&1).unwrap();
+                let sub = client.surface_subs.get_mut(&7).unwrap();
+                sub.last_keyframe_sent_at = Some(old);
+                sub.max_inflight_frames = Some(0);
+                let generation = sub.last_encoded_gen.unwrap() + u64::from(new_generation);
+                client.vulkan_video_surfaces.insert(
+                    7,
+                    VulkanVideoSurfaceState {
+                        encoder_name: "h264-vulkan",
+                        codec_flag: SURFACE_FRAME_CODEC_H264,
+                        width: 64,
+                        height: 64,
+                        is_444: false,
+                        output: yas_compositor::color::OutputColor::Srgb,
+                    },
+                );
+                session.compositor.as_mut().unwrap().last_encoded.insert(
+                    (7, 1),
+                    LastEncoded {
+                        logical_size: Some((64, 64)),
+                        width: 64,
+                        height: 64,
+                        data: Arc::new(vec![1, 2, 3]),
+                        is_keyframe: false,
+                        codec_flag: SURFACE_FRAME_CODEC_H264,
+                        generation,
+                        timestamp_ms: 16,
+                        timestamp_sub_us: 0,
+                    },
+                );
+            }
+            tick(&state).await;
+            assert!(
+                !requests.try_iter().any(|command| matches!(
+                    command,
+                    CompositorCommand::RequestVulkanKeyframe { .. }
+                )),
+                "no GPU refresh while decoder credit is exhausted"
+            );
+            assert!(received.try_recv().is_err());
+            {
+                let mut session = state.session.lock().await;
+                session
+                    .clients
+                    .get_mut(&1)
+                    .unwrap()
+                    .surface_subs
+                    .get_mut(&7)
+                    .unwrap()
+                    .max_inflight_frames = Some(1);
+            }
+            tick(&state).await;
+            assert!(requests.try_iter().any(|command| matches!(
+                command,
+                CompositorCommand::RequestVulkanKeyframe {
+                    surface_id: 7,
+                    client_id: 1
+                }
+            )));
+            assert!(
+                received.try_recv().is_err(),
+                "cached output must not satisfy refresh"
+            );
+            {
+                let mut session = state.session.lock().await;
+                let frame = session
+                    .compositor
+                    .as_mut()
+                    .unwrap()
+                    .last_encoded
+                    .get_mut(&(7, 1))
+                    .unwrap();
+                frame.generation += 1;
+                frame.is_keyframe = true;
+            }
+            tick(&state).await;
+            assert!(matches!(received.try_recv().unwrap(), Event::Frame(frame) if frame.keyframe));
+            {
+                let session = state.session.lock().await;
+                let sub = &session.clients[&1].surface_subs[&7];
+                assert!(sub.last_keyframe_sent_at.unwrap() > old);
+                assert!(
+                    sub.still_quality_override,
+                    "refresh preserves still-image quality"
+                );
+            }
+            {
+                let mut session = state.session.lock().await;
+                let client = session.clients.get_mut(&1).unwrap();
+                record_surface_ack(client, 7);
+                let sub = client.surface_subs.get_mut(&7).unwrap();
+                assert!(!sub.sent_delta_since_keyframe);
+                // Expire the timer again with delivery credit available.
+                sub.last_keyframe_sent_at = Some(old);
+            }
+            tick(&state).await;
+            assert!(
+                !requests.try_iter().any(|command| matches!(
+                    command,
+                    CompositorCommand::RequestVulkanKeyframe { .. }
+                )),
+                "an idle keyframe is not refreshed again"
+            );
+            assert!(received.try_recv().is_err());
+            {
+                let mut session = state.session.lock().await;
+                record_surface_ack(session.clients.get_mut(&1).unwrap(), 7);
+                let cs = session.compositor.as_mut().unwrap();
+                let pixels = cs.last_pixels[&(7, 64, 64)].pixels.clone();
+                cache_surface_commit(
+                    &mut cs.last_pixels,
+                    &mut cs.pixel_generation,
+                    (7, 64, 64),
+                    Some((64, 64)),
+                    pixels,
+                    32,
+                    0,
+                    false,
+                );
+                cs.mark_pixel_snapshot_dirty();
+                let frame = cs.last_encoded.get_mut(&(7, 1)).unwrap();
+                frame.generation += 1;
+                frame.is_keyframe = false;
+            }
+            tick(&state).await;
+            assert!(
+                !state.session.lock().await.clients[&1].surface_subs[&7].still_quality_override,
+                "a new source generation restores motion quality"
+            );
+            assert!(matches!(received.try_recv().unwrap(), Event::Frame(frame) if !frame.keyframe));
+            {
+                let mut session = state.session.lock().await;
+                record_surface_ack(session.clients.get_mut(&1).unwrap(), 7);
+            }
+            tick(&state).await;
+            assert!(
+                requests.try_iter().any(|command| matches!(
+                    command,
+                    CompositorCommand::RequestVulkanKeyframe { .. }
+                )),
+                "motion rearms periodic refresh"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "openh264", feature = "x264")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn periodic_software_refresh_reencodes_idle_pixels_as_a_keyframe() {
+        let (state, mut received, _requests) = surface_refresh_fixture().await;
+        {
+            let mut session = state.session.lock().await;
+            let pixels = &session.compositor.as_ref().unwrap().last_pixels[&(7, 64, 64)].pixels;
+            let mut encoder = SurfaceEncoder::new_or_resize(
+                None,
+                &[SurfaceEncoderPreference::H264Software],
+                64,
+                64,
+                "",
+                state.config.surface_encoding,
+                false,
+                CODEC_SUPPORT_H264,
+                ChromaSubsampling::Cs420,
+            )
+            .unwrap();
+            assert!(encoder.encode_pixels(pixels).unwrap().1);
+            assert!(!encoder.encode_pixels(pixels).unwrap().1);
+            session
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .surface_subs
+                .get_mut(&7)
+                .unwrap()
+                .encoder = Some(encoder);
+        }
+        tick(&state).await;
+        assert!(
+            received.try_recv().is_err(),
+            "idle picture stays quiet before deadline"
+        );
+        let old = Instant::now() - SURFACE_KEYFRAME_REFRESH_INTERVAL;
+        {
+            let mut session = state.session.lock().await;
+            let sub = session
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .surface_subs
+                .get_mut(&7)
+                .unwrap();
+            sub.last_keyframe_sent_at = Some(old);
+            sub.max_inflight_frames = Some(0);
+        }
+        tick(&state).await;
+        {
+            let mut session = state.session.lock().await;
+            let sub = session
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .surface_subs
+                .get_mut(&7)
+                .unwrap();
+            assert!(!sub.encode_in_flight, "no encode without delivery credit");
+            assert_eq!(sub.last_keyframe_sent_at, Some(old));
+            sub.max_inflight_frames = Some(1);
+        }
+        tick(&state).await;
+        let event = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, Event::Frame(frame) if frame.keyframe));
+        {
+            let mut session = state.session.lock().await;
+            let client = session.clients.get_mut(&1).unwrap();
+            record_surface_ack(client, 7);
+            let sub = client.surface_subs.get_mut(&7).unwrap();
+            assert!(sub.last_keyframe_sent_at.unwrap() > old);
+            assert!(
+                sub.still_quality_override,
+                "refresh preserves still-image quality"
+            );
+            assert!(!sub.sent_delta_since_keyframe);
+            sub.last_keyframe_sent_at = Some(old);
+        }
+        tick(&state).await;
+        assert!(
+            received.try_recv().is_err(),
+            "an idle keyframe is not refreshed again"
+        );
+        assert!(!state.session.lock().await.clients[&1].surface_subs[&7].encode_in_flight);
+    }
+
     #[test]
     fn pointer_leave_and_handoff_publish_immediate_remote_retirement() {
         use yas_wire::codec::{Decode, Encode};
