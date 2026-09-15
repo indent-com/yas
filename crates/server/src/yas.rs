@@ -964,7 +964,7 @@ struct TerminalWriterGate {
     release: Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl TerminalWriterGate {
     fn new() -> Self {
         Self {
@@ -1037,7 +1037,7 @@ struct TerminalFrameDropProbe {
     final_frame: Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl TerminalFrameDropProbe {
     fn new() -> Self {
         Self {
@@ -1059,6 +1059,7 @@ struct SurfaceWatchPublicationProbe {
 
 #[cfg(test)]
 impl SurfaceWatchPublicationProbe {
+    #[cfg(unix)]
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -1068,6 +1069,7 @@ impl SurfaceWatchPublicationProbe {
         self.changed.notify_waiters();
     }
 
+    #[cfg(unix)]
     async fn wait_after(&self, generation: u64) {
         loop {
             let changed = self.changed.notified();
@@ -40018,6 +40020,7 @@ mod tests {
         (client, codec, server_hello, task)
     }
 
+    #[cfg(unix)]
     async fn start_registered_session(
         state: AppState,
         family_ids: &[u16],
@@ -40030,6 +40033,7 @@ mod tests {
         start_registered_session_with_receive(state, family_ids, TEST_PEER_MAX_BUFFERED).await
     }
 
+    #[cfg(unix)]
     async fn start_registered_session_with_receive(
         state: AppState,
         family_ids: &[u16],
@@ -40062,6 +40066,7 @@ mod tests {
         (client, codec, server_hello, task)
     }
 
+    #[cfg(unix)]
     async fn start_registered_session_with_surface_watch_probe(
         state: AppState,
         family_ids: &[u16],
@@ -40095,6 +40100,7 @@ mod tests {
         (client, codec, server_hello, task)
     }
 
+    #[cfg(unix)]
     async fn start_registered_session_with_outbound_max(
         state: AppState,
         family_ids: &[u16],
@@ -40129,6 +40135,7 @@ mod tests {
         (client, codec, server_hello, task)
     }
 
+    #[cfg(unix)]
     async fn start_registered_session_with_terminal_writer_gate(
         state: AppState,
         family_ids: &[u16],
@@ -40160,6 +40167,7 @@ mod tests {
         (client, codec, server_hello, task)
     }
 
+    #[cfg(unix)]
     async fn start_registered_session_with_terminal_drop_probe(
         state: AppState,
         family_ids: &[u16],
@@ -40240,6 +40248,7 @@ mod tests {
         timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
     }
 
+    #[cfg(unix)]
     async fn start_registered_read_only_session(
         state: AppState,
         family_ids: &[u16],
@@ -40280,6 +40289,7 @@ mod tests {
         (client, codec, server_hello, task)
     }
 
+    #[cfg(unix)]
     async fn start_shutdown_retry_session(
         state: AppState,
         family_ids: &[u16],
@@ -40805,6 +40815,7 @@ mod tests {
         ResultPrefix::decode(&frame.payload).unwrap()
     }
 
+    #[cfg(unix)]
     async fn next_extension_result(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -40832,6 +40843,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn next_goaway(client: &mut DuplexStream, codec: &FrameCodec) -> GoAway {
         let frame = next_frame(client, codec).await;
         assert_eq!(
@@ -40841,6 +40853,7 @@ mod tests {
         GoAway::decode(&frame.payload).unwrap()
     }
 
+    #[cfg(unix)]
     async fn next_terminal_result(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -40875,6 +40888,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn next_client_result(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -40900,6 +40914,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn next_terminal_frame_for(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -40926,6 +40941,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn acknowledge_terminal_frame(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -41089,6 +41105,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn next_process_result_collecting_state(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -41196,6 +41213,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     async fn next_channel_result_collecting_state(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -41229,6 +41247,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn next_channel_state(client: &mut DuplexStream, codec: &FrameCodec) -> StateEvent {
         let frame = next_frame(client, codec).await;
         assert_eq!(
@@ -45168,6 +45187,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     async fn next_client_terminal_subscription_count(
         client: &mut DuplexStream,
         codec: &FrameCodec,

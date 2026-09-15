@@ -57,6 +57,10 @@ CI runs on standard GitHub-hosted Linux, ARM Linux, macOS, and Windows
 runners. It parses every Nix file, checks formatting and Clippy, runs Rust,
 JavaScript, end-to-end, and coverage tests, builds all release platforms, and
 runs a bounded campaign over every YAS wire fuzz target.
+The native Windows build and macOS test build reject Rust compiler warnings,
+including platform-specific unused code. WebTransport bandwidth and loss tests
+use QUIC over an in-memory link with a virtual clock; real UDP tests cover
+connection lifecycle and forwarding without measuring host throughput.
 
 Signed tags run the same gates with longer fuzz campaigns, then build Linux and
 macOS tarballs plus a Windows zip. The release job uploads both versioned

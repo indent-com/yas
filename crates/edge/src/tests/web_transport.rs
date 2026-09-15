@@ -1,6 +1,7 @@
+#[path = "simulated_link.rs"]
+mod simulated_link;
+
 use super::*;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -17,13 +18,49 @@ struct Peer {
 
 struct UdpRelay {
     blackhole: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for UdpRelay {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
+}
+
+async fn udp_relay(server_addr: SocketAddr) -> (SocketAddr, UdpRelay) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = socket.local_addr().unwrap();
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let drop_packets = blackhole.clone();
+    let task = tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut buffer = vec![0; 65_536];
+        loop {
+            let (length, from) = socket.recv_from(&mut buffer).await.unwrap();
+            if drop_packets.load(Ordering::SeqCst) {
+                continue;
+            }
+            let destination = if from == server_addr {
+                client_addr.unwrap()
+            } else {
+                client_addr = Some(from);
+                server_addr
+            };
+            socket
+                .send_to(&buffer[..length], destination)
+                .await
+                .unwrap();
+        }
+    });
+    (
+        relay_addr,
+        UdpRelay {
+            blackhole,
+            task: Some(task),
+        },
+    )
 }
 
 async fn peers() -> (Peer, Peer, UdpRelay) {
@@ -38,77 +75,33 @@ async fn peers_with_link(delay: Duration, bytes_per_second: u64) -> (Peer, Peer,
         let private_key = directory.path().join("key.pem");
         std::fs::write(&certificate, identity.cert.pem()).unwrap();
         std::fs::write(&private_key, identity.signing_key.serialize_pem()).unwrap();
-        let (mut server, _, _) = prepare_web_transport(Some(WebTransportOptions {
-            addr: "127.0.0.1:0".into(),
-            public_port: 0,
-            certificate: Some(certificate),
-            private_key: Some(private_key),
-            pin_certificate: false,
-        }))
+        let link = (!delay.is_zero()).then(|| simulated_link::Link::new(delay, bytes_per_second));
+        let (mut server, _, _) = prepare_web_transport_with_endpoint(
+            Some(WebTransportOptions {
+                addr: "127.0.0.1:0".into(),
+                public_port: 0,
+                certificate: Some(certificate),
+                private_key: Some(private_key),
+                pin_certificate: false,
+            }),
+            |config, addr| match &link {
+                Some(link) => link.server(config),
+                None => web_transport_quinn::quinn::Endpoint::server(config, addr),
+            },
+        )
         .unwrap()
         .unwrap();
         let server_addr = server.local_addr().unwrap();
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let relay_addr = socket.local_addr().unwrap();
-        let blackhole = Arc::new(AtomicBool::new(false));
-        let drop_packets = blackhole.clone();
-        let relay = UdpRelay {
-            blackhole,
-            task: tokio::spawn(async move {
-                let mut client_addr = None;
-                let mut buffer = vec![0; 65_536];
-                let mut pending = BinaryHeap::new();
-                let mut downstream_ready = tokio::time::Instant::now();
-                let mut sequence = 0u64;
-                loop {
-                    let next = pending
-                        .peek()
-                        .map(|Reverse((due, _, _, _))| *due)
-                        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60));
-                    tokio::select! {
-                        packet = socket.recv_from(&mut buffer) => {
-                            let (length, from) = packet.unwrap();
-                            if drop_packets.load(Ordering::SeqCst) {
-                                continue;
-                            }
-                            let now = tokio::time::Instant::now();
-                            let mut transmitted = now;
-                            let destination = if from == server_addr {
-                                if let Some(serialization_ns) =
-                                    (length as u64 * 1_000_000_000).checked_div(bytes_per_second)
-                                {
-                                    // Model a link with 50 ms of bottleneck queue,
-                                    // independently of its propagation delay.
-                                    if downstream_ready.saturating_duration_since(now)
-                                        > Duration::from_millis(50)
-                                    {
-                                        continue;
-                                    }
-                                    downstream_ready = downstream_ready.max(now)
-                                        + Duration::from_nanos(serialization_ns);
-                                    transmitted = downstream_ready;
-                                }
-                                client_addr.unwrap()
-                            } else {
-                                client_addr = Some(from);
-                                server_addr
-                            };
-                            sequence += 1;
-                            pending.push(Reverse((transmitted + delay, sequence, destination, buffer[..length].to_vec())));
-                        }
-                        _ = tokio::time::sleep_until(next), if !pending.is_empty() => {
-                            // Drain all due datagrams together; one timer per
-                            // packet would impose its own throughput limit.
-                            while pending.peek().is_some_and(|Reverse((due, _, _, _))| *due <= tokio::time::Instant::now()) {
-                                let Reverse((_, _, destination, packet)) = pending.pop().unwrap();
-                                if !drop_packets.load(Ordering::SeqCst) {
-                                    socket.send_to(&packet, destination).await.unwrap();
-                                }
-                            }
-                        }
-                    }
-                }
-            }),
+        let (relay_addr, relay) = if let Some(link) = &link {
+            (
+                server_addr,
+                UdpRelay {
+                    blackhole: link.blackhole.clone(),
+                    task: None,
+                },
+            )
+        } else {
+            udp_relay(server_addr).await
         };
         let url: url::Url = format!("https://{relay_addr}/edge").parse().unwrap();
         // The default test client's 1.25 MB per-stream receive window is also
@@ -123,14 +116,19 @@ async fn peers_with_link(delay: Duration, bytes_per_second: u64) -> (Peer, Peer,
         .with_root_certificates(roots)
         .with_no_client_auth();
         tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
-        let crypto = web_transport_quinn::quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let crypto =
+            web_transport_quinn::quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
         let mut config = web_transport_quinn::quinn::ClientConfig::new(Arc::new(crypto));
         let mut transport = web_transport_quinn::quinn::TransportConfig::default();
         transport
             .stream_receive_window((32u32 * 1024 * 1024).into())
             .receive_window((64u32 * 1024 * 1024).into());
         config.transport_config(Arc::new(transport));
-        let endpoint = web_transport_quinn::quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = match &link {
+            Some(link) => link.client().unwrap(),
+            None => web_transport_quinn::quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+                .unwrap(),
+        };
         let client = web_transport_quinn::Client::new(endpoint, config);
         let (client, edge) = tokio::join!(
             async {
@@ -447,7 +445,7 @@ async fn congested_video_cannot_fill_a_multi_megabyte_quic_send_queue() {
     client.session.close(0, b"test complete");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn long_fat_pipe_carries_video_without_delaying_control_by_seconds() {
     for composite in [false, true] {
         // 80 Mbit/s, 100 ms each way: the path needs 2 MB in flight.
@@ -524,10 +522,14 @@ async fn long_fat_pipe_carries_video_without_delaying_control_by_seconds() {
             goodput > 4_000_000.0,
             "fast long path throttled to {goodput:.0} B/s"
         );
+        assert!(
+            worst_rtt >= Duration::from_millis(200),
+            "the simulated path did not apply its propagation delay"
+        );
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_warm_fast_pipe_does_not_turn_into_a_large_waiting_queue_on_loss() {
     let (mut client, edge, relay) = peers_with_link(Duration::from_millis(100), 10_000_000).await;
     let mut send = web_transport_send::Writer::new(&edge.session, edge.send);

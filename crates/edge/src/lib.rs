@@ -407,6 +407,23 @@ fn prepare_web_transport(
     )>,
     String,
 > {
+    prepare_web_transport_with_endpoint(options, web_transport_quinn::quinn::Endpoint::server)
+}
+
+fn prepare_web_transport_with_endpoint(
+    options: Option<WebTransportOptions>,
+    bind: impl FnOnce(
+        web_transport_quinn::quinn::ServerConfig,
+        SocketAddr,
+    ) -> std::io::Result<web_transport_quinn::quinn::Endpoint>,
+) -> Result<
+    Option<(
+        web_transport_quinn::Server,
+        WebTransportAdvertisement,
+        String,
+    )>,
+    String,
+> {
     let Some(options) = options else {
         return Ok(None);
     };
@@ -452,7 +469,7 @@ fn prepare_web_transport(
         ))
         .keep_alive_interval(Some(WEBTRANSPORT_KEEP_ALIVE_INTERVAL));
     config.transport_config(Arc::new(transport));
-    let endpoint = quinn::Endpoint::server(config, addr)
+    let endpoint = bind(config, addr)
         .map_err(|error| format!("cannot bind WebTransport to {addr}: {error}"))?;
     let server = web_transport_quinn::Server::new(endpoint);
     Ok(Some((

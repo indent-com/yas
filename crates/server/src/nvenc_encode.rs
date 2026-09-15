@@ -881,7 +881,7 @@ impl NvencDirectEncoder {
     /// `codec` should be `"h264"` or `"av1"`.
     /// `qp` is the constant QP value (0–51 for H.264, 0–255 for AV1).
     /// `preset` is the NVENC preset index, 1 (P1, fastest) … 7 (P7, slowest).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub fn try_new(
         codec: &str,
         width: u32,

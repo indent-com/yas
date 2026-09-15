@@ -35,6 +35,8 @@ jobs:
             cores = ${{ matrix.label == 'linux-aarch64' && '2' || '4' }}
       - name: Test the complete cross-platform YAS product graph on macOS
         if: ${{ matrix.label == 'macos-aarch64' }}
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           # Linux-only compositor probes are Cargo examples. Exercise every
           # workspace library, product binary, and integration/unit test here

@@ -135,7 +135,7 @@ pub(super) struct Writer {
     flight: Arc<Flight>,
     window: u64,
     refresh: Pin<Box<tokio::time::Sleep>>,
-    last_write_poll: Instant,
+    last_write_poll: tokio::time::Instant,
 }
 
 impl Writer {
@@ -148,7 +148,7 @@ impl Writer {
             flight,
             window: QUEUE_BYTES,
             refresh: Box::pin(tokio::time::sleep(REFRESH_INTERVAL)),
-            last_write_poll: Instant::now(),
+            last_write_poll: tokio::time::Instant::now(),
         }
     }
 
@@ -176,7 +176,7 @@ impl AsyncWrite for Writer {
                 .as_mut()
                 .reset(tokio::time::Instant::now() + REFRESH_INTERVAL);
         }
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let idle = now.duration_since(self.last_write_poll);
         if idle >= Duration::from_secs(2) && idle >= self.connection.rtt().saturating_mul(3) {
             // ACK-only packets can accumulate in on_sent without another ACK

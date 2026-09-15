@@ -775,6 +775,7 @@ fn receive_retention_inventory_exactly_covers_the_canonical_family_registry() {
     );
 }
 
+#[cfg(unix)]
 async fn matching_result(
     client: &mut tokio::io::DuplexStream,
     codec: &FrameCodec,

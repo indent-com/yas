@@ -1,16 +1,20 @@
 //! Native Terminal view streams used by attach and recording.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use yas_wire::{Decode, Encode, Extensions, family, terminal};
 
+#[cfg(unix)]
+use super::watch_terminal_exit;
+
 use super::{
-    NativeClient, close_view, find_terminal, open_view, recording, terminal_exit_code,
-    watch_terminal_exit, wire_error,
+    NativeClient, close_view, find_terminal, open_view, recording, terminal_exit_code, wire_error,
 };
 
+#[cfg(unix)]
 const DETACH: u8 = 0x1d;
 
 #[derive(Default)]
@@ -397,6 +401,7 @@ impl GridState {
         Ok(())
     }
 
+    #[cfg(any(unix, test))]
     fn ansi_text(&self) -> String {
         let mut lines = Vec::with_capacity(usize::from(self.rows));
         for row in 0..self.rows {
@@ -515,12 +520,14 @@ async fn send_frame_ack(
         .await
 }
 
+#[cfg(unix)]
 pub(crate) struct ViewUpdate {
     pub(crate) text: String,
     pub(crate) cursor: (u16, u16),
     pub(crate) final_exit: Option<i32>,
 }
 
+#[cfg(unix)]
 pub(crate) async fn start_view_task(
     on: Option<&str>,
     hub: &str,
@@ -936,6 +943,7 @@ pub(crate) async fn start_interactive_view_task(
     })
 }
 
+#[cfg(unix)]
 async fn start_lifecycle_task(
     on: Option<&str>,
     hub: &str,

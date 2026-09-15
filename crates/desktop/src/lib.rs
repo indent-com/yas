@@ -50,7 +50,9 @@ mod portal;
 /// module-private test modules can reach it.
 #[cfg(test)]
 mod test_http {
+    #[cfg(unix)]
     use std::sync::Arc;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Serves one canned response per connection and keeps accepting, so a
@@ -60,6 +62,7 @@ mod test_http {
     /// `declared_len` overrides Content-Length so a body can overrun what it
     /// advertised, which is the only way to exercise the streamed size cap
     /// rather than the header precheck.
+    #[cfg(unix)]
     pub(crate) fn serve(
         body: Vec<u8>,
         status: &str,

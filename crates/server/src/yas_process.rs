@@ -63,6 +63,7 @@ impl TestOperationGate {
             .forget();
     }
 
+    #[cfg(unix)]
     pub(crate) async fn wait_for_entered(&self, expected: usize) {
         loop {
             let changed = self.changed.notified();
@@ -73,6 +74,7 @@ impl TestOperationGate {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn release(&self, count: usize) {
         self.releases.add_permits(count);
     }
@@ -258,7 +260,7 @@ impl Runtime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_operation_gate(mut self, gate: Arc<TestOperationGate>) -> Self {
         self.operation_gate = Some(gate);
         self
@@ -707,12 +709,12 @@ impl Attachment {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn next(&mut self) -> Option<Event> {
         self.events.recv().await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn acknowledge_output(
         &self,
         stream: Stream,

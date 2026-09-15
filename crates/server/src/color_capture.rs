@@ -89,6 +89,7 @@ pub(super) fn encode(
     Some(bytes)
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn thumbnail(
     pixels: &[f32],
     width: u32,

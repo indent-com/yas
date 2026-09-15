@@ -32,8 +32,6 @@ use crate::pty;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
-#[cfg(windows)]
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -466,7 +464,7 @@ impl Server {
         self.0.policy.enabled
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn active_terminate_timeout_tasks(&self) -> usize {
         self.0.terminate_timeout_tasks.load(Ordering::Acquire)
     }
@@ -2316,21 +2314,6 @@ fn create_kill_on_close_job() -> io::Result<JobHandle> {
     }
 }
 
-#[cfg(windows)]
-fn windows_env_keys_equal(left: &str, right: &str) -> bool {
-    let left = left.encode_utf16().collect::<Vec<_>>();
-    let right = right.encode_utf16().collect::<Vec<_>>();
-    unsafe {
-        CompareStringOrdinal(
-            left.as_ptr(),
-            left.len() as i32,
-            right.as_ptr(),
-            right.len() as i32,
-            1,
-        ) == CSTR_EQUAL
-    }
-}
-
 fn send_stdin_ack(inner: &RecordInner, bytes: u64, stdin_state: u8) {
     for binding in &inner.bindings {
         binding
@@ -3092,9 +3075,4 @@ fn os_error_detail(error: io::Error) -> &'static str {
         Some(libc::EINVAL) => "invalid signal",
         _ => "process control failed",
     }
-}
-
-#[cfg(windows)]
-fn os_error_detail(_error: io::Error) -> &'static str {
-    "process control failed"
 }
