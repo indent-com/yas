@@ -438,6 +438,10 @@ frame at the new size carries fresh headers and a keyframe. Growth remains
 limited to the session's existing 25% headroom per axis. Shrinking below a
 quarter of its reserved pixel area rebuilds the session to release memory.
 Other backends and incompatible changes use the ordinary creation path.
+Native view configuration retains the encoder for geometry and pacing changes.
+If a worker is busy, its pre-configuration output is discarded while its
+session is kept for the latest size. Superseded creations cannot register
+stale compositor targets, and every configuration still requires a new keyframe.
 
 ### GPU rendering and encoding
 

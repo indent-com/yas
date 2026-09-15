@@ -2603,6 +2603,11 @@ struct SurfaceSubState {
     /// bandwidth / speed change (resubscribe) while encoding — the completion
     /// handler must drop the stale encoder instead of reinserting it.
     encoder_invalidated: bool,
+    /// Geometry/pacing changed while a worker owned the encoder. Discard its
+    /// output but retain the session for resizing. Also forces registration
+    /// after a creation completed at a superseded target, even if the next
+    /// requested size returns to that same target.
+    encoder_reconfigure_pending: bool,
     /// When this subscriber first declined BGRA while waiting for its
     /// `OPAQUE_FD` publish. After `OPAQUE_PUBLISH_GRACE` this becomes the
     /// rate limit for re-registering and recompositing a missing target.
@@ -3936,28 +3941,43 @@ fn encoded_generation(
     }
 }
 
-/// Apply an encode completion to its subscription.
-///
-/// A resubscribe can invalidate an encode while it is running.  Its output
-/// belongs to the old codec or dimensions, so it must neither be delivered
-/// nor advance the generation mark used by the delivery gate.  In
-/// particular, an old-size keyframe must not satisfy the new encoder's
-/// keyframe debt.
+/// Whether completed work belongs to the current frame boundary, and whether
+/// its encoder can be retained when the output no longer does.
+#[derive(Debug, PartialEq, Eq)]
+enum EncoderCompletion {
+    Accept,
+    Reconfigure,
+    Discard,
+}
+
+fn completed_encoder_disposition(state: &mut SurfaceSubState) -> EncoderCompletion {
+    let reconfigure = std::mem::take(&mut state.encoder_reconfigure_pending);
+    if std::mem::take(&mut state.encoder_invalidated) {
+        EncoderCompletion::Discard
+    } else if reconfigure {
+        EncoderCompletion::Reconfigure
+    } else {
+        EncoderCompletion::Accept
+    }
+}
+
+/// Stale output must not advance the generation or satisfy keyframe debt.
 fn accept_completed_encode(
     state: &mut SurfaceSubState,
     generation: u64,
     produced_output: bool,
-) -> bool {
+) -> EncoderCompletion {
     state.encode_in_flight = false;
     state.reserved_encode_bytes = 0;
     state.in_flight_generation = None;
-    if std::mem::replace(&mut state.encoder_invalidated, false) {
+    let disposition = completed_encoder_disposition(state);
+    if disposition != EncoderCompletion::Accept {
         state.pending_encode = None;
-        return false;
+        return disposition;
     }
     state.last_encoded_gen =
         encoded_generation(state.last_encoded_gen, generation, produced_output);
-    true
+    EncoderCompletion::Accept
 }
 
 /// Retire an encoder-creation task at the subscription boundary.
@@ -3969,13 +3989,14 @@ fn accept_completed_encode(
 /// first can leave only thumbnail-sized pixels cached while the final native
 /// subscription waits for native pixels before dispatching its own creation;
 /// a later surface resize happens to break that deadlock by recompositing.
-fn accept_completed_creation(state: &mut SurfaceSubState) -> bool {
+fn accept_completed_creation(state: &mut SurfaceSubState) -> EncoderCompletion {
     state.creation_in_flight = false;
-    if std::mem::replace(&mut state.encoder_invalidated, false) {
-        return false;
+    let disposition = completed_encoder_disposition(state);
+    if disposition != EncoderCompletion::Accept {
+        return disposition;
     }
     state.encode_warmed_up = false;
-    true
+    EncoderCompletion::Accept
 }
 
 // ---------------------------------------------------------------------------
@@ -10853,6 +10874,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && sub.encode_in_flight
                         && !sub.creation_in_flight
                         && !sub.encoder_invalidated
+                        && !sub.encoder_reconfigure_pending
                         && cached.is_some()
                         && (px_w, px_h) == (target_w, target_h)
                         && (still_refresh
@@ -10878,7 +10900,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                             timestamp_ms: px_timestamp_ms,
                             timestamp_sub_us: px_timestamp_sub_us,
                         });
-                    } else if !full_rate || sub.encoder_invalidated {
+                    } else if !full_rate
+                        || sub.encoder_invalidated
+                        || sub.encoder_reconfigure_pending
+                    {
                         sub.pending_encode = None;
                     }
                     client.skip_in_flight_count = client.skip_in_flight_count.saturating_add(1);
@@ -10900,15 +10925,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let needs_new_encoder = if has_vulkan_enc {
                     false
                 } else {
-                    client
-                        .surface_subs
-                        .get(&sid)
-                        .and_then(|s| s.encoder.as_ref())
-                        .is_none_or(|e| {
-                            e.source_dimensions() != (enc_w, enc_h)
-                                || e.managed != managed_source.is_some()
-                                || e.output_color != output_color
-                        })
+                    client.surface_subs.get(&sid).is_none_or(|s| {
+                        s.encoder_reconfigure_pending
+                            || s.encoder.as_ref().is_none_or(|e| {
+                                e.source_dimensions() != (enc_w, enc_h)
+                                    || e.managed != managed_source.is_some()
+                                    || e.output_color != output_color
+                            })
+                    })
                 };
 
                 // If the encoder was dropped due to persistent nal_data=None,
@@ -11226,6 +11250,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     let previous = {
                         let state = client.surface_subs.entry(sid).or_default();
                         state.creation_in_flight = true;
+                        state.encoder_reconfigure_pending = false;
                         state.encoder.take()
                     };
                     create_jobs.push(CreateJob {
@@ -11624,12 +11649,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                     } else {
                         continue;
                     };
-                    if !accepted {
-                        // This output belongs to the pre-resubscribe encoder.
-                        // Dropping it preserves the keyframe debt set by the
-                        // subscription change, so the replacement encoder
-                        // starts a decoder-compatible reference chain.
-                        retire_encoder(returned_encoder.take());
+                    if accepted != EncoderCompletion::Accept {
+                        // Drop pre-boundary output without paying off the new
+                        // keyframe debt. A geometry-only change keeps the
+                        // session so the next tick can resize it in place.
+                        if accepted == EncoderCompletion::Reconfigure {
+                            sess.clients
+                                .get_mut(&result.cid)
+                                .unwrap()
+                                .surface_subs
+                                .entry(result.sid)
+                                .or_default()
+                                .encoder = returned_encoder.take();
+                        } else {
+                            retire_encoder(returned_encoder.take());
+                        }
                         needs_delivery_nudge = true;
                         continue;
                     }
@@ -12088,6 +12122,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         {
                             s.creation_in_flight = false;
                             s.encoder_invalidated = false;
+                            s.encoder_reconfigure_pending = false;
                         }
                         continue;
                     }
@@ -12100,9 +12135,25 @@ async fn tick(state: &AppState) -> TickOutcome {
                     {
                         accept_completed_creation(state)
                     } else {
-                        false
+                        EncoderCompletion::Discard
                     };
-                    if !accepted {
+                    if accepted != EncoderCompletion::Accept {
+                        if accepted == EncoderCompletion::Reconfigure {
+                            let sub = sess
+                                .clients
+                                .get_mut(&result.cid)
+                                .unwrap()
+                                .surface_subs
+                                .get_mut(&result.sid)
+                                .unwrap();
+                            sub.encoder = result.encoder;
+                            // No targets from this completion were installed.
+                            // Go through creation/registration again even if
+                            // the latest size happens to match this encoder.
+                            sub.encoder_reconfigure_pending = true;
+                        } else {
+                            retire_encoder(result.encoder);
+                        }
                         continue;
                     }
 
@@ -16587,7 +16638,10 @@ mod tests {
     fn a_recreated_encoder_does_not_inherit_a_cold_work_sample() {
         let mut sub = SurfaceSubState::default();
         record_surface_encode_work(&mut sub, 450_000);
-        assert!(accept_completed_creation(&mut sub));
+        assert_eq!(
+            accept_completed_creation(&mut sub),
+            EncoderCompletion::Accept
+        );
         record_surface_encode_work(&mut sub, 450_000);
         assert_eq!(sub.encode_work_us, 0.0);
         record_surface_encode_work(&mut sub, 3_000);
@@ -17631,8 +17685,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            !accept_completed_encode(&mut sub, 12, true),
+        assert_eq!(
+            accept_completed_encode(&mut sub, 12, true),
+            EncoderCompletion::Discard,
             "old-size output must be dropped after a resubscribe",
         );
         assert!(!sub.encode_in_flight);
@@ -17657,7 +17712,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(accept_completed_encode(&mut sub, 12, true));
+        assert_eq!(
+            accept_completed_encode(&mut sub, 12, true),
+            EncoderCompletion::Accept
+        );
         assert!(!sub.encode_in_flight);
         assert_eq!(sub.reserved_encode_bytes, 0);
         assert_eq!(sub.in_flight_generation, None);
@@ -17673,7 +17731,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!accept_completed_creation(&mut sub));
+        assert_eq!(
+            accept_completed_creation(&mut sub),
+            EncoderCompletion::Discard
+        );
         assert!(!sub.creation_in_flight);
         assert!(!sub.encoder_invalidated);
         assert_eq!(
@@ -17690,7 +17751,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(accept_completed_creation(&mut sub));
+        assert_eq!(
+            accept_completed_creation(&mut sub),
+            EncoderCompletion::Accept
+        );
         assert!(!sub.creation_in_flight);
     }
 

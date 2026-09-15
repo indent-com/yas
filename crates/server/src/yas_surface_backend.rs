@@ -643,6 +643,8 @@ pub(crate) async fn configure(
     if client.native_surface.is_none() || !client.surface_subscriptions.contains(&surface_id) {
         return false;
     }
+    let incompatible = client.surface_codec_support != config.codec_support
+        || client.surface_color_capabilities != config.color_capabilities;
     client.display_fps = f32::from(config.max_fps.max(1));
     client.surface_codec_support = config.codec_support;
     client.surface_color_capabilities = config.color_capabilities;
@@ -651,13 +653,21 @@ pub(crate) async fn configure(
         .surface_view_sizes
         .insert(surface_id, (config.width, config.height, 120));
     let sub = client.surface_subs.entry(surface_id).or_default();
-    retire_encoder(sub.encoder.take());
+    // Geometry and pacing changes can reuse the existing encoder. Destroying
+    // it here bypasses new_or_resize and pays device initialization on every
+    // drag step. In-flight output still belongs to the old frame boundary.
+    if incompatible {
+        retire_encoder(sub.encoder.take());
+        sub.encoder_invalidated |= sub.encode_in_flight || sub.creation_in_flight;
+    } else {
+        sub.encoder_reconfigure_pending |= sub.encode_in_flight || sub.creation_in_flight;
+    }
+    sub.pending_encode = None;
     sub.codec_override = config.codec_support;
     sub.scaled_target = Some((config.width, config.height));
     sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
     sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
-    sub.encoder_invalidated |= sub.encode_in_flight || sub.creation_in_flight;
     sub.nal_none_streak = 0;
     sub.nal_none_latched_at = None;
     sub.create_failures = 0;
@@ -1151,6 +1161,135 @@ pub(crate) fn enqueue_remote_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_configure_preserves_resize_sessions_and_rejects_stale_work() {
+        let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
+        let config = ViewConfig {
+            width: 64,
+            height: 64,
+            max_fps: 60,
+            decoder_capacity: 4,
+            codec_support: CODEC_SUPPORT_AV1,
+            color_capabilities: 0,
+        };
+        let encoder = || {
+            SurfaceEncoder::new_or_resize(
+                None,
+                &[SurfaceEncoderPreference::AV1Software],
+                64,
+                64,
+                "",
+                SurfaceEncoding::default(),
+                false,
+                CODEC_SUPPORT_AV1,
+                surface_encoder::ChromaSubsampling::Cs420,
+            )
+            .unwrap()
+        };
+        for phase in ["idle", "encode", "create"] {
+            let (events, _received) = mpsc::channel(4);
+            let mut client = hidden_client(1, events, config, Arc::new(AtomicU64::new(0)));
+            client.surface_subscriptions.insert(7);
+            let sub = client.surface_subs.entry(7).or_default();
+            sub.encoder = (phase == "idle").then(encoder);
+            sub.encode_in_flight = phase == "encode";
+            sub.creation_in_flight = phase == "create";
+            sub.has_keyframe = true;
+            sub.last_encoded_gen = Some(11);
+            sub.last_registered_target = Some((64, 64));
+            state.session.lock().await.clients.insert(1, client);
+
+            // A burst must preserve the original session, including when
+            // the final geometry comes back to its starting dimensions.
+            for width in [72, 80, 64] {
+                assert!(configure(&state, 1, 7, ViewConfig { width, ..config }).await);
+            }
+            let mut session = state.session.lock().await;
+            let sub = session
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .surface_subs
+                .get_mut(&7)
+                .unwrap();
+            assert!(!sub.encoder_invalidated, "{phase}");
+            assert!(
+                !sub.has_keyframe,
+                "configuration must require a fresh keyframe"
+            );
+            match phase {
+                "idle" => {
+                    assert_eq!(sub.encoder.as_ref().unwrap().source_dimensions(), (64, 64));
+                    assert!(!sub.encoder_reconfigure_pending);
+                }
+                "encode" => {
+                    assert_eq!(
+                        accept_completed_encode(sub, 12, true),
+                        EncoderCompletion::Reconfigure
+                    );
+                    assert!(!sub.encode_in_flight);
+                    assert_eq!(sub.last_encoded_gen, Some(11));
+                }
+                "create" => {
+                    assert_eq!(
+                        accept_completed_creation(sub),
+                        EncoderCompletion::Reconfigure
+                    );
+                    assert!(!sub.creation_in_flight);
+                    assert_eq!(sub.last_registered_target, Some((64, 64)));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !sub.has_keyframe,
+                "old output cannot satisfy the new boundary"
+            );
+        }
+
+        // A color capability change still invalidates the session, even if
+        // a geometry change had already marked it for reuse.
+        {
+            let mut session = state.session.lock().await;
+            let sub = session
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .surface_subs
+                .get_mut(&7)
+                .unwrap();
+            sub.encoder = Some(encoder());
+            sub.encode_in_flight = true;
+        }
+        assert!(configure(&state, 1, 7, config).await);
+        assert!(
+            configure(
+                &state,
+                1,
+                7,
+                ViewConfig {
+                    color_capabilities: 1,
+                    ..config
+                }
+            )
+            .await
+        );
+        let mut session = state.session.lock().await;
+        let sub = session
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .surface_subs
+            .get_mut(&7)
+            .unwrap();
+        assert!(sub.encoder.is_none());
+        assert_eq!(
+            accept_completed_encode(sub, 12, true),
+            EncoderCompletion::Discard
+        );
+        assert!(!sub.encoder_reconfigure_pending);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
