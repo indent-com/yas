@@ -1287,6 +1287,15 @@ struct OutboundFrame {
     written: Option<oneshot::Sender<()>>,
     terminal_written: Option<Arc<TerminalFrameWriteCompletion>>,
     terminal_guard: Option<super::yas_terminal_backend::FrameWriteGuard>,
+    surface_write_blocked_us: Option<Arc<AtomicU64>>,
+}
+
+impl OutboundFrame {
+    fn record_write_duration(&self, elapsed: Duration) {
+        if let Some(counter) = &self.surface_write_blocked_us {
+            accumulate_write_duration(counter, elapsed);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1522,6 +1531,20 @@ impl FrameSender {
         confirmed.await.map_err(|_| mpsc::error::SendError(failed))
     }
 
+    async fn send_surface_confirmed(
+        &self,
+        frame: Frame,
+        write_blocked_us: Arc<AtomicU64>,
+    ) -> Result<(), mpsc::error::SendError<Frame>> {
+        debug_assert_eq!(frame.header.family, family::SURFACE);
+        debug_assert_eq!(frame.header.kind, yas_wire::schema::surface::event::FRAME);
+        let failed = frame.clone();
+        let (written, confirmed) = oneshot::channel();
+        self.send_queued_with_feedback(frame, Some(written), None, None, Some(write_blocked_us))
+            .await?;
+        confirmed.await.map_err(|_| mpsc::error::SendError(failed))
+    }
+
     async fn send_urgent_confirmed(
         &self,
         frame: Frame,
@@ -1537,7 +1560,7 @@ impl FrameSender {
         frame: Frame,
         written: Option<oneshot::Sender<()>>,
     ) -> Result<(), mpsc::error::SendError<Frame>> {
-        self.send_queued_with_terminal_guard(frame, written, None, None)
+        self.send_queued_with_feedback(frame, written, None, None, None)
             .await
     }
 
@@ -1549,16 +1572,17 @@ impl FrameSender {
     ) -> Result<(), mpsc::error::SendError<Frame>> {
         debug_assert_eq!(frame.header.family, family::TERMINAL);
         debug_assert_eq!(classify_outbound(&frame), OutboundClass::Data);
-        self.send_queued_with_terminal_guard(frame, None, written, Some(guard))
+        self.send_queued_with_feedback(frame, None, written, Some(guard), None)
             .await
     }
 
-    async fn send_queued_with_terminal_guard(
+    async fn send_queued_with_feedback(
         &self,
         frame: Frame,
         written: Option<oneshot::Sender<()>>,
         terminal_written: Option<Arc<TerminalFrameWriteCompletion>>,
         terminal_guard: Option<super::yas_terminal_backend::FrameWriteGuard>,
+        surface_write_blocked_us: Option<Arc<AtomicU64>>,
     ) -> Result<(), mpsc::error::SendError<Frame>> {
         let (tx, budget) = self.lane(classify_outbound(&frame));
         let decoded_len = frame
@@ -1579,6 +1603,7 @@ impl FrameSender {
             written,
             terminal_written,
             terminal_guard,
+            surface_write_blocked_us,
         })
         .await
         .map_err(|error| mpsc::error::SendError(error.0.frame))
@@ -1603,6 +1628,7 @@ impl FrameSender {
             written: None,
             terminal_written: None,
             terminal_guard: None,
+            surface_write_blocked_us: None,
         })
         .map_err(|error| match error {
             mpsc::error::TrySendError::Full(queued) => {
@@ -2076,8 +2102,6 @@ async fn serve_registered<S>(
     let writer_cancel = cancellation.clone();
     let writer_codec = negotiated.outbound_codec.clone();
     let writer_bytes = Arc::clone(&native_outbound_bytes);
-    let write_blocked_us = Arc::new(AtomicU64::new(0));
-    let writer_blocked_us = Arc::clone(&write_blocked_us);
     #[cfg(test)]
     let terminal_writer_gate = services.terminal_writer_gate.clone();
     #[cfg(test)]
@@ -2140,7 +2164,7 @@ async fn serve_registered<S>(
             if writer.write_all(&encoded).await.is_err() {
                 break;
             }
-            accumulate_write_duration(&writer_blocked_us, write_started.elapsed());
+            queued.record_write_duration(write_started.elapsed());
             if let Some(guard) = &queued.terminal_guard {
                 guard.commit();
             }
@@ -2310,7 +2334,6 @@ async fn serve_registered<S>(
         terminal_frame_tx,
         surface_event_tx,
         media_audio_tx,
-        write_blocked_us,
         registration.take(),
         attempt_context,
         native,
@@ -2646,10 +2669,6 @@ struct Session {
     terminal_frames: mpsc::Sender<super::yas_terminal_backend::Frame>,
     surface_events: mpsc::Sender<super::yas_surface_backend::Event>,
     surface_send: Option<tokio::task::JoinHandle<Result<(), ()>>>,
-    /// Wall time spent awaiting this connection's reliable writer. Native
-    /// Surface delivery clients share it with the adaptive encoder so socket
-    /// pressure on the actual WAN path is not hidden behind their event sink.
-    write_blocked_us: Arc<AtomicU64>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     media_audio: mpsc::Sender<NativeAudioFrame>,
     _registration: Option<ConnectionRegistration>,
@@ -3984,6 +4003,9 @@ struct NativeSurfaceView {
     surface_handle: u64,
     surface_id: u16,
     backend_client_id: u64,
+    // Only this view's Surface writes feed its encoder's pressure signal.
+    // Sharing a connection must not let other traffic degrade an idle view.
+    write_blocked_us: Arc<AtomicU64>,
     width: u16,
     height: u16,
     max_fps: u16,
@@ -6980,7 +7002,6 @@ impl Session {
         terminal_frames: mpsc::Sender<super::yas_terminal_backend::Frame>,
         surface_events: mpsc::Sender<super::yas_surface_backend::Event>,
         media_audio: mpsc::Sender<NativeAudioFrame>,
-        write_blocked_us: Arc<AtomicU64>,
         registration: Option<ConnectionRegistration>,
         attempt_context: Option<yas_extension_wire::AttemptContext>,
         native: Option<NativeRuntime>,
@@ -7087,7 +7108,6 @@ impl Session {
             terminal_frames,
             surface_events,
             surface_send: None,
-            write_blocked_us,
             media_audio,
             _registration: registration,
             shutdown_admission,
@@ -9150,13 +9170,14 @@ impl Session {
             decoder_capacity: request.decoder_capacity,
             codec_support,
         };
+        let write_blocked_us = Arc::new(AtomicU64::new(0));
         let Some(registration) = super::yas_surface_backend::register(
             &state,
             view_id,
             surface_id,
             config,
             self.surface_events.clone(),
-            Arc::clone(&self.write_blocked_us),
+            Arc::clone(&write_blocked_us),
         )
         .await
         else {
@@ -9174,6 +9195,7 @@ impl Session {
                 surface_handle: request.surface_handle,
                 surface_id,
                 backend_client_id,
+                write_blocked_us,
                 width,
                 height,
                 max_fps: request.max_fps,
@@ -27298,6 +27320,7 @@ impl Session {
                         | yas_wire::schema::surface::FRAME_CODEC_CONFIG as u16;
                 }
                 let previous = view.last_frame_written.clone();
+                let write_blocked_us = Arc::clone(&view.write_blocked_us);
                 let written = self.send_surface_frame(
                     frame.view_id,
                     sequence,
@@ -27307,6 +27330,7 @@ impl Session {
                     codec_version,
                     payload,
                     previous,
+                    write_blocked_us,
                 )?;
                 if let Some(view) = self
                     .native
@@ -27354,6 +27378,7 @@ impl Session {
         codec_version: u16,
         payload: Vec<u8>,
         previous: Option<SurfaceWriteReceipt>,
+        write_blocked_us: Arc<AtomicU64>,
     ) -> Result<SurfaceWriteReceipt, ()> {
         if self.surface_send.is_some() {
             return Err(());
@@ -27406,7 +27431,9 @@ impl Session {
                         },
                         payload,
                     };
-                    out.send_confirmed(frame).await.map_err(|_| ())?;
+                    out.send_surface_confirmed(frame, Arc::clone(&write_blocked_us))
+                        .await
+                        .map_err(|_| ())?;
                 }
                 complete.send_replace(true);
                 Ok(())
@@ -38960,6 +38987,7 @@ mod tests {
             surface_handle: 0xfeed,
             surface_id: 7,
             backend_client_id: 8,
+            write_blocked_us: Arc::new(AtomicU64::new(0)),
             width: 640,
             height: 360,
             max_fps: 60,
@@ -43092,6 +43120,76 @@ mod tests {
             urgent_budget,
             control_budget,
             data_budget,
+        }
+    }
+
+    #[tokio::test]
+    async fn surface_write_pressure_is_isolated_between_views_and_other_traffic() {
+        let TestOutbound {
+            sender,
+            mut receivers,
+            ..
+        } = test_outbound(4096, 4096, 4096);
+        let first = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(0));
+        let surface_frame = |view_id| Frame {
+            header: FrameHeader::event(family::SURFACE, yas_wire::schema::surface::event::FRAME),
+            payload: yas_surface::SurfaceFrame {
+                view_id,
+                sequence: 1,
+                base_sequence: 0,
+                capture_ns: 0,
+                presentation_ns: 0,
+                flags: yas_wire::schema::surface::FRAME_KEYFRAME as u16,
+                codec_version: 1,
+                fragment_index: 0,
+                fragment_count: 1,
+                complete_len: 1,
+                payload: vec![0],
+            }
+            .encode()
+            .unwrap(),
+        };
+        let cancellation = ConnectionCancellation::default();
+        // Both views use the same physical writer. A stalled fragment must
+        // still reduce its own view's quality, but an idle view must not
+        // inherit that stall or pressure from unrelated connection traffic.
+        for (frame, counter, elapsed_ms, expected) in [
+            (surface_frame(11), Some(Arc::clone(&first)), 70, (65_000, 0)),
+            (surface_frame(12), Some(Arc::clone(&second)), 2, (65_000, 0)),
+            (data_frame(1, 0, 16), None, 1_000, (65_000, 0)),
+            (control_result(family::CORE, 1, 0), None, 100, (65_000, 0)),
+            (
+                surface_frame(12),
+                Some(Arc::clone(&second)),
+                40,
+                (65_000, 35_000),
+            ),
+        ] {
+            timeout(TEST_TIMEOUT, async {
+                let send = async {
+                    match counter {
+                        Some(counter) => sender.send_surface_confirmed(frame, counter).await,
+                        None => sender.send_confirmed(frame).await,
+                    }
+                    .unwrap();
+                };
+                let write = async {
+                    let mut queued = receivers.recv(&cancellation).await.unwrap();
+                    queued.record_write_duration(Duration::from_millis(elapsed_ms));
+                    queued.written.take().unwrap().send(()).unwrap();
+                };
+                tokio::join!(send, write);
+            })
+            .await
+            .expect("frame write was confirmed");
+            assert_eq!(
+                (
+                    first.load(Ordering::Relaxed),
+                    second.load(Ordering::Relaxed)
+                ),
+                expected,
+            );
         }
     }
 

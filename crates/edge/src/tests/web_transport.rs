@@ -18,6 +18,7 @@ struct Peer {
 
 struct UdpRelay {
     blackhole: Arc<AtomicBool>,
+    link: Option<simulated_link::Link>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -58,6 +59,7 @@ async fn udp_relay(server_addr: SocketAddr) -> (SocketAddr, UdpRelay) {
         relay_addr,
         UdpRelay {
             blackhole,
+            link: None,
             task: Some(task),
         },
     )
@@ -97,6 +99,7 @@ async fn peers_with_link(delay: Duration, bytes_per_second: u64) -> (Peer, Peer,
                 server_addr,
                 UdpRelay {
                     blackhole: link.blackhole.clone(),
+                    link: Some(link.clone()),
                     task: None,
                 },
             )
@@ -445,88 +448,219 @@ async fn congested_video_cannot_fill_a_multi_megabyte_quic_send_queue() {
     client.session.close(0, b"test complete");
 }
 
+struct VideoConditions {
+    bytes_per_second: u64,
+    queue_delay_ms: u64,
+    drop_every: u64,
+    warmup: Duration,
+    changed_rate: Option<u64>,
+    path_delay: Duration,
+    changed_delay: Option<Duration>,
+}
+
+async fn video_control_measurement(
+    composite: bool,
+    conditions: VideoConditions,
+) -> (f64, Duration) {
+    let (mut client, edge, relay) =
+        peers_with_link(Duration::from_millis(100), conditions.bytes_per_second).await;
+    let link = relay.link.as_ref().unwrap();
+    link.set_queue_delay(conditions.queue_delay_ms);
+    link.set_loss(conditions.drop_every);
+    link.set_delay(conditions.path_delay);
+    let (bridge, home, _datagram) = start_bridge(edge, composite, 16 * 1024);
+    let (mut input, mut output) = tokio::io::split(home);
+    let producer = tokio::spawn(async move {
+        let video = vec![0x5a; 16 * 1024];
+        loop {
+            // Match the native priority writer: control goes before the next
+            // video fragment, once the current fragment has finished writing.
+            let request = tokio::select! {
+                biased;
+                request = input.read_u8() => match request {
+                    Ok(request) => request,
+                    Err(_) => break,
+                },
+                _ = tokio::task::yield_now() => 0,
+            };
+            if output.write_all(&[request]).await.is_err() {
+                break;
+            }
+            if request == 0 && output.write_all(&video).await.is_err() {
+                break;
+            }
+        }
+    });
+    let bytes = Arc::new(AtomicU64::new(0));
+    let received = bytes.clone();
+    let (pongs, mut replies) = tokio::sync::mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        let mut video = vec![0; 16 * 1024];
+        while let Ok(kind) = client.recv.read_u8().await {
+            if kind == 0 {
+                if client.recv.read_exact(&mut video).await.is_err() {
+                    break;
+                }
+                received.fetch_add(video.len() as u64, Ordering::Relaxed);
+            } else if pongs.send(kind).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(conditions.warmup).await;
+    if let Some(rate) = conditions.changed_rate {
+        link.set_rate(rate);
+        // Bytes already in the network must drain at its new capacity. Test
+        // recovery after that transient, not instantaneous removal of bytes
+        // a router has already accepted.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    if let Some(delay) = conditions.changed_delay {
+        link.set_delay(delay);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    let start_bytes = bytes.load(Ordering::Relaxed);
+    let start = tokio::time::Instant::now();
+    let mut worst_rtt = Duration::ZERO;
+    for id in 1..=30 {
+        let sent = tokio::time::Instant::now();
+        client.send.write_all(&[id]).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), replies.recv())
+                .await
+                .expect("control queued behind seconds of video"),
+            Some(id),
+        );
+        worst_rtt = worst_rtt.max(sent.elapsed());
+    }
+    let goodput =
+        (bytes.load(Ordering::Relaxed) - start_bytes) as f64 / start.elapsed().as_secs_f64();
+    eprintln!(
+        "WebTransport composite={composite}, rate={}, queue={}ms, drop_every={}, path={:?} each way: {:.1} Mbit/s, worst control RTT {:.1} ms",
+        conditions
+            .changed_rate
+            .unwrap_or(conditions.bytes_per_second),
+        conditions.queue_delay_ms,
+        conditions.drop_every,
+        conditions.changed_delay.unwrap_or(conditions.path_delay),
+        goodput * 8.0 / 1_000_000.0,
+        worst_rtt.as_secs_f64() * 1000.0,
+    );
+    client.session.close(0, b"test complete");
+    timeout(TEST_TIMEOUT, bridge).await.unwrap().unwrap();
+    producer.await.unwrap();
+    reader.await.unwrap();
+    assert!(
+        worst_rtt >= Duration::from_millis(200),
+        "the simulated path did not apply its propagation delay"
+    );
+    (goodput, worst_rtt)
+}
+
 #[tokio::test(start_paused = true)]
 async fn long_fat_pipe_carries_video_without_delaying_control_by_seconds() {
     for composite in [false, true] {
         // 80 Mbit/s, 100 ms each way: the path needs 2 MB in flight.
-        let (mut client, edge, _relay) =
-            peers_with_link(Duration::from_millis(100), 10_000_000).await;
-        let (bridge, home, _datagram) = start_bridge(edge, composite, 16 * 1024);
-        let (mut input, mut output) = tokio::io::split(home);
-        let producer = tokio::spawn(async move {
-            let video = vec![0x5a; 16 * 1024];
-            loop {
-                // Echo control ahead of the next video fragment, just as the
-                // native connection's priority writer does. A blocked write
-                // may finish its current fragment first.
-                let request = tokio::select! {
-                    biased;
-                    request = input.read_u8() => match request {
-                        Ok(request) => request,
-                        Err(_) => break,
-                    },
-                    _ = tokio::task::yield_now() => 0,
-                };
-                if output.write_all(&[request]).await.is_err() {
-                    break;
-                }
-                if request == 0 && output.write_all(&video).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let bytes = Arc::new(AtomicU64::new(0));
-        let received = bytes.clone();
-        let (pongs, mut replies) = tokio::sync::mpsc::unbounded_channel();
-        let reader = tokio::spawn(async move {
-            let mut video = vec![0; 16 * 1024];
-            while let Ok(kind) = client.recv.read_u8().await {
-                if kind == 0 {
-                    if client.recv.read_exact(&mut video).await.is_err() {
-                        break;
-                    }
-                    received.fetch_add(video.len() as u64, Ordering::Relaxed);
-                } else if pongs.send(kind).is_err() {
-                    break;
-                }
-            }
-        });
-        // Allow ordinary QUIC slow start to discover the long path.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let start_bytes = bytes.load(Ordering::Relaxed);
-        let start = tokio::time::Instant::now();
-        let mut worst_rtt = Duration::ZERO;
-        for id in 1..=12 {
-            let sent = tokio::time::Instant::now();
-            client.send.write_all(&[id]).await.unwrap();
-            assert_eq!(
-                timeout(Duration::from_millis(750), replies.recv())
-                    .await
-                    .expect("control queued behind seconds of video"),
-                Some(id),
-            );
-            worst_rtt = worst_rtt.max(sent.elapsed());
-        }
-        let goodput =
-            (bytes.load(Ordering::Relaxed) - start_bytes) as f64 / start.elapsed().as_secs_f64();
-        eprintln!(
-            "WebTransport composite={composite}: {:.1} Mbit/s, worst control RTT {:.1} ms",
-            goodput * 8.0 / 1_000_000.0,
-            worst_rtt.as_secs_f64() * 1000.0,
-        );
-        client.session.close(0, b"test complete");
-        timeout(TEST_TIMEOUT, bridge).await.unwrap().unwrap();
-        producer.await.unwrap();
-        reader.await.unwrap();
+        let (goodput, worst_rtt) = video_control_measurement(
+            composite,
+            VideoConditions {
+                bytes_per_second: 10_000_000,
+                queue_delay_ms: 50,
+                drop_every: 0,
+                warmup: Duration::from_secs(3),
+                changed_rate: None,
+                path_delay: Duration::from_millis(100),
+                changed_delay: None,
+            },
+        )
+        .await;
         assert!(
             goodput > 4_000_000.0,
             "fast long path throttled to {goodput:.0} B/s"
         );
         assert!(
-            worst_rtt >= Duration::from_millis(200),
-            "the simulated path did not apply its propagation delay"
+            worst_rtt < Duration::from_millis(750),
+            "control RTT {worst_rtt:?}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "Known saturated-router bufferbloat; RTT-only congestion backoff was unsafe"]
+async fn deep_network_buffers_do_not_add_seconds_to_control() {
+    for composite in [false, true] {
+        // A router can retain seconds of video even when the local QUIC
+        // waiting queue is bounded. Loss-only CUBIC reached 4.1 seconds here.
+        let (goodput, worst_rtt) = video_control_measurement(
+            composite,
+            VideoConditions {
+                bytes_per_second: 1_000_000,
+                queue_delay_ms: 2_000,
+                drop_every: 0,
+                warmup: Duration::from_secs(10),
+                changed_rate: None,
+                path_delay: Duration::from_millis(100),
+                changed_delay: None,
+            },
+        )
+        .await;
+        assert!(goodput > 400_000.0, "video throttled to {goodput:.0} B/s");
+        assert!(
+            worst_rtt < Duration::from_millis(750),
+            "network buffering raised RTT to {worst_rtt:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "Known saturated-router bufferbloat; RTT-only congestion backoff was unsafe"]
+async fn long_path_recovers_after_bandwidth_drops() {
+    let (goodput, worst_rtt) = video_control_measurement(
+        true,
+        VideoConditions {
+            bytes_per_second: 10_000_000,
+            queue_delay_ms: 2_000,
+            drop_every: 0,
+            warmup: Duration::from_secs(3),
+            changed_rate: Some(1_000_000),
+            path_delay: Duration::from_millis(100),
+            changed_delay: None,
+        },
+    )
+    .await;
+    assert!(
+        goodput > 400_000.0,
+        "video did not recover: {goodput:.0} B/s"
+    );
+    assert!(
+        worst_rtt < Duration::from_millis(750),
+        "queue did not drain: {worst_rtt:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_path_with_packet_loss_keeps_control_responsive() {
+    let (goodput, worst_rtt) = video_control_measurement(
+        true,
+        VideoConditions {
+            bytes_per_second: 1_000_000,
+            queue_delay_ms: 2_000,
+            drop_every: 200,
+            warmup: Duration::from_secs(10),
+            changed_rate: None,
+            path_delay: Duration::from_millis(100),
+            changed_delay: None,
+        },
+    )
+    .await;
+    assert!(goodput > 100_000.0, "loss stalled video: {goodput:.0} B/s");
+    // A lost stream packet can require several recovery round trips. Keep
+    // that transient bounded without treating retransmission time as a queue
+    // the application could discard.
+    assert!(
+        worst_rtt < Duration::from_millis(1_500),
+        "loss stalled control: {worst_rtt:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -560,4 +694,39 @@ async fn a_warm_fast_pipe_does_not_turn_into_a_large_waiting_queue_on_loss() {
         "queued {extra} extra bytes after the pipe stopped"
     );
     eprintln!("warm WebTransport path admitted {extra} extra bytes after packet loss");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_higher_path_rtt_does_not_collapse_video_throughput() {
+    for composite in [false, true] {
+        for change_after_warmup in [false, true] {
+            // The handshake measured 200 ms. Later packets take 300 ms even
+            // on an uncongested path. Treating every ACK above the historical
+            // minimum as another congestion event collapses CUBIC's window.
+            let (goodput, worst_rtt) = video_control_measurement(
+                composite,
+                VideoConditions {
+                    bytes_per_second: 10_000_000,
+                    queue_delay_ms: 50,
+                    drop_every: 0,
+                    warmup: Duration::from_secs(10),
+                    changed_rate: None,
+                    path_delay: Duration::from_millis(if change_after_warmup { 100 } else { 150 }),
+                    changed_delay: change_after_warmup.then_some(Duration::from_millis(150)),
+                },
+            )
+            .await;
+            assert!(
+                goodput > 4_000_000.0,
+                "changed path throttled video to {goodput:.0} B/s"
+            );
+            // CUBIC can incur packet loss at the bottleneck during probing.
+            // Permit recovery round trips, but catch the multi-second stalls
+            // caused by treating a higher propagation RTT as perpetual loss.
+            assert!(
+                worst_rtt < Duration::from_millis(900),
+                "control RTT {worst_rtt:?}"
+            );
+        }
+    }
 }

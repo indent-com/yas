@@ -1432,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_surface_client_observes_its_connection_writer() {
+    fn hidden_surface_client_observes_its_view_write_pressure() {
         let write_blocked_us = Arc::new(AtomicU64::new(17));
         let (events, _events_rx) = mpsc::channel(1);
         let client = hidden_client(

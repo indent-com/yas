@@ -2291,10 +2291,13 @@ write completes before the next fragment is admitted. Control Results can
 therefore interleave with even a large keyframe. CONFIGURE_VIEW, RESET_VIEW,
 and CLOSE_VIEW wait for their write barriers asynchronously, so incoming ping,
 input, and frame acknowledgements remain dispatchable under backpressure.
-The hosted endpoint buffers 64 KiB per direction, and Edge caps WebTransport's
-unacknowledged send window at 64 KiB rather than Quinn's 10 MB default. This
-bounds buffering ahead of control; it is not an absolute RTT guarantee and can
-limit throughput on links with a large bandwidth-delay product.
+The hosted endpoint buffers 16 KiB per direction. Edge sizes WebTransport's
+reliable send window to observed QUIC bytes in flight plus 64 KiB of waiting
+headroom, capped at 64 MiB. QUIC retains CUBIC's normal loss and ECN feedback;
+a higher RTT alone does not justify repeated congestion-window reductions.
+These local buffering controls are not an absolute RTT guarantee: downstream
+network queues, packet recovery, and client processing still contribute to
+application-level RTT.
 
 Successful OPEN_VIEW and CONFIGURE_VIEW Results are write barriers before
 frames from the new or replacement configuration become observable across the

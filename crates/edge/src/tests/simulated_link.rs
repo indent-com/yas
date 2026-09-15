@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
 use web_transport_quinn::quinn::{self, AsyncUdpSocket, UdpPoller, udp};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Link {
     pub(super) blackhole: Arc<AtomicBool>,
     server: Arc<Socket>,
@@ -30,8 +30,10 @@ impl Link {
             Arc::new(Socket {
                 address: ([127, 0, 0, 1], port).into(),
                 blackhole: blackhole.clone(),
-                delay,
-                bytes_per_second: rate,
+                delay_us: AtomicU64::new(delay.as_micros() as u64),
+                bytes_per_second: AtomicU64::new(rate),
+                queue_delay_ms: AtomicU64::new(50),
+                drop_every: AtomicU64::new(0),
                 outgoing,
                 incoming: Mutex::new(Incoming {
                     packets: incoming,
@@ -47,6 +49,30 @@ impl Link {
             client: socket(5001, to_server, client_rx, 0),
             blackhole,
         }
+    }
+
+    pub(super) fn set_delay(&self, delay: Duration) {
+        for socket in [&self.server, &self.client] {
+            socket
+                .delay_us
+                .store(delay.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn set_rate(&self, bytes_per_second: u64) {
+        self.server
+            .bytes_per_second
+            .store(bytes_per_second, Ordering::Relaxed);
+    }
+
+    pub(super) fn set_queue_delay(&self, milliseconds: u64) {
+        self.server
+            .queue_delay_ms
+            .store(milliseconds, Ordering::Relaxed);
+    }
+
+    pub(super) fn set_loss(&self, every: u64) {
+        self.server.drop_every.store(every, Ordering::Relaxed);
     }
 
     pub(super) fn server(&self, config: quinn::ServerConfig) -> io::Result<quinn::Endpoint> {
@@ -84,8 +110,10 @@ struct Incoming {
 struct Socket {
     address: SocketAddr,
     blackhole: Arc<AtomicBool>,
-    delay: Duration,
-    bytes_per_second: u64,
+    delay_us: AtomicU64,
+    bytes_per_second: AtomicU64,
+    queue_delay_ms: AtomicU64,
+    drop_every: AtomicU64,
     outgoing: mpsc::UnboundedSender<Packet>,
     incoming: Mutex<Incoming>,
     ready: Mutex<Instant>,
@@ -101,23 +129,29 @@ impl AsyncUdpSocket for Socket {
         if self.blackhole.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let drop_every = self.drop_every.load(Ordering::Relaxed);
+        if drop_every != 0 && sequence.is_multiple_of(drop_every) {
+            return Ok(());
+        }
         let now = Instant::now();
         let mut due = now;
-        if self.bytes_per_second != 0 {
+        let rate = self.bytes_per_second.load(Ordering::Relaxed);
+        if rate != 0 {
             let mut ready = self.ready.lock().unwrap();
             // Bound the bottleneck queue independently of propagation delay.
-            if ready.saturating_duration_since(now) > Duration::from_millis(50) {
+            if ready.saturating_duration_since(now)
+                > Duration::from_millis(self.queue_delay_ms.load(Ordering::Relaxed))
+            {
                 return Ok(());
             }
             *ready = (*ready).max(now)
-                + Duration::from_secs_f64(
-                    transmit.contents.len() as f64 / self.bytes_per_second as f64,
-                );
+                + Duration::from_secs_f64(transmit.contents.len() as f64 / rate as f64);
             due = *ready;
         }
         let _ = self.outgoing.send((
-            due + self.delay,
-            self.sequence.fetch_add(1, Ordering::Relaxed),
+            due + Duration::from_micros(self.delay_us.load(Ordering::Relaxed)),
+            sequence,
             transmit.contents.to_vec(),
         ));
         Ok(())

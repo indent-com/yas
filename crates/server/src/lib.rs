@@ -2929,6 +2929,7 @@ struct VulkanVideoSurfaceState {
 
 struct ClientState {
     /// Accumulated write time beyond the per-write serialization allowance.
+    /// Native Surface clients receive only their own view's write feedback.
     /// The controller samples the delta between steps; normal short writes
     /// must not turn high throughput into a congestion signal.
     write_blocked_us: Arc<AtomicU64>,
@@ -4624,6 +4625,8 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         .filter_map(|s| s.adaptive_quantizer)
         .max();
     let adaptive_q_log = adaptive_q.map_or(-1i32, |q| q as i32);
+    let surface_write_blocked_total_ms =
+        c.write_blocked_us.load(Ordering::Relaxed) as f64 / 1_000.0;
     let adaptive_scale_divisor = 1u16
         << c.surface_subs
             .values()
@@ -4661,7 +4664,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         });
         let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
         eprintln!(
-            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s surface_goodput={surface_goodput_bps:.0}B/s surface_ack={surface_ack_ms:.1}ms surface_credit={surface_credit_used}/{surface_credit_limit}B jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms surface_decode_q={surface_decode_q} surface_decode_pressure={surface_decode_pressure} | tick_fires={} tick_snaps={} frame_req={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} enc_queue={encode_queue_avg_us}/{}us enc_work={encode_work_avg_us}/{}us enc_handoff={encode_handoff_avg_us}/{}us px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst} adaptive_q={adaptive_q_log} adaptive_scale=1/{adaptive_scale_divisor}",
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s surface_goodput={surface_goodput_bps:.0}B/s surface_ack={surface_ack_ms:.1}ms surface_credit={surface_credit_used}/{surface_credit_limit}B jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms surface_decode_q={surface_decode_q} surface_decode_pressure={surface_decode_pressure} surface_write_blocked_total={surface_write_blocked_total_ms:.1}ms | tick_fires={} tick_snaps={} frame_req={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} enc_queue={encode_queue_avg_us}/{}us enc_work={encode_work_avg_us}/{}us enc_handoff={encode_handoff_avg_us}/{}us px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst} adaptive_q={adaptive_q_log} adaptive_scale=1/{adaptive_scale_divisor}",
             sess.tick_fires,
             sess.tick_snaps,
             sess.frame_requests,

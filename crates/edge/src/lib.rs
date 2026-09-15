@@ -784,7 +784,10 @@ async fn web_transport_closed(session: &web_transport_quinn::Session) {
     // vanished peer's lifetime. QUIC ACKs count, even while copies are blocked
     // or the optional application datagram path has failed.
     let connection: &web_transport_quinn::quinn::Connection = session;
-    let mut received = connection.stats().udp_rx.datagrams;
+    let log_stats = std::env::var("YAS_WEBTRANSPORT_STATS").is_ok_and(|value| value == "1");
+    let mut previous_stats = connection.stats();
+    let mut stats_at = tokio::time::Instant::now();
+    let mut received = previous_stats.udp_rx.datagrams;
     let mut last_received = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -792,7 +795,27 @@ async fn web_transport_closed(session: &web_transport_quinn::Session) {
         tokio::select! {
             _ = session.closed() => return,
             _ = tick.tick() => {
-                let current = connection.stats().udp_rx.datagrams;
+                let stats = connection.stats();
+                let elapsed = stats_at.elapsed();
+                if log_stats && elapsed >= Duration::from_secs(5) {
+                    let bytes = stats.udp_tx.bytes.saturating_sub(previous_stats.udp_tx.bytes);
+                    let lost = stats.path.lost_packets.saturating_sub(previous_stats.path.lost_packets);
+                    let sent = stats.path.sent_packets.saturating_sub(previous_stats.path.sent_packets);
+                    eprintln!(
+                        "[webtransport {}] rtt={:.1}ms min_rtt={:.1}ms cwnd={}B udp_tx={:.2}Mbit/s sent={} lost={} congestion_events={}",
+                        connection.stable_id(),
+                        stats.path.rtt.as_secs_f64() * 1_000.0,
+                        stats.path.min_rtt.as_secs_f64() * 1_000.0,
+                        stats.path.cwnd,
+                        bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
+                        sent,
+                        lost,
+                        stats.path.congestion_events.saturating_sub(previous_stats.path.congestion_events),
+                    );
+                    previous_stats = stats;
+                    stats_at = tokio::time::Instant::now();
+                }
+                let current = stats.udp_rx.datagrams;
                 if current != received {
                     received = current;
                     last_received = tokio::time::Instant::now();

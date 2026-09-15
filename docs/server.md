@@ -297,13 +297,17 @@ round down to stop-and-wait and never discover spare capacity after a stall.
 The probe remains one frame in bytes; keeping the display-rate bootstrap
 permanently would multiply a large high-resolution delta into seconds of
 reliable queueing on a constrained WAN. Negotiated decoder slots still bound
-admission, and an ACK wakes delivery as soon as it returns credit. Native
-Surface viewers also share the real connection writer's blocked-time counter
-with their encoder controller, so socket pressure backs off quality instead
-of being hidden by the in-process Surface event sink. Each write gets a 5 ms
-serialization allowance; only excess time accumulates as pressure. Otherwise
-continuous short fragment writes on a healthy fast link would lower quality
-merely because the writer was busy. Transport pressure preserves resolution.
+admission, and an ACK wakes delivery as soon as it returns credit.
+
+Each native Surface view gives the real connection writer its own blocked-time
+counter. Only writes of that view's video fragments feed its encoder controller;
+other views, Terminal output, and file transfers cannot directly reduce its
+quality. This exposes socket pressure hidden by the in-process Surface event
+sink without degrading idle views. Verbose client logs include the cumulative
+`surface_write_blocked_total` for comparing pressure with quality changes.
+Each write gets a 5 ms serialization allowance; only excess time accumulates
+as pressure. Otherwise continuous short fragment writes on a healthy fast
+link would lower quality merely because the writer was busy. Transport pressure preserves resolution.
 
 The hosted edge and share use a 16 KiB in-process byte buffer per direction,
 independent of the recommended 1 MiB wire-frame size. Large frames stream through
@@ -321,6 +325,21 @@ controller's send, ACK, and loss callbacks and adjusts admission before each
 write; it does not bypass congestion control. Packet overhead makes the flight
 estimate conservative, and each ACK batch corrects it. An idle writer resets
 its estimate, and blocked writers refresh it after connection path changes.
+
+QUIC uses CUBIC's normal loss and ECN feedback. An RTT increase by itself
+must not be reported as packet loss: a change in propagation or ACK timing
+can leave RTT above its historical minimum indefinitely, and repeated
+synthetic congestion events then collapse the sending window and video
+quality. Tests cover both an initially long path and a later RTT increase.
+Local queue bounds do not prevent bufferbloat in downstream routers. The
+saturated-router and bandwidth-drop regression tests remain as explicitly
+ignored known failures while that issue is unresolved; they can be run with
+`cargo test -p yas-edge --lib -- --ignored --nocapture`.
+
+Set `YAS_WEBTRANSPORT_STATS=1` to log each connection's QUIC RTT, minimum RTT,
+congestion window, outbound UDP rate, and packet-loss counters every five
+seconds. Compare these with application RTT and the server's verbose Surface
+ACK/encoder statistics when diagnosing latency on a remote client.
 
 Surface registration, focus, close, refresh-rate changes, touch capability,
 and resize requests never wait for compositor command-queue space while
