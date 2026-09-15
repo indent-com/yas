@@ -522,5 +522,104 @@ fn cursor_authority_replacement_and_artwork_deduplication() {
         "a stale shape, identical commits, and commits from a replaced cursor \
          surface must all remain silent, while leave/re-enter restores a hidden cursor",
     );
+
+    // Visible cursors are just as stale as hidden ones after a new entry.
+    // Keep them during ordinary motion, but do not leave a resize cursor or
+    // custom artwork cached forever while the app's enter response is absent.
+    for custom in [false, true] {
+        let serial = app.enter_serial.expect("current enter serial");
+        if custom {
+            pointer.set_cursor(serial, Some(&cursor), 1, 1);
+        } else {
+            cursor_shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::EwResize);
+        }
+        queue.roundtrip(&mut app).expect("visible cursor roundtrip");
+        let selected: Vec<_> = handle
+            .event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                CompositorEvent::SurfaceCursor { cursor, .. } => Some(cursor),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selected.len(), 1, "cursor selection was not announced");
+
+        handle
+            .command_tx
+            .send(CompositorCommand::PointerMotion {
+                surface_id,
+                x: 14.0,
+                y: 10.0,
+                time_ms: 4,
+            })
+            .expect("send motion with a visible cursor");
+        handle.wake();
+        std::thread::sleep(Duration::from_millis(50));
+        queue.roundtrip(&mut app).expect("visible motion roundtrip");
+        assert_eq!(app.enter_serial, Some(serial));
+        assert!(
+            !handle
+                .event_rx
+                .try_iter()
+                .any(|event| matches!(event, CompositorEvent::SurfaceCursor { .. }))
+        );
+
+        let leaves = app.leave_count;
+        handle
+            .command_tx
+            .send(CompositorCommand::PointerLeave { surface_id })
+            .expect("leave visible cursor");
+        handle
+            .command_tx
+            .send(CompositorCommand::PointerMotion {
+                surface_id,
+                x: 10.0,
+                y: 10.0,
+                time_ms: 5,
+            })
+            .expect("re-enter with a cached visible cursor");
+        handle.wake();
+        std::thread::sleep(Duration::from_millis(50));
+        queue
+            .roundtrip(&mut app)
+            .expect("visible re-entry roundtrip");
+        assert_eq!(app.leave_count, leaves + 1);
+        assert_ne!(app.enter_serial, Some(serial));
+
+        // Late artwork and shape requests from the previous entry cannot
+        // replace the default, even though they belong to the same client.
+        cursor.commit();
+        cursor_shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::Text);
+        queue.roundtrip(&mut app).expect("late cursor roundtrip");
+        let reset: Vec<_> = handle
+            .event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                CompositorEvent::SurfaceCursor { cursor, .. } => Some(cursor),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reset == [CursorImage::Named("default".to_owned())],
+            "re-entry did not reset the stale cursor (custom={custom})"
+        );
+
+        let serial = app.enter_serial.expect("fresh enter serial");
+        if custom {
+            pointer.set_cursor(serial, Some(&cursor), 1, 1);
+        } else {
+            cursor_shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::EwResize);
+        }
+        queue.roundtrip(&mut app).expect("fresh cursor roundtrip");
+        let restored: Vec<_> = handle
+            .event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                CompositorEvent::SurfaceCursor { cursor, .. } => Some(cursor),
+                _ => None,
+            })
+            .collect();
+        assert!(restored == selected, "fresh cursor request was suppressed");
+    }
     handle.stop();
 }

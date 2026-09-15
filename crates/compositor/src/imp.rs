@@ -5748,12 +5748,12 @@ impl Compositor {
                 // longer be allowed to commit artwork onto the new
                 // client's surface while its enter response is in flight.
                 self.current_cursor_surface = None;
-                // The previous entry's hidden image must not survive a new
-                // viewer/entry. The app may explicitly hide it again using
-                // the new enter serial, but until then use a visible default.
-                if matching_ptrs > 0
-                    && matches!(self.last_cursor.get(&surface_id), Some(CursorImage::Hidden))
-                {
+                // Every cached cursor belongs to the previous entry, not
+                // just hidden images. Otherwise a custom or resize cursor
+                // can remain stuck even after leaving and returning when
+                // the app does not select a replacement. Use the default
+                // until a request with the new enter serial replaces it.
+                if matching_ptrs > 0 && self.last_cursor.contains_key(&surface_id) {
                     self.announce_cursor(surface_id, CursorImage::Named("default".to_owned()));
                 }
                 if matching_ptrs == 0 {
