@@ -375,8 +375,10 @@ open. The fallback yields to a pane input when one becomes available. Removing
 a focused control also restores pane focus while the page stays active, unless
 an overlay owns the keyboard or another control has taken focus. Explicitly
 blurring an input that remains mounted does not trigger this recovery, so the
-mobile keyboard can still be dismissed. A pending keyboard prefix is cancelled
-on blur or backgrounding.
+mobile keyboard can still be dismissed. The keyboard prefix stays armed across
+blur and backgrounding until the next key chooses an action or cancels it.
+Surface arrivals and activation requests preserve open menus and their input;
+explicit selections dismiss the menu when chosen, before asynchronous work.
 
 The durable UI around those live processes is a **workspace**. The
 home server stores each session in YAS KV; it contains the selected remote

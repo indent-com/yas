@@ -212,7 +212,7 @@ export function handlePrefixKey(event: PrefixChord): boolean {
   return true;
 }
 
-/** Drop the armed state, e.g. when the window loses the keyboard. */
+/** Drop the armed state when its workspace is disposed. */
 export function disarmPrefix(): void {
   setArmed(false);
 }

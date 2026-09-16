@@ -255,7 +255,7 @@ describe("workspace focus after returning to the app", () => {
     expect(document.activeElement).toBe(document.body);
   });
 
-  it.each(["blur", "hidden"])("cancels an armed Cmd-B on %s", (event) => {
+  it.each(["blur", "hidden"])("preserves an armed Cmd-B on %s", (event) => {
     fixture();
     vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
     const commandB = new KeyboardEvent("keydown", {
@@ -267,10 +267,19 @@ describe("workspace focus after returning to the app", () => {
     expect(prefixArmed()).toBe(true);
     if (event === "blur") window.dispatchEvent(new Event("blur"));
     else visibility("hidden");
-    expect(prefixArmed()).toBe(false);
+    expect(prefixArmed()).toBe(true);
     visibility("visible");
     vi.runOnlyPendingTimers();
-    handlePrefixKey(commandB);
     expect(prefixArmed()).toBe(true);
+    handlePrefixKey(new KeyboardEvent("keydown", { key: "Escape" }));
+    expect(prefixArmed()).toBe(false);
+  });
+
+  it("drops the pending prefix when its workspace is disposed", () => {
+    const { release } = fixture();
+    handlePrefixKey(new KeyboardEvent("keydown", { key: "b", ctrlKey: true }));
+    expect(prefixArmed()).toBe(true);
+    release();
+    expect(prefixArmed()).toBe(false);
   });
 });

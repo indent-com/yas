@@ -70,7 +70,8 @@ export function restoreWorkspaceFocusOnWake(
   const leave = () => {
     cancel();
     remember();
-    disarmPrefix();
+    // Focus/visibility changes are not menu dismissal. Keep the prefix armed
+    // so the viewer can finish the chord after returning.
   };
   const visibility = () => {
     if (doc.visibilityState === "hidden") leave();
@@ -87,6 +88,7 @@ export function restoreWorkspaceFocusOnWake(
   win.addEventListener("focus", wake);
   return () => {
     cancel();
+    disarmPrefix();
     observer.disconnect();
     doc.removeEventListener("focusin", remember);
     doc.removeEventListener("focusout", recover);

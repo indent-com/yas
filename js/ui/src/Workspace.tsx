@@ -720,9 +720,8 @@ function WorkspaceScreen(props: {
       const conn = workspace.getConnection(spec.id);
       if (!conn) continue;
       cleanups.push(conn.surfaceStore.onChange(syncAll));
-      // A client asking to be activated (xdg_activation_v1 — e.g. an Electron
-      // app reacting to a notification click) gets the same treatment as
-      // picking its surface in the switcher.
+      // Activation requests only mark attention; they do not select a surface
+      // or dismiss the viewer's menu.
       cleanups.push(
         conn.surfaceStore.onActivated((surfaceId) =>
           activateSurface(surfaceId, spec.id),
@@ -3077,7 +3076,7 @@ function WorkspaceScreen(props: {
   function focusAssignment(assignment: string) {
     const surface = parseSurfaceAssignment(assignment);
     if (surface) {
-      focusSurface(surface.surfaceId, surface.connectionId);
+      selectSurface(surface.surfaceId, surface.connectionId);
       return;
     }
     if (isTileAssignment(assignment) || isWebAssignment(assignment)) {
@@ -4432,6 +4431,17 @@ function WorkspaceScreen(props: {
     workspace.focusSession(sessionId);
   }
 
+  /** Explicit selection owns dismissal; a delayed surface arrival does not. */
+  function selectSurface(
+    surfaceId: SurfaceId,
+    connectionId?: ConnectionId,
+    asNewWindow = false,
+  ) {
+    previousFocus = null;
+    closeOverlay();
+    focusSurface(surfaceId, connectionId, asNewWindow);
+  }
+
   function focusSurface(
     surfaceId: SurfaceId,
     connectionId?: ConnectionId,
@@ -4451,8 +4461,6 @@ function WorkspaceScreen(props: {
       const assignment = surfaceAssignment(connId, surfaceId);
       if (asNewWindow && showAsManagedWindow(assignment)) {
         focusSurfaceById(null);
-        previousFocus = null;
-        closeOverlay();
         return;
       }
       // During a LayoutContainer remount the focused pane and its move
@@ -4482,10 +4490,6 @@ function WorkspaceScreen(props: {
     } else {
       focusSurfaceById(surfaceId, connectionId);
     }
-    // Null first: closeOverlay restores previousFocus on a timeout, which
-    // would steal focus back from the surface — see selectPane.
-    previousFocus = null;
-    closeOverlay();
   }
 
   function raiseMediaPlayer(player: {
@@ -4503,7 +4507,7 @@ function WorkspaceScreen(props: {
       }))
       .filter((candidate) => candidate.score > 1)
       .sort((left, right) => right.score - left.score)[0]?.surface;
-    if (target) focusSurface(target.surfaceId, target.connectionId, true);
+    if (target) selectSurface(target.surfaceId, target.connectionId, true);
   }
 
   /**
@@ -4584,6 +4588,10 @@ function WorkspaceScreen(props: {
       const fid = wsState().focusedSessionId;
       const connId = connectionId ?? activeConnectionId();
       const paneId = preferredTilePane();
+      // Dismiss the selected action now; its response may arrive after the
+      // viewer has opened another menu.
+      previousFocus = null;
+      closeOverlay();
       reservation = await reserveTerminalPane(paneId);
       const size = reservation ?? fallbackTerminalSize();
       const session = await workspace.createSession({
@@ -4618,8 +4626,6 @@ function WorkspaceScreen(props: {
       }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
-      previousFocus = null;
-      closeOverlay();
     } catch {
       // A failed server CREATE must not leave its empty measured pane behind.
       reservation?.cancel();
@@ -4716,6 +4722,8 @@ function WorkspaceScreen(props: {
       const previous = focusedAssignment();
       const fid = wsState().focusedSessionId;
       const paneId = inLayout() ? layoutFocusedPaneId() : null;
+      previousFocus = null;
+      closeOverlay();
       if (paneId) reservation = await reserveTerminalPane(paneId, "split");
       const size = reservation ?? fallbackTerminalSize();
       const session = await workspace.createSession({
@@ -4747,8 +4755,6 @@ function WorkspaceScreen(props: {
       }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
-      previousFocus = null;
-      closeOverlay();
     } catch {
       reservation?.cancel();
     }
@@ -5847,7 +5853,7 @@ function WorkspaceScreen(props: {
               isMobileTouch={isMobileTouch()}
               onFocusSession={focusSessionFromUi}
               onFocusSurface={(connectionId, surfaceId) =>
-                focusSurface(surfaceId, connectionId, true)
+                selectSurface(surfaceId, connectionId, true)
               }
               onCloseSession={(id) => void closeSessionFromUi(id)}
               onCloseSurface={(connectionId, surfaceId) =>
@@ -6093,7 +6099,7 @@ function WorkspaceScreen(props: {
               focusedSurfaceId={focusedSurfaceId()}
               focusedSurfaceConnId={focusedSurfaceConnId()}
               hasAttention={hasAttention}
-              onFocusSurface={focusSurface}
+              onFocusSurface={selectSurface}
               onMoveSurfaceToPane={(sid, connId, targetPaneId) => {
                 moveToPaneFn?.(surfaceAssignment(connId, sid), targetPaneId);
                 focusSurfaceById(null);
