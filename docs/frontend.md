@@ -146,7 +146,42 @@ Input is captured via a hidden `<textarea>` element. `keyToBytes()` converts `Ke
 | Modifier combos | `\x1b[1;{mod}X` format                                            |
 | Alt+key         | `\x1b` prefix                                                     |
 
-IME/composition input is handled via `compositionend` to capture multi-codepoint sequences as a single input event.
+Enter sends `\r`; Ctrl+Enter sends `\x1b[13;5u` (CSI-u), including when Ctrl
+is armed in the mobile toolbar. Additional modifiers are retained in the
+CSI-u modifier parameter. Applications can bind the two chords separately.
+Plain Alt+Enter continues to send `\x1b\r`.
+
+Applications can enable the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+with CSI `>flags u`, update it with CSI `=flags;mode u`, query with CSI `?u`,
+and restore it with CSI `<count u`. YAS maintains separate stacks for the
+normal and alternate screens and resets them on RIS. Keyboard flags travel
+with terminal grid state, including mode-only deltas and scrollback views.
+
+All five progressive enhancement flags are supported: disambiguation,
+repeat/release events, alternate key identities, all-key reporting, and
+associated text. Modified Enter, Tab, Backspace, Escape, letters, navigation,
+function, keypad, media, and modifier keys retain their identities. Ctrl+I,
+Ctrl+M, and Ctrl+[ become distinct from Tab, Enter, and Escape. Key releases
+are sent only for forwarded presses; blur releases held keys. Enhanced mode
+forwards Shift+PageUp/PageDown/Home/End to the application.
+
+Browser layout metadata supplies alternate identities when available; missing
+metadata is omitted. Browser and OS shortcuts can intercept keys before YAS
+receives them. Ctrl+Shift+V remains paste; Ctrl+V preserves image clipboard
+forwarding and emits the negotiated key sequence after the clipboard is ready.
+Paste remains text, with bracketed paste when enabled. IME and soft-keyboard
+commits use associated text in all-key mode when requested; otherwise YAS
+encodes the committed characters. Mobile modifier buttons use the same encoder.
+
+The native viewer requests disambiguation and key events from supporting host
+terminals, enabling all-key reporting only when the focused child requests it.
+Crossterm does not expose layout alternatives or associated-text fields, so
+native forwarding omits unavailable metadata. Hosts without enhanced keyboard
+support cannot recover distinctions already lost in their input bytes.
+`yas terminal attach` mirrors the child's negotiated flags directly to the
+host and forwards its raw sequences, including layout and text metadata.
+Ctrl+] still detaches in enhanced mode; exiting restores the host's keyboard
+mode. No negotiation is forced on legacy child programs.
 
 ### Mouse
 
@@ -420,6 +455,7 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 - Native file drags announce planned screenshot filenames during hover. Selection creates private files for that drag, exposes their URI list to the destination, and fills them only after every DROP payload has validated. No prior FS upload is required. File offers expose URI and binary representations rather than making Chromium wait for unavailable image bytes during hover; this supports screenshot-thumbnail drops into Electron apps such as Legcord. Dropped files remain available until the session closes.
 - Surface views accept `touchMode="pointer" | "direct"`. Direct mode is the default and forwards each event's contact changes as Surface `TOUCH` for native Wayland multitouch. Pointer mode is the explicit fallback and maps touch to tap, finger scroll, long-press right-click, and hold-drag. The UI exposes this as **Media → Touch input**.
 - Hardware-keyboard Shift+Space is forwarded as a native key chord, preserving Shift for shortcuts such as scrolling up in a remote browser. Other printable keys use browser-resolved text to preserve the host keyboard layout.
+- Enter preserves held modifiers even when the browser omits its physical key code, so Wayland applications receive Ctrl+Enter distinctly from Enter.
 - Backspace and Delete fall back to their logical key when the browser omits or cannot identify the physical code (notably iPadOS forward Delete). Modified deletion chords and forward Delete retain hardware press/release handling. Unmodified iPad Backspace edits the capture field natively so held-key repeat continues; deletions reach the app through input events. Deletable filler remains behind the recent text, and its delayed refill preserves that text and waits beyond the initial long-press delay.
 - Losing page focus or hiding the PWA cancels its active touch sequence. Closing a native surface view also releases its server-side touch lock and cancels its compositor contacts, even when the browser could not send a final release. Other views remain able to touch after reloads and view replacement.
 - Fresh Wayland text-input enables may open the mobile on-screen keyboard by default. Users can opt out with **Media → On-screen keyboard → Manual only**, leaving the status-bar keyboard control available. The native catalogue carries a request revision across coalesced caret updates; viewers consume each new revision once and suppress historical requests in their initial snapshot. Removing text-input metadata delivers a disable. Requests that arrive during a touch can retry at release with browser user activation.

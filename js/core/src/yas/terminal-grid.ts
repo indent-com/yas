@@ -13,6 +13,7 @@ import {
   YAS_TERMINAL_FRAME_VIEW_OFFSET,
   YAS_TERMINAL_GRID_CODEC_V1,
   YAS_TERMINAL_CELL_BYTES,
+  YAS_TERMINAL_COMPONENT_KEYBOARD_FLAGS,
 } from "./generated";
 import type { YasTerminalFrameEvent } from "./terminal";
 import { YasCursor, YasProtocolError } from "./wire";
@@ -52,6 +53,7 @@ export interface YasTerminalGridState {
   cursorRow: number;
   cursorCol: number;
   modes: number;
+  keyboardFlags: number;
   scrollbackLines: number;
   scrollOffset: bigint;
   title: string;
@@ -125,6 +127,7 @@ export function decodeTerminalGridV1(
     cursorCol = cursor.u16("Terminal cursor column");
   }
   let modes = base?.modes ?? 0;
+  let keyboardFlags = keyframe ? 0 : (base?.keyboardFlags ?? 0);
   if (frame.flags & YAS_TERMINAL_FRAME_MODES)
     modes = cursor.u16("Terminal modes");
   let scrollbackLines = base?.scrollbackLines ?? 0;
@@ -353,10 +356,16 @@ export function decodeTerminalGridV1(
           hyperlinkRuns.push({ startCell, cellCount, linkId });
           previousEnd = startCell + cellCount;
         }
+      } else if (kind === YAS_TERMINAL_COMPONENT_KEYBOARD_FLAGS) {
+        keyboardFlags = component.u8("Terminal keyboard flags");
+        if (keyboardFlags & ~31)
+          throw new YasProtocolError("invalid Terminal keyboard flags");
       } else if (componentFlags & 1) {
         throw new YasProtocolError(
           `unknown required Terminal component ${kind}`,
         );
+      } else {
+        component.take(component.remaining);
       }
       component.end("Terminal component");
     }
@@ -380,6 +389,7 @@ export function decodeTerminalGridV1(
     cursorRow,
     cursorCol,
     modes,
+    keyboardFlags,
     scrollbackLines,
     scrollOffset,
     title,

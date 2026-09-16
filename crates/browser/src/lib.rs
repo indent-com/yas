@@ -743,6 +743,9 @@ impl Terminal {
     pub fn app_cursor(&self) -> bool {
         self.inner.mode() & 2 != 0
     }
+    pub fn keyboard_flags(&self) -> u8 {
+        self.inner.keyboard_flags()
+    }
     pub fn bracketed_paste(&self) -> bool {
         self.inner.mode() & 8 != 0
     }

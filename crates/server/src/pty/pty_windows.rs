@@ -240,20 +240,16 @@ fn adopt_into_job(job: HANDLE, pi: &PROCESS_INFORMATION) -> HANDLE {
     }
 }
 
-/// Answer terminal queries found in `data`; returns the last OSC 7
-/// working-directory report seen in the chunk, if any (docs/protocol.md,
-/// "Working directory tracking").
+/// Emit parser-owned keyboard replies before the legacy query responses.
 pub fn respond_to_queries(
     handle: &PtyHandle,
-    data: &[u8],
-    size: (u16, u16),
-    cursor: (u16, u16),
-) -> crate::TerminalScan {
-    let mut scan = crate::parse_terminal_queries(data, size, cursor);
+    scan: &mut crate::TerminalScan,
+    keyboard_replies: &[u8],
+) {
+    pty_write_all(PtyWriteTarget(handle.input), keyboard_replies);
     for resp in std::mem::take(&mut scan.responses) {
         pty_write_all(PtyWriteTarget(handle.input), resp.as_bytes());
     }
-    scan
 }
 
 pub(crate) struct SendHandle(pub(crate) HANDLE);

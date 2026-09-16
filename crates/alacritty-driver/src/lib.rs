@@ -311,12 +311,14 @@ impl alacritty_terminal::vte::ansi::Timeout for NoSyncTimeout {
 #[derive(Clone)]
 struct YasEventProxy {
     title: Arc<Mutex<Option<String>>>,
+    keyboard_replies: Arc<Mutex<Vec<u8>>>,
 }
 
 impl YasEventProxy {
     fn new() -> Self {
         Self {
             title: Arc::new(Mutex::new(None)),
+            keyboard_replies: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn take_title(&self) -> Option<String> {
@@ -332,6 +334,13 @@ impl EventListener for YasEventProxy {
             }
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = Some(String::new());
+            }
+            // Other query replies are owned by the server's query scanner.
+            Event::PtyWrite(reply) if reply.starts_with("\x1b[?") && reply.ends_with('u') => {
+                let mut replies = self.keyboard_replies.lock().unwrap();
+                if replies.len() + reply.len() <= 64 * 1024 {
+                    replies.extend_from_slice(reply.as_bytes());
+                }
             }
             // PTY output is untrusted. OSC 52 must not asynchronously replace
             // the user's browser or Wayland clipboard without a user gesture.
@@ -461,6 +470,7 @@ impl TerminalDriver {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let config = Config {
             scrolling_history: scrollback,
+            kitty_keyboard: true,
             ..Config::default()
         };
         let dims = TermDims {
@@ -552,6 +562,10 @@ impl TerminalDriver {
             self.history_len().saturating_sub(history_before) as u64
         };
         self.rotated_lines += probed.max(grown);
+    }
+
+    pub fn take_keyboard_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.event_proxy.keyboard_replies.lock().unwrap())
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -1221,6 +1235,7 @@ impl TerminalDriver {
             cells,
         );
         *frame.overflow_mut() = overflow;
+        frame.keyboard_flags = ((self.term.mode().bits() >> 18) & 31) as u8;
         frame.set_links(links.cell_links, links.uris);
 
         // Set line wrap flags
@@ -1476,6 +1491,47 @@ mod tests {
         assert!(driver.alt_screen());
         driver.process(b"\x1b[?1049l");
         assert!(!driver.alt_screen());
+    }
+
+    #[test]
+    fn kitty_modes_query_set_stack_screens_and_reset() {
+        let mut driver = TerminalDriver::new(24, 80, 100);
+        for (request, expected) in [
+            ("\x1b[?u", 0),
+            ("\x1b[=1u\x1b[?u", 1),
+            ("\x1b[=2;2u\x1b[?u", 3),
+            ("\x1b[>31u\x1b[?u", 31),
+            ("\x1b[=2;3u\x1b[?u", 29),
+            ("\x1b[<u\x1b[?u", 3),
+            ("\x1b[?1049h\x1b[?u", 0),
+            ("\x1b[=8u\x1b[?u", 8),
+            ("\x1b[?1049l\x1b[?u", 3),
+            ("\x1b[?1049h\x1b[?u", 8),
+            ("\x1bc\x1b[?u", 0),
+        ] {
+            // Every byte boundary is legal, including the mode query itself.
+            for byte in request.as_bytes() {
+                driver.process(&[*byte]);
+            }
+            assert_eq!(
+                driver.take_keyboard_replies(),
+                format!("\x1b[?{expected}u").into_bytes()
+            );
+            assert_eq!(driver.snapshot(false, false).keyboard_flags, expected);
+            assert_eq!(driver.scrollback_frame(1).keyboard_flags, expected);
+        }
+    }
+
+    #[test]
+    fn kitty_stack_overflow_is_bounded_and_does_not_touch_titles() {
+        let mut driver = TerminalDriver::new(24, 80, 100);
+        driver.process(b"\x1b]0;title\x07");
+        for _ in 0..5000 {
+            driver.process(b"\x1b[>1u");
+        }
+        driver.process(b"\x1b[<4096u\x1b[?u");
+        assert_eq!(driver.take_keyboard_replies(), b"\x1b[?0u");
+        assert_eq!(driver.title(), "title");
     }
 
     #[test]

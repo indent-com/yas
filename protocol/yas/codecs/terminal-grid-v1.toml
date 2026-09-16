@@ -33,6 +33,9 @@ value = 1
 name = "COMPONENT_HYPERLINKS"
 value = 2
 [[constant]]
+name = "COMPONENT_KEYBOARD_FLAGS"
+value = 3
+[[constant]]
 name = "COMPONENT_REQUIRED"
 value = 1
 [[constant]]

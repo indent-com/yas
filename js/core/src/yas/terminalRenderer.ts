@@ -100,6 +100,7 @@ export function encodeBrowserTerminalGrid(
   writer.u16(Math.min(runs.length, 0xffff));
   for (const run of runs.slice(0, 0xffff))
     writer.u32(run.startCell).u16(run.cellCount).u16(linkIds.get(run.linkId)!);
+  if (grid.keyboardFlags) writer.u8(grid.keyboardFlags);
   return lz4Compress(writer.finish());
 }
 

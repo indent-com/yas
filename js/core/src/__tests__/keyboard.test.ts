@@ -80,6 +80,28 @@ describe("keyToBytes", () => {
       ).toEqual([0x1b, 0x0d]);
     });
 
+    it.each(["Enter", "NumpadEnter", ""])(
+      "Ctrl+Enter sends CSI-u with code %j",
+      (code) => {
+        for (const appCursor of [false, true]) {
+          expect(
+            keyToBytes(makeEvent("Enter", { code, ctrlKey: true }), appCursor),
+          ).toEqual(new TextEncoder().encode("\x1b[13;5u"));
+        }
+      },
+    );
+
+    it.each([
+      [{ shiftKey: true }, 6],
+      [{ altKey: true }, 7],
+      [{ shiftKey: true, altKey: true }, 8],
+      [{ metaKey: true }, 13],
+    ])("Ctrl+Enter retains additional modifiers %j", (modifiers, modifier) => {
+      expect(
+        keyToBytes(makeEvent("Enter", { ctrlKey: true, ...modifiers }), false),
+      ).toEqual(new TextEncoder().encode(`\x1b[13;${modifier}u`));
+    });
+
     it("Backspace sends DEL", () => {
       expect(Array.from(keyToBytes(makeEvent("Backspace"), false)!)).toEqual([
         0x7f,
@@ -109,7 +131,7 @@ describe("keyToBytes", () => {
         makeEvent("c", { ctrlKey: true, code: "KeyC" }),
         false,
       );
-      expect(bytes).toEqual(new Uint8Array([0x03]));
+      expect(Array.from(bytes!)).toEqual([0x03]);
     });
 
     it("Ctrl+A sends 0x01", () => {
@@ -117,7 +139,7 @@ describe("keyToBytes", () => {
         makeEvent("a", { ctrlKey: true, code: "KeyA" }),
         false,
       );
-      expect(bytes).toEqual(new Uint8Array([0x01]));
+      expect(Array.from(bytes!)).toEqual([0x01]);
     });
 
     it("Ctrl+Z sends 0x1A", () => {
@@ -125,7 +147,7 @@ describe("keyToBytes", () => {
         makeEvent("z", { ctrlKey: true, code: "KeyZ" }),
         false,
       );
-      expect(bytes).toEqual(new Uint8Array([0x1a]));
+      expect(Array.from(bytes!)).toEqual([0x1a]);
     });
 
     it("Ctrl+[ sends ESC", () => {
@@ -133,7 +155,7 @@ describe("keyToBytes", () => {
         makeEvent("[", { ctrlKey: true, code: "BracketLeft" }),
         false,
       );
-      expect(bytes).toEqual(new Uint8Array([0x1b]));
+      expect(Array.from(bytes!)).toEqual([0x1b]);
     });
   });
 

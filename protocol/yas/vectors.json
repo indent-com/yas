@@ -1788,6 +1788,10 @@
     {
       "name": "packed_codec.terminal-grid-v1.payload",
       "hex": "01000100000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "packed_codec.terminal-grid-v1.keyboard_flags.payload",
+      "hex": "01000100000000000000000000000000000000000000000000010300011f"
     }
   ]
 }

@@ -17,6 +17,78 @@ use super::{
 #[cfg(unix)]
 const DETACH: u8 = 0x1d;
 
+/// Preserve raw input while recognizing the local detach chord in legacy and
+/// Kitty encodings, including sequences split between reads. Paste is opaque.
+#[cfg(unix)]
+#[derive(Default)]
+struct AttachInput {
+    pending: Vec<u8>,
+    paste: bool,
+}
+
+#[cfg(unix)]
+impl AttachInput {
+    fn feed(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
+        let mut output = Vec::new();
+        for &byte in chunk {
+            if self.pending.is_empty() {
+                if byte == DETACH && !self.paste {
+                    return (output, true);
+                }
+                if byte == 27 {
+                    self.pending.push(byte);
+                } else {
+                    output.push(byte);
+                }
+                continue;
+            }
+            self.pending.push(byte);
+            if self.pending.len() == 2 && byte == b'[' {
+                continue;
+            }
+            if self.pending.starts_with(b"\x1b[") && self.pending.len() > 2 {
+                if (byte.is_ascii_digit() || byte == b';' || byte == b':')
+                    && self.pending.len() < 128
+                {
+                    continue;
+                }
+                if self.pending == b"\x1b[200~" {
+                    self.paste = true;
+                } else if self.pending == b"\x1b[201~" {
+                    self.paste = false;
+                } else if !self.paste
+                    && byte == b'u'
+                    && Self::is_detach(&self.pending[2..self.pending.len() - 1])
+                {
+                    self.pending.clear();
+                    return (output, true);
+                }
+            }
+            output.append(&mut self.pending);
+        }
+        (output, false)
+    }
+
+    fn is_detach(parameters: &[u8]) -> bool {
+        let Ok(parameters) = std::str::from_utf8(parameters) else {
+            return false;
+        };
+        let mut fields = parameters.split(';');
+        let key = fields.next().and_then(|field| field.split(':').next());
+        if !matches!(key, Some("93" | "53")) {
+            return false;
+        }
+        let mut modifiers = fields.next().unwrap_or("1").split(':');
+        let value = modifiers.next().and_then(|value| value.parse::<u16>().ok());
+        let event = modifiers.next().unwrap_or("1");
+        value.is_some_and(|value| value != 0 && (value - 1) & 63 == 4) && matches!(event, "1" | "2")
+    }
+
+    fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 #[derive(Default)]
 struct FrameAssembler {
     view_id: u32,
@@ -143,6 +215,7 @@ pub(crate) struct GridState {
     pub(crate) cursor: (u16, u16),
     pub(crate) title: String,
     pub(crate) modes: u16,
+    pub(crate) keyboard_flags: u8,
     pub(crate) scrollback_lines: u32,
     pub(crate) scroll_offset: i64,
     pub(crate) cells: Vec<terminal::Cell>,
@@ -167,6 +240,9 @@ impl GridState {
         let grid = frame
             .decode_grid_codec1(max_decoded, base)
             .map_err(wire_error)?;
+        if keyframe {
+            self.keyboard_flags = 0;
+        }
         if let Some((rows, cols)) = grid.dimensions {
             self.resize(rows, cols)?;
         }
@@ -361,6 +437,9 @@ impl GridState {
 
     fn apply_component(&mut self, component: terminal::Component) -> Result<(), String> {
         match component.kind {
+            kind if kind == yas_wire::schema::terminal::COMPONENT_KEYBOARD_FLAGS as u8 => {
+                self.keyboard_flags = component.body[0];
+            }
             kind if kind == yas_wire::schema::terminal::COMPONENT_OVERFLOW_STRINGS as u8 => {
                 let mut input = ComponentDecoder::new(&component.body);
                 let count = input.uleb()?;
@@ -524,6 +603,7 @@ async fn send_frame_ack(
 pub(crate) struct ViewUpdate {
     pub(crate) text: String,
     pub(crate) cursor: (u16, u16),
+    pub(crate) keyboard_flags: u8,
     pub(crate) final_exit: Option<i32>,
 }
 
@@ -573,6 +653,7 @@ pub(crate) async fn start_view_task(
                     .send(Ok(ViewUpdate {
                         text: grid.ansi_text(),
                         cursor: grid.cursor,
+                        keyboard_flags: grid.keyboard_flags,
                         final_exit,
                     }))
                     .await
@@ -978,7 +1059,7 @@ mod tty {
         RESIZED.store(true, Ordering::Relaxed);
     }
 
-    pub(super) struct RawMode(Option<libc::termios>);
+    pub(super) struct RawMode(Option<libc::termios>, bool);
 
     impl RawMode {
         pub(super) fn enter() -> Result<Self, String> {
@@ -1000,8 +1081,15 @@ mod tty {
                 }
                 let handler: extern "C" fn(libc::c_int) = on_sigwinch;
                 libc::signal(libc::SIGWINCH, handler as usize as libc::sighandler_t);
-                Ok(Self(Some(saved)))
+                Ok(Self(Some(saved), false))
             }
+        }
+
+        pub(super) fn start_keyboard(&mut self) {
+            self.1 = true;
+            let mut output = std::io::stdout();
+            let _ = output.write_all(b"\x1b[?1049h\x1b[?25l\x1b[>0u");
+            let _ = output.flush();
         }
     }
 
@@ -1014,6 +1102,9 @@ mod tty {
                 }
             }
             let mut output = std::io::stdout();
+            if self.1 {
+                let _ = output.write_all(b"\x1b[<u");
+            }
             let _ = output.write_all(b"\x1b[?25h\x1b[?1049l");
             let _ = output.flush();
         }
@@ -1075,10 +1166,11 @@ mod tty {
 pub(super) async fn attach(on: Option<&str>, hub: &str, id: u64) -> Result<i32, String> {
     use std::sync::atomic::Ordering;
 
-    let raw = tty::RawMode::enter()?;
+    let mut raw = tty::RawMode::enter()?;
+    raw.start_keyboard();
     let mut output = std::io::stdout();
-    let _ = output.write_all(b"\x1b[?1049h\x1b[?25l");
-    let _ = output.flush();
+    let mut keyboard_flags = 0;
+    let mut keys = AttachInput::default();
 
     let (mut cols, mut rows) = tty::window_size();
     let (mut updates, mut view_task) = start_view_task(on, hub, id, rows, cols).await?;
@@ -1089,14 +1181,13 @@ pub(super) async fn attach(on: Option<&str>, hub: &str, id: u64) -> Result<i32, 
     let (mut input, stop) = tty::input_channel();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut detached = false;
+    let mut pending_since = None;
     let exit = loop {
         tokio::select! {
             chunk = input.recv() => {
                 let Some(chunk) = chunk else { break 0 };
-                let (bytes, detach) = match chunk.iter().position(|byte| *byte == DETACH) {
-                    Some(position) => (&chunk[..position], true),
-                    None => (chunk.as_slice(), false),
-                };
+                let (bytes, detach) = keys.feed(&chunk);
+                pending_since = (!keys.pending.is_empty()).then(Instant::now);
                 for bytes in bytes.chunks(yas_wire::schema::terminal::MAX_INPUT_BYTES as usize) {
                     if bytes.is_empty() {
                         continue;
@@ -1124,6 +1215,11 @@ pub(super) async fn attach(on: Option<&str>, hub: &str, id: u64) -> Result<i32, 
             update = updates.recv() => {
                 match update {
                     Some(Ok(update)) => {
+                        if keyboard_flags != update.keyboard_flags {
+                            keyboard_flags = update.keyboard_flags;
+                            let _ = write!(output, "\x1b[={keyboard_flags}u");
+                            let _ = output.flush();
+                        }
                         tty::repaint(&update.text, update.cursor);
                         if let Some(exit) = update.final_exit {
                             break exit;
@@ -1138,6 +1234,23 @@ pub(super) async fn attach(on: Option<&str>, hub: &str, id: u64) -> Result<i32, 
                     .map_err(|_| "YAS Terminal lifecycle watcher stopped".to_string())??;
             }
             _ = tick.tick() => {
+                // A lone Escape must not wait forever for a CSI continuation.
+                if pending_since.is_some_and(|at| at.elapsed() >= Duration::from_millis(100)) {
+                    pending_since = None;
+                    let bytes = keys.flush();
+                    if !bytes.is_empty() {
+                        input_client.send_typed_event(
+                            family::TERMINAL, terminal::event_kind::INPUT,
+                            &terminal::Input {
+                                feedback: terminal::ViewFeedback {
+                                    view_id: input_view.view_id,
+                                    presented_sequence: input_view.first_sequence.wrapping_sub(1),
+                                    decoder_queue_depth: 0, available_frame_slots: 0,
+                                }, data: bytes,
+                            }, true,
+                        ).await?;
+                    }
+                }
                 if tty::RESIZED.swap(false, Ordering::Relaxed) {
                     (cols, rows) = tty::window_size();
                     view_task.abort();
@@ -1270,6 +1383,45 @@ pub(super) async fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_detach_handles_fragmented_kitty_and_opaque_paste() {
+        for sequence in [
+            b"\x1d".as_slice(),
+            b"\x1b[93;5u",
+            b"\x1b[53;197:2u",
+            b"\x1b[93::93;5u",
+        ] {
+            let mut keys = AttachInput::default();
+            let mut detached = false;
+            for (index, byte) in sequence.iter().enumerate() {
+                let (forwarded, detach) = keys.feed(&[*byte]);
+                assert!(forwarded.is_empty());
+                assert_eq!(detach, index == sequence.len() - 1);
+                detached |= detach;
+            }
+            assert!(detached);
+        }
+        for sequence in [
+            b"\x1b[93;5:3u".as_slice(),
+            b"\x1b[93;6u",
+            b"\x1b[200~\x1d\x1b[93;5u\x1b[201~",
+            b"hello\x1b[A",
+        ] {
+            let mut keys = AttachInput::default();
+            let mut forwarded = Vec::new();
+            for byte in sequence {
+                let (bytes, detach) = keys.feed(&[*byte]);
+                assert!(!detach);
+                forwarded.extend(bytes);
+            }
+            assert_eq!(forwarded, sequence);
+        }
+        let mut keys = AttachInput::default();
+        assert_eq!(keys.feed(b"\x1b"), (vec![], false));
+        assert_eq!(keys.flush(), b"\x1b");
+    }
 
     fn keyframe_flags() -> u16 {
         yas_wire::schema::terminal::FRAME_KEYFRAME as u16

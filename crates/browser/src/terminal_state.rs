@@ -29,6 +29,7 @@ pub struct TerminalState {
     cursor_row: u16,
     cursor_col: u16,
     mode: u16,
+    keyboard_flags: u8,
     title: String,
     cells: Vec<u8>,
     overflow: BTreeMap<usize, String>,
@@ -50,6 +51,7 @@ impl TerminalState {
             cursor_row: 0,
             cursor_col: 0,
             mode: 0,
+            keyboard_flags: 0,
             title: String::new(),
             cells,
             overflow: BTreeMap::new(),
@@ -82,6 +84,10 @@ impl TerminalState {
 
     pub const fn mode(&self) -> u16 {
         self.mode
+    }
+
+    pub const fn keyboard_flags(&self) -> u8 {
+        self.keyboard_flags
     }
 
     pub fn title(&self) -> &str {
@@ -312,7 +318,8 @@ impl TerminalState {
             }
             cell_links[start..end].fill(id);
         }
-        if !cursor.is_empty() {
+        let keyboard_flags = if cursor.is_empty() { 0 } else { cursor.u8()? };
+        if keyboard_flags & !31 != 0 || !cursor.is_empty() {
             return None;
         }
         Some(Self {
@@ -321,6 +328,7 @@ impl TerminalState {
             cursor_row,
             cursor_col,
             mode,
+            keyboard_flags,
             title,
             cells,
             overflow,
@@ -448,6 +456,17 @@ mod tests {
         assert_eq!(state.link_segments(0, 1), vec![(0, 1, 1)]);
         assert!(state.is_wrapped(0));
         assert_eq!(state.scrollback_lines(), 7);
+        assert_eq!(state.keyboard_flags(), 0);
+
+        raw.push(31);
+        assert!(state.feed_compressed(&lz4_flex::block::compress_prepend_size(&raw)));
+        assert_eq!(state.keyboard_flags(), 31);
+        *raw.last_mut().unwrap() = 32;
+        assert!(!state.feed_compressed(&lz4_flex::block::compress_prepend_size(&raw)));
+        assert_eq!(state.keyboard_flags(), 31);
+        raw.pop();
+        assert!(state.feed_compressed(&lz4_flex::block::compress_prepend_size(&raw)));
+        assert_eq!(state.keyboard_flags(), 0);
     }
 
     #[test]

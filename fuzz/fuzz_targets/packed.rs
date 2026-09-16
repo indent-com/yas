@@ -16,7 +16,9 @@ fuzz_target!(|input: &[u8]| {
             drop(yas_wire::events::EventBatch::decode(payload));
         }
         1 => {
-            let flags = u16::from(parameters) & yas_wire::terminal::TerminalFrame::KNOWN_FLAGS;
+            let flags = (u16::from(parameters)
+                | yas_wire::schema::terminal::FRAME_COMPONENTS as u16)
+                & yas_wire::terminal::TerminalFrame::KNOWN_FLAGS;
             drop(yas_wire::terminal::Grid::decode_codec1(
                 flags,
                 payload,

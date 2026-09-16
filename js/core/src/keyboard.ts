@@ -1,159 +1,277 @@
+import {
+  controlByte,
+  encodeTerminalKey,
+  namedKeys,
+  REPORT_ALL,
+  REPORT_EVENTS,
+  type TerminalKey,
+} from "./keyboardProtocol";
+export {
+  encodeTerminalText,
+  REPORT_ALL,
+  REPORT_EVENTS,
+} from "./keyboardProtocol";
 export const encoder = new TextEncoder();
 
-/**
- * Convert a single character to its Ctrl+char byte representation.
- * For a-z returns 0x01–0x1a, for special chars returns the standard mapping.
- * Returns null if the character has no Ctrl equivalent.
- */
 export function ctrlCharToByte(char: string): Uint8Array | null {
-  if (char.length !== 1) return null;
-  const code = char.toLowerCase().charCodeAt(0);
-  if (code >= 97 && code <= 122) return new Uint8Array([code - 96]); // a-z → 0x01-0x1a
-  if (char === "[") return new Uint8Array([0x1b]); // Ctrl+[ = Escape
-  if (char === "\\") return new Uint8Array([0x1c]);
-  if (char === "]") return new Uint8Array([0x1d]);
-  if (char === " " || char === "@") return new Uint8Array([0x00]); // Ctrl+Space / Ctrl+@
-  return null;
+  if (Array.from(char).length !== 1) return null;
+  const byte = controlByte(char.codePointAt(0)!);
+  return byte === null ? null : new Uint8Array([byte]);
 }
 
-/**
- * Encode a keyboard event into the byte sequence expected by the terminal.
- * Returns null if the event should not be forwarded.
- */
+const physicalCharacters: Record<string, string> = {
+  Space: " ",
+  Backquote: "`",
+  Minus: "-",
+  Equal: "=",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Semicolon: ";",
+  Quote: "'",
+  Comma: ",",
+  Period: ".",
+  Slash: "/",
+  IntlBackslash: "\\",
+};
+const shiftedCharacters: Record<string, string> = {
+  Backquote: "~",
+  Minus: "_",
+  Equal: "+",
+  BracketLeft: "{",
+  BracketRight: "}",
+  Backslash: "|",
+  Semicolon: ":",
+  Quote: '"',
+  Comma: "<",
+  Period: ">",
+  Slash: "?",
+  Digit1: "!",
+  Digit2: "@",
+  Digit3: "#",
+  Digit4: "$",
+  Digit5: "%",
+  Digit6: "^",
+  Digit7: "&",
+  Digit8: "*",
+  Digit9: "(",
+  Digit0: ")",
+};
+function physicalCharacter(code: string): string | undefined {
+  if (/^Key[A-Z]$/.test(code)) return code[3].toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code[5];
+  return physicalCharacters[code];
+}
+let layout = new Map<string, string>();
+/** Layout maps are optional in browsers. Observed unshifted keys also teach
+ * the fallback, and unavailable metadata is simply omitted. */
+export async function refreshKeyboardLayout(): Promise<void> {
+  const keyboard = (
+    navigator as Navigator & {
+      keyboard?: { getLayoutMap?: () => Promise<Map<string, string>> };
+    }
+  ).keyboard;
+  try {
+    if (keyboard?.getLayoutMap) layout = new Map(await keyboard.getLayoutMap());
+  } catch {
+    /* Unsupported or disallowed by the embedding page. */
+  }
+}
+
+export function terminalKeyFromEvent(e: KeyboardEvent): TerminalKey | null {
+  if (e.isComposing || e.key === "Dead" || e.key === "Process") return null;
+  const altGraph = e.getModifierState?.("AltGraph") ?? false;
+  const control = e.ctrlKey && !altGraph;
+  const alt = e.altKey && !altGraph;
+  let modifiers =
+    (e.shiftKey ? 1 : 0) |
+    (alt ? 2 : 0) |
+    (control ? 4 : 0) |
+    (e.metaKey ? 8 : 0) |
+    (e.getModifierState?.("CapsLock") ? 64 : 0) |
+    (e.getModifierState?.("NumLock") ? 128 : 0);
+  let key = namedKeys[e.key];
+  let text = "";
+  let shiftedKey: number | undefined;
+  let baseKey: number | undefined;
+  const character =
+    Array.from(e.key).length === 1 && e.key.codePointAt(0)! >= 32;
+  if (character) {
+    const physical = physicalCharacter(e.code);
+    const lower = Array.from(e.key.toLowerCase());
+    if (e.code && !e.shiftKey && !control && !alt && !e.metaKey && !altGraph)
+      layout.set(e.code, lower.length === 1 ? lower[0] : e.key);
+    let unshifted =
+      layout.get(e.code) ?? (lower.length === 1 ? lower[0] : e.key);
+    if (
+      !layout.has(e.code) &&
+      e.shiftKey &&
+      shiftedCharacters[e.code] === e.key
+    )
+      unshifted = physical ?? unshifted;
+    key =
+      Array.from(unshifted).length === 1
+        ? unshifted.codePointAt(0)!
+        : e.key.codePointAt(0)!;
+    shiftedKey = e.shiftKey ? e.key.codePointAt(0)! : undefined;
+    baseKey = physical?.codePointAt(0);
+    if (!control && !alt && !e.metaKey) text = e.key;
+    // Option-generated non-ASCII characters are resolved text on macOS.
+    if (
+      alt &&
+      !control &&
+      !e.metaKey &&
+      e.key.codePointAt(0)! > 127 &&
+      /Mac/.test(navigator.platform)
+    ) {
+      modifiers &= ~2;
+      text = e.key;
+    }
+  } else if (/^F([1-9]|[12][0-9]|3[0-5])$/.test(e.key)) {
+    key = 57363 + Number(e.key.slice(1));
+  } else if (key === undefined) {
+    const modifiersByCode: Record<string, number> = {
+      ShiftLeft: 57441,
+      ControlLeft: 57442,
+      AltLeft: 57443,
+      MetaLeft: 57444,
+      HyperLeft: 57445,
+      SuperLeft: 57444,
+      ShiftRight: 57447,
+      ControlRight: 57448,
+      AltRight: 57449,
+      MetaRight: 57450,
+      HyperRight: 57451,
+      SuperRight: 57450,
+    };
+    key = e.key === "AltGraph" ? 57453 : modifiersByCode[e.code];
+    if (key === undefined && control) {
+      // Some browsers report Ctrl+letters as a C0 byte or Unidentified.
+      const physical = physicalCharacter(e.code);
+      if (physical) key = physical.codePointAt(0)!;
+      else if (
+        e.key.length === 1 &&
+        e.key.charCodeAt(0) >= 1 &&
+        e.key.charCodeAt(0) <= 26
+      )
+        key = e.key.charCodeAt(0) + 96;
+    }
+  }
+  if (e.code?.startsWith("Numpad") || e.location === 3) {
+    const keypad: Record<string, number> = {
+      Decimal: 57409,
+      Divide: 57410,
+      Multiply: 57411,
+      Subtract: 57412,
+      Add: 57413,
+      Enter: 57414,
+      Equal: 57415,
+      Comma: 57416,
+    };
+    const navigation: Record<string, number> = {
+      ArrowLeft: 57417,
+      ArrowRight: 57418,
+      ArrowUp: 57419,
+      ArrowDown: 57420,
+      PageUp: 57421,
+      PageDown: 57422,
+      Home: 57423,
+      End: 57424,
+      Insert: 57425,
+      Delete: 57426,
+      Clear: 57427,
+    };
+    const suffix = e.code?.slice(6);
+    key =
+      navigation[e.key] ??
+      keypad[suffix] ??
+      (/^[0-9]$/.test(suffix) ? 57399 + Number(suffix) : key);
+  }
+  if (key === undefined) return null;
+  return {
+    key,
+    modifiers,
+    eventType: e.type === "keyup" ? 3 : e.repeat ? 2 : 1,
+    text,
+    shiftedKey,
+    baseKey,
+  };
+}
+
+/** Convert a DOM key using the application's negotiated keyboard flags. */
 export function keyToBytes(
   e: KeyboardEvent,
   appCursor: boolean,
+  flags = 0,
 ): Uint8Array | null {
-  if (e.ctrlKey && !e.altKey && !e.metaKey) {
-    // Let Ctrl+Shift+V fall through to the browser so native paste works.
-    // On macOS Cmd+V already bypasses this path via the metaKey guard.
-    if (e.shiftKey && e.code === "KeyV") return null;
+  if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyV")
+    return null;
+  // Preserve host Command shortcuts in legacy terminal mode.
+  if (!flags && e.metaKey && Array.from(e.key).length === 1) return null;
+  // Brave sometimes reports Shift+digit as its unshifted digit. Let the
+  // textarea provide the layout-resolved text in legacy mode.
+  if (
+    !(flags & REPORT_ALL) &&
+    e.shiftKey &&
+    !e.ctrlKey &&
+    !e.altKey &&
+    !e.metaKey &&
+    /^[0-9]$/.test(e.key) &&
+    e.code?.startsWith("Digit")
+  )
+    return null;
+  const key = terminalKeyFromEvent(e);
+  if (!key) return null;
+  const value = encodeTerminalKey(key, flags, appCursor);
+  return value === null ? null : encoder.encode(value);
+}
 
-    const kc = e.key.charCodeAt(0);
-    if (e.key.length === 1 && kc >= 1 && kc <= 26) return new Uint8Array([kc]);
-    if (e.key.length === 1) {
-      const code = e.key.toLowerCase().charCodeAt(0);
-      if (code >= 97 && code <= 122) return new Uint8Array([code - 96]);
-      if (e.key === "[") return new Uint8Array([0x1b]);
-      if (e.key === "\\") return new Uint8Array([0x1c]);
-      if (e.key === "]") return new Uint8Array([0x1d]);
+/** Track only keys actually forwarded by a pane; locally consumed shortcuts
+ * never produce orphan releases. Blur releases held keys before losing input. */
+export class TerminalKeyboard {
+  private held = new Map<string, TerminalKey>();
+  private flags = 0;
+  encode(
+    e: KeyboardEvent,
+    appCursor: boolean,
+    flags: number,
+  ): Uint8Array | null {
+    if (this.flags !== flags) this.held.clear();
+    this.flags = flags;
+    const id = e.code || e.key;
+    if (e.type === "keyup") {
+      const held = this.held.get(id);
+      this.held.delete(id);
+      const current = terminalKeyFromEvent(e);
+      if (!held || !current) return null;
+      const value = encodeTerminalKey(
+        { ...held, modifiers: current.modifiers, eventType: 3, text: "" },
+        flags,
+        appCursor,
+      );
+      return value === null ? null : encoder.encode(value);
     }
-    // Fallback: use e.code when e.key is unhelpful (e.g. macOS Ctrl+letter)
-    if (e.code && e.code.startsWith("Key")) {
-      const cc = e.code.charCodeAt(3);
-      if (cc >= 65 && cc <= 90) return new Uint8Array([cc - 64]);
+    const bytes = keyToBytes(e, appCursor, flags);
+    if (bytes && flags & REPORT_EVENTS) {
+      const key = terminalKeyFromEvent(e);
+      if (key) this.held.set(id, key);
     }
-    if (e.code === "BracketLeft") return new Uint8Array([0x1b]);
-    if (e.code === "Backslash") return new Uint8Array([0x1c]);
-    if (e.code === "BracketRight") return new Uint8Array([0x1d]);
+    return bytes;
   }
-
-  if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
-    if (e.key === "?") return new Uint8Array([0x7f]);
-    if (e.key === " " || e.key === "@") return new Uint8Array([0x00]);
+  release(flags: number): Uint8Array | null {
+    const held = [...this.held.values()];
+    this.held.clear();
+    if (flags !== this.flags || !(flags & REPORT_EVENTS)) return null;
+    return encoder.encode(
+      held
+        .map(
+          (key) =>
+            encodeTerminalKey(
+              { ...key, modifiers: 0, eventType: 3, text: "" },
+              flags,
+            ) ?? "",
+        )
+        .join(""),
+    );
   }
-
-  const arrows: Record<string, string> = {
-    ArrowUp: "A",
-    ArrowDown: "B",
-    ArrowRight: "C",
-    ArrowLeft: "D",
-  };
-  if (arrows[e.key]) {
-    const mod =
-      (e.shiftKey ? 1 : 0) +
-      (e.altKey ? 2 : 0) +
-      (e.ctrlKey ? 4 : 0) +
-      (e.metaKey ? 8 : 0);
-    if (mod) return encoder.encode(`\x1b[1;${mod + 1}${arrows[e.key]}`);
-    const prefix = appCursor ? "\x1bO" : "\x1b[";
-    return encoder.encode(prefix + arrows[e.key]);
-  }
-
-  const mod =
-    (e.shiftKey ? 1 : 0) +
-    (e.altKey ? 2 : 0) +
-    (e.ctrlKey ? 4 : 0) +
-    (e.metaKey ? 8 : 0);
-
-  const tilde: Record<string, string> = {
-    PageUp: "5",
-    PageDown: "6",
-    Delete: "3",
-    Insert: "2",
-  };
-  if (tilde[e.key]) {
-    if (mod) return encoder.encode(`\x1b[${tilde[e.key]};${mod + 1}~`);
-    return encoder.encode(`\x1b[${tilde[e.key]}~`);
-  }
-
-  const he: Record<string, string> = { Home: "H", End: "F" };
-  if (he[e.key]) {
-    if (mod) return encoder.encode(`\x1b[1;${mod + 1}${he[e.key]}`);
-    return encoder.encode(`\x1b[${he[e.key]}`);
-  }
-
-  const f14: Record<string, string> = { F1: "P", F2: "Q", F3: "R", F4: "S" };
-  if (f14[e.key]) {
-    if (mod) return encoder.encode(`\x1b[1;${mod + 1}${f14[e.key]}`);
-    return encoder.encode(`\x1bO${f14[e.key]}`);
-  }
-
-  const fkeys: Record<string, string> = {
-    F5: "15",
-    F6: "17",
-    F7: "18",
-    F8: "19",
-    F9: "20",
-    F10: "21",
-    F11: "23",
-    F12: "24",
-  };
-  if (fkeys[e.key]) {
-    if (mod) return encoder.encode(`\x1b[${fkeys[e.key]};${mod + 1}~`);
-    return encoder.encode(`\x1b[${fkeys[e.key]}~`);
-  }
-
-  // Shift+Tab → CBT (cursor backward tabulation).  Must be checked before
-  // the plain Tab mapping below or it would fall through to HT.
-  if (e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
-    return encoder.encode("\x1b[Z");
-  }
-
-  const simple: Record<string, string> = {
-    Enter: "\r",
-    Backspace: "\x7f",
-    Tab: "\t",
-    Escape: "\x1b",
-  };
-  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key === "Enter") {
-    return encoder.encode("\x1b" + simple.Enter);
-  }
-  if (simple[e.key]) return encoder.encode(simple[e.key]);
-
-  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.length === 1) {
-    const code = e.key.charCodeAt(0);
-    if (code >= 0x20 && code <= 0x7e) return encoder.encode("\x1b" + e.key);
-    return encoder.encode(e.key);
-  }
-
-  if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    // Some browsers (notably Brave) report the unshifted digit as e.key even
-    // when Shift is held (e.g. Shift+2 → e.key="2" instead of "@").  When we
-    // detect Shift + a digit key whose e.key is still a digit, bail out and
-    // let the browser's input event on the hidden textarea produce the correct
-    // character for the user's keyboard layout.
-    if (
-      e.shiftKey &&
-      e.key >= "0" &&
-      e.key <= "9" &&
-      e.code &&
-      e.code.startsWith("Digit")
-    ) {
-      return null;
-    }
-    return encoder.encode(e.key);
-  }
-
-  return null;
 }

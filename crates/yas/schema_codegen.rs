@@ -4330,6 +4330,12 @@ fn vectors(artifact: &Artifact) -> VectorArtifact {
             name: format!("packed_codec.{}.payload", codec.name),
             hex: codec.golden_hex.to_ascii_lowercase(),
         });
+        if codec.name == "terminal-grid-v1" {
+            vectors.push(GoldenVector {
+                name: "packed_codec.terminal-grid-v1.keyboard_flags.payload".into(),
+                hex: format!("{}010300011f", codec.golden_hex.to_ascii_lowercase()),
+            });
+        }
         if let Some(tag) = codec
             .constants
             .iter()

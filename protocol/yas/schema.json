@@ -11209,6 +11209,10 @@
           "value": 2
         },
         {
+          "name": "COMPONENT_KEYBOARD_FLAGS",
+          "value": 3
+        },
+        {
           "name": "COMPONENT_REQUIRED",
           "value": 1
         },

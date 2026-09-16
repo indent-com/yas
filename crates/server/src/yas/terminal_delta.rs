@@ -88,6 +88,7 @@ fn snapshot(source: &FrameState, rows: u16, cols: u16) -> FrameState {
     state.cursor_row = source.cursor_row.min(rows.saturating_sub(1));
     state.cursor_col = source.cursor_col.min(cols.saturating_sub(1));
     state.mode = source.mode;
+    state.keyboard_flags = source.keyboard_flags;
     state.title.clone_from(&source.title);
     state.scrollback_lines = source.scrollback_lines;
     state
@@ -291,6 +292,11 @@ fn components(
             COMPONENT_HYPERLINKS,
             terminal_hyperlink_component(&state.cell_links, &state.link_uris),
         );
+    }
+    if previous.map_or(state.keyboard_flags != 0, |old| {
+        state.keyboard_flags != old.keyboard_flags
+    }) {
+        push(COMPONENT_KEYBOARD_FLAGS, vec![state.keyboard_flags]);
     }
     components
 }
@@ -515,6 +521,37 @@ mod tests {
                 _ => panic!("unexpected operation"),
             }
         }
+    }
+
+    #[test]
+    fn keyboard_mode_only_deltas_and_resets_are_transmitted() {
+        let mut view = terminal_encoding_view(3, 10);
+        let guard = FrameGuard::current_for_test();
+        let mut state = FrameState::new(3, 10);
+        write(&mut view, &state, &guard);
+        for flags in [31, 1, 0] {
+            state.keyboard_flags = flags;
+            let (frame, grid) = write(&mut view, &state, &guard);
+            assert_eq!(frame.frame_flags, FRAME_COMPONENTS as u16);
+            assert!(grid.operations.is_empty());
+            assert_eq!(
+                grid.components,
+                vec![Component {
+                    kind: COMPONENT_KEYBOARD_FLAGS as u8,
+                    required: false,
+                    body: vec![flags],
+                }]
+            );
+            assert!(encode(&mut view, &state, &guard).is_none());
+        }
+        state.keyboard_flags = 31;
+        assert_eq!(snapshot(&state, 2, 5).keyboard_flags, 31);
+        assert!(
+            make_grid(&state, 0, None)
+                .components
+                .iter()
+                .any(|c| c.kind == COMPONENT_KEYBOARD_FLAGS as u8 && c.body == [31])
+        );
     }
 
     #[test]

@@ -1797,6 +1797,14 @@ flags are zero. Codec 1 defines:
 | `0x01` | OVERFLOW_STRINGS | `[entry_count:uleb128] repeated{ [cell_index:uleb128][utf8_len:uleb128][utf8:N] }`; supplies strings for cells patched to overflow content                                                                         |
 | `0x02` | HYPERLINKS       | `[uri_count:uleb128] repeated{ [link_id:uleb128][uri_len:uleb128][uri:N] }[run_count:uleb128] repeated{ [start_cell:uleb128][cell_count:uleb128][link_id:uleb128] }`; replaces the complete URI table and cell map |
 
+| `0x03` | KEYBOARD_FLAGS | `[flags:u8]`; replaces the active Kitty keyboard enhancement flags; only bits 0–4 are valid |
+
+KEYBOARD_FLAGS is optional for older decoders. It defaults to zero on each
+keyframe, persists when omitted from deltas, and must be sent when it changes,
+including changes back to zero. It follows the active terminal screen even
+when the view is scrolled back. Encoders preserve this input state when shedding
+optional visual components to fit a frame budget.
+
 LINE_FLAGS runs are ordered, nonoverlapping, nonzero, and in bounds.
 OVERFLOW_STRINGS indices are strictly increasing; every patched cell whose
 content length is the overflow marker has exactly one entry, and patching a

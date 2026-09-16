@@ -485,6 +485,7 @@ trait PtyDriver: Send {
     fn size(&self) -> (u16, u16);
     fn resize(&mut self, rows: u16, cols: u16);
     fn process(&mut self, data: &[u8]);
+    fn take_keyboard_replies(&mut self) -> Vec<u8>;
     fn title(&self) -> &str;
     fn search_result(&self, query: &str) -> Option<PtySearchResult>;
     fn take_title_dirty(&mut self) -> bool;
@@ -538,6 +539,10 @@ impl PtyDriver for AlacrittyDriver {
 
     fn process(&mut self, data: &[u8]) {
         AlacrittyDriver::process(self, data);
+    }
+
+    fn take_keyboard_replies(&mut self) -> Vec<u8> {
+        AlacrittyDriver::take_keyboard_replies(self)
     }
 
     fn title(&self) -> &str {
@@ -8069,12 +8074,8 @@ fn feed_pty_chunk(pty: &mut Pty, data: &[u8]) {
         std::borrow::Cow::Owned(buf)
     };
 
-    let scan = pty::respond_to_queries(
-        &pty.handle,
-        &scanned,
-        pty.driver.size(),
-        pty.driver.cursor_position(),
-    );
+    let mut scan =
+        parse_terminal_queries(&scanned, pty.driver.size(), pty.driver.cursor_position());
 
     if journal::enabled() {
         pty.osc_carry.clear();
@@ -8115,6 +8116,10 @@ fn feed_pty_chunk(pty: &mut Pty, data: &[u8]) {
         }
     }
 
+    // Reply to Kitty probes before the DA response used as their detection
+    // barrier. The parser preserves mode changes and fragmented CSI queries.
+    let keyboard_replies = pty.driver.take_keyboard_replies();
+    pty::respond_to_queries(&pty.handle, &mut scan, &keyboard_replies);
     let _ = note_osc7_cwd(&mut pty.osc7_cwd, scan.osc7_cwd);
 }
 

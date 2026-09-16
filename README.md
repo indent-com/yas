@@ -112,10 +112,17 @@ live terminal output and send input without leaving the UI.
 The Muster list fits its expanded rows; panels share compact separators.
 Drag the Events header to resize it, down to a single header line. Scroll a
 terminal with the mouse wheel or PageUp/PageDown. While sending terminal
-input, use Shift+PageUp/PageDown; Shift+Home/End jumps to oldest/latest output.
+input, use Shift+PageUp/PageDown; Shift+Home/End jumps to oldest/latest output
+unless the application enables enhanced keyboard input.
 Typing returns to latest output. Focused mouse-aware applications receive
 normal wheel events; Shift+wheel always scrolls history. Retained terminals
 remain scrollable after exit. Press `?` in navigation mode for all controls.
+Browser panes and the native viewer support application-negotiated Kitty
+keyboard input: distinct modified Enter/Tab/Backspace, control chords,
+keypad keys, repeat/release events, and extended modifiers. Without negotiation,
+Enter sends `\r` and Ctrl+Enter sends `\x1b[13;5u`. Native input depends on the
+host terminal; browser input depends on keys delivered by the browser and OS.
+See [keyboard handling](docs/frontend.md#keyboard) for details.
 
 Run a pipe-oriented process without a terminal, connecting its stdin, stdout,
 and stderr and returning its exit code:

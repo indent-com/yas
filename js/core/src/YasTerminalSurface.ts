@@ -6,7 +6,14 @@ import { DEFAULT_FONT, DEFAULT_FONT_SIZE, DEFAULT_TEXT_GAMMA } from "./types";
 import { cancelFrame, scheduleFrame } from "./frameScheduler";
 import { measureCell, cssFontFamily, type CellMetrics } from "./measure";
 import type { GlRenderer } from "./gl-renderer";
-import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
+import {
+  keyToBytes,
+  encoder,
+  TerminalKeyboard,
+  refreshKeyboardLayout,
+  encodeTerminalText,
+  REPORT_ALL,
+} from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./input";
 import { YAS_TERMINAL_WHEEL_SOURCE_FINGER } from "./yas/generated";
 import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
@@ -48,10 +55,6 @@ export interface LinkHover {
   /** The on-screen text of the link, for comparison against the target. */
   text: string;
 }
-
-// The ^V control byte.  Sent for a plain Ctrl+V (quoted-insert in shells, and
-// the paste-trigger TUIs like Claude Code use to read the clipboard).
-const CTRL_V = 0x16;
 
 /** Screenshots land far below this; anything above it is not something a
  *  paste should risk the session on. */
@@ -559,6 +562,10 @@ export class YasTerminalSurface {
   private fontsHandler: (() => void) | null = null;
 
   // --- event handler refs (for cleanup) ---
+  private keyboard = new TerminalKeyboard();
+  private boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
+  private boundKeyboardBlur: (() => void) | null = null;
+  private boundKeyboardVisibility: (() => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private boundCompositionStart: (() => void) | null = null;
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
@@ -969,7 +976,7 @@ export class YasTerminalSurface {
           this.status !== "connected"
         )
           return false;
-        this.sendInput(sid, new Uint8Array([CTRL_V]));
+        this.sendCtrlV();
         return true;
       } catch {
         return false;
@@ -2539,7 +2546,7 @@ export class YasTerminalSurface {
   private predictionActive(): boolean {
     if (!this._predictionCapture || this._readOnly) return false;
     const t = this.terminal;
-    return !!t && !t.alt_screen();
+    return !!t && !t.alt_screen() && !(this.keyboardFlags() & REPORT_ALL);
   }
 
   /** Match the chip to the terminal's own font and palette. */
@@ -2605,7 +2612,7 @@ export class YasTerminalSurface {
           );
         }
         if (delta.send) {
-          this.sendInput(this._sessionId, encoder.encode(delta.send));
+          this.sendTypedText(delta.send, false);
           this.echoLocally(delta.send);
         }
       }
@@ -2702,7 +2709,11 @@ export class YasTerminalSurface {
       if (e.key === "Dead") return;
 
       // Scroll-key shortcuts run in all modes, including read-only.
-      if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
+      if (
+        (this._readOnly || !this.keyboardFlags()) &&
+        e.shiftKey &&
+        (e.key === "PageUp" || e.key === "PageDown")
+      ) {
         const t2 = this.terminal;
         const maxScroll = t2 ? t2.scrollback_lines() : 0;
         if (maxScroll > 0 || this.scrollOffset > 0) {
@@ -2723,7 +2734,11 @@ export class YasTerminalSurface {
         }
         return;
       }
-      if (e.shiftKey && (e.key === "Home" || e.key === "End")) {
+      if (
+        (this._readOnly || !this.keyboardFlags()) &&
+        e.shiftKey &&
+        (e.key === "Home" || e.key === "End")
+      ) {
         const t2 = this.terminal;
         const maxScroll = t2 ? t2.scrollback_lines() : 0;
         if (maxScroll > 0 || this.scrollOffset > 0) {
@@ -2739,67 +2754,24 @@ export class YasTerminalSurface {
       // Past this point: input-producing paths, blocked in read-only.
       if (this._readOnly) return;
 
-      // Ctrl modifier from mobile toolbar: intercept the next printable key
-      if (
-        this._ctrlModifier &&
-        e.key.length === 1 &&
-        !e.ctrlKey &&
-        !e.metaKey
-      ) {
-        const bytes = ctrlCharToByte(e.key);
-        if (bytes) {
-          e.preventDefault();
-          this.sendInput(this._sessionId!, bytes);
-        }
-        this.setCtrlModifier(false);
-        return;
-      }
-
-      // Alt modifier from mobile toolbar: prefix next printable key with ESC
-      if (
-        this._altModifier &&
-        e.key.length === 1 &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.altKey
-      ) {
-        e.preventDefault();
-        const charCode = e.key.charCodeAt(0);
-        this.sendInput(this._sessionId!, new Uint8Array([0x1b, charCode]));
-        this.setAltModifier(false);
-        return;
-      }
-
-      // Named keys from the mobile toolbar (arrows, navigation keys, F-keys)
-      // arrive without the one-shot modifier in the synthetic KeyboardEvent.
-      // Re-encode them with the armed modifier so, for example, Ctrl+Right
-      // produces CSI 1;5C just like the same chord on a physical keyboard.
+      // Toolbar modifiers apply to a complete synthetic chord. Soft keyboards
+      // and toolbar buttons may never deliver a matching keyup.
       if (
         (this._ctrlModifier || this._altModifier) &&
-        e.key.length > 1 &&
-        !e.ctrlKey &&
-        !e.altKey &&
-        !e.metaKey
+        !["Control", "Alt", "Shift", "Meta", "AltGraph"].includes(e.key)
       ) {
-        const t = this.terminal;
-        const bytes = keyToBytes(
-          {
-            key: e.key,
-            code: e.code,
-            ctrlKey: this._ctrlModifier,
-            shiftKey: e.shiftKey,
-            altKey: this._altModifier,
-            metaKey: false,
-          } as KeyboardEvent,
-          t ? t.app_cursor() : false,
+        e.preventDefault();
+        this.sendSyntheticKey(
+          e.key,
+          e.code,
+          e.shiftKey,
+          e.ctrlKey,
+          e.altKey,
+          e.metaKey,
         );
-        if (bytes) {
-          e.preventDefault();
-          this.sendInput(this._sessionId!, bytes);
-          this.setCtrlModifier(false);
-          this.setAltModifier(false);
-          return;
-        }
+        this.setCtrlModifier(false);
+        this.setAltModifier(false);
+        return;
       }
 
       // Ctrl+Shift+V pastes from the browser clipboard.  Ctrl+V is left as
@@ -2856,7 +2828,7 @@ export class YasTerminalSurface {
 
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
-      const bytes = keyToBytes(e, appCursor);
+      const bytes = this.keyboard.encode(e, appCursor, this.keyboardFlags());
       if (bytes) {
         e.preventDefault();
         if (this.scrollOffset > 0) {
@@ -2920,7 +2892,7 @@ export class YasTerminalSurface {
         return;
       }
       if (e.data && this._sessionId !== null && this.status === "connected") {
-        this.sendInput(this._sessionId, encoder.encode(e.data));
+        this.sendTypedText(e.data, false);
       }
       // Re-seed the iOS filler so Backspace-repeat keeps working after a
       // dictation/accent composition (no-op off iOS → empties the field).
@@ -2963,7 +2935,7 @@ export class YasTerminalSurface {
           this._sessionId !== null &&
           this.status === "connected"
         ) {
-          this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+          this.sendSyntheticKey("Backspace");
         }
         return;
       }
@@ -2975,7 +2947,7 @@ export class YasTerminalSurface {
       // goes idle, or immediately if it is about to run dry mid-hold.
       if (this._iosPad && inputEvent.inputType === "deleteContentBackward") {
         if (this._sessionId !== null && this.status === "connected") {
-          this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+          this.sendSyntheticKey("Backspace");
         }
         if (input.value.length <= 4) this.seedIosPad();
         else this.scheduleIosRepad();
@@ -3002,39 +2974,9 @@ export class YasTerminalSurface {
       // On iOS the field carries the filler buffer; strip it so we only act on
       // what the user actually typed/pasted.
       const typed = this._iosPad ? stripIosPad(input.value) : input.value;
-      // Ctrl modifier: convert the next typed character to Ctrl+char
-      if (
-        this._ctrlModifier &&
-        typed &&
-        this._sessionId !== null &&
-        this.status === "connected"
-      ) {
-        const char = typed[0];
-        const bytes = ctrlCharToByte(char);
-        if (bytes) {
-          this.sendInput(this._sessionId, bytes);
-        }
-        this.setCtrlModifier(false);
-        this.resetCaptureField();
-        return;
-      }
-      // Alt modifier: prefix next typed character with ESC
-      if (
-        this._altModifier &&
-        typed &&
-        this._sessionId !== null &&
-        this.status === "connected"
-      ) {
-        const char = typed[0];
-        const charCode = char.charCodeAt(0);
-        this.sendInput(this._sessionId, new Uint8Array([0x1b, charCode]));
-        this.setAltModifier(false);
-        this.resetCaptureField();
-        return;
-      }
       if (inputEvent.inputType === "deleteContentBackward" && !typed) {
         if (this._sessionId !== null && this.status === "connected") {
-          this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+          this.sendSyntheticKey("Backspace");
         }
       } else if (typed) {
         this.sendTypedText(typed, inputEvent.inputType === "insertFromPaste");
@@ -3050,6 +2992,41 @@ export class YasTerminalSurface {
     };
 
     input.addEventListener("keydown", this.boundKeyDown);
+    this.boundKeyUp = (e: KeyboardEvent) => {
+      if (
+        this._readOnly ||
+        this._sessionId === null ||
+        this.status !== "connected"
+      )
+        return;
+      const bytes = this.keyboard.encode(
+        e,
+        this.terminal?.app_cursor() ?? false,
+        this.keyboardFlags(),
+      );
+      if (bytes?.length) {
+        e.preventDefault();
+        this.sendInput(this._sessionId, bytes);
+      }
+    };
+    this.boundKeyboardBlur = () => {
+      const bytes = this.keyboard.release(this.keyboardFlags());
+      if (
+        bytes?.length &&
+        this._sessionId !== null &&
+        this.status === "connected"
+      )
+        this.sendInput(this._sessionId, bytes);
+    };
+    this.boundKeyboardVisibility = () => {
+      if (document.hidden) this.boundKeyboardBlur?.();
+    };
+    input.addEventListener("keyup", this.boundKeyUp);
+    input.addEventListener("blur", this.boundKeyboardBlur);
+    input.addEventListener("focus", refreshKeyboardLayout);
+    window.addEventListener("blur", this.boundKeyboardBlur);
+    document.addEventListener("visibilitychange", this.boundKeyboardVisibility);
+    void refreshKeyboardLayout();
     input.addEventListener("compositionstart", this.boundCompositionStart);
     input.addEventListener("compositionend", this.boundCompositionEnd);
     input.addEventListener("input", this.boundInput);
@@ -3061,6 +3038,22 @@ export class YasTerminalSurface {
   private teardownKeyboard(): void {
     const input = this.inputEl;
     if (!input) return;
+    this.boundKeyboardBlur?.();
+    if (this.boundKeyUp) input.removeEventListener("keyup", this.boundKeyUp);
+    if (this.boundKeyboardBlur) {
+      input.removeEventListener("blur", this.boundKeyboardBlur);
+      window.removeEventListener("blur", this.boundKeyboardBlur);
+    }
+    if (this.boundKeyboardVisibility)
+      document.removeEventListener(
+        "visibilitychange",
+        this.boundKeyboardVisibility,
+      );
+    input.removeEventListener("focus", refreshKeyboardLayout);
+    this.boundKeyUp =
+      this.boundKeyboardBlur =
+      this.boundKeyboardVisibility =
+        null;
     if (this.boundKeyDown)
       input.removeEventListener("keydown", this.boundKeyDown);
     if (this.boundCompositionStart)
@@ -3089,8 +3082,8 @@ export class YasTerminalSurface {
   // --- Ctrl+V image paste ---------------------------------------------------
 
   /** Arm the Ctrl+V deferral: don't send ^V yet, wait for the `paste` event
-   *  to forward any clipboard image first.  A fallback timer sends the raw
-   *  ^V if no paste event materialises (empty clipboard, denied permission,
+   *  to forward any clipboard image first. A fallback timer sends Ctrl+V
+   *  using the negotiated keyboard mode if no paste event materialises (empty clipboard, denied permission,
    *  or a browser that won't fire paste without content) so quoted-insert and
    *  app paste-triggers still work. */
   private beginCtrlVPaste(): void {
@@ -3120,7 +3113,7 @@ export class YasTerminalSurface {
   private sendCtrlV(): void {
     if (this._readOnly) return;
     if (this._sessionId === null || this.status !== "connected") return;
-    this.sendInput(this._sessionId, new Uint8Array([CTRL_V]));
+    this.sendSyntheticKey("v", "KeyV", false, true);
   }
 
   /** Find the first image entry on a clipboard payload, if any. */
@@ -3193,7 +3186,7 @@ export class YasTerminalSurface {
             this.status !== "connected"
           )
             return;
-          this.sendInput(sid, new Uint8Array([CTRL_V]));
+          this.sendCtrlV();
         })
         .catch((error) =>
           console.warn("YAS: failed to publish clipboard image", error),
@@ -3240,7 +3233,7 @@ export class YasTerminalSurface {
     const oldValue = this._androidCompositionValue;
 
     if (inputEvent.inputType === "deleteContentBackward" && !value) {
-      this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+      this.sendSyntheticKey("Backspace");
       this._androidCompositionValue = value;
       return;
     }
@@ -3263,11 +3256,7 @@ export class YasTerminalSurface {
       value.startsWith(oldValue) &&
       value.length > oldValue.length
     ) {
-      const char = value.slice(oldValue.length)[0];
-      const bytes = this._ctrlModifier
-        ? ctrlCharToByte(char)
-        : new Uint8Array([0x1b, char.charCodeAt(0)]);
-      if (bytes) this.sendInput(this._sessionId, bytes);
+      this.sendTypedText(value.slice(oldValue.length), false);
       this.setCtrlModifier(false);
       this.setAltModifier(false);
       this._androidCompositionValue = "";
@@ -3278,27 +3267,21 @@ export class YasTerminalSurface {
     if (value.startsWith(oldValue)) {
       const added = value.slice(oldValue.length);
       if (added) {
-        this.sendInput(
-          this._sessionId,
-          encoder.encode(added.replace(/\n/g, "\r")),
-        );
+        this.sendTypedText(added, false);
       }
     } else if (oldValue.startsWith(value)) {
       const deleted = oldValue.length - value.length;
       for (let i = 0; i < deleted; i++) {
-        this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+        this.sendSyntheticKey("Backspace");
       }
     } else {
       // Replacement (autocorrect/suggestion).  Delete what we previously
       // forwarded and send the new value.
       for (let i = 0; i < oldValue.length; i++) {
-        this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+        this.sendSyntheticKey("Backspace");
       }
       if (value) {
-        this.sendInput(
-          this._sessionId,
-          encoder.encode(value.replace(/\n/g, "\r")),
-        );
+        this.sendTypedText(value, false);
       }
     }
 
@@ -4525,12 +4508,65 @@ export class YasTerminalSurface {
     this._workspace?.sendInput(sessionId, data);
   }
 
+  private keyboardFlags(): number {
+    return this.terminal?.keyboard_flags?.() ?? 0;
+  }
+
+  private sendSyntheticKey(
+    key: string,
+    code = key,
+    shiftKey = false,
+    ctrlKey = false,
+    altKey = false,
+    metaKey = false,
+  ): void {
+    if (
+      this._readOnly ||
+      this._sessionId === null ||
+      this.status !== "connected"
+    )
+      return;
+    const flags = this.keyboardFlags();
+    const init = {
+      key,
+      code,
+      shiftKey,
+      ctrlKey: ctrlKey || this._ctrlModifier,
+      altKey: altKey || this._altModifier,
+      metaKey,
+    };
+    const down = keyToBytes(
+      new KeyboardEvent("keydown", init),
+      this.terminal?.app_cursor() ?? false,
+      flags,
+    );
+    const up = keyToBytes(
+      new KeyboardEvent("keyup", init),
+      this.terminal?.app_cursor() ?? false,
+      flags,
+    );
+    if (down) this.sendInput(this._sessionId, down);
+    if (down && up) this.sendInput(this._sessionId, up);
+  }
+
   /** Forward text the user typed or pasted, bracketing a paste when the app
    *  asked for it.  Newlines are carriage returns on a terminal. */
   private sendTypedText(text: string, isPaste: boolean): void {
     if (!text || this._sessionId === null || this.status !== "connected")
       return;
-    const payload = encoder.encode(text.replace(/\n/g, "\r"));
+    if (!isPaste && (this._ctrlModifier || this._altModifier)) {
+      const [first, ...rest] = Array.from(text);
+      this.sendSyntheticKey(first === "\n" || first === "\r" ? "Enter" : first);
+      this.setCtrlModifier(false);
+      this.setAltModifier(false);
+      if (rest.length) this.sendTypedText(rest.join(""), false);
+      return;
+    }
+    const payload = encoder.encode(
+      isPaste
+        ? text.replace(/\n/g, "\r")
+        : encodeTerminalText(text, this.keyboardFlags()),
+    );
     const t = this.terminal;
     if (isPaste && t && t.bracketed_paste()) {
       const open = encoder.encode("\x1b[200~");

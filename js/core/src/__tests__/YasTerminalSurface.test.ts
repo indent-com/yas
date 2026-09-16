@@ -697,7 +697,10 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
     expect(sendClipboard).toHaveBeenCalledTimes(1);
     expect(sendClipboard).toHaveBeenCalledWith("image/png", bytes);
     expect(sendInput).toHaveBeenCalledTimes(1);
-    expect(sendInput).toHaveBeenCalledWith("s1", new Uint8Array([0x16]));
+    expect(sendInput.mock.calls.at(-1)?.[0]).toBe("s1");
+    expect(Array.from(sendInput.mock.calls.at(-1)?.[1] as Uint8Array)).toEqual([
+      0x16,
+    ]);
     // The clipboard must be populated server-side before ^V reaches the app.
     expect(sendClipboard.mock.invocationCallOrder[0]).toBeLessThan(
       sendInput.mock.invocationCallOrder[0],
@@ -723,7 +726,10 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
 
     commit();
     await paste;
-    expect(sendInput).toHaveBeenCalledWith("s1", new Uint8Array([0x16]));
+    expect(sendInput.mock.calls.at(-1)?.[0]).toBe("s1");
+    expect(Array.from(sendInput.mock.calls.at(-1)?.[1] as Uint8Array)).toEqual([
+      0x16,
+    ]);
   });
 
   it("does not send ^V when publishing an image Selection fails", async () => {
@@ -883,7 +889,7 @@ describe("YasTerminalSurface Ctrl+Shift+V paste shortcut", () => {
   });
 });
 
-describe("YasTerminalSurface mobile toolbar modifiers", () => {
+describe("YasTerminalSurface keyboard modifiers", () => {
   beforeEach(() => {
     mockCanvasContext();
   });
@@ -905,6 +911,80 @@ describe("YasTerminalSurface mobile toolbar modifiers", () => {
     s["setupKeyboard"]();
     return { s, input };
   }
+
+  it("forwards enhanced press, repeat and release, with blur cleanup", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attachKeyboard(sendInput);
+    // @ts-expect-error — only the keyboard modes are needed.
+    s["terminal"] = {
+      keyboard_flags: () => 11,
+      app_cursor: () => false,
+      alt_screen: () => false,
+      echo: () => false,
+    };
+    const init = {
+      key: "Enter",
+      code: "Enter",
+      shiftKey: true,
+      cancelable: true,
+    };
+    input.dispatchEvent(new KeyboardEvent("keydown", init));
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { ...init, repeat: true }),
+    );
+    input.dispatchEvent(new KeyboardEvent("keyup", init));
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "a", code: "KeyA" }),
+    );
+    input.dispatchEvent(new Event("blur"));
+    input.dispatchEvent(new KeyboardEvent("keyup", { key: "a", code: "KeyA" }));
+    expect(
+      sendInput.mock.calls.map((call) => new TextDecoder().decode(call[1])),
+    ).toEqual([
+      "\x1b[13;2u",
+      "\x1b[13;2:2u",
+      "\x1b[13;2:3u",
+      "\x1b[97u",
+      "\x1b[97;1:3u",
+    ]);
+    s["teardownKeyboard"]();
+  });
+
+  it("forwards Ctrl+Enter separately from Enter", () => {
+    const sendInput = vi.fn();
+    const { input } = attachKeyboard(sendInput);
+    for (const ctrlKey of [true, false]) {
+      const event = new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        ctrlKey,
+        cancelable: true,
+      });
+      input.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+    }
+    expect(
+      sendInput.mock.calls.map((call) => new TextDecoder().decode(call[1])),
+    ).toEqual(["\x1b[13;5u", "\r"]);
+  });
+
+  it("consumes one-shot Ctrl on Enter without affecting the next Enter", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attachKeyboard(sendInput);
+    s.setCtrlModifier(true);
+    for (let i = 0; i < 2; i++) {
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          cancelable: true,
+        }),
+      );
+      expect(s.ctrlModifier).toBe(false);
+    }
+    expect(
+      sendInput.mock.calls.map((call) => new TextDecoder().decode(call[1])),
+    ).toEqual(["\x1b[13;5u", "\r"]);
+  });
 
   it("applies one-shot Ctrl to an arrow key", () => {
     const sendInput = vi.fn();
@@ -1007,6 +1087,24 @@ describe("YasTerminalSurface Ctrl+V image paste", () => {
     input.dispatchEvent(ev);
     return ev;
   }
+
+  it("preserves Ctrl+V paste deferral in enhanced keyboard mode", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attach(sendInput);
+    // @ts-expect-error — only keyboard modes are needed.
+    s["terminal"] = { keyboard_flags: () => 11, app_cursor: () => false };
+    const init = { key: "v", code: "KeyV", ctrlKey: true, cancelable: true };
+    const down = new KeyboardEvent("keydown", init);
+    input.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(false);
+    expect(sendInput).not.toHaveBeenCalled();
+    firePaste(input, null);
+    input.dispatchEvent(new KeyboardEvent("keyup", init));
+    expect(
+      sendInput.mock.calls.map((call) => new TextDecoder().decode(call[1])),
+    ).toEqual(["\x1b[118;5u", "\x1b[118;5:3u"]);
+    s["teardownKeyboard"]();
+  });
 
   it("sends bracketed Cmd+V text without waiting for another input", () => {
     const sendInput = vi.fn();

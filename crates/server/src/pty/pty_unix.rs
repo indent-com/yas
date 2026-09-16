@@ -849,20 +849,16 @@ fn status_from_wstatus(wstatus: libc::c_int) -> i32 {
     }
 }
 
-/// Answer terminal queries found in `data`; returns the last OSC 7
-/// working-directory report seen in the chunk, if any (docs/protocol.md,
-/// "Working directory tracking").
+/// Emit parser-owned keyboard replies before the legacy query responses.
 pub fn respond_to_queries(
     handle: &PtyHandle,
-    data: &[u8],
-    size: (u16, u16),
-    cursor: (u16, u16),
-) -> crate::TerminalScan {
-    let mut scan = crate::parse_terminal_queries(data, size, cursor);
+    scan: &mut crate::TerminalScan,
+    keyboard_replies: &[u8],
+) {
+    pty_write_all(handle.master_fd, keyboard_replies);
     for resp in std::mem::take(&mut scan.responses) {
         pty_write_all(handle.master_fd, resp.as_bytes());
     }
-    scan
 }
 
 pub fn pty_reader(
@@ -1296,6 +1292,27 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn kitty_detection_reply_precedes_device_attributes_barrier() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (mut reader, writer) = os_pipe::pipe().unwrap();
+        let handle = PtyHandle {
+            master_fd: writer.as_raw_fd(),
+            child_pid: -1,
+        };
+        let mut driver = yas_terminal_driver::TerminalDriver::new(24, 80, 0);
+        let mut scan = crate::parse_terminal_queries(b"\x1b[?u\x1b[c", (24, 80), (0, 0));
+        let expected = [b"\x1b[?0u".as_slice(), scan.responses.concat().as_bytes()].concat();
+        driver.process(b"\x1b[?u\x1b[c");
+        super::respond_to_queries(&handle, &mut scan, &driver.take_keyboard_replies());
+        drop(writer);
+        let mut replies = Vec::new();
+        reader.read_to_end(&mut replies).unwrap();
+        assert_eq!(replies, expected);
+        assert!(scan.responses.is_empty());
+    }
 
     #[tokio::test]
     async fn retired_reader_cannot_consume_reused_descriptor_output() {

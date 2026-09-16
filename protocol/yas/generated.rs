@@ -283,6 +283,7 @@ pub const GRID_FILL_RECT: u64 = 4;
 pub const COMPONENT_LINE_FLAGS: u64 = 0;
 pub const COMPONENT_OVERFLOW_STRINGS: u64 = 1;
 pub const COMPONENT_HYPERLINKS: u64 = 2;
+pub const COMPONENT_KEYBOARD_FLAGS: u64 = 3;
 pub const COMPONENT_REQUIRED: u64 = 1;
 pub const CELL_BYTES: u64 = 12;
 pub const MAX_ULEB32_BYTES: u64 = 5;
@@ -297,6 +298,7 @@ super::super::ConstantMetadata { name: "GRID_FILL_RECT", value: 4 },
 super::super::ConstantMetadata { name: "COMPONENT_LINE_FLAGS", value: 0 },
 super::super::ConstantMetadata { name: "COMPONENT_OVERFLOW_STRINGS", value: 1 },
 super::super::ConstantMetadata { name: "COMPONENT_HYPERLINKS", value: 2 },
+super::super::ConstantMetadata { name: "COMPONENT_KEYBOARD_FLAGS", value: 3 },
 super::super::ConstantMetadata { name: "COMPONENT_REQUIRED", value: 1 },
 super::super::ConstantMetadata { name: "CELL_BYTES", value: 12 },
 super::super::ConstantMetadata { name: "MAX_ULEB32_BYTES", value: 5 },
@@ -745,6 +747,7 @@ pub const GRID_FILL_RECT: u64 = super::packed_codec::terminal_grid_codec_v1::GRI
 pub const COMPONENT_LINE_FLAGS: u64 = super::packed_codec::terminal_grid_codec_v1::COMPONENT_LINE_FLAGS;
 pub const COMPONENT_OVERFLOW_STRINGS: u64 = super::packed_codec::terminal_grid_codec_v1::COMPONENT_OVERFLOW_STRINGS;
 pub const COMPONENT_HYPERLINKS: u64 = super::packed_codec::terminal_grid_codec_v1::COMPONENT_HYPERLINKS;
+pub const COMPONENT_KEYBOARD_FLAGS: u64 = super::packed_codec::terminal_grid_codec_v1::COMPONENT_KEYBOARD_FLAGS;
 pub const COMPONENT_REQUIRED: u64 = super::packed_codec::terminal_grid_codec_v1::COMPONENT_REQUIRED;
 pub const CELL_BYTES: u64 = super::packed_codec::terminal_grid_codec_v1::CELL_BYTES;
 pub const MAX_ULEB32_BYTES: u64 = super::packed_codec::terminal_grid_codec_v1::MAX_ULEB32_BYTES;
@@ -984,6 +987,7 @@ super::ConstantMetadata { name: "GRID_FILL_RECT", value: super::packed_codec::te
 super::ConstantMetadata { name: "COMPONENT_LINE_FLAGS", value: super::packed_codec::terminal_grid_codec_v1::COMPONENT_LINE_FLAGS },
 super::ConstantMetadata { name: "COMPONENT_OVERFLOW_STRINGS", value: super::packed_codec::terminal_grid_codec_v1::COMPONENT_OVERFLOW_STRINGS },
 super::ConstantMetadata { name: "COMPONENT_HYPERLINKS", value: super::packed_codec::terminal_grid_codec_v1::COMPONENT_HYPERLINKS },
+super::ConstantMetadata { name: "COMPONENT_KEYBOARD_FLAGS", value: super::packed_codec::terminal_grid_codec_v1::COMPONENT_KEYBOARD_FLAGS },
 super::ConstantMetadata { name: "COMPONENT_REQUIRED", value: super::packed_codec::terminal_grid_codec_v1::COMPONENT_REQUIRED },
 super::ConstantMetadata { name: "CELL_BYTES", value: super::packed_codec::terminal_grid_codec_v1::CELL_BYTES },
 super::ConstantMetadata { name: "MAX_ULEB32_BYTES", value: super::packed_codec::terminal_grid_codec_v1::MAX_ULEB32_BYTES },
@@ -5113,4 +5117,5 @@ GoldenVector { name: "packed_codec.surface-h264-v1.logical_dimensions.payload", 
 GoldenVector { name: "packed_codec.surface-png-v1.payload", hex: "0000000089504e470d0a1a0a" },
 GoldenVector { name: "packed_codec.surface-png-v1.logical_dimensions.payload", hex: "010000000400000008000000900100002c01000089504e470d0a1a0a" },
 GoldenVector { name: "packed_codec.terminal-grid-v1.payload", hex: "01000100000000000000000000000000000000000000000000" },
+GoldenVector { name: "packed_codec.terminal-grid-v1.keyboard_flags.payload", hex: "01000100000000000000000000000000000000000000000000010300011f" },
 ];

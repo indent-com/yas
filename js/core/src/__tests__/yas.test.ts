@@ -141,6 +141,7 @@ import {
   YAS_TERMINAL_FRAME_CHUNK,
   YAS_TERMINAL_GRID_CODEC_V1,
   YAS_TERMINAL_GOLDEN_FRAME_FLAGS,
+  YAS_TERMINAL_FRAME_COMPONENTS,
   YAS_TERMINAL_OPEN_VIEW,
   YAS_TERMINAL_STATE,
   YAS_TERMINAL_STATE_ACK,
@@ -2375,6 +2376,19 @@ describe("YAS v1", () => {
       YAS_TERMINAL_GOLDEN_FRAME_FLAGS,
     );
     matches("packed_codec.terminal-grid-v1.payload", packedTerminal);
+    const keyboardGrid = fromHex(
+      vector("packed_codec.terminal-grid-v1.keyboard_flags.payload"),
+    );
+    expect(
+      validateTerminalGridCodecPayload(
+        keyboardGrid,
+        YAS_TERMINAL_GOLDEN_FRAME_FLAGS | YAS_TERMINAL_FRAME_COMPONENTS,
+      ).keyboardFlags,
+    ).toBe(31);
+    matches(
+      "packed_codec.terminal-grid-v1.keyboard_flags.payload",
+      keyboardGrid,
+    );
     const fullPayloadNames = YAS_GOLDEN_VECTORS.vectors
       .map((entry) => entry.name)
       .filter((name) => name.endsWith(".payload"));

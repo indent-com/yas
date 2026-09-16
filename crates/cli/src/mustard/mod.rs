@@ -1,16 +1,21 @@
 mod channel;
+mod keyboard;
 mod model;
 mod ui;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{IsTerminal, stdout};
 use std::time::Duration;
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+#[cfg(unix)]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -77,6 +82,8 @@ struct App {
     resizing_events: bool,
     pub help_open: bool,
     pub terminal_focus: bool,
+    terminal_keys: BTreeMap<u32, keyboard::Key>,
+    terminal_key_flags: u8,
     pub terminal_handle: Option<u64>,
     pub terminal_grid: Option<GridState>,
     pub terminal_error: Option<String>,
@@ -101,6 +108,8 @@ impl App {
             resizing_events: false,
             help_open: false,
             terminal_focus: false,
+            terminal_keys: BTreeMap::new(),
+            terminal_key_flags: 0,
             terminal_handle: None,
             terminal_grid: None,
             terminal_error: None,
@@ -389,7 +398,31 @@ impl App {
         }
     }
 
+    async fn release_terminal_keys(&mut self) {
+        let flags = self
+            .terminal_grid
+            .as_ref()
+            .map_or(0, |grid| grid.keyboard_flags);
+        let keys = std::mem::take(&mut self.terminal_keys);
+        if flags != self.terminal_key_flags {
+            return;
+        }
+        let mut bytes = Vec::new();
+        for (_, mut key) in keys {
+            key.event_type = 3;
+            key.modifiers = 0;
+            key.text.clear();
+            if let Some(encoded) = keyboard::encode(&key, flags, false) {
+                bytes.extend(encoded);
+            }
+        }
+        if !bytes.is_empty() {
+            self.send_terminal(bytes).await;
+        }
+    }
+
     async fn close_view(&mut self) {
+        self.release_terminal_keys().await;
         let Some(mut view) = self.view.take() else {
             return;
         };
@@ -406,6 +439,9 @@ impl App {
         if focused && self.terminal_handle.is_none() {
             self.notice = "selected item has no terminal".into();
             return;
+        }
+        if !focused {
+            self.release_terminal_keys().await;
         }
         self.terminal_focus = focused;
         if let Some(view) = &self.view {
@@ -504,10 +540,19 @@ pub(crate) async fn run(on: Option<&str>, hub: &str) -> Result<(), String> {
         EnterAlternateScreen,
         EnableBracketedPaste,
         EnableMouseCapture,
+        EnableFocusChange,
         Clear(ClearType::All),
         MoveTo(0, 0)
     )
     .map_err(|error| format!("cannot enter alternate screen: {error}"))?;
+    #[cfg(unix)]
+    execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::from_bits_retain(
+            keyboard::CAPTURE_FLAGS
+        ))
+    )
+    .map_err(|error| format!("cannot enable disambiguated keys: {error}"))?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)
         .map_err(|error| format!("cannot initialize terminal UI: {error}"))?;
@@ -515,11 +560,33 @@ pub(crate) async fn run(on: Option<&str>, hub: &str) -> Result<(), String> {
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut running = true;
+    #[cfg(unix)]
+    let mut capture_flags = keyboard::CAPTURE_FLAGS;
     while running {
         let area = terminal
             .size()
             .map_err(|error| format!("cannot read terminal size: {error}"))?;
         app.sync_view(area.into()).await;
+        #[cfg(unix)]
+        {
+            let flags = keyboard::CAPTURE_FLAGS
+                | if app.terminal_focus {
+                    app.terminal_grid
+                        .as_ref()
+                        .map_or(0, |grid| grid.keyboard_flags & 8)
+                } else {
+                    0
+                };
+            if flags != capture_flags {
+                execute!(
+                    stdout(),
+                    PopKeyboardEnhancementFlags,
+                    PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::from_bits_retain(flags))
+                )
+                .map_err(|error| format!("cannot update keyboard reporting: {error}"))?;
+                capture_flags = flags;
+            }
+        }
         terminal
             .draw(|frame| ui::draw(frame, &app))
             .map_err(|error| format!("cannot draw terminal UI: {error}"))?;
@@ -537,8 +604,11 @@ pub(crate) async fn run(on: Option<&str>, hub: &str) -> Result<(), String> {
             _ = tick.tick() => Next::Tick,
         };
         match next {
-            Next::Input(Some(Ok(Event::Key(key)))) if key.kind != KeyEventKind::Release => {
+            Next::Input(Some(Ok(Event::Key(key)))) => {
                 running = handle_key(&mut app, key).await;
+            }
+            Next::Input(Some(Ok(Event::FocusLost))) => {
+                app.release_terminal_keys().await;
             }
             Next::Input(Some(Ok(Event::Mouse(mouse)))) => {
                 handle_mouse(&mut app, area.into(), mouse).await;
@@ -695,13 +765,25 @@ async fn handle_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.kind == KeyEventKind::Release && (!app.terminal_focus || app.help_open) {
+        return true;
+    }
     if app.help_open {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
             app.help_open = false;
         }
         return true;
     }
-    let shifted = key.modifiers == KeyModifiers::SHIFT;
+    let flags = app
+        .terminal_grid
+        .as_ref()
+        .map_or(0, |grid| grid.keyboard_flags);
+    let app_cursor = app
+        .terminal_grid
+        .as_ref()
+        .is_some_and(|grid| grid.modes & 2 != 0);
+    let shifted =
+        key.kind != KeyEventKind::Release && flags == 0 && key.modifiers == KeyModifiers::SHIFT;
     if shifted || (!app.terminal_focus && key.modifiers.is_empty()) {
         let page = i64::from(app.terminal_size.1.saturating_sub(1).max(1));
         let scroll = match key.code {
@@ -717,10 +799,39 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
     }
     if app.terminal_focus {
-        let bytes = terminal_key(key);
-        if bytes.as_deref() == Some(&[0x1d]) {
+        if key.kind != KeyEventKind::Release
+            && key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
+        {
             app.set_terminal_focus(false).await;
-        } else if let Some(bytes) = bytes {
+            return true;
+        }
+        if app.terminal_key_flags != flags {
+            app.terminal_keys.clear();
+            app.terminal_key_flags = flags;
+        }
+        let Some(mut input) = keyboard::from_event(key) else {
+            return true;
+        };
+        if key.kind == KeyEventKind::Release {
+            if app.terminal_keys.remove(&input.key).is_none() {
+                return true;
+            }
+            if (57441..=57452).contains(&input.key) {
+                let twin = if input.key < 57447 {
+                    input.key + 6
+                } else {
+                    input.key - 6
+                };
+                if app.terminal_keys.contains_key(&twin) {
+                    input.modifiers |= keyboard::modifier_bit(input.key);
+                }
+            }
+        }
+        if let Some(bytes) = keyboard::encode(&input, flags, app_cursor) {
+            if flags & 2 != 0 && key.kind != KeyEventKind::Release {
+                app.terminal_keys.insert(input.key, input);
+            }
             app.send_terminal(bytes).await;
         }
         return true;
@@ -753,70 +864,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-fn terminal_key(key: KeyEvent) -> Option<Vec<u8>> {
-    let mut bytes = match key.code {
-        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let value = match character {
-                ' ' | '@' => 0,
-                'a'..='z' => character as u8 - b'a' + 1,
-                'A'..='Z' => character as u8 - b'A' + 1,
-                '[' => 27,
-                '\\' => 28,
-                ']' => 29,
-                '^' => 30,
-                '_' => 31,
-                // Crossterm normalizes input bytes 0x1c..=0x1f to Ctrl-4..=Ctrl-7.
-                // This includes the byte emitted by Ctrl-] (Ctrl-5 / 0x1d).
-                '4'..='7' => character as u8 - b'4' + 28,
-                '?' => 127,
-                _ => return None,
-            };
-            vec![value]
-        }
-        KeyCode::Char(character) => {
-            let mut buffer = [0; 4];
-            character.encode_utf8(&mut buffer).as_bytes().to_vec()
-        }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::F(number) => function_key(number)?.to_vec(),
-        _ => return None,
-    };
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        bytes.insert(0, 0x1b);
-    }
-    Some(bytes)
-}
-
-fn function_key(number: u8) -> Option<&'static [u8]> {
-    Some(match number {
-        1 => b"\x1bOP",
-        2 => b"\x1bOQ",
-        3 => b"\x1bOR",
-        4 => b"\x1bOS",
-        5 => b"\x1b[15~",
-        6 => b"\x1b[17~",
-        7 => b"\x1b[18~",
-        8 => b"\x1b[19~",
-        9 => b"\x1b[20~",
-        10 => b"\x1b[21~",
-        11 => b"\x1b[23~",
-        12 => b"\x1b[24~",
-        _ => return None,
-    })
+#[cfg(test)]
+fn terminal_key(key: KeyEvent, flags: u8, app_cursor: bool) -> Option<Vec<u8>> {
+    let key = keyboard::from_event(key)?;
+    keyboard::encode(&key, flags, app_cursor)
 }
 
 async fn receive_view(
@@ -914,9 +965,12 @@ struct ScreenGuard;
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        #[cfg(unix)]
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(
             stdout(),
             DisableMouseCapture,
+            DisableFocusChange,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -1038,25 +1092,72 @@ mod tests {
     }
 
     #[test]
+    fn terminal_keys_distinguish_control_enter() {
+        for (modifiers, expected) in [
+            (KeyModifiers::NONE, b"\r".as_slice()),
+            (KeyModifiers::SHIFT, b"\r".as_slice()),
+            (KeyModifiers::ALT, b"\x1b\r".as_slice()),
+            (KeyModifiers::CONTROL, b"\x1b[13;5u".as_slice()),
+            (
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                b"\x1b[13;6u".as_slice(),
+            ),
+            (
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                b"\x1b[13;7u".as_slice(),
+            ),
+            (
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+                b"\x1b[13;8u".as_slice(),
+            ),
+            (
+                KeyModifiers::CONTROL | KeyModifiers::SUPER,
+                b"\x1b[13;13u".as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                terminal_key(KeyEvent::new(KeyCode::Enter, modifiers), 0, false),
+                Some(expected.to_vec())
+            );
+        }
+    }
+
+    #[test]
     fn terminal_keys_encode_control_and_navigation() {
         assert_eq!(
-            terminal_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            terminal_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                0,
+                false
+            ),
             Some(vec![3])
         );
         assert_eq!(
-            terminal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            terminal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 0, false),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            terminal_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+            terminal_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+                0,
+                false
+            ),
             Some(b"\x1bx".to_vec())
         );
         assert_eq!(
-            terminal_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)),
+            terminal_key(
+                KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL),
+                0,
+                false
+            ),
             Some(vec![0x1d])
         );
         assert_eq!(
-            terminal_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            terminal_key(
+                KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+                0,
+                false
+            ),
             Some(vec![0x1d])
         );
     }

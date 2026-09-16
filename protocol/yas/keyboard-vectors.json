@@ -1,0 +1,865 @@
+[
+  {
+    "name": "legacy Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\r"
+  },
+  {
+    "name": "legacy Ctrl Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001b[13;5u"
+  },
+  {
+    "name": "legacy Alt Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 2,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001b\r"
+  },
+  {
+    "name": "legacy Ctrl C",
+    "input": {
+      "key": 99,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u0003"
+  },
+  {
+    "name": "legacy Ctrl Alt C",
+    "input": {
+      "key": 99,
+      "modifiers": 6,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001b\u0003"
+  },
+  {
+    "name": "legacy Ctrl Space",
+    "input": {
+      "key": 32,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u0000"
+  },
+  {
+    "name": "legacy Ctrl Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\b"
+  },
+  {
+    "name": "legacy Alt Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 2,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001b"
+  },
+  {
+    "name": "legacy Shift Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001b[Z"
+  },
+  {
+    "name": "legacy Ctrl Shift A",
+    "input": {
+      "key": 97,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001b[97;6u"
+  },
+  {
+    "name": "legacy unicode",
+    "input": {
+      "key": 128512,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": "😀"
+    },
+    "flags": 0,
+    "expected": "😀"
+  },
+  {
+    "name": "enhanced 1 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;2u"
+  },
+  {
+    "name": "enhanced 2 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 2,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;3u"
+  },
+  {
+    "name": "enhanced 4 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;5u"
+  },
+  {
+    "name": "enhanced 5 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;6u"
+  },
+  {
+    "name": "enhanced 6 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 6,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;7u"
+  },
+  {
+    "name": "enhanced 7 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 7,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;8u"
+  },
+  {
+    "name": "enhanced 8 Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 8,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13;9u"
+  },
+  {
+    "name": "enhanced 1 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;2u"
+  },
+  {
+    "name": "enhanced 2 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 2,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;3u"
+  },
+  {
+    "name": "enhanced 4 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;5u"
+  },
+  {
+    "name": "enhanced 5 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;6u"
+  },
+  {
+    "name": "enhanced 6 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 6,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;7u"
+  },
+  {
+    "name": "enhanced 7 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 7,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;8u"
+  },
+  {
+    "name": "enhanced 8 Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 8,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[9;9u"
+  },
+  {
+    "name": "enhanced 1 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;2u"
+  },
+  {
+    "name": "enhanced 2 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 2,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;3u"
+  },
+  {
+    "name": "enhanced 4 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;5u"
+  },
+  {
+    "name": "enhanced 5 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;6u"
+  },
+  {
+    "name": "enhanced 6 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 6,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;7u"
+  },
+  {
+    "name": "enhanced 7 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 7,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;8u"
+  },
+  {
+    "name": "enhanced 8 Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 8,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[127;9u"
+  },
+  {
+    "name": "enhanced 1 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;2u"
+  },
+  {
+    "name": "enhanced 2 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 2,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;3u"
+  },
+  {
+    "name": "enhanced 4 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;5u"
+  },
+  {
+    "name": "enhanced 5 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;6u"
+  },
+  {
+    "name": "enhanced 6 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 6,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;7u"
+  },
+  {
+    "name": "enhanced 7 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 7,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;8u"
+  },
+  {
+    "name": "enhanced 8 Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 8,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27;9u"
+  },
+  {
+    "name": "enhanced bare Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\r"
+  },
+  {
+    "name": "enhanced bare Tab",
+    "input": {
+      "key": 9,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\t"
+  },
+  {
+    "name": "enhanced bare Backspace",
+    "input": {
+      "key": 127,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": ""
+  },
+  {
+    "name": "enhanced Escape",
+    "input": {
+      "key": 27,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[27u"
+  },
+  {
+    "name": "Ctrl I",
+    "input": {
+      "key": 105,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[105;5u"
+  },
+  {
+    "name": "Ctrl M",
+    "input": {
+      "key": 109,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[109;5u"
+  },
+  {
+    "name": "Ctrl bracket",
+    "input": {
+      "key": 91,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[91;5u"
+  },
+  {
+    "name": "Ctrl Alt C",
+    "input": {
+      "key": 99,
+      "modifiers": 6,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[99;7u"
+  },
+  {
+    "name": "Ctrl Shift C",
+    "input": {
+      "key": 99,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[99;6u"
+  },
+  {
+    "name": "plain shifted text",
+    "input": {
+      "key": 97,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": "A"
+    },
+    "flags": 1,
+    "expected": "A"
+  },
+  {
+    "name": "numpad Enter",
+    "input": {
+      "key": 57414,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[57414;5u"
+  },
+  {
+    "name": "legacy numpad Enter",
+    "input": {
+      "key": 57414,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\r"
+  },
+  {
+    "name": "numpad digit",
+    "input": {
+      "key": 57400,
+      "modifiers": 128,
+      "eventType": 1,
+      "text": "1"
+    },
+    "flags": 1,
+    "expected": "\u001b[57400;129u"
+  },
+  {
+    "name": "enhanced F3",
+    "input": {
+      "key": 57366,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[13~"
+  },
+  {
+    "name": "legacy F3",
+    "input": {
+      "key": 57366,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 0,
+    "expected": "\u001bOR"
+  },
+  {
+    "name": "arrow repeat",
+    "input": {
+      "key": 57352,
+      "modifiers": 4,
+      "eventType": 2,
+      "text": ""
+    },
+    "flags": 3,
+    "expected": "\u001b[1;5:2A"
+  },
+  {
+    "name": "arrow release",
+    "input": {
+      "key": 57352,
+      "modifiers": 4,
+      "eventType": 3,
+      "text": ""
+    },
+    "flags": 3,
+    "expected": "\u001b[1;5:3A"
+  },
+  {
+    "name": "no release without flag",
+    "input": {
+      "key": 99,
+      "modifiers": 4,
+      "eventType": 3,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": null
+  },
+  {
+    "name": "no bare Enter release without all",
+    "input": {
+      "key": 13,
+      "modifiers": 0,
+      "eventType": 3,
+      "text": ""
+    },
+    "flags": 3,
+    "expected": null
+  },
+  {
+    "name": "Ctrl C release",
+    "input": {
+      "key": 99,
+      "modifiers": 4,
+      "eventType": 3,
+      "text": ""
+    },
+    "flags": 3,
+    "expected": "\u001b[99;5:3u"
+  },
+  {
+    "name": "Ctrl C repeat",
+    "input": {
+      "key": 99,
+      "modifiers": 4,
+      "eventType": 2,
+      "text": ""
+    },
+    "flags": 3,
+    "expected": "\u001b[99;5:2u"
+  },
+  {
+    "name": "all Enter",
+    "input": {
+      "key": 13,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 8,
+    "expected": "\u001b[13u"
+  },
+  {
+    "name": "all Enter release",
+    "input": {
+      "key": 13,
+      "modifiers": 0,
+      "eventType": 3,
+      "text": ""
+    },
+    "flags": 10,
+    "expected": "\u001b[13;1:3u"
+  },
+  {
+    "name": "all letter",
+    "input": {
+      "key": 97,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": "a"
+    },
+    "flags": 8,
+    "expected": "\u001b[97u"
+  },
+  {
+    "name": "all letter text",
+    "input": {
+      "key": 97,
+      "modifiers": 1,
+      "eventType": 1,
+      "text": "A"
+    },
+    "flags": 24,
+    "expected": "\u001b[97;2;65u"
+  },
+  {
+    "name": "all letter release excludes text",
+    "input": {
+      "key": 97,
+      "modifiers": 0,
+      "eventType": 3,
+      "text": "a"
+    },
+    "flags": 26,
+    "expected": "\u001b[97;1:3u"
+  },
+  {
+    "name": "text cannot include C0",
+    "input": {
+      "key": 99,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": "\u0003"
+    },
+    "flags": 24,
+    "expected": "\u001b[99;5u"
+  },
+  {
+    "name": "modifier suppressed",
+    "input": {
+      "key": 57442,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": null
+  },
+  {
+    "name": "modifier press",
+    "input": {
+      "key": 57442,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 8,
+    "expected": "\u001b[57442;5u"
+  },
+  {
+    "name": "modifier release",
+    "input": {
+      "key": 57442,
+      "modifiers": 0,
+      "eventType": 3,
+      "text": ""
+    },
+    "flags": 10,
+    "expected": "\u001b[57442;1:3u"
+  },
+  {
+    "name": "media key",
+    "input": {
+      "key": 57430,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[57430u"
+  },
+  {
+    "name": "F35",
+    "input": {
+      "key": 57398,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": ""
+    },
+    "flags": 1,
+    "expected": "\u001b[57398u"
+  },
+  {
+    "name": "shifted alternate",
+    "input": {
+      "key": 61,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": "",
+      "shiftedKey": 43
+    },
+    "flags": 5,
+    "expected": "\u001b[61:43;6u"
+  },
+  {
+    "name": "base alternate",
+    "input": {
+      "key": 1089,
+      "modifiers": 4,
+      "eventType": 1,
+      "text": "",
+      "baseKey": 99
+    },
+    "flags": 5,
+    "expected": "\u001b[1089::99;5u"
+  },
+  {
+    "name": "both alternates",
+    "input": {
+      "key": 1089,
+      "modifiers": 5,
+      "eventType": 1,
+      "text": "",
+      "shiftedKey": 1057,
+      "baseKey": 99
+    },
+    "flags": 5,
+    "expected": "\u001b[1089:1057:99;6u"
+  },
+  {
+    "name": "IME associated text",
+    "input": {
+      "key": 0,
+      "modifiers": 0,
+      "eventType": 1,
+      "text": "你好"
+    },
+    "flags": 24,
+    "expected": "\u001b[0;1;20320:22909u"
+  },
+  {
+    "name": "caps reported with all",
+    "input": {
+      "key": 97,
+      "modifiers": 64,
+      "eventType": 1,
+      "text": "A"
+    },
+    "flags": 24,
+    "expected": "\u001b[97;65;65u"
+  },
+  {
+    "name": "caps omitted for normal text",
+    "input": {
+      "key": 97,
+      "modifiers": 64,
+      "eventType": 1,
+      "text": "A"
+    },
+    "flags": 1,
+    "expected": "A"
+  },
+  {
+    "name": "legacy Alt+Shift+A retains uppercase text",
+    "flags": 0,
+    "input": {
+      "key": 97,
+      "modifiers": 3,
+      "eventType": 1,
+      "text": "",
+      "shiftedKey": 65
+    },
+    "expected": "\u001bA"
+  }
+]

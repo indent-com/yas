@@ -133,6 +133,8 @@ pub struct FrameState {
     pub cursor_col: u16,
     #[doc(hidden)]
     pub mode: u16,
+    /// Negotiated Kitty keyboard progressive enhancement flags (bits 0–4).
+    pub keyboard_flags: u8,
     #[doc(hidden)]
     pub title: String,
     #[doc(hidden)]
@@ -167,6 +169,7 @@ impl FrameState {
             cursor_row: 0,
             cursor_col: 0,
             mode: 0,
+            keyboard_flags: 0,
             title: String::new(),
             overflow: BTreeMap::new(),
             line_flags: vec![0; usize::from(rows)],

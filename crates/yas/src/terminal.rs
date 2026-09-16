@@ -4256,6 +4256,12 @@ fn validate_component(component: &Component, dimensions: (u16, u16)) -> Result<(
         value if value == crate::schema::terminal::COMPONENT_HYPERLINKS as u8 => {
             validate_hyperlinks(&component.body, grid_cells(dimensions))
         }
+        value if value == crate::schema::terminal::COMPONENT_KEYBOARD_FLAGS as u8 => {
+            if component.body.len() != 1 || component.body[0] & !31 != 0 {
+                return Err(Error::Invalid("Terminal keyboard flags"));
+            }
+            Ok(())
+        }
         _ if component.required => Err(Error::Invalid("unknown required Terminal component")),
         _ => Ok(()),
     }
@@ -4375,6 +4381,34 @@ mod tests {
             "18005000000000001111111111111111111111111111111137000000010101000200020000007368020000002d6c040000002f746d70020004004c414e4700010000004304005445524d01000000000000000000000000"
         );
         truncations::<Create>(&encoded);
+    }
+
+    #[test]
+    fn keyboard_flags_component_validates_and_round_trips() {
+        let flags = crate::schema::terminal::FRAME_COMPONENTS as u16;
+        let payload = [
+            0,
+            1,
+            crate::schema::terminal::COMPONENT_KEYBOARD_FLAGS as u8,
+            0,
+            1,
+            31,
+        ];
+        let grid = Grid::decode_codec1(flags, &payload, 4096, Some((1, 1))).unwrap();
+        assert_eq!(grid.components[0].body, [31]);
+        assert_eq!(
+            grid.encode_codec1(flags, 4096, Some((1, 1))).unwrap(),
+            payload
+        );
+        for end in 0..payload.len() {
+            assert!(Grid::decode_codec1(flags, &payload[..end], 4096, Some((1, 1))).is_err());
+        }
+        for body in [vec![], vec![32], vec![1, 0]] {
+            let mut invalid = payload[..4].to_vec();
+            invalid.push(body.len() as u8);
+            invalid.extend(body);
+            assert!(Grid::decode_codec1(flags, &invalid, 4096, Some((1, 1))).is_err());
+        }
     }
 
     #[test]

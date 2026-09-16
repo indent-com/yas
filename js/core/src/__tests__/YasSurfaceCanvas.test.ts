@@ -5275,6 +5275,40 @@ describe("YasSurfaceCanvas soft-keyboard input", () => {
     surface.dispose();
   });
 
+  it.each(["Enter", "NumpadEnter", "", "Unidentified"])(
+    "preserves Ctrl+Enter and releases stale Ctrl with code %j",
+    (code) => {
+      const { surface, ta, keys, texts } = attachTyping();
+      try {
+        // Ctrl was pressed before this surface received focus. No separate
+        // modifier event arrives, including when the browser omits the code.
+        for (const ctrlKey of [true, false]) {
+          for (const type of ["keydown", "keyup"]) {
+            const event = new KeyboardEvent(type, {
+              key: "Enter",
+              code,
+              ctrlKey,
+              cancelable: true,
+            });
+            ta.dispatchEvent(event);
+            expect(event.defaultPrevented).toBe(true);
+          }
+        }
+        expect(keys).toEqual([
+          { keycode: 29, pressed: true },
+          { keycode: 28, pressed: true },
+          { keycode: 28, pressed: false },
+          { keycode: 29, pressed: false },
+          { keycode: 28, pressed: true },
+          { keycode: 28, pressed: false },
+        ]);
+        expect(texts).toEqual([]);
+      } finally {
+        surface.dispose();
+      }
+    },
+  );
+
   it("applies a toolbar modifier to input-event Enter", () => {
     const { surface, ta, keys } = attachTyping();
     surface.setCtrlModifier(true);

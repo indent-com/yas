@@ -5246,6 +5246,7 @@ export class YasSurfaceCanvas {
     // press atomically; a late key-up remains an ignored orphan.
     if (domKeyToEvdev(code) === 0 && isEnterKeyEvent(e)) {
       if (pressed) {
+        this.syncModifiers(e, conn);
         sendKey(this._surfaceId, EVDEV_MAP.Enter, true);
         sendKey(this._surfaceId, EVDEV_MAP.Enter, false);
       }

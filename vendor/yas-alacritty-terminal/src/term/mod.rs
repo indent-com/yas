@@ -1461,7 +1461,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -1501,6 +1501,16 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.set_keyboard_mode(mode.into(), apply);
+        // Set/union/difference changes the current stack entry, so querying,
+        // popping a nested mode, and switching screens all restore that mode.
+        let current = KeyboardModes::from_bits_truncate(
+            ((self.mode & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> 18) as u8,
+        );
+        if let Some(top) = self.keyboard_mode_stack.last_mut() {
+            *top = current;
+        } else {
+            self.keyboard_mode_stack.push(current);
+        }
     }
 
     #[inline]
