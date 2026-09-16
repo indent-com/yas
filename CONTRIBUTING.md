@@ -127,6 +127,11 @@ E2E (Playwright, requires built binaries):
 ./bin/e2e
 ```
 
+The browser harness uses Bash, a fixed test passphrase, and an isolated
+WebSocket edge. It disables inherited embedded-edge, WebRTC-share, and
+WebTransport settings. Keep the Playwright version in `e2e/package.json`
+aligned with the pinned Nix `playwright-test` package and browser bundle.
+
 Uplink E2E (included in `./bin/tests` on Unix):
 
 ```bash

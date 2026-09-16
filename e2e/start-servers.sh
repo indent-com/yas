@@ -64,6 +64,11 @@ trap cleanup EXIT INT TERM
 # browser/edge suite depend on host GPU initialization; compositor-specific
 # repros can opt back in with YAS_SKIP_COMPOSITOR=0.
 export YAS_SKIP_COMPOSITOR="${YAS_SKIP_COMPOSITOR:-1}"
+# Terminal specs assume a POSIX shell, independent of the developer's login shell.
+export SHELL="$(command -v bash)"
+# Match CI regardless of the developer's server configuration: the harness owns
+# a separate WebSocket edge and does not publish a WebRTC share.
+export YAS_EDGE=0 YAS_SHARE=0 YAS_WEBTRANSPORT=0
 "${REPO_ROOT}/target/debug/yas" server &
 SERVER_PID=$!
 

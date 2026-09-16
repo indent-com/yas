@@ -3,6 +3,11 @@ import path from "path";
 
 const PORT = 3274;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const PASSPHRASE = "test-secret";
+
+// webServer.env only reaches the server process; specs must use the same
+// fixture credential instead of an inherited development passphrase.
+process.env.YAS_PASSPHRASE = PASSPHRASE;
 
 export default defineConfig({
   testDir: "./tests",
@@ -41,7 +46,7 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,
     env: {
-      YAS_PASSPHRASE: "test-secret",
+      YAS_PASSPHRASE: PASSPHRASE,
       YAS_ADDR: `127.0.0.1:${PORT}`,
     },
     stdout: "pipe",

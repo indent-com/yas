@@ -30,6 +30,10 @@ pub fn cli(binary: &Path, directory: &Path, ca: &Path) -> Command {
             directory.join("state/extensions.redb"),
         )
         .env("YAS_PROXY", "0")
+        // Fixture edges use WebSocket; the uplink relay owns its QUIC listener.
+        .env("YAS_EDGE", "0")
+        .env("YAS_SHARE", "0")
+        .env("YAS_WEBTRANSPORT", "0")
         .env("YAS_SKIP_COMPOSITOR", "1")
         .env("YAS_AUDIO", "0")
         .env("YAS_FONTS", "0")
