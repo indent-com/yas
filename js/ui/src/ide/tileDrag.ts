@@ -289,7 +289,7 @@ const LONG_PRESS_MS = 450;
 const LONG_PRESS_SLOP_PX = 10;
 
 /**
- * Drag anything with a finger.
+ * Drag anything with a finger or an iPad mouse.
  *
  * HTML5 drag-and-drop never fires from touch, so every `draggable` in this app
  * was mouse-only: pane grips, explorer rows, changed files, search hits,
@@ -306,9 +306,10 @@ const LONG_PRESS_SLOP_PX = 10;
  * the window-level listeners that reveal the dock as a park target. They
  * cannot tell the difference, which is the point.
  *
- * Mouse and pen keep the native path (real drag image, edge autoscroll); this
- * takes over only for touch. See {@link TouchDragActivation} for why a handle
- * and a list row start differently.
+ * Desktop mouse and pen keep the native path (real drag image, edge
+ * autoscroll). iPad mouse/trackpad input uses this bridge on movement in any
+ * direction, since native dragging can fail to start there. Touch keeps the
+ * gestures in {@link TouchDragActivation} so lists still scroll and swipe.
  */
 /** Optional behaviours for {@link startTouchDrag}. */
 export interface TouchDragOptions {
@@ -333,15 +334,19 @@ export function startTouchDrag(
   activate: TouchDragActivation = "move",
   options?: TouchDragOptions,
 ): void {
-  // Touch only, and tested positively rather than by excluding mouse: a pen
-  // drives native drag-and-drop in Chromium just as a mouse does, so letting
-  // it in here would run both paths at once — and this one's `dragend` would
-  // clear the in-flight count and unmount the dock underneath the native
-  // drag, which is the failure the enter-before-leave ordering below exists
-  // to avoid.
-  if (e.pointerType !== "touch") return;
-  startPointerDrag(e, fill, activate, options);
+  if (e.pointerType === "touch") {
+    startPointerDrag(e, fill, activate, options);
+  } else if (isIOSMouseDrag(e) && fill) {
+    // Mouse movement has no competing scroll/swipe gesture and a stationary
+    // hold remains a click. Menu-only rows have no payload to drag.
+    startPointerDrag(e, fill, "move", options);
+  }
 }
+
+// Claim only primary iPad mouse input. Pen input retains native dragging;
+// running both paths would let one dragend tear down the other's drop zones.
+const isIOSMouseDrag = (e: PointerEvent): boolean =>
+  e.pointerType === "mouse" && e.button === 0 && isIOS();
 
 let pointerDragActive = false;
 
@@ -358,6 +363,9 @@ function startPointerDrag(
   const data = new DataTransfer();
   fill?.(data);
   pointerDragActive = true;
+  // Suppress compatibility mousedown/text selection while preserving the
+  // click from a press released before the drag threshold.
+  if (e.pointerType === "mouse") e.preventDefault();
 
   // iPad supports native touch dragging too. Disable it for the whole press,
   // including a hold before our movement threshold: native drag takeover
@@ -606,11 +614,7 @@ export function startPanePointerDrag(
   // iPad mouse/trackpad input emits mouse pointers, but native HTML dragging
   // can fail to start from the tab-bar button. Desktop mouse and pen input
   // keep native dragging; the explicit mouse fallback must not claim a pen.
-  if (
-    e.pointerType !== "touch" &&
-    !(e.pointerType === "mouse" && e.button === 0 && isIOS())
-  )
-    return;
+  if (e.pointerType !== "touch" && !isIOSMouseDrag(e)) return;
   const handle = e.currentTarget as HTMLElement | null;
   if (!handle || pointerDragActive || typeof DataTransfer !== "function")
     return;

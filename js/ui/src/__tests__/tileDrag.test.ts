@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   startTouchDrag,
   startPanePointerDrag,
+  fillTileDrag,
   tileDragAssignment,
   paneDragSource,
+  type TouchDragActivation,
 } from "../ide/tileDrag";
 
 /** jsdom has no DataTransfer; the drag only ever uses it as a MIME map. */
@@ -55,7 +57,7 @@ function pointerEvent(
   return ev;
 }
 
-describe("startTouchDrag holdMenu", () => {
+describe("pointer drag bridge", () => {
   const realDataTransfer = globalThis.DataTransfer;
   const realDragEvent = globalThis.DragEvent;
   const realElementFromPoint = document.elementFromPoint;
@@ -89,6 +91,100 @@ describe("startTouchDrag holdMenu", () => {
     );
     el.dispatchEvent(pointerEvent("pointerdown", 10, 10));
   }
+
+  it.each([
+    { platform: "MacIntel", activate: "swipe-left", x: 40, y: 10 },
+    { platform: "iPad", activate: "swipe-left", x: 10, y: 40 },
+    { platform: "MacIntel", activate: "long-press", x: 40, y: 40 },
+  ] as const)(
+    "drags an iPad mouse sidebar source on movement: $platform $activate",
+    ({ platform, activate, x, y }) => {
+      vi.stubGlobal("navigator", { platform, maxTouchPoints: 5 });
+      const target = document.body.appendChild(document.createElement("div"));
+      document.elementFromPoint = () => target;
+      el.draggable = true;
+      const started = vi.fn();
+      const dropped = vi.fn();
+      const ended = vi.fn();
+      const clicked = vi.fn();
+      const menu = vi.fn();
+      el.addEventListener("dragstart", started);
+      el.addEventListener("dragend", ended);
+      el.addEventListener("click", clicked);
+      el.addEventListener("contextmenu", menu);
+      target.addEventListener("drop", (event) => {
+        const drag = event as DragEvent;
+        dropped(tileDragAssignment(drag), paneDragSource(drag));
+      });
+      el.addEventListener("pointerdown", (event) =>
+        startTouchDrag(event, (data) => fillTileDrag(data, "dev:7"), activate, {
+          holdMenu: true,
+        }),
+      );
+
+      const down = pointerEvent("pointerdown", 10, 10, "mouse");
+      el.dispatchEvent(down);
+      expect(down.defaultPrevented).toBe(true);
+      expect(el.draggable).toBe(false);
+      window.dispatchEvent(pointerEvent("pointermove", 13, 10, "mouse"));
+      expect(started).not.toHaveBeenCalled();
+      window.dispatchEvent(pointerEvent("pointermove", x, y, "mouse"));
+      window.dispatchEvent(pointerEvent("pointerup", x, y, "mouse"));
+      el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+      expect(started).toHaveBeenCalledOnce();
+      expect(dropped).toHaveBeenCalledExactlyOnceWith("dev:7", null);
+      expect(ended).toHaveBeenCalledOnce();
+      expect(clicked).not.toHaveBeenCalled();
+      expect(menu).not.toHaveBeenCalled();
+      expect(el.draggable).toBe(true);
+      target.remove();
+    },
+  );
+
+  it.each<TouchDragActivation>(["swipe-left", "long-press"])(
+    "leaves a stationary iPad mouse click alone for %s sources",
+    (activate) => {
+      vi.stubGlobal("navigator", { platform: "MacIntel", maxTouchPoints: 5 });
+      const started = vi.fn();
+      const clicked = vi.fn();
+      const menu = vi.fn();
+      el.addEventListener("dragstart", started);
+      el.addEventListener("click", clicked);
+      el.addEventListener("contextmenu", menu);
+      el.addEventListener("pointerdown", (event) =>
+        startTouchDrag(event, (data) => fillTileDrag(data, "dev:7"), activate, {
+          holdMenu: true,
+        }),
+      );
+      el.dispatchEvent(pointerEvent("pointerdown", 10, 10, "mouse"));
+      vi.advanceTimersByTime(700);
+      window.dispatchEvent(pointerEvent("pointerup", 10, 10, "mouse"));
+      el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      expect(started).not.toHaveBeenCalled();
+      expect(menu).not.toHaveBeenCalled();
+      expect(clicked).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("leaves iPad mouse input alone on menu-only rows", () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel", maxTouchPoints: 5 });
+    const started = vi.fn();
+    const menu = vi.fn();
+    el.addEventListener("dragstart", started);
+    el.addEventListener("contextmenu", menu);
+    el.addEventListener("pointerdown", (event) =>
+      startTouchDrag(event, null, "long-press", { holdMenu: true }),
+    );
+    const down = pointerEvent("pointerdown", 10, 10, "mouse");
+    el.dispatchEvent(down);
+    window.dispatchEvent(pointerEvent("pointermove", 50, 50, "mouse"));
+    vi.advanceTimersByTime(700);
+    window.dispatchEvent(pointerEvent("pointerup", 50, 50, "mouse"));
+    expect(down.defaultPrevented).toBe(false);
+    expect(started).not.toHaveBeenCalled();
+    expect(menu).not.toHaveBeenCalled();
+  });
 
   it.each(["MacIntel", "iPad"])(
     "drops an iPad mouse grip once with the pane payload (%s)",
@@ -188,15 +284,26 @@ describe("startTouchDrag holdMenu", () => {
       pointerType: "mouse",
       button: 2,
     },
+    {
+      platform: "MacIntel",
+      maxTouchPoints: 5,
+      pointerType: "mouse",
+      button: 1,
+    },
   ])(
-    "leaves native/non-primary grip input alone: $pointerType $button $maxTouchPoints",
+    "leaves native/non-primary input alone: $pointerType $button $maxTouchPoints",
     (input) => {
       vi.stubGlobal("navigator", input);
       const started = vi.fn();
       el.addEventListener("dragstart", started);
-      el.addEventListener("pointerdown", (event) =>
-        startPanePointerDrag(event, "surface:dev:7", "0"),
-      );
+      el.addEventListener("pointerdown", (event) => {
+        startPanePointerDrag(event, "surface:dev:7", "0");
+        startTouchDrag(
+          event,
+          (data) => fillTileDrag(data, "surface:dev:7"),
+          "swipe-left",
+        );
+      });
       const down = pointerEvent(
         "pointerdown",
         10,

@@ -306,6 +306,49 @@ test.describe("Touch drag on list rows", () => {
   test.beforeEach(closeAllTerminals);
   test.afterAll(closeAllTerminals);
 
+  test("an iPad mouse drags a dock card into the layout without holding", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "platform", { get: () => "MacIntel" });
+      Object.defineProperty(navigator, "maxTouchPoints", { get: () => 5 });
+    });
+    await authenticate(page);
+    const { card, expectedCount } = await parkedCard(page);
+    const assignment = await card.getAttribute("data-yas-preview-assignment");
+    expect(assignment).toBeTruthy();
+    const box = await card.boundingBox();
+    if (!box) throw new Error("parked card has no bounds");
+    const start = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    const drags = await page.evaluateHandle(() => {
+      const trusted: boolean[] = [];
+      window.addEventListener("dragstart", (event) =>
+        trusted.push(event.isTrusted),
+      );
+      return trusted;
+    });
+
+    // Real mouse input exercises pointer capture and compatibility clicks.
+    // Start vertically: an iPad mouse must not inherit touch's leftward-only
+    // swipe activation or long-press timer.
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.mouse.move(start.x, start.y + 12, { steps: 3 });
+    expect(await drags.jsonValue()).toEqual([false]);
+    await page.mouse.move(400, 350, { steps: 10 });
+    await page.mouse.up();
+
+    await expect(
+      page.locator(`[data-yas-preview-assignment="${assignment}"]`),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(`[data-yas-pane-tools-assignment="${assignment}"]`),
+    ).toBeVisible();
+    await expect.poll(() => terminalCount(page)).toBe(expectedCount);
+    expect(await drags.jsonValue()).toEqual([false]);
+    await drags.dispose();
+  });
+
   test("holding a dock card drags it into the main view", async ({ page }) => {
     await authenticate(page);
     const { card, label } = await parkedCard(page);

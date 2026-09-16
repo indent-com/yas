@@ -7292,16 +7292,16 @@ function Thumbnail(props: {
     // Draggable onto a pane, like the background-tile cards above: the
     // card is inert (see the body wrapper), so the whole thing is the handle
     // and a drag can't be swallowed by the terminal or surface inside.
-    // Touch is unaffected — mobile browsers don't synthesize dragstart, so
-    // swipe-to-dismiss below keeps working.
+    // The pointer bridge handles touch and iPad mouse/trackpad input.
     <div
       data-yas-preview-assignment={props.assignment}
       draggable={true}
       onDragStart={(e) => startTileDrag(e, props.assignment)}
-      // Touch never reaches onDragStart. A leftward swipe starts the drag —
+      // For touch, a leftward swipe starts the drag —
       // the one horizontal gesture the swipe-to-dismiss below does not claim
       // (it claims rightward) — and a hold works as a fallback. Either way
-      // the card can still be flicked away to the right.
+      // the card can still be flicked away to the right. iPad mouse input
+      // starts on movement in any direction.
       onPointerDown={(e) =>
         startTouchDrag(
           e,

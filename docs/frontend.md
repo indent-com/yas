@@ -201,13 +201,16 @@ pointer ID for the whole gesture. A connected mouse or a second finger cannot
 move or end a touch drag. Cancellation, lost capture, window blur, and unmount
 release the drag listeners.
 
-Pane movement grips use the pointer-driven drag bridge for iPad mouse and
-trackpad input as well as touch. This keeps pane placement and parking working
-when WebKit does not start a native drag from the tab-bar button. Desktop
-mouse and pen input retain native dragging. Escape or window blur cancels the
-bridge without dropping the pane. The bridge disables native dragging for the
-whole press, including a stationary touch hold, and restores it on release or
-cancel. Dedicated grips also cancel touch defaults to preserve pane focus.
+Pane movement grips and sidebar drag sources use the pointer-driven drag
+bridge for iPad mouse and trackpad input as well as touch. This keeps pane
+placement, parking, and dragging sidebar cards into the layout working when
+WebKit does not start a native drag. iPad mouse drags start on movement in any
+direction; touch keeps its leftward swipe/hold on parked cards and long press
+on scrollable rows. Stationary mouse presses remain clicks. Desktop mouse and
+pen input retain native dragging. Escape or window blur cancels the bridge
+without dropping. The bridge disables native dragging for the whole press,
+including a stationary touch hold, and restores it on release or cancel.
+Dedicated grips also cancel touch defaults to preserve pane focus.
 Only one pointer can own the bridge at a time.
 
 Chrome buttons (`TapButton`), main-menu entries, and left-dock headers/list
