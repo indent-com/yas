@@ -1,6 +1,6 @@
 [package]
 name = "yas-uplink"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 description = "End-to-end authenticated YAS uplink transport"
 license.workspace = true
