@@ -15,7 +15,6 @@ import {
   batch,
   Show,
   For,
-  Index,
   type JSX,
 } from "solid-js";
 import {
@@ -88,6 +87,10 @@ import {
 } from "../ide/tileDrag";
 import { resolveTab, stripConn, tabId } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
+import {
+  identifyLayoutChildren,
+  type IdentifiedLayoutChild,
+} from "./childIdentity";
 import {
   LayoutTreeContext,
   autoFocusPaneTarget,
@@ -2621,9 +2624,8 @@ function PaneNode(props: {
 }) {
   const ctx = useLayoutTree();
   // All branching uses <Show> so Solid re-evaluates when props.node changes
-  // (e.g. on layout switch or resize).  <Index> is used for split children
-  // so that components persist by position — only the item signal updates,
-  // avoiding unnecessary recreation during resize drags.
+  // (e.g. on layout switch or resize). Children retain their DOM owners when
+  // siblings are inserted or removed, including through immutable resize edits.
 
   const path = () => props.path ?? [];
   const paneId = () => {
@@ -2638,6 +2640,14 @@ function PaneNode(props: {
     props.node.type === "split" ? props.node : previous,
   );
   const split = () => retainedSplit()!;
+  const identifiedChildren = createMemo<IdentifiedLayoutChild[]>(
+    (previous) =>
+      identifyLayoutChildren(previous, retainedSplit()?.children ?? []),
+    [],
+  );
+  const childKeys = createMemo(() =>
+    identifiedChildren().map((child) => child.key),
+  );
 
   /**
    * Index of the child containing the soloed pane, or -1 when this split has
@@ -2688,14 +2698,17 @@ function PaneNode(props: {
                     height: "100%",
                   }}
                 >
-                  <Index each={split().children}>
-                    {(child, index) => {
+                  <For each={childKeys()}>
+                    {(key, index) => {
+                      const child = () =>
+                        identifiedChildren().find((entry) => entry.key === key)!
+                          .child;
                       const solo = () => soloChild(split().children);
-                      const hidden = () => solo() >= 0 && index !== solo();
+                      const hidden = () => solo() >= 0 && index() !== solo();
                       return (
                         <>
                           {/* No handle to drag while one pane fills the split. */}
-                          <Show when={index > 0 && solo() < 0}>
+                          <Show when={index() > 0 && solo() < 0}>
                             <ResizeHandle
                               direction={
                                 split().direction as "horizontal" | "vertical"
@@ -2703,8 +2716,8 @@ function PaneNode(props: {
                               onDrag={(fraction) =>
                                 ctx.onResize(
                                   split(),
-                                  index - 1,
-                                  index,
+                                  index() - 1,
+                                  index(),
                                   fraction,
                                 )
                               }
@@ -2736,13 +2749,13 @@ function PaneNode(props: {
                               surfaceSizingVisible={
                                 props.surfaceSizingVisible && !hidden()
                               }
-                              path={[...(props.path ?? []), index]}
+                              path={[...(props.path ?? []), index()]}
                             />
                           </div>
                         </>
                       );
                     }}
-                  </Index>
+                  </For>
                 </div>
               }
             >

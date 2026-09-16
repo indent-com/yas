@@ -13,6 +13,11 @@ Workspace layouts are restored from the attached backend session, or local
 storage for embedded workspaces. Development source changes require a manual
 page reload.
 
+Split children retain their mounted views by surviving leaf identity. Inserting
+or removing a sibling updates pane paths without rebinding existing terminal
+or surface canvases. Immutable branch and weight edits preserve those owners
+through nested layout resizes as well.
+
 Transient disconnects retain the last terminal and surface catalogues, pane
 assignments, and mounted canvases while the status indicator shows recovery.
 Wire subscriptions and decoders are released; complete catalogues after
