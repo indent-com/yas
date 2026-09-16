@@ -2774,7 +2774,23 @@ export class YasTerminalSurface {
         return;
       }
 
-      // Ctrl+Shift+V pastes from the browser clipboard.  Ctrl+V is left as
+      // A Wayland copy need not reach the host clipboard (Brave can deny the
+      // export). Cmd+V must read it here: an empty host clipboard may produce
+      // no native paste event at all. Browser-owned Cmd+V still uses that event
+      // below, without requiring navigator.clipboard.readText permission.
+      if (
+        e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        (e.key === "v" || e.key === "V") &&
+        this._yasConn?.usesWaylandClipboard?.()
+      ) {
+        e.preventDefault();
+        if (!e.repeat) void this.pasteFromClipboard();
+        return;
+      }
+
+      // Ctrl+Shift+V pastes from the active clipboard. Ctrl+V is left as
       // the terminal's default ^V (quoted-insert) control character.
       if (
         e.ctrlKey &&

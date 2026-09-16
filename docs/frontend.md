@@ -178,6 +178,12 @@ Paste remains text, with bracketed paste when enabled. IME and soft-keyboard
 commits use associated text in all-key mode when requested; otherwise YAS
 encodes the committed characters. Mobile modifier buttons use the same encoder.
 
+When a Wayland app owns the clipboard, Cmd+V and Ctrl+Shift+V in a terminal pane
+on the same connection read that selection directly, including a pending copy.
+They do not require host clipboard export or browser clipboard-read permission;
+Cmd+V works even when an empty host clipboard produces no browser paste event.
+For browser-owned clipboard contents, Cmd+V keeps using the native paste event.
+
 The native viewer requests disambiguation and key events from supporting host
 terminals, enabling all-key reporting only when the focused child requests it.
 Crossterm does not expose layout alternatives or associated-text fields, so

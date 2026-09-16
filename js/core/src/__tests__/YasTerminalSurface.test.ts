@@ -1124,6 +1124,7 @@ describe("YasTerminalSurface Ctrl+V image paste", () => {
         bubbles: true,
       }),
     );
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
     const ev = fireTextPaste(input, "pasted-text");
 
     expect(ev.defaultPrevented).toBe(true);
@@ -1133,7 +1134,92 @@ describe("YasTerminalSurface Ctrl+V image paste", () => {
     );
   });
 
-  it("uses Wayland text instead of stale Cmd+V clipboardData", async () => {
+  it.each([0, 11])(
+    "pastes Wayland text on Cmd+V without a browser paste event (keyboard flags %i)",
+    async (flags) => {
+      const sendInput = vi.fn();
+      const { s, input, sendClipboard } = attach(sendInput);
+      let resolveText!: (text: string) => void;
+      const readWaylandClipboardText = vi.fn(
+        () => new Promise<string>((resolve) => (resolveText = resolve)),
+      );
+      // A pending copy and an already-owned selection both bypass the host.
+      // @ts-expect-error — add clipboard authority to the focused connection.
+      Object.assign(s["_yasConn"], {
+        usesWaylandClipboard: () => true,
+        readWaylandClipboardText,
+      });
+      // @ts-expect-error — only the input modes are needed here.
+      s["terminal"] = {
+        keyboard_flags: () => flags,
+        app_cursor: () => false,
+        bracketed_paste: () => true,
+      };
+      vi.mocked(navigator.clipboard.readText).mockRejectedValue(
+        new DOMException("Clipboard permission denied", "NotAllowedError"),
+      );
+      const init = {
+        key: "v",
+        code: "KeyV",
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      };
+      const down = new KeyboardEvent("keydown", init);
+      input.dispatchEvent(down);
+      expect(down.defaultPrevented).toBe(true);
+      expect(readWaylandClipboardText).toHaveBeenCalledOnce();
+      expect(sendInput).not.toHaveBeenCalled();
+
+      // The prevented keydown must not need a native paste event; Brave can
+      // leave the host clipboard empty when the Wayland export is denied.
+      const repeat = new KeyboardEvent("keydown", { ...init, repeat: true });
+      input.dispatchEvent(repeat);
+      input.dispatchEvent(new KeyboardEvent("keyup", init));
+      expect(repeat.defaultPrevented).toBe(true);
+      expect(readWaylandClipboardText).toHaveBeenCalledOnce();
+      resolveText("from surface\nnext line");
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+      expect(sendClipboard).not.toHaveBeenCalled();
+      expect(sendInput).toHaveBeenCalledTimes(1);
+      expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+        "\x1b[200~from surface\rnext line\x1b[201~",
+      );
+      s["teardownKeyboard"]();
+    },
+  );
+
+  it("leaves browser-owned Cmd+V to the native paste event", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attach(sendInput);
+    const readWaylandClipboardText = vi.fn();
+    // @ts-expect-error — add clipboard authority to the focused connection.
+    Object.assign(s["_yasConn"], {
+      usesWaylandClipboard: () => false,
+      readWaylandClipboardText,
+    });
+    const down = new KeyboardEvent("keydown", {
+      key: "v",
+      code: "KeyV",
+      metaKey: true,
+      cancelable: true,
+    });
+    input.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(false);
+    expect(readWaylandClipboardText).not.toHaveBeenCalled();
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+    fireTextPaste(input, "host text");
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "host text",
+    );
+    s["teardownKeyboard"]();
+  });
+
+  it("uses Wayland text instead of stale context-menu clipboardData", async () => {
     const sendInput = vi.fn();
     const { s, input } = attach(sendInput);
     const readWaylandClipboardText = vi.fn().mockResolvedValue("from surface");
@@ -1143,14 +1229,6 @@ describe("YasTerminalSurface Ctrl+V image paste", () => {
       readWaylandClipboardText,
     });
 
-    input.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "v",
-        code: "KeyV",
-        metaKey: true,
-        bubbles: true,
-      }),
-    );
     const ev = fireTextPaste(input, "stale host text");
     await Promise.resolve();
     await Promise.resolve();
