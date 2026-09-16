@@ -171,6 +171,10 @@ impl Fixture {
     /// test here is about what focus itself delivers, and mapping a toplevel
     /// hands it focus already.
     fn new() -> Self {
+        Self::with_keyboard(true)
+    }
+
+    fn with_keyboard(bind_keyboard: bool) -> Self {
         let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
         let stream =
             UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");
@@ -185,7 +189,9 @@ impl Fixture {
         let wm_base = app.wm_base.clone().expect("xdg_wm_base advertised");
         let seat = app.seat.clone().expect("wl_seat advertised");
 
-        let _keyboard = seat.get_keyboard(&qh, ());
+        if bind_keyboard {
+            seat.get_keyboard(&qh, ());
+        }
         let surface = compositor.create_surface(&qh, ());
         let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
         let toplevel = xdg_surface.get_toplevel(&qh, ());
@@ -213,6 +219,15 @@ impl Fixture {
         let handle = self.handle.as_ref().expect("compositor running");
         handle.command_tx.send(cmd).expect("send command");
         handle.wake();
+    }
+
+    fn bind_keyboard(&mut self) {
+        self.app
+            .seat
+            .as_ref()
+            .unwrap()
+            .get_keyboard(&self.queue.handle(), ());
+        self.settle();
     }
 
     /// Flush our requests, let the compositor's own thread act, read back.
@@ -270,6 +285,75 @@ impl Fixture {
         }
         panic!("compositor never announced the surface");
     }
+}
+
+#[test]
+fn keyboard_bound_after_focus_receives_enter_and_modifiers_before_keys() {
+    // Weston creates its output before processing the seat capabilities that
+    // cause get_keyboard. Without bind-time focus it ignores every later key.
+    let mut fx = Fixture::with_keyboard(false);
+    fx.focus(fx.surface_id);
+    fx.key(KEY_LEFTCTRL, true);
+    fx.tap(KEY_CAPSLOCK);
+    fx.bind_keyboard();
+    fx.tap(KEY_K);
+
+    assert_eq!(
+        fx.take_log(),
+        vec![
+            Ev::Enter,
+            Ev::Mods(MOD_CONTROL, MOD_LOCK),
+            Ev::Key(KEY_K, true),
+            Ev::Key(KEY_K, false),
+        ],
+    );
+}
+
+#[test]
+fn binding_another_keyboard_does_not_reenter_existing_keyboards() {
+    let mut fx = Fixture::new();
+    fx.focus(fx.surface_id);
+    fx.take_log();
+
+    fx.bind_keyboard();
+
+    assert_eq!(fx.take_log(), vec![Ev::Enter, Ev::Mods(0, 0)]);
+    fx.focus(fx.surface_id);
+    assert!(fx.take_log().is_empty(), "unchanged focus must not reenter");
+}
+
+#[test]
+fn keyboard_bound_without_focus_waits_for_focus() {
+    let mut fx = Fixture::with_keyboard(false);
+    fx.bind_keyboard();
+    assert!(fx.take_log().is_empty());
+
+    fx.focus(fx.surface_id);
+    assert_eq!(fx.take_log(), vec![Ev::Enter, Ev::Mods(0, 0)]);
+}
+
+#[test]
+fn keyboard_bound_by_another_client_does_not_receive_focus() {
+    let mut fx = Fixture::new();
+    fx.focus(fx.surface_id);
+    fx.take_log();
+
+    let stream = UnixStream::connect(&fx.handle.as_ref().unwrap().socket_name).unwrap();
+    let conn = Connection::from_socket(stream).unwrap();
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    conn.display().get_registry(&qh, ());
+    let mut app = App::default();
+    queue.roundtrip(&mut app).unwrap();
+    app.seat.as_ref().unwrap().get_keyboard(&qh, ());
+    queue.roundtrip(&mut app).unwrap();
+
+    assert!(app.log.is_empty(), "focus belongs to the first client");
+    fx.settle();
+    assert!(
+        fx.take_log().is_empty(),
+        "the existing keyboard keeps focus"
+    );
 }
 
 #[test]

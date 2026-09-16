@@ -9615,6 +9615,20 @@ impl Dispatch<WlSeat, ()> for Compositor {
                 if kb.version() >= 4 {
                     kb.repeat_info(25, 200);
                 }
+                // A client can create its keyboard after its surface already
+                // gained focus (Weston's Wayland backend does this). Replay
+                // focus to this resource now; unchanged SurfaceFocus commands
+                // cannot supply the missed enter, and Weston ignores keys
+                // until it receives one. Only the new keyboard may re-enter:
+                // broadcasting would duplicate enter on existing resources.
+                if let Some(wl) = state.keyboard_focus_wl()
+                    && same_client(&kb, &wl)
+                {
+                    let serial = state.next_serial();
+                    kb.enter(serial, &wl, vec![]);
+                    let serial = state.next_serial();
+                    kb.modifiers(serial, state.mods_depressed, 0, state.mods_locked, 0);
+                }
                 state.keyboards.push(kb);
             }
             Request::GetPointer { id } => {
