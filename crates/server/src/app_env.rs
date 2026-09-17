@@ -73,8 +73,19 @@ pub fn session_env(
     } else {
         env.remove.push("DBUS_SESSION_BUS_ADDRESS");
     }
+    // Waydroid mounts $PULSE_RUNTIME_PATH/native instead of using PULSE_SERVER.
+    // Do not let an inherited host path override this session's private audio.
+    env.remove.push("PULSE_RUNTIME_PATH");
     if let Some(server) = pulse_server {
         set("PULSE_SERVER", server.to_string());
+        if let Some(socket) = server.strip_prefix("unix:") {
+            let socket = std::path::Path::new(socket);
+            if socket.is_absolute()
+                && let Some(dir) = socket.parent()
+            {
+                set("PULSE_RUNTIME_PATH", dir.to_string_lossy().into_owned());
+            }
+        }
     } else {
         // No audio pipeline — point PULSE_SERVER at a path that will make
         // libpulse fail immediately.  Without this, libpulse falls back to
