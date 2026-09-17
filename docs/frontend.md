@@ -13,10 +13,14 @@ Workspace layouts are restored from the attached backend session, or local
 storage for embedded workspaces. Development source changes require a manual
 page reload.
 
-Split children retain their mounted views by surviving leaf identity. Inserting
-or removing a sibling updates pane paths without rebinding existing terminal
-or surface canvases. Immutable branch and weight edits preserve those owners
-through nested layout resizes as well.
+Pane content is owned by surviving leaf identity outside the recursive layout.
+Structural slots adopt the existing pane DOM when adding a first sibling,
+nesting or collapsing splits, changing container kinds, or moving between tiled
+and floating layouts. These edits retain terminal and surface canvases, input
+state, and stream subscriptions, including the last picture of an idle Wayland
+app. Only removing a leaf disposes its content; geometry and visibility still
+update its size claim normally. Frozen leaves restored from backend snapshots
+keep their original identity outside the mutable pane-prop store.
 
 Transient disconnects retain the last terminal and surface catalogues, pane
 assignments, and mounted canvases while the status indicator shows recovery.

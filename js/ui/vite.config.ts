@@ -1,5 +1,5 @@
 import { defineConfig, type Plugin } from "vite";
-import { dropWasmUrlFallback } from "../vite-wasm-fallback";
+import { dropWasmUrlFallback } from "../vite-wasm-fallback.mts";
 import { lezer } from "@lezer/generator/rollup";
 import solid from "vite-plugin-solid";
 import { viteSingleFile } from "vite-plugin-singlefile";
@@ -10,10 +10,13 @@ import { request as httpRequest } from "node:http";
 import { Socket } from "node:net";
 
 const wasmPath = resolve(
-  __dirname,
+  import.meta.dirname,
   "../../crates/browser/pkg/yas_browser_bg.wasm",
 );
-const snippetsDir = resolve(__dirname, "../../crates/browser/pkg/snippets");
+const snippetsDir = resolve(
+  import.meta.dirname,
+  "../../crates/browser/pkg/snippets",
+);
 const isDev =
   process.env.NODE_ENV !== "production" && !process.argv.includes("build");
 const devEdgeHost =
@@ -187,7 +190,7 @@ export default bin.buffer;
         // bundled service worker.
         const assets = ["dist/index.html"];
         for (const asset of assets) {
-          const path = resolve(__dirname, asset);
+          const path = resolve(import.meta.dirname, asset);
           if (!existsSync(path)) continue;
           const contents = readFileSync(path);
           const compressed = brotliCompressSync(contents, {
@@ -204,7 +207,7 @@ export default bin.buffer;
   resolve: {
     alias: {
       "@yas-run/browser": resolve(
-        __dirname,
+        import.meta.dirname,
         "../../crates/browser/pkg/yas_browser.js",
       ),
     },
@@ -217,7 +220,7 @@ export default bin.buffer;
     allowedHosts: true,
     fs: {
       // Allow serving the WASM file from outside the ui directory.
-      allow: [resolve(__dirname, "../..")],
+      allow: [resolve(import.meta.dirname, "../..")],
     },
     proxy: isDev
       ? (() => {
@@ -242,7 +245,7 @@ export default bin.buffer;
       : undefined,
   },
   build: {
-    outDir: resolve(__dirname, "dist"),
+    outDir: resolve(import.meta.dirname, "dist"),
     target: "es2020",
     // One stylesheet, not one per chunk. The single-file build inlines every
     // emitted CSS asset as its own <style>, so code-splitting the CSS just

@@ -10,6 +10,18 @@ import type { LayoutRect, LayoutSplit } from "@yas-run/core/layout";
 const PANE_FOCUS_OWNER_SELECTOR =
   "[data-yas-pane-id], [data-yas-workspace-focus-owner]";
 
+/** Prefer an editable CodeMirror body over its earlier, focusable scroller.
+ * Bare terminal canvases have no tabindex; their input target lives beside
+ * them. Read-only editors fall through to their focusable wrapper.
+ */
+export function paneKeyboardTarget(container: HTMLElement): HTMLElement | null {
+  return (
+    container.querySelector<HTMLElement>(
+      '.cm-content[contenteditable="true"]',
+    ) ?? container.querySelector<HTMLElement>("[tabindex], input, textarea")
+  );
+}
+
 /**
  * Whether a focused pane may move DOM focus to its own keyboard target.
  *

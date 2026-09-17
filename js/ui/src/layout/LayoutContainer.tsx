@@ -88,12 +88,18 @@ import {
 import { resolveTab, stripConn, tabId } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
 import {
+  PaneSlot,
+  PersistentPanes,
+  type PaneContentProps,
+} from "./PersistentPanes";
+import {
   identifyLayoutChildren,
   type IdentifiedLayoutChild,
 } from "./childIdentity";
 import {
   LayoutTreeContext,
   autoFocusPaneTarget,
+  paneKeyboardTarget,
   useLayoutTree,
   type LayoutTreeCtx,
 } from "./treeContext";
@@ -2569,16 +2575,21 @@ export function LayoutContainer(props: {
           position: "relative",
         }}
       >
-        <PaneNode
-          node={root()}
-          assignments={layoutState().assignments}
-          focusedPaneId={focusedPaneId()}
-          visible={props.manageVisibility ?? true}
-          // Expose/overlay visibility is not a structural hide. Keep the
-          // mounted surface's size claim alive there so choosing its card
-          // does not destroy and recreate the encoder.
-          surfaceSizingVisible
-        />
+        <PersistentPanes
+          leaves={panes().map((pane) => pane.leaf)}
+          render={(current) => <LeafPane {...current} />}
+        >
+          <PaneNode
+            node={root()}
+            assignments={layoutState().assignments}
+            focusedPaneId={focusedPaneId()}
+            visible={props.manageVisibility ?? true}
+            // Expose/overlay visibility is not a structural hide. Keep the
+            // mounted surface's size claim alive there so choosing its card
+            // does not destroy and recreate the encoder.
+            surfaceSizingVisible
+          />
+        </PersistentPanes>
         <Show when={nextSplitDirection()}>
           {(direction) => (
             <div
@@ -2670,7 +2681,7 @@ function PaneNode(props: {
         props.node.type === "split" ? (props.node as LayoutSplit) : undefined
       }
       fallback={
-        <LeafPane
+        <PaneSlot
           paneId={paneId()}
           leaf={props.node as LayoutLeaf}
           sessionId={props.assignments[paneId()] ?? null}
@@ -3002,14 +3013,7 @@ function PaneNode(props: {
   );
 }
 
-function LeafPane(props: {
-  paneId: string;
-  leaf: LayoutLeaf;
-  sessionId: SessionId | null;
-  isFocused: boolean;
-  visible: boolean;
-  surfaceSizingVisible: boolean;
-}) {
+function LeafPane(props: PaneContentProps) {
   const ctx = useLayoutTree();
   const theme = () => themeFor(ctx.palette);
   const scale = () => uiScale(ctx.fontSize);
@@ -3111,21 +3115,10 @@ function LeafPane(props: {
     const _vis = paneVisible();
     if (!focused || !paneContainer) return;
 
-    // Focus the pane container's focusable child. An editable CodeMirror
-    // content div comes FIRST: a comma-list querySelector returns the
-    // first match in *document* order, and an editor tile has [tabindex]
-    // elements (the scroller) before `.cm-content` — focusing those
-    // leaves the editor without keyboard focus or a visible cursor.
-    // Read-only CM contents (diff views) are contenteditable=false and
-    // unfocusable, so they fall through to the [tabindex] pass (the
-    // diff root). Bare "canvas" is excluded — the terminal canvas has
-    // no tabindex so focus() is a no-op; surface canvases have tabindex.
-    const pick = (): HTMLElement | null =>
-      paneContainer.querySelector<HTMLElement>(
-        '.cm-content[contenteditable="true"]',
-      ) ??
-      paneContainer.querySelector<HTMLElement>("[tabindex], input, textarea");
-    autoFocusPaneTarget(() => props.isFocused, pick);
+    autoFocusPaneTarget(
+      () => props.isFocused,
+      () => paneKeyboardTarget(paneContainer),
+    );
   });
 
   return (

@@ -6,12 +6,14 @@ import { render } from "solid-js/web";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { handlePrefixKey, disarmPrefix } from "../keyPrefix";
 import { LayoutContainer } from "../layout/LayoutContainer";
+import type { PaneToolActions } from "../PaneTools";
 import { surfaceWorkspaceRef, type LayoutAssignments } from "../layout/store";
 
-const { workspace, frames, frameListeners } = vi.hoisted(() => {
+const { workspace, frames, frameListeners, unsubscribe } = vi.hoisted(() => {
   const frames = new Map<bigint, HTMLCanvasElement>();
   const frameListeners = new Set<(id: bigint) => void>();
   const mounts = new Map<bigint, Set<string>>();
+  const unsubscribe = vi.fn();
   let nextView = 0;
   const connection = {
     surfaceStore: {
@@ -42,6 +44,7 @@ const { workspace, frames, frameListeners } = vi.hoisted(() => {
       mounts.get(id)!.add(view);
     },
     sendSurfaceUnsubscribe: (id: bigint, view: string) => {
+      unsubscribe(id, view);
       const owners = mounts.get(id);
       owners?.delete(view);
       // The native connection releases the backing frame with the last view.
@@ -51,6 +54,7 @@ const { workspace, frames, frameListeners } = vi.hoisted(() => {
   return {
     frames,
     frameListeners,
+    unsubscribe,
     workspace: {
       getConnection: () => connection,
       setVisibleSessions: () => {},
@@ -109,6 +113,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   frames.clear();
   frameListeners.clear();
+  unsubscribe.mockClear();
   localStorage.clear();
   document.body.replaceChildren();
 });
@@ -121,6 +126,121 @@ function presentFrame(id: bigint) {
   frames.set(id, frame);
   for (const listener of frameListeners) listener(id);
 }
+
+it.each(["horizontal", "vertical"] as const)(
+  "keeps idle surface pixels and its stream across %s sibling edits",
+  async (direction) => {
+    const [layout, setLayout] = createSignal<WorkspaceLayout>({
+      name: "Idle surface",
+      root: { type: "leaf" },
+    });
+    let remove!: (paneId: string) => void;
+    let actions: PaneToolActions | null = null;
+    let addFloating!: (assignment: string) => boolean;
+    let split!: (
+      assignment: string,
+      paneId: string,
+      direction: "horizontal" | "vertical",
+    ) => void;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 900, 300),
+    );
+    presentFrame(7n);
+    dispose = render(
+      () => (
+        <YasWorkspaceProvider workspace={workspace as unknown as YasWorkspace}>
+          <LayoutContainer
+            layout={layout()}
+            onLayoutChange={(next) => next && setLayout(next)}
+            connectionId="dev"
+            palette={PALETTES[0]}
+            fontFamily="monospace"
+            fontSize={14}
+            focusedSessionId={null}
+            lruSessionIds={[]}
+            liveSurfaceKeys={["dev:7", "dev:9", "dev:11"]}
+            storedAssignments={{ "0": surfaceWorkspaceRef("dev", 7n) }}
+            onFocusSession={() => {}}
+            onClearPaneAssignment={(fn) => {
+              remove = fn;
+            }}
+            onSplitPane={(fn) => {
+              split = fn;
+            }}
+            onFocusedPaneActionsChange={(value) => {
+              actions = value;
+            }}
+            onAddFloatingWindow={(fn) => {
+              addFloating = fn;
+            }}
+          />
+        </YasWorkspaceProvider>
+      ),
+      document.body,
+    );
+    await Promise.resolve();
+    vi.advanceTimersByTime(50);
+    const original = document.querySelector<HTMLCanvasElement>("canvas")!;
+    expect(original.dataset.pixels).toBe("surface:dev:7");
+    // The app produces no further frames. A remount releases the shared
+    // backing frame and the replacement canvas stays black.
+    const check = () => {
+      expect(original.isConnected).toBe(true);
+      expect([original.width, original.height]).toEqual([900, 300]);
+      expect(original.dataset.pixels).toBe("surface:dev:7");
+      expect(frames.has(7n)).toBe(true);
+      expect(unsubscribe.mock.calls.some(([id]) => id === 7n)).toBe(false);
+      if (document.querySelectorAll("[data-yas-pane-id]").length === 1) {
+        expect(
+          original
+            .closest("[data-yas-pane-id]")!
+            .contains(document.activeElement),
+        ).toBe(true);
+      }
+    };
+    for (let iteration = 0; iteration < 3; iteration++) {
+      split("surface:dev:9", "0", direction);
+      await Promise.resolve();
+      vi.advanceTimersByTime(50);
+      check();
+      split(
+        "surface:dev:11",
+        "0",
+        direction === "horizontal" ? "vertical" : "horizontal",
+      );
+      await Promise.resolve();
+      vi.advanceTimersByTime(50);
+      check();
+      for (const id of ["0.1", "1"]) {
+        remove(id);
+        await Promise.resolve();
+        vi.advanceTimersByTime(50);
+        check();
+      }
+    }
+    // A floating sibling wraps the tiled base in a workspace scene; removing
+    // it collapses that scene again. Floating the survivor changes both owners.
+    expect(addFloating("surface:dev:9")).toBe(true);
+    await Promise.resolve();
+    vi.advanceTimersByTime(50);
+    check();
+    remove("1");
+    await Promise.resolve();
+    vi.advanceTimersByTime(50);
+    check();
+    for (let toggle = 0; toggle < 2; toggle++) {
+      (actions as PaneToolActions | null)?.floating?.onToggle();
+      await Promise.resolve();
+      vi.advanceTimersByTime(50);
+      check();
+    }
+    expect(frameListeners.size).toBe(1);
+    dispose();
+    dispose = undefined;
+    expect(frames.has(7n)).toBe(false);
+    expect(frameListeners.size).toBe(0);
+  },
+);
 
 it("never displays another window's pixels after C-b Shift-Up swaps tiled surfaces", async () => {
   const [layout, setLayout] = createSignal<WorkspaceLayout>({

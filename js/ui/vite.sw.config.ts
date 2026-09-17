@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import { dropWasmUrlFallback } from "../vite-wasm-fallback";
+import { dropWasmUrlFallback } from "../vite-wasm-fallback.mts";
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -18,7 +18,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@yas-run/browser": resolve(
-        __dirname,
+        import.meta.dirname,
         "../../crates/browser/pkg/yas_browser.js",
       ),
     },
@@ -29,7 +29,7 @@ export default defineConfig({
     emptyOutDir: false,
     target: "es2022",
     rollupOptions: {
-      input: resolve(__dirname, "src/sw/index.ts"),
+      input: resolve(import.meta.dirname, "src/sw/index.ts"),
       output: {
         // A service worker cannot be an ES module in every browser that
         // otherwise supports one, and this bundle has no reason to be: it is
@@ -54,7 +54,7 @@ export default defineConfig({
           throw new Error("service-worker build did not emit sw.js");
         const source = Buffer.from(entry.code);
         writeFileSync(
-          resolve(__dirname, "dist/sw.js.br"),
+          resolve(import.meta.dirname, "dist/sw.js.br"),
           brotliCompressSync(source, {
             params: {
               [zlibConstants.BROTLI_PARAM_QUALITY]: 11,

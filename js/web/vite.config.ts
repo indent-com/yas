@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import { dropWasmUrlFallback } from "../vite-wasm-fallback";
+import { dropWasmUrlFallback } from "../vite-wasm-fallback.mts";
 import solid from "vite-plugin-solid";
 import tailwindcss from "@tailwindcss/vite";
 import { lezer } from "@lezer/generator/rollup";

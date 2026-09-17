@@ -1,6 +1,6 @@
 import { PALETTES } from "@yas-run/core";
 import type { WorkspaceLayout } from "@yas-run/core/layout";
-import { createEffect, createSignal } from "solid-js";
+import { createEffect, createSignal, onCleanup } from "solid-js";
 import { render } from "solid-js/web";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { LayoutContainer } from "../layout/LayoutContainer";
@@ -11,12 +11,14 @@ import {
 } from "../layout/store";
 
 const bindings = vi.hoisted(() => new Map<HTMLCanvasElement, Set<string>>());
+const retired = vi.hoisted(() => new Set<HTMLCanvasElement>());
 
 vi.mock("@yas-run/solid", () => {
   const canvasFor = (resource: () => string) => {
     const canvas = document.createElement("canvas");
     const seen = new Set<string>();
     bindings.set(canvas, seen);
+    onCleanup(() => retired.add(canvas));
     createEffect(() => {
       const id = resource();
       seen.add(id);
@@ -62,22 +64,40 @@ afterEach(() => {
   dispose?.();
   dispose = undefined;
   bindings.clear();
+  retired.clear();
   vi.unstubAllGlobals();
   localStorage.clear();
   document.body.replaceChildren();
 });
 
-it.each([
-  { direction: "horizontal", nested: false },
-  { direction: "vertical", nested: false },
-  { direction: "horizontal", nested: true },
-  { direction: "vertical", nested: true },
-] as const)(
-  "keeps terminal and surface canvases through insertion and removal ($direction, nested: $nested)",
-  async ({ direction, nested }) => {
+it.each(
+  (
+    [
+      { direction: "horizontal", nested: false },
+      { direction: "vertical", nested: false },
+      { direction: "horizontal", nested: true },
+      { direction: "vertical", nested: true },
+      { direction: "tabs", nested: false },
+      { direction: "stacking", nested: false },
+      { direction: "tabs", nested: true },
+      { direction: "stacking", nested: true },
+    ] as const
+  ).flatMap((layout) => [
+    { ...layout, frozenLeaves: false },
+    { ...layout, frozenLeaves: true },
+  ]),
+)(
+  "keeps terminal and surface canvases through insertion and removal ($direction, nested: $nested, frozen leaves: $frozenLeaves)",
+  async ({ direction, nested, frozenLeaves }) => {
     const prefix = nested ? "0." : "";
+    // Backend workspace snapshots freeze their leaves; locally created
+    // layouts remain mutable.
+    const leaf = () => {
+      const node = { type: "leaf" as const };
+      return frozenLeaves ? Object.freeze(node) : node;
+    };
     const children = Array.from({ length: 4 }, () => ({
-      node: { type: "leaf" as const },
+      node: leaf(),
       weight: 1,
     }));
     const [layout, setLayout] = createSignal<WorkspaceLayout>({
@@ -88,7 +108,7 @@ it.each([
             direction: direction === "horizontal" ? "vertical" : "horizontal",
             children: [
               { node: { type: "split", direction, children }, weight: 1 },
-              { node: { type: "leaf" }, weight: 1 },
+              { node: leaf(), weight: 1 },
             ],
           }
         : { type: "split", direction, children },
@@ -168,5 +188,84 @@ it.each([
       await Promise.resolve();
       check();
     }
+  },
+);
+
+it.each(["horizontal", "vertical"] as const)(
+  "keeps an idle surface through first sibling, nested %s split, and collapse",
+  async (direction) => {
+    const [layout, setLayout] = createSignal<WorkspaceLayout>({
+      name: "Surface continuity",
+      root: { type: "leaf" },
+    });
+    let remove!: (paneId: string) => void;
+    let split!: (
+      assignment: string,
+      paneId: string,
+      direction: "horizontal" | "vertical",
+    ) => void;
+    dispose = render(
+      () => (
+        <LayoutContainer
+          layout={layout()}
+          onLayoutChange={(next) => next && setLayout(next)}
+          connectionId="dev"
+          palette={PALETTES[0]}
+          fontFamily="monospace"
+          fontSize={14}
+          focusedSessionId={null}
+          lruSessionIds={[]}
+          liveSurfaceKeys={["dev:7", "dev:9"]}
+          storedAssignments={{ "0": surfaceWorkspaceRef("dev", 7n) }}
+          onFocusSession={() => {}}
+          onClearPaneAssignment={(fn) => {
+            remove = fn;
+          }}
+          onSplitPane={(fn) => {
+            split = fn;
+          }}
+        />
+      ),
+      document.body,
+    );
+    await Promise.resolve();
+    const original = document.querySelector<HTMLCanvasElement>("canvas")!;
+    const check = () => {
+      expect(document.querySelector('canvas[data-resource="surface:7"]')).toBe(
+        original,
+      );
+      expect(retired.has(original)).toBe(false);
+      expect([...bindings.get(original)!]).toEqual(["surface:7"]);
+    };
+    for (let iteration = 0; iteration < 3; iteration++) {
+      split("terminal:1", "0", direction);
+      await Promise.resolve();
+      check();
+      const terminal = document.querySelector<HTMLCanvasElement>(
+        'canvas[data-resource="terminal:1"]',
+      )!;
+      split(
+        surfaceAssignment("dev", 9n),
+        "0",
+        direction === "horizontal" ? "vertical" : "horizontal",
+      );
+      await Promise.resolve();
+      check();
+      expect(document.querySelector('canvas[data-resource="terminal:1"]')).toBe(
+        terminal,
+      );
+      remove("0.1");
+      await Promise.resolve();
+      check();
+      remove("1");
+      await Promise.resolve();
+      check();
+      expect(retired.has(terminal)).toBe(true);
+      expect(bindings.size).toBe(1 + 2 * (iteration + 1));
+    }
+    dispose!();
+    dispose = undefined;
+    expect(retired.has(original)).toBe(true);
+    expect(retired.size).toBe(bindings.size);
   },
 );

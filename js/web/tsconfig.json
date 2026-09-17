@@ -4,6 +4,7 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "jsx": "preserve",
     "jsxImportSource": "solid-js",
