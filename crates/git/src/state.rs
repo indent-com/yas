@@ -1032,6 +1032,11 @@ impl Engine {
             },
             _ => return,
         };
+        // Make sure the index snapshot is up-to-date before the walk
+        // decides which ignored directories contain tracked files. The
+        // snapshot is lazy, and on Windows the file-changed signal can
+        // arrive before gix's mtime check sees the new index.
+        let _ = self.local.index_or_empty();
         let desired = self.watchable_dirs(&workdir, prune);
         let Some(arms) = &mut self.watch else { return };
         let missing: Vec<PathBuf> = desired.difference(&arms.worktree_dirs).cloned().collect();
@@ -1322,6 +1327,14 @@ impl Engine {
                 continue;
             }
             if self.under_gitdir(path) {
+                // Paths under .git can change the watchable set: index
+                // edits add or remove tracked exceptions to ignore pruning,
+                // and the exact index path can be spelled differently by
+                // the native watcher on Windows. Recompute watches on any
+                // gitdir event to avoid missing those transitions.
+                if let Some(arms) = &mut self.watch {
+                    arms.worktree_stale = true;
+                }
                 refs_side = true;
                 continue;
             }
