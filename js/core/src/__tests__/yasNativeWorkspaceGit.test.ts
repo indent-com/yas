@@ -72,7 +72,7 @@ describe("YasNativeWorkspaceGit lifecycle", () => {
     );
   });
 
-  it("selects status on the server without client-side filtering", async () => {
+  it("selects status on the server and filters unrequested classes client-side", async () => {
     const list = vi.fn(async () => ({
       revision: 1n,
       entities: [ignoredStatusEntity("ignored")],
@@ -101,6 +101,36 @@ describe("YasNativeWorkspaceGit lifecycle", () => {
         statusSelection: YAS_GIT_WATCH_STATUS_UNTRACKED,
       }),
     );
+    // An old server that ignored the selection extension can still send
+    // ignored records; the client drops them rather than surfacing them.
+    expect(handle.state.status.map(({ path }) => path)).toEqual([]);
+  });
+
+  it("includes ignored status when requested", async () => {
+    const list = vi.fn(async () => ({
+      revision: 1n,
+      entities: [ignoredStatusEntity("ignored")],
+    }));
+    const native = Object.assign(nativeRepository(), {
+      list,
+      catalog: {
+        subscribe: vi.fn(() => () => undefined),
+      },
+    });
+    const workspace = new YasNativeWorkspaceGit(connection(), {
+      terminalHandle: () => undefined,
+      client: {
+        open: vi.fn(async () => native),
+        discover: vi.fn(),
+      },
+    });
+
+    const handle = await workspace.openRepo("/repo", {
+      status: true,
+      untracked: true,
+      ignored: true,
+    });
+
     expect(handle.state.status.map(({ path }) => path)).toEqual(["ignored"]);
   });
 

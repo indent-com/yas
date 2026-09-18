@@ -412,15 +412,9 @@ fn collect_untracked(
                 return Ok(());
             }
             let abs = entry.path();
-            let Ok(rel) = abs.strip_prefix(workdir) else {
+            let Some(rel_bytes) = crate::worktree_relative_git_path(&abs, workdir) else {
                 continue;
             };
-            let Ok(rel_bytes) = gix::path::os_str_into_bstr(rel.as_os_str()) else {
-                continue;
-            };
-            // Filters, ignore rules, index lookups, and emitted records all
-            // use slash-separated Git paths, including on Windows.
-            let rel_bytes = gix::path::to_unix_separators_on_windows(rel_bytes);
             let rel_vec = rel_bytes.to_vec();
             if rel_vec == b".git" || rel_vec.is_empty() {
                 continue;

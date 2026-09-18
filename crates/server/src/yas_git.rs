@@ -194,24 +194,32 @@ fn status_selection(options: &wire::WatchOptions) -> (bool, bool) {
     let selection = options
         .status_selection
         .unwrap_or(yas_wire::schema::git::WATCH_STATUS_SELECTION_FLAGS as u8);
-    (
-        selection & yas_wire::schema::git::WATCH_STATUS_UNTRACKED as u8 != 0,
-        selection & yas_wire::schema::git::WATCH_STATUS_IGNORED as u8 != 0,
-    )
+    let untracked = selection & yas_wire::schema::git::WATCH_STATUS_UNTRACKED as u8 != 0;
+    let ignored = selection & yas_wire::schema::git::WATCH_STATUS_IGNORED as u8 != 0;
+    // The wire protocol rejects IGNORED without UNTRACKED, but a malformed
+    // or hand-built request should not be silently downgraded to tracked-only.
+    if ignored && !untracked {
+        (true, true)
+    } else {
+        (untracked, ignored)
+    }
 }
 
 fn query_watch_state_options(body: &wire::QueryBody) -> yas_git::StateOptions {
-    // LOG depends on refs, operation pseudo-refs, and configured upstreams,
-    // not on index/worktree status. Other query kinds keep the complete
-    // mutable projection as their conservative invalidation source.
-    let status = !matches!(body, wire::QueryBody::Log { .. });
+    // LOG depends on refs and operation pseudo-refs, plus the config files
+    // that define upstreams and remotes. Those config files are watched
+    // independently, so LOG does not need tracking/remotes records either.
+    // Other query kinds keep the complete mutable projection as their
+    // conservative invalidation source.
+    let is_log = matches!(body, wire::QueryBody::Log { .. });
+    let status = !is_log;
     yas_git::StateOptions {
         wants_state: true,
         status,
         untracked: status,
         ignored: status,
-        tracking: true,
-        remotes: true,
+        tracking: !is_log,
+        remotes: !is_log,
         ..Default::default()
     }
 }
@@ -2090,6 +2098,15 @@ mod tests {
                 ..Default::default()
             }),
             (false, false)
+        );
+        // A malformed ignored-only value is hardened to the broader selection
+        // instead of being silently downgraded to tracked-only.
+        assert_eq!(
+            status_selection(&wire::WatchOptions {
+                status_selection: Some(yas_wire::schema::git::WATCH_STATUS_IGNORED as u8),
+                ..Default::default()
+            }),
+            (true, true)
         );
     }
 

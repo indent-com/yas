@@ -1409,17 +1409,9 @@ impl Engine {
     /// `target`). Any failure — stack build, non-decodable path — reads
     /// as not-ignored: the safe direction is a recompute.
     fn path_ignored(&mut self, abs: &Path, workdir: &Path) -> bool {
-        let Ok(rel) = abs.strip_prefix(workdir) else {
+        let Some(rel) = crate::worktree_relative_git_path(abs, workdir) else {
             return false;
         };
-        if rel.as_os_str().is_empty() {
-            return false;
-        }
-        let Ok(rel) = gix::path::os_str_into_bstr(rel.as_os_str()) else {
-            return false;
-        };
-        // The exclude stack and index both take slash-separated Git paths.
-        let rel = gix::path::to_unix_separators_on_windows(rel);
         if self.excludes.is_none() {
             self.build_excludes();
         }
