@@ -2566,6 +2566,10 @@ pub const REPOSITORY_FLAGS: u64 = 63;
 pub const WATCH_REFS_SETTLE_MS_EXTENSION: u64 = 1;
 pub const WATCH_STATUS_SETTLE_MS_EXTENSION: u64 = 2;
 pub const WATCH_REF_PREFIXES_EXTENSION: u64 = 3;
+pub const WATCH_STATUS_SELECTION_EXTENSION: u64 = 4;
+pub const WATCH_STATUS_UNTRACKED: u64 = 1;
+pub const WATCH_STATUS_IGNORED: u64 = 2;
+pub const WATCH_STATUS_SELECTION_FLAGS: u64 = 3;
 pub const CURSOR_LOG_FRONTIER: u64 = 1;
 pub const CURSOR_PATH: u64 = 2;
 pub const CURSOR_PLATFORM_PATH: u64 = 3;
@@ -2884,6 +2888,10 @@ super::ConstantMetadata { name: "REPOSITORY_FLAGS", value: 63 },
 super::ConstantMetadata { name: "WATCH_REFS_SETTLE_MS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "WATCH_STATUS_SETTLE_MS_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "WATCH_REF_PREFIXES_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "WATCH_STATUS_SELECTION_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "WATCH_STATUS_UNTRACKED", value: 1 },
+super::ConstantMetadata { name: "WATCH_STATUS_IGNORED", value: 2 },
+super::ConstantMetadata { name: "WATCH_STATUS_SELECTION_FLAGS", value: 3 },
 super::ConstantMetadata { name: "CURSOR_LOG_FRONTIER", value: 1 },
 super::ConstantMetadata { name: "CURSOR_PATH", value: 2 },
 super::ConstantMetadata { name: "CURSOR_PLATFORM_PATH", value: 3 },

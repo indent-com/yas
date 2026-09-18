@@ -400,6 +400,7 @@ class NativeGitRepository implements YasNativeGitRepoHandle {
       refsSettleMs: this.options.refsLatencyMs,
       statusSettleMs: this.options.statusLatencyMs,
       refPrefixes: sortedRefPrefixes(this.options.refPrefixes),
+      statusSelection: watchStatusSelection(this.options),
     });
     if (this.closed) return;
     this.applySnapshot(snapshot);
@@ -939,6 +940,17 @@ function applyEntity(
   } else {
     mirror.worktreeGen = { count: body.count, digest: body.digest };
   }
+}
+
+function watchStatusSelection(
+  options: YasNativeGitOpenOptions,
+): number | undefined {
+  if (!(options.status || options.untracked || options.ignored))
+    return undefined;
+  return (
+    (options.untracked ? g.YAS_GIT_WATCH_STATUS_UNTRACKED : 0) |
+    (options.ignored ? g.YAS_GIT_WATCH_STATUS_IGNORED : 0)
+  );
 }
 
 function wantsState(options: YasNativeGitOpenOptions): boolean {

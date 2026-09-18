@@ -118,10 +118,13 @@ paths, revision, and capability flags. `CLOSE` is idempotent. A terminal
 `CLOSED` Event reports server-side loss with the last revision and exact reason.
 
 `WATCH` subscribes to selected HEAD, refs, remotes, in-progress operation,
-index/worktree status, upstreams, stashes, and worktree-generation state. The
-server publishes typed State records with revision/credit semantics; clients do
-not parse `.git` or rebuild state from a lossy event log. Reconnect can resume
-from a retained repository revision and otherwise receives a staged snapshot.
+index/worktree status, upstreams, stashes, and worktree-generation state. A
+status-selection extension independently admits untracked and ignored entries;
+the server applies it before walking and serializing status. Its absence admits
+both for compatibility with clients that predate selection. The server publishes
+typed State records with revision/credit semantics; clients do not parse `.git`
+or rebuild state from a lossy event log. Reconnect can resume from a retained
+repository revision and otherwise receives a staged snapshot.
 
 `QUERY` is a generated tagged union covering `RESOLVE`, `MERGE_BASE`, `LOG`,
 `TREE`, `BLOB`, `DIFF`, `PATCH`, `INDEX`, `DISCOVER`, `BLAME`, `REFLOG`, and

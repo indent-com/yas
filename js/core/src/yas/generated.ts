@@ -1122,6 +1122,10 @@ export const YAS_GIT_REPOSITORY_FLAGS = 63 as const;
 export const YAS_GIT_WATCH_REFS_SETTLE_MS_EXTENSION = 1 as const;
 export const YAS_GIT_WATCH_STATUS_SETTLE_MS_EXTENSION = 2 as const;
 export const YAS_GIT_WATCH_REF_PREFIXES_EXTENSION = 3 as const;
+export const YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION = 4 as const;
+export const YAS_GIT_WATCH_STATUS_UNTRACKED = 1 as const;
+export const YAS_GIT_WATCH_STATUS_IGNORED = 2 as const;
+export const YAS_GIT_WATCH_STATUS_SELECTION_FLAGS = 3 as const;
 export const YAS_GIT_CURSOR_LOG_FRONTIER = 1 as const;
 export const YAS_GIT_CURSOR_PATH = 2 as const;
 export const YAS_GIT_CURSOR_PLATFORM_PATH = 3 as const;
@@ -8912,6 +8916,22 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "WATCH_REF_PREFIXES_EXTENSION",
+          "value": 3
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "WATCH_STATUS_UNTRACKED",
+          "value": 1
+        },
+        {
+          "name": "WATCH_STATUS_IGNORED",
+          "value": 2
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_FLAGS",
           "value": 3
         },
         {

@@ -6085,6 +6085,22 @@
           "value": 3
         },
         {
+          "name": "WATCH_STATUS_SELECTION_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "WATCH_STATUS_UNTRACKED",
+          "value": 1
+        },
+        {
+          "name": "WATCH_STATUS_IGNORED",
+          "value": 2
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_FLAGS",
+          "value": 3
+        },
+        {
           "name": "CURSOR_LOG_FRONTIER",
           "value": 1
         },

@@ -190,6 +190,16 @@ impl Runtime {
     }
 }
 
+fn status_selection(options: &wire::WatchOptions) -> (bool, bool) {
+    let selection = options
+        .status_selection
+        .unwrap_or(yas_wire::schema::git::WATCH_STATUS_SELECTION_FLAGS as u8);
+    (
+        selection & yas_wire::schema::git::WATCH_STATUS_UNTRACKED as u8 != 0,
+        selection & yas_wire::schema::git::WATCH_STATUS_IGNORED as u8 != 0,
+    )
+}
+
 impl Session {
     pub(crate) async fn open(
         &self,
@@ -323,13 +333,12 @@ impl Session {
                 u64::from(value)
             })
         };
+        let (untracked, ignored) = status_selection(options);
         let state_options = yas_git::StateOptions {
             wants_state: true,
             status: datasets & yas_wire::schema::git::WATCH_STATUS as u16 != 0,
-            // Native STATUS is a complete status dataset, not only tracked
-            // paths. The repository engine already bounds these walks.
-            untracked: true,
-            ignored: true,
+            untracked,
+            ignored,
             tracking: datasets & yas_wire::schema::git::WATCH_UPSTREAMS as u16 != 0,
             remotes: datasets & yas_wire::schema::git::WATCH_REMOTES as u16 != 0,
             ref_prefixes,
@@ -2058,6 +2067,28 @@ mod tests {
             body,
             extensions: Extensions::default(),
         }
+    }
+
+    #[test]
+    fn watch_status_selection_defaults_complete_and_narrows_on_request() {
+        assert_eq!(
+            status_selection(&wire::WatchOptions::default()),
+            (true, true)
+        );
+        assert_eq!(
+            status_selection(&wire::WatchOptions {
+                status_selection: Some(yas_wire::schema::git::WATCH_STATUS_UNTRACKED as u8,),
+                ..Default::default()
+            }),
+            (true, false)
+        );
+        assert_eq!(
+            status_selection(&wire::WatchOptions {
+                status_selection: Some(0),
+                ..Default::default()
+            }),
+            (false, false)
+        );
     }
 
     #[test]

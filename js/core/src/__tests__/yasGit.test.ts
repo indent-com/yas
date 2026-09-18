@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   YAS_GOLDEN_VECTORS,
+  YAS_GIT_WATCH_STATUS_IGNORED,
+  YAS_GIT_WATCH_STATUS_UNTRACKED,
   YasProtocolError,
   decodeGitClose,
   decodeGitClosed,
@@ -296,5 +298,25 @@ describe("YAS Git v1", () => {
           `${name}@${end}`,
         ).toThrow(YasProtocolError);
     }
+  });
+
+  it("round-trips status selection and rejects ignored without untracked", () => {
+    expect(
+      decodeGitWatchOptions(
+        encodeGitWatchOptions({
+          statusSelection: YAS_GIT_WATCH_STATUS_UNTRACKED,
+        }),
+      ),
+    ).toEqual({
+      refsSettleMs: 0,
+      statusSettleMs: 0,
+      refPrefixes: [],
+      statusSelection: YAS_GIT_WATCH_STATUS_UNTRACKED,
+    });
+    expect(() =>
+      encodeGitWatchOptions({
+        statusSelection: YAS_GIT_WATCH_STATUS_IGNORED,
+      }),
+    ).toThrow("invalid Git status selection");
   });
 });

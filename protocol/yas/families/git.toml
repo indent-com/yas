@@ -332,6 +332,18 @@ value = 2
 [[constant]]
 name = "WATCH_REF_PREFIXES_EXTENSION"
 value = 3
+[[constant]]
+name = "WATCH_STATUS_SELECTION_EXTENSION"
+value = 4
+[[constant]]
+name = "WATCH_STATUS_UNTRACKED"
+value = 1
+[[constant]]
+name = "WATCH_STATUS_IGNORED"
+value = 2
+[[constant]]
+name = "WATCH_STATUS_SELECTION_FLAGS"
+value = 3
 
 [[constant]]
 name = "CURSOR_LOG_FRONTIER"

@@ -579,6 +579,7 @@ pub struct WatchOptions {
     pub refs_settle_ms: u16,
     pub status_settle_ms: u16,
     pub ref_prefixes: Vec<Vec<u8>>,
+    pub status_selection: Option<u8>,
 }
 
 impl WatchOptions {
@@ -597,6 +598,13 @@ impl WatchOptions {
                 return Err(Error::Invalid("Git ref prefix order"));
             }
             previous = Some(prefix);
+        }
+        if let Some(selection) = self.status_selection
+            && (selection & !(crate::schema::git::WATCH_STATUS_SELECTION_FLAGS as u8) != 0
+                || selection & crate::schema::git::WATCH_STATUS_IGNORED as u8 != 0
+                    && selection & crate::schema::git::WATCH_STATUS_UNTRACKED as u8 == 0)
+        {
+            return Err(Error::Invalid("Git status selection"));
         }
         Ok(())
     }
@@ -630,6 +638,13 @@ impl WatchOptions {
                 value,
             });
         }
+        if let Some(selection) = self.status_selection {
+            values.push(Extension {
+                tag: crate::schema::git::WATCH_STATUS_SELECTION_EXTENSION as u16,
+                required: false,
+                value: vec![selection],
+            });
+        }
         Ok(Extensions(values))
     }
 
@@ -640,6 +655,7 @@ impl WatchOptions {
                 crate::schema::git::WATCH_REFS_SETTLE_MS_EXTENSION as u16,
                 crate::schema::git::WATCH_STATUS_SETTLE_MS_EXTENSION as u16,
                 crate::schema::git::WATCH_REF_PREFIXES_EXTENSION as u16,
+                crate::schema::git::WATCH_STATUS_SELECTION_EXTENSION as u16,
             ],
         )?;
         let settle = |tag: u64| -> Result<u16> {
@@ -674,10 +690,26 @@ impl WatchOptions {
             }
             decoder.finish()?;
         }
+        let status_selection = extensions
+            .0
+            .iter()
+            .find(|extension| {
+                extension.tag == crate::schema::git::WATCH_STATUS_SELECTION_EXTENSION as u16
+            })
+            .map(|extension| {
+                extension
+                    .value
+                    .as_slice()
+                    .try_into()
+                    .map(u8::from_le_bytes)
+                    .map_err(|_| Error::Invalid("Git status selection extension"))
+            })
+            .transpose()?;
         let value = Self {
             refs_settle_ms: settle(crate::schema::git::WATCH_REFS_SETTLE_MS_EXTENSION)?,
             status_settle_ms: settle(crate::schema::git::WATCH_STATUS_SETTLE_MS_EXTENSION)?,
             ref_prefixes,
+            status_selection,
         };
         value.validate()?;
         Ok(value)
@@ -4164,9 +4196,18 @@ mod tests {
             refs_settle_ms: 50,
             status_settle_ms: 500,
             ref_prefixes: vec![b"refs/heads/".to_vec(), b"refs/remotes/".to_vec()],
+            status_selection: Some(crate::schema::git::WATCH_STATUS_UNTRACKED as u8),
         };
         let extensions = options.to_extensions().unwrap();
         assert_eq!(WatchOptions::from_extensions(&extensions).unwrap(), options);
+        assert!(
+            WatchOptions {
+                status_selection: Some(crate::schema::git::WATCH_STATUS_IGNORED as u8),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
         round_trip(Watch {
             repository_handle: 4,
             datasets: (crate::schema::git::WATCH_HEAD
