@@ -12,7 +12,7 @@ import {
 } from "solid-js";
 import { createStore } from "solid-js/store";
 import type { LayoutLeaf } from "@yas-run/core/layout";
-import { autoFocusPaneTarget, paneKeyboardTarget } from "./treeContext";
+import { autoFocusPaneTarget, paneKeyboardTarget } from "./paneFocus";
 
 export interface PaneContentProps {
   paneId: string;
@@ -120,7 +120,7 @@ export function PaneSlot(props: PaneContentProps) {
         if (disposed || !slot.isConnected || pane.element.parentNode !== slot)
           return;
         autoFocusPaneTarget(
-          () => props.isFocused,
+          () => props.isFocused && props.visible,
           () =>
             focused?.isConnected ? focused : paneKeyboardTarget(pane.element),
           pane.element.ownerDocument,

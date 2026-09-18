@@ -238,7 +238,7 @@ import { newlyLaunchedSurface } from "./layout/floatingWindow";
 import {
   autoFocusPaneTarget,
   canRestorePaneKeyboardFocus,
-} from "./layout/treeContext";
+} from "./layout/paneFocus";
 import { WebOverlay } from "./WebOverlay";
 import type { WebPaneHandle } from "./WebPane";
 import { WebPaneHost } from "./WebPaneHost";

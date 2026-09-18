@@ -81,6 +81,11 @@ Tabbed and stacking containers keep every child mounted. Selecting a hidden
 child changes its local active child and restores its existing terminal,
 editor, or web state.
 
+Arming or cancelling the keyboard prefix preserves DOM focus. Layout updates
+also preserve the active control within a pane, including editor search and
+rename fields; only a pane handoff moves focus to another pane's default input.
+Hidden panes never request keyboard focus.
+
 Each header follows its content's live title: terminal title/command, Wayland
 window title, editor filename, commit, management view, or web host. Numbered
 labels are used only while that identity is unresolved.

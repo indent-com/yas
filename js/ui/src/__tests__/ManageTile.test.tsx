@@ -4,7 +4,7 @@ import { render } from "solid-js/web";
 import { afterEach, expect, it, vi } from "vitest";
 import { ManageTile } from "../ManageTile";
 import { activeEditor } from "../ide/activeEditor";
-import { autoFocusPaneTarget } from "../layout/treeContext";
+import { autoFocusPaneTarget } from "../layout/paneFocus";
 import { themeFor, uiScale } from "../theme";
 
 vi.mock("@yas-run/solid", () => ({

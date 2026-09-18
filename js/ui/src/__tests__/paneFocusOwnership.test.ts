@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { createEffect, createRoot, createSignal } from "solid-js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   autoFocusPaneTarget,
   canAutoFocusPane,
   canRestorePaneKeyboardFocus,
-} from "../layout/treeContext";
+  paneKeyboardTarget,
+} from "../layout/paneFocus";
 
 describe("layout focus ownership", () => {
   afterEach(() => document.body.replaceChildren());
@@ -31,6 +33,50 @@ describe("layout focus ownership", () => {
     expect(canAutoFocusPane(document.activeElement, document.body)).toBe(true);
 
     previousPane.remove();
+  });
+
+  it("preserves focus on an editor's search field during pane updates", () => {
+    const pane = document.createElement("div");
+    pane.dataset.yasPaneId = "0";
+    pane.innerHTML =
+      '<div class="cm-content" contenteditable="true" tabindex="0"></div><input name="search">';
+    document.body.append(pane);
+    const search = pane.querySelector("input")!;
+    search.focus();
+
+    autoFocusPaneTarget(
+      () => true,
+      () => paneKeyboardTarget(pane),
+    );
+
+    expect(document.activeElement).toBe(search);
+  });
+
+  it("does not subscribe a pane focus effect to its DOM focus handlers", () => {
+    const [revision, setRevision] = createSignal(0);
+    const input = document.createElement("textarea");
+    document.body.append(input);
+    input.addEventListener("focus", () => revision());
+    const run = vi.fn(() =>
+      autoFocusPaneTarget(
+        () => true,
+        () => input,
+      ),
+    );
+    let dispose!: () => void;
+    createRoot((cleanup) => {
+      dispose = cleanup;
+      createEffect(run);
+    });
+
+    try {
+      expect(document.activeElement).toBe(input);
+      expect(run).toHaveBeenCalledOnce();
+      setRevision(1);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      dispose();
+    }
   });
 
   it("allows focus to hand off from a body-portaled web pane", () => {

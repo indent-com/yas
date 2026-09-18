@@ -9,6 +9,7 @@ import {
   createSignal,
   createEffect,
   createMemo,
+  on,
   onMount,
   onCleanup,
   untrack,
@@ -98,12 +99,11 @@ import {
 } from "./childIdentity";
 import {
   LayoutTreeContext,
-  autoFocusPaneTarget,
-  paneKeyboardTarget,
   useLayoutTree,
   type LayoutTreeCtx,
 } from "./treeContext";
 import type { Theme } from "../theme";
+import { autoFocusPaneTarget, paneKeyboardTarget } from "./paneFocus";
 import { mergeStyle, themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
 import { armPrefix, prefixChordLabel } from "../keyPrefix";
@@ -3098,28 +3098,24 @@ function LeafPane(props: PaneContentProps) {
     ctx.onCreateInPane?.(props.paneId, props.leaf.command);
   });
 
-  // Per-pane memos (default equality): the raw props read through the shared
-  // assignments object, whose identity changes on ANY pane's reassignment —
-  // without the memo, every pane's focus effect re-runs on every layout
-  // mutation and the focused pane re-asserts DOM focus it never lost.
-  const paneSession = createMemo(() => props.sessionId);
-  const paneVisible = createMemo(() => props.visible);
   const paneAttention = createMemo(() => {
     const assignment = props.sessionId;
     return assignment != null && (ctx.hasAttention?.(assignment) ?? false);
   });
-  createEffect(() => {
-    // Track these dependencies
-    const focused = props.isFocused;
-    const _sid = paneSession();
-    const _vis = paneVisible();
-    if (!focused || !paneContainer) return;
-
-    autoFocusPaneTarget(
-      () => props.isFocused,
-      () => paneKeyboardTarget(paneContainer),
-    );
-  });
+  // PersistentPanes tracks these fields separately. Focus follows ownership,
+  // content replacement, and visibility, never incidental reads in handlers.
+  createEffect(
+    on(
+      [() => props.isFocused, () => props.sessionId, () => props.visible],
+      () => {
+        if (!paneContainer) return;
+        autoFocusPaneTarget(
+          () => props.isFocused && props.visible,
+          () => paneKeyboardTarget(paneContainer),
+        );
+      },
+    ),
+  );
 
   return (
     <div
@@ -3260,7 +3256,7 @@ function LeafPane(props: PaneContentProps) {
               fallback={
                 <EmptyPane
                   paneId={props.paneId}
-                  isFocused={props.isFocused}
+                  isFocused={props.isFocused && props.visible}
                   showHint={showEmptyPaneHint(
                     ctx.multiPane,
                     ctx.hasAssignedPane,
