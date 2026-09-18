@@ -69,6 +69,16 @@ impl Repository {
         self.git(&["add", "."]);
         self.git(&["commit", "-q", "-m", message]);
     }
+
+    fn worktree_watches(&self) -> Vec<PathBuf> {
+        // gix discovery simplifies Windows verbatim paths, while the fixture
+        // uses canonical paths. Compare the same spelling on both sides.
+        yas_git::debug_worktree_watches(&self.0.join(".git"))
+            .unwrap()
+            .into_iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect()
+    }
 }
 
 impl Drop for Repository {
@@ -429,7 +439,7 @@ fn status_keeps_tracked_files_and_ancestors_observable_despite_ignore_rules() {
         let (handle, _) = open(&repository);
         let state = StateStream::new(&handle, status_options(untracked, false));
         assert!(state.status().is_empty());
-        let watches = yas_git::debug_worktree_watches(&repository.0.join(".git")).unwrap();
+        let watches = repository.worktree_watches();
         assert!(watches.contains(&repository.0.join("generated/nested")));
         assert!(!watches.contains(&repository.0.join("generated/cache")));
 
@@ -451,7 +461,7 @@ fn index_changes_reconcile_tracked_exceptions_to_ignore_pruning() {
     let (handle, _) = open(&repository);
     let state = StateStream::new(&handle, status_options(true, false));
     assert!(state.status().is_empty());
-    let watches = || yas_git::debug_worktree_watches(&repository.0.join(".git")).unwrap();
+    let watches = || repository.worktree_watches();
     assert!(!watches().contains(&repository.0.join("generated")));
 
     repository.git(&["add", "-f", "generated/nested/tracked"]);
@@ -508,6 +518,41 @@ fn status_budgets_are_independent_across_shared_selections() {
 }
 
 #[test]
+fn nested_status_paths_share_index_and_ignore_rules() {
+    let repository = Repository::new();
+    repository.write("nested/tracked", b"initial\n");
+    repository.write("nested/.gitignore", b"*.log\ncache/\n");
+    repository.commit("base");
+    repository.write("nested/tracked", b"modified\n");
+    repository.write("nested/untracked", b"untracked\n");
+    repository.write("nested/ignored.log", b"ignored\n");
+    repository.write("nested/cache/ignored", b"ignored\n");
+    let (handle, _) = open(&repository);
+
+    // Keep the shared engine alive while widening its status demand.
+    let mut states = Vec::new();
+    for (untracked, ignored) in [(false, false), (true, false), (true, true)] {
+        let state = StateStream::new(&handle, status_options(untracked, ignored));
+        let mut expected = BTreeMap::from([("nested/tracked".to_owned(), (b' ', b'M'))]);
+        if untracked {
+            expected.insert("nested/untracked".to_owned(), (b'?', b'?'));
+        }
+        if ignored {
+            expected.insert("nested/ignored.log".to_owned(), (b'!', b'!'));
+            expected.insert("nested/cache/ignored".to_owned(), (b'!', b'!'));
+        }
+        assert_eq!(state.status(), expected);
+        assert_eq!(
+            repository
+                .worktree_watches()
+                .contains(&repository.0.join("nested/cache")),
+            ignored
+        );
+        states.push(state);
+    }
+}
+
+#[test]
 fn non_status_subscribers_do_not_widen_status_collection() {
     let repository = Repository::new();
     repository.write(".gitignore", b"ignored/\n");
@@ -526,7 +571,7 @@ fn non_status_subscribers_do_not_widen_status_collection() {
     assert!(refs.status().is_empty());
     let selected = StateStream::new(&handle, status_options(true, false));
     assert_eq!(selected.status().len(), 1);
-    let watches = yas_git::debug_worktree_watches(&repository.0.join(".git")).unwrap();
+    let watches = repository.worktree_watches();
     assert!(!watches.contains(&repository.0.join("ignored")));
     assert_eq!(
         yas_git::debug_status_recomputes(&repository.0.join(".git")),
@@ -550,8 +595,8 @@ fn reattached_status_selection_observes_changes_made_while_pruned() {
     // Wait for the asynchronous detach to disarm this directory. Writes
     // inside it then cannot invalidate a cached ignored-status segment.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while yas_git::debug_worktree_watches(&repository.0.join(".git"))
-        .unwrap()
+    while repository
+        .worktree_watches()
         .contains(&repository.0.join("ignored"))
     {
         assert!(

@@ -1418,6 +1418,8 @@ impl Engine {
         let Ok(rel) = gix::path::os_str_into_bstr(rel.as_os_str()) else {
             return false;
         };
+        // The exclude stack and index both take slash-separated Git paths.
+        let rel = gix::path::to_unix_separators_on_windows(rel);
         if self.excludes.is_none() {
             self.build_excludes();
         }
@@ -1432,7 +1434,7 @@ impl Engine {
         let objects = &self.local.objects;
         let mut excluded = |mode: Mode| -> bool {
             stack
-                .at_entry(rel, Some(mode), objects)
+                .at_entry(rel.as_ref(), Some(mode), objects)
                 .map(|platform| platform.is_excluded())
                 .unwrap_or(false)
         };
@@ -1446,7 +1448,6 @@ impl Engine {
         let Ok(index) = self.local.index_or_empty() else {
             return false;
         };
-        let rel = gix::path::to_unix_separators_on_windows(rel);
         index.entry_index_by_path(rel.as_ref()).is_err() && !index.path_is_directory(rel.as_ref())
     }
 
