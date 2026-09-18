@@ -2763,13 +2763,14 @@ struct Compositor {
     /// Where the cursor last was inside `pointer_entered_id`, in surface-local
     /// coordinates, so a pointer created later can be entered there.
     pointer_entered_local: (f64, f64),
-    /// Latest `wl_pointer.enter` serial delivered to each pointer resource.
+    /// Latest `wl_pointer.enter` serial delivered to each client on this seat.
     ///
     /// Cursor requests are authority-bearing: both core `set_cursor` and
     /// `wp_cursor_shape_device_v1.set_shape` must name the latest enter.  A
     /// compositor-wide serial alone is insufficient because two clients can
-    /// reply independently after focus crosses between them.
-    pointer_enter_serials: FxHashMap<ObjectId, u32>,
+    /// reply independently after focus crosses between them. Cursor-shape
+    /// devices survive replacement of the wl_pointer that created them.
+    pointer_enter_serials: FxHashMap<ClientId, u32>,
     /// The surface the client last passed to `wl_pointer.set_cursor`.  A
     /// toolkit may keep a pool of cursor surfaces and retire one it is not
     /// showing, so `is_cursor` alone (which is set once and never cleared) does
@@ -5362,7 +5363,7 @@ impl Compositor {
         self.keyboards.retain(|k| k.is_alive());
         self.pointers.retain(|p| p.is_alive());
         self.pointer_enter_serials
-            .retain(|id, _| self.pointers.iter().any(|pointer| pointer.id() == *id));
+            .retain(|client, _| backend.get_client_data(client.clone()).is_ok());
         self.touches.retain(|t| t.is_alive());
         self.data_devices.retain(|d| d.is_alive());
         self.primary_devices.retain(|d| d.is_alive());
@@ -5539,22 +5540,22 @@ impl Compositor {
             .unwrap_or(self.focused_surface_id)
     }
 
-    /// Resolve a cursor request only when it belongs to the pointer that is
-    /// currently inside the requesting client's surface and carries that
-    /// pointer's latest enter serial.
+    /// Resolve a cursor request only when the seat's pointer is inside the
+    /// requesting client's surface and it carries that client's latest enter
+    /// serial. A cursor-shape device is tied to the pointer capability, not
+    /// the lifetime of the wl_pointer resource used to create it.
     ///
     /// Requests from different Wayland clients share the compositor thread
     /// but not an ordering relationship.  Without both checks, a late shape
     /// from the surface just left is filed against the surface now hovered,
     /// after its own client may already have selected the right cursor.
-    fn cursor_request_target_sid(&self, pointer_id: &ObjectId, serial: u32) -> Option<u16> {
-        if self.pointer_enter_serials.get(pointer_id) != Some(&serial) {
+    fn cursor_request_target_sid(&self, client_id: &ClientId, serial: u32) -> Option<u16> {
+        if self.pointer_enter_serials.get(client_id) != Some(&serial) {
             return None;
         }
-        let pointer = self.pointers.iter().find(|p| p.id() == *pointer_id)?;
         let entered = self.pointer_entered_id.as_ref()?;
         let entered_surface = self.surfaces.get(entered)?;
-        if !same_client(pointer, &entered_surface.wl_surface) {
+        if entered_surface.wl_surface.client()?.id() != *client_id {
             return None;
         }
         self.find_toplevel_root(entered).1
@@ -5780,7 +5781,9 @@ impl Compositor {
                 for ptr in &self.pointers {
                     if same_client(ptr, &wl_surface) {
                         ptr.enter(serial, &wl_surface, lx, ly);
-                        self.pointer_enter_serials.insert(ptr.id(), serial);
+                        if let Some(client) = ptr.client() {
+                            self.pointer_enter_serials.insert(client.id(), serial);
+                        }
                     }
                 }
                 // An enter nobody received is not focus. The next motion
@@ -9594,7 +9597,7 @@ impl GlobalDispatch<WlSeat, ()> for Compositor {
 impl Dispatch<WlSeat, ()> for Compositor {
     fn request(
         state: &mut Self,
-        _: &Client,
+        client: &Client,
         resource: &WlSeat,
         request: <WlSeat as Resource>::Request,
         _: &(),
@@ -9652,7 +9655,7 @@ impl Dispatch<WlSeat, ()> for Compositor {
                     let serial = state.next_serial();
                     let (lx, ly) = state.pointer_entered_local;
                     ptr.enter(serial, &wl, lx, ly);
-                    state.pointer_enter_serials.insert(ptr.id(), serial);
+                    state.pointer_enter_serials.insert(client.id(), serial);
                     // Mandatory here: with no motion following, the frame is
                     // what tells a v5+ client the group is complete.
                     ptr.frame();
@@ -9692,7 +9695,7 @@ impl Dispatch<WlKeyboard, ()> for Compositor {
 impl Dispatch<WlPointer, ()> for Compositor {
     fn request(
         state: &mut Self,
-        _: &Client,
+        client: &Client,
         resource: &WlPointer,
         request: <WlPointer as Resource>::Request,
         _: &(),
@@ -9707,8 +9710,7 @@ impl Dispatch<WlPointer, ()> for Compositor {
                 hotspot_x,
                 hotspot_y,
             } => {
-                let Some(surface_id) = state.cursor_request_target_sid(&resource.id(), serial)
-                else {
+                let Some(surface_id) = state.cursor_request_target_sid(&client.id(), serial) else {
                     return;
                 };
                 if let Some(surface) = surface {
@@ -9734,7 +9736,6 @@ impl Dispatch<WlPointer, ()> for Compositor {
             }
             Request::Release => {
                 state.pointers.retain(|p| p.id() != resource.id());
-                state.pointer_enter_serials.remove(&resource.id());
             }
             _ => {}
         }
@@ -12061,7 +12062,7 @@ impl GlobalDispatch<WpCursorShapeManagerV1, ()> for Compositor {
 impl Dispatch<WpCursorShapeManagerV1, ()> for Compositor {
     fn request(
         _: &mut Self,
-        _: &Client,
+        client: &Client,
         _: &WpCursorShapeManagerV1,
         request: <WpCursorShapeManagerV1 as Resource>::Request,
         _: &(),
@@ -12072,9 +12073,12 @@ impl Dispatch<WpCursorShapeManagerV1, ()> for Compositor {
         match request {
             Request::GetPointer {
                 cursor_shape_device,
-                pointer,
+                pointer: _,
             } => {
-                data_init.init(cursor_shape_device, Some(pointer.id()));
+                // Chromium recreates wl_pointer after seat capability changes
+                // while retaining this device. Releasing that resource does
+                // not remove the seat's pointer capability or cursor authority.
+                data_init.init(cursor_shape_device, Some(client.id()));
             }
             Request::GetTabletToolV2 {
                 cursor_shape_device,
@@ -12091,23 +12095,23 @@ impl Dispatch<WpCursorShapeManagerV1, ()> for Compositor {
     }
 }
 
-impl Dispatch<WpCursorShapeDeviceV1, Option<ObjectId>> for Compositor {
+impl Dispatch<WpCursorShapeDeviceV1, Option<ClientId>> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
         _: &WpCursorShapeDeviceV1,
         request: <WpCursorShapeDeviceV1 as Resource>::Request,
-        pointer_id: &Option<ObjectId>,
+        pointer_client: &Option<ClientId>,
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
         use wp_cursor_shape_device_v1::Request;
         match request {
             Request::SetShape { serial, shape } => {
-                let Some(pointer_id) = pointer_id else {
+                let Some(client_id) = pointer_client else {
                     return;
                 };
-                let Some(surface_id) = state.cursor_request_target_sid(pointer_id, serial) else {
+                let Some(surface_id) = state.cursor_request_target_sid(client_id, serial) else {
                     return;
                 };
                 use wayland_server::WEnum;

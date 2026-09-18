@@ -621,5 +621,62 @@ fn cursor_authority_replacement_and_artwork_deduplication() {
             .collect();
         assert!(restored == selected, "fresh cursor request was suppressed");
     }
+    // Chromium replaces wl_pointer when seat capabilities change (for
+    // example, when a touch viewer connects), but keeps its cursor-shape
+    // device. The device belongs to the seat's pointer capability, not the
+    // lifetime of that particular wl_pointer resource.
+    let previous_serial = app.enter_serial.expect("enter before pointer replacement");
+    let replacement = seat.get_pointer(&qh, ());
+    pointer.release();
+    queue
+        .roundtrip(&mut app)
+        .expect("pointer replacement roundtrip");
+    let replacement_serial = app.enter_serial.expect("replacement pointer enter");
+    assert_ne!(replacement_serial, previous_serial);
+    let leaves = app.leave_count;
+    replacement.set_cursor(replacement_serial, None, 0, 0);
+    cursor.attach(None, 0, 0);
+    cursor.commit();
+    queue.roundtrip(&mut app).expect("replacement cursor hide");
+    let hidden: Vec<_> = handle
+        .event_rx
+        .try_iter()
+        .filter_map(|event| match event {
+            CompositorEvent::SurfaceCursor { cursor, .. } => Some(cursor),
+            _ => None,
+        })
+        .collect();
+    assert!(hidden == [CursorImage::Hidden]);
+
+    cursor_shape.set_shape(previous_serial, wp_cursor_shape_device_v1::Shape::Text);
+    queue.roundtrip(&mut app).expect("old pointer serial");
+    assert!(
+        !handle
+            .event_rx
+            .try_iter()
+            .any(|event| matches!(event, CompositorEvent::SurfaceCursor { .. }))
+    );
+
+    cursor_shape.set_shape(
+        replacement_serial,
+        wp_cursor_shape_device_v1::Shape::Default,
+    );
+    queue
+        .roundtrip(&mut app)
+        .expect("retained shape device restores cursor");
+    let restored: Vec<_> = handle
+        .event_rx
+        .try_iter()
+        .filter_map(|event| match event {
+            CompositorEvent::SurfaceCursor { cursor, .. } => Some(cursor),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        restored == [CursorImage::Named("default".to_owned())],
+        "replacing wl_pointer broke the retained cursor-shape device"
+    );
+    assert_eq!(app.leave_count, leaves, "cursor restore changed focus");
+    assert_eq!(app.enter_serial, Some(replacement_serial));
     handle.stop();
 }
