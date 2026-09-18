@@ -168,8 +168,11 @@ export interface GitDiscoverOptions {
 
 export interface GitOpenOptions {
   watch?: boolean;
+  /** Request tracked status entries (staged/unstaged changes to index-known files). */
   status?: boolean;
+  /** Also include untracked entries. Requires `status` to have any effect. */
   untracked?: boolean;
+  /** Also include ignored entries. Requires `untracked`. */
   ignored?: boolean;
   tracking?: boolean;
   remotes?: boolean;

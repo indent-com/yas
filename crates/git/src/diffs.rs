@@ -412,12 +412,9 @@ fn collect_untracked(
                 return Ok(());
             }
             let abs = entry.path();
-            let Ok(rel) = abs.strip_prefix(workdir) else {
+            let Some(rel_bytes) = crate::worktree_relative_git_path(&abs, workdir) else {
                 continue;
             };
-            let rel_bytes = gix::path::os_str_into_bstr(rel.as_os_str())
-                .map(|b| b.to_owned())
-                .unwrap_or_default();
             let rel_vec = rel_bytes.to_vec();
             if rel_vec == b".git" || rel_vec.is_empty() {
                 continue;
@@ -2382,9 +2379,9 @@ fn append_text_patch(
 
 /// STATUS records for the state stream: staged = HEAD×INDEX, unstaged =
 /// INDEX×WORKTREE, joined by path; conflicts from index stages.
-/// `untracked`/`ignored` are the engine's superset demand across
-/// subscribers; `caches` carries the engine's HEAD-flatten memo and
-/// worktree stat cache.
+/// `untracked`/`ignored` select one independently bounded status segment;
+/// `caches` carries the engine's shared HEAD-flatten memo and worktree stat
+/// cache across selections.
 pub(crate) fn append_status_records(
     repo: &gix::Repository,
     untracked: bool,

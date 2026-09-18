@@ -2566,6 +2566,10 @@ pub const REPOSITORY_FLAGS: u64 = 63;
 pub const WATCH_REFS_SETTLE_MS_EXTENSION: u64 = 1;
 pub const WATCH_STATUS_SETTLE_MS_EXTENSION: u64 = 2;
 pub const WATCH_REF_PREFIXES_EXTENSION: u64 = 3;
+pub const WATCH_STATUS_SELECTION_EXTENSION: u64 = 4;
+pub const WATCH_STATUS_UNTRACKED: u64 = 1;
+pub const WATCH_STATUS_IGNORED: u64 = 2;
+pub const WATCH_STATUS_SELECTION_FLAGS: u64 = 3;
 pub const CURSOR_LOG_FRONTIER: u64 = 1;
 pub const CURSOR_PATH: u64 = 2;
 pub const CURSOR_PLATFORM_PATH: u64 = 3;
@@ -2822,6 +2826,7 @@ pub static TYPES: &[super::TypeMetadata] = &[
 super::TypeMetadata { name: "object_id", layout: "algorithm:u8,byte_len:u8,reserved:u16=0,bytes:[u8;byte_len]; SHA1 requires 20 bytes and SHA256 requires 32 bytes; zero bytes are not a sentinel" },
 super::TypeMetadata { name: "repository_source", layout: "kind:u8,reserved:[u8;3]=0; PLATFORM_PATH path:bytes_u32 raw platform bytes; FS root_handle:u64,path:bytes_u32 containing FS WirePath; SUBMODULE parent_repository:u64,path:bytes_u32 containing non-root FS WirePath; TERMINAL_CWD terminal_handle:u64,suffix:bytes_u32 containing relative FS WirePath, resolved atomically from that terminal's live cwd" },
 super::TypeMetadata { name: "watch_options", layout: "StateWatch Extensions: optional tag WATCH_REFS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_STATUS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_REF_PREFIXES_EXTENSION value count:u16 followed by unique strictly raw-byte-ascending prefix:bytes_u16 entries; empty/absent prefix list means every ref" },
+super::TypeMetadata { name: "watch_status_selection", layout: "Additional optional Git WATCH StateWatch extension: tag WATCH_STATUS_SELECTION_EXTENSION, REQUIRED clear, value exactly one u8 of flags admitting WATCH_STATUS_UNTRACKED and WATCH_STATUS_IGNORED in addition to tracked status; unknown bits are invalid and IGNORED requires UNTRACKED, so valid values are 0, 1, and 3. Absence admits both classes for compatibility; selection only applies with the WATCH_STATUS dataset and is enforced before collection budgets. Older servers may ignore this optional extension" },
 super::TypeMetadata { name: "query_endpoint", layout: "kind:u8,reserved:[u8;3]=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId; COMMIT,TREE,MERGE_BASE require object; EMPTY,INDEX,WORKTREE forbid object; MERGE_BASE is valid only as the left endpoint" },
 super::TypeMetadata { name: "query_cursor", layout: "empty bytes mean START; otherwise kind:u8,reserved:[u8;3]=0 and variant body: LOG_FRONTIER count:u16,reserved:u16=0,repeated ObjectId; PATH path:bytes_u32 containing FS WirePath; PLATFORM_PATH path:bytes_u32 raw platform bytes; PATCH path:bytes_u32 containing FS WirePath,position:u64; POSITION position:u64. Cursors are emitted by the server and replayed unchanged, but their exact form permits faithful protocol adaptation" },
 super::TypeMetadata { name: "query_body", layout: "kind:u16,flags:u16=0,variant body; RESOLVE spec:bytes_u16; MERGE_BASE object_count:u16,reserved:u16=0,repeated ordered ObjectId where 2 <= object_count <= MAX_QUERY_ENDPOINTS and the result is the best common ancestor of the complete set rather than an associative pairwise reduction; LOG query_flags:u16,reserved:u16=0,spec:bytes_u16,tip_count:u16,hide_count:u16,repeated tips:ObjectId,repeated hides:ObjectId,path:bytes_u32 empty or FS WirePath, where nonempty spec forbids explicit tips/hides and empty spec with no tips means HEAD; TREE tree:ObjectId,path:bytes_u32 FS WirePath; BLOB query_flags:u16,reserved:u16=0,object:ObjectId,path:bytes_u32 empty or FS WirePath,offset:u64,max_bytes:u32; DIFF query_flags:u16,rename_threshold:u8,reserved:u8=0,left:QueryEndpoint,right:QueryEndpoint,path:bytes_u32 empty or FS WirePath; PATCH query_flags:u16,context_lines:u8,rename_threshold:u8,max_bytes:u32,left:QueryEndpoint,right:QueryEndpoint,path:bytes_u32 empty or FS WirePath and returns the patch transforming left into right; INDEX query_flags:u16,reserved:u16=0,path:bytes_u32 empty or FS WirePath; DISCOVER query_flags:u16,max_depth:u16,source:bytes_u32 containing RepositorySource; BLAME query_flags:u16,reserved:u16=0,object:ObjectId,path:bytes_u32 FS WirePath,start_line:u32 one-based,line_count:u32 where zero means through end; REFLOG query_flags:u16,reserved:u16=0,name:bytes_u16 empty meaning HEAD; WORKTREES empty" },
@@ -2884,6 +2889,10 @@ super::ConstantMetadata { name: "REPOSITORY_FLAGS", value: 63 },
 super::ConstantMetadata { name: "WATCH_REFS_SETTLE_MS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "WATCH_STATUS_SETTLE_MS_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "WATCH_REF_PREFIXES_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "WATCH_STATUS_SELECTION_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "WATCH_STATUS_UNTRACKED", value: 1 },
+super::ConstantMetadata { name: "WATCH_STATUS_IGNORED", value: 2 },
+super::ConstantMetadata { name: "WATCH_STATUS_SELECTION_FLAGS", value: 3 },
 super::ConstantMetadata { name: "CURSOR_LOG_FRONTIER", value: 1 },
 super::ConstantMetadata { name: "CURSOR_PATH", value: 2 },
 super::ConstantMetadata { name: "CURSOR_PLATFORM_PATH", value: 3 },
@@ -5008,7 +5017,7 @@ GoldenVector { name: "git.open_terminal.payload", hex: "1b0000000300000009000000
 GoldenVector { name: "git.open_result.payload", hex: "0100000000000000070000000000000000003000050000002f7265706f0a0000002f7265706f2f2e67697400000000" },
 GoldenVector { name: "git.close.payload", hex: "010000000000000000000000" },
 GoldenVector { name: "git.watch.payload", hex: "0100000000000000030000001000000000000000000400000000000000000000" },
-GoldenVector { name: "git.watch_options.payload", hex: "0100000000000000130000004a0000000000000000100000000000003a000000010000000200000032000200000002000000f401030000001e00000002000b00726566732f68656164732f0d00726566732f72656d6f7465732f" },
+GoldenVector { name: "git.watch_options.payload", hex: "0100000000000000130000005300000000000000001000000000000043000000010000000200000032000200000002000000f401030000001e00000002000b00726566732f68656164732f0d00726566732f72656d6f7465732f040000000100000001" },
 GoldenVector { name: "git.unwatch.payload", hex: "01000000" },
 GoldenVector { name: "git.query.payload", hex: "010000000000000010000000000000100000000000004c0000000500000001003200010000000100000000140000010101010101010101010101010101010101010101000000010000000014000002020202020202020202020202020202020202020000000000000000" },
 GoldenVector { name: "git.resolve_query.payload", hex: "0100000000000000080000000000001000000000000012000000000000000c006d61696e2e2e2e746f70696300000000" },

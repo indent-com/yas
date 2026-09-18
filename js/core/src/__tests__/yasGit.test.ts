@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   YAS_GOLDEN_VECTORS,
+  YAS_GIT_WATCH_STATUS_IGNORED,
+  YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION,
+  YAS_GIT_WATCH_STATUS_UNTRACKED,
   YasProtocolError,
   decodeGitClose,
   decodeGitClosed,
@@ -296,5 +299,46 @@ describe("YAS Git v1", () => {
           `${name}@${end}`,
         ).toThrow(YasProtocolError);
     }
+  });
+
+  it("decodes status selection from the shared WATCH-options vector", () => {
+    const watch = decodeGitWatch(bytes("git.watch_options.payload"));
+    const cursor = new YasCursor(watch.encodedStateWatch);
+    expect(cursor.u16("State WATCH flags")).toBe(0);
+    expect(cursor.u16("State WATCH reserved")).toBe(0);
+    expect(cursor.u64("State WATCH credit")).toBe(4096n);
+    const extensions = decodeExtensions(cursor, new Set(), "Git WATCH");
+    cursor.end("State WATCH");
+    const options = decodeGitWatchOptions(extensions);
+    expect(options.statusSelection).toBe(YAS_GIT_WATCH_STATUS_UNTRACKED);
+    expect(encodeExtensions(encodeGitWatchOptions(options))).toEqual(
+      encodeExtensions(extensions),
+    );
+  });
+
+  it("preserves absent and zero selection and rejects malformed extensions", () => {
+    for (const statusSelection of [undefined, 0, 1, 3]) {
+      const extensions = encodeGitWatchOptions({ statusSelection });
+      expect(decodeGitWatchOptions(extensions).statusSelection).toBe(
+        statusSelection,
+      );
+      expect(extensions.every((extension) => !extension.required)).toBe(true);
+      expect(extensions.length === 0).toBe(statusSelection === undefined);
+    }
+    expect(() =>
+      encodeGitWatchOptions({
+        statusSelection: YAS_GIT_WATCH_STATUS_IGNORED,
+      }),
+    ).toThrow("invalid Git status selection");
+    for (const value of [[], [0, 0], [2], [4], [255]])
+      expect(() =>
+        decodeGitWatchOptions([
+          {
+            tag: YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION,
+            required: false,
+            value: new Uint8Array(value),
+          },
+        ]),
+      ).toThrow(YasProtocolError);
   });
 });

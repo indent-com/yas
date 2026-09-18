@@ -92,6 +92,7 @@ export interface YasGitWatchOptions {
   refsSettleMs?: number;
   statusSettleMs?: number;
   refPrefixes?: readonly Uint8Array[];
+  statusSelection?: number;
 }
 
 export type YasGitQueryEndpoint =
@@ -684,7 +685,17 @@ export function encodeGitWatchOptions(
   const refsSettleMs = value.refsSettleMs ?? 0;
   const statusSettleMs = value.statusSettleMs ?? 0;
   const prefixes = value.refPrefixes ?? [];
+  const statusSelection = value.statusSelection;
   const extensions: YasExtension[] = [];
+  if (
+    statusSelection !== undefined &&
+    (!Number.isInteger(statusSelection) ||
+      statusSelection < 0 ||
+      statusSelection & ~g.YAS_GIT_WATCH_STATUS_SELECTION_FLAGS ||
+      (statusSelection & g.YAS_GIT_WATCH_STATUS_IGNORED &&
+        !(statusSelection & g.YAS_GIT_WATCH_STATUS_UNTRACKED)))
+  )
+    throw new YasProtocolError("invalid Git status selection");
   if (refsSettleMs !== 0)
     extensions.push({
       tag: g.YAS_GIT_WATCH_REFS_SETTLE_MS_EXTENSION,
@@ -715,6 +726,12 @@ export function encodeGitWatchOptions(
       value: writer.finish(),
     });
   }
+  if (statusSelection !== undefined)
+    extensions.push({
+      tag: g.YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION,
+      required: false,
+      value: new YasWriter().u8(statusSelection).finish(),
+    });
   return extensions;
 }
 
@@ -727,6 +744,7 @@ export function decodeGitWatchOptions(
       g.YAS_GIT_WATCH_REFS_SETTLE_MS_EXTENSION,
       g.YAS_GIT_WATCH_STATUS_SETTLE_MS_EXTENSION,
       g.YAS_GIT_WATCH_REF_PREFIXES_EXTENSION,
+      g.YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION,
     ]),
     "Git WATCH",
   );
@@ -751,10 +769,20 @@ export function decodeGitWatchOptions(
       refPrefixes.push(new Uint8Array(cursor.bytesU16("Git ref prefix")));
     cursor.end("Git ref prefixes");
   }
+  const statusSelectionExtension = extensions.find(
+    (entry) => entry.tag === g.YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION,
+  );
+  let statusSelection: number | undefined;
+  if (statusSelectionExtension) {
+    const cursor = new YasCursor(statusSelectionExtension.value);
+    statusSelection = cursor.u8("Git status selection");
+    cursor.end("Git status selection extension");
+  }
   const result = {
     refsSettleMs: settle(g.YAS_GIT_WATCH_REFS_SETTLE_MS_EXTENSION),
     statusSettleMs: settle(g.YAS_GIT_WATCH_STATUS_SETTLE_MS_EXTENSION),
     refPrefixes,
+    statusSelection,
   };
   encodeGitWatchOptions(result);
   return result;
