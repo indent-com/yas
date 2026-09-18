@@ -4233,6 +4233,30 @@ mod tests {
     }
 
     #[test]
+    fn status_selection_preserves_absence_and_zero_and_rejects_malformed_extensions() {
+        for selection in [None, Some(0), Some(1), Some(3)] {
+            let options = WatchOptions {
+                status_selection: selection,
+                ..Default::default()
+            };
+            let extensions = options.to_extensions().unwrap();
+            assert_eq!(WatchOptions::from_extensions(&extensions).unwrap(), options);
+            assert!(extensions.0.iter().all(|extension| !extension.required));
+            assert_eq!(extensions.0.is_empty(), selection.is_none());
+        }
+        for value in [vec![], vec![0, 0], vec![2], vec![4], vec![255]] {
+            assert!(
+                WatchOptions::from_extensions(&Extensions(vec![Extension {
+                    tag: crate::schema::git::WATCH_STATUS_SELECTION_EXTENSION as u16,
+                    required: false,
+                    value,
+                }]))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn every_query_variant_and_cursor_round_trips() {
         for endpoint in [
             QueryEndpoint::Empty,

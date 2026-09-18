@@ -200,6 +200,22 @@ fn status_selection(options: &wire::WatchOptions) -> (bool, bool) {
     )
 }
 
+fn query_watch_state_options(body: &wire::QueryBody) -> yas_git::StateOptions {
+    // LOG depends on refs, operation pseudo-refs, and configured upstreams,
+    // not on index/worktree status. Other query kinds keep the complete
+    // mutable projection as their conservative invalidation source.
+    let status = !matches!(body, wire::QueryBody::Log { .. });
+    yas_git::StateOptions {
+        wants_state: true,
+        status,
+        untracked: status,
+        ignored: status,
+        tracking: true,
+        remotes: true,
+        ..Default::default()
+    }
+}
+
 impl Session {
     pub(crate) async fn open(
         &self,
@@ -392,22 +408,8 @@ impl Session {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let outbox: yas_git::native::StateSink =
             Box::new(move |event| sender.try_send(event).is_ok());
-        let handle = repository_handle.start_native_state(
-            yas_git::StateOptions {
-                // Request the complete mutable repository projection. Its
-                // byte-identical suppression is precisely the coalescing we
-                // need: a watched query is re-run only when refs, index,
-                // worktree, remotes, tracking, or operation state changes.
-                wants_state: true,
-                status: true,
-                untracked: true,
-                ignored: true,
-                tracking: true,
-                remotes: true,
-                ..Default::default()
-            },
-            outbox,
-        );
+        let handle =
+            repository_handle.start_native_state(query_watch_state_options(&request.body), outbox);
         Ok(QueryWatch {
             object_algorithm,
             repository: repository_handle,
@@ -2255,22 +2257,12 @@ mod tests {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let outbox: yas_git::native::StateSink =
             Box::new(move |event| sender.try_send(event).is_ok());
-        let handle = repository.start_native_state(
-            yas_git::StateOptions {
-                wants_state: true,
-                status: true,
-                untracked: true,
-                ignored: true,
-                tracking: true,
-                remotes: true,
-                ..Default::default()
-            },
-            outbox,
-        );
         let request = query(wire::QueryBody::Index {
             path: None,
             flags: yas_wire::schema::git::INDEX_STAGED as u16,
         });
+        let handle =
+            repository.start_native_state(query_watch_state_options(&request.body), outbox);
         let mut watch = QueryWatch {
             object_algorithm,
             repository,
@@ -2302,6 +2294,75 @@ mod tests {
         assert!(replacement.update_id > update.update_id);
         assert!(replacement.result.is_ok());
         watch.acknowledge(replacement.update_id);
+        watch.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_log_tracks_ref_changes_without_collecting_worktree_status() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "-q"]);
+        std::fs::write(directory.path().join("hello.txt"), b"hello\n").unwrap();
+        std::fs::write(directory.path().join(".gitignore"), b"generated/\n").unwrap();
+        git(directory.path(), &["add", "."]);
+        git(directory.path(), &["commit", "-qm", "initial"]);
+        std::fs::create_dir(directory.path().join("generated")).unwrap();
+        std::fs::write(directory.path().join("generated/ignored"), b"ignored\n").unwrap();
+
+        let (repository, info) = yas_git::native::open_path(directory.path()).unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let outbox: yas_git::native::StateSink =
+            Box::new(move |event| sender.try_send(event).is_ok());
+        let request = query(wire::QueryBody::Log {
+            spec: b"HEAD".to_vec(),
+            tips: Vec::new(),
+            hides: Vec::new(),
+            path: None,
+            flags: 0,
+        });
+        let handle =
+            repository.start_native_state(query_watch_state_options(&request.body), outbox);
+        let mut watch = QueryWatch {
+            object_algorithm: yas_wire::schema::git::OBJECT_SHA1 as u8,
+            repository,
+            request,
+            discover_path: None,
+            handle,
+            receiver,
+        };
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .expect("watched log timeout")
+            .expect("watched log closed");
+        assert!(update.result.unwrap().records.iter().any(|record| matches!(
+            record,
+            QueryItem::Record(wire::QueryRecord::Commit(commit)) if commit.message == b"initial"
+        )));
+        watch.acknowledge(update.update_id);
+        assert_eq!(yas_git::debug_status_recomputes(&info.git_dir), 0);
+        assert!(
+            yas_git::debug_worktree_watches(&info.git_dir)
+                .unwrap_or_default()
+                .is_empty()
+        );
+
+        std::fs::write(directory.path().join("hello.txt"), b"updated\n").unwrap();
+        std::fs::write(
+            directory.path().join("generated/ignored"),
+            b"generated again\n",
+        )
+        .unwrap();
+        git(directory.path(), &["add", "hello.txt"]);
+        git(directory.path(), &["commit", "-qm", "updated"]);
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .expect("watched log replacement timeout")
+            .expect("watched log closed");
+        assert!(replacement.update_id > update.update_id);
+        assert!(replacement.result.unwrap().records.iter().any(|record| matches!(
+            record,
+            QueryItem::Record(wire::QueryRecord::Commit(commit)) if commit.message == b"updated"
+        )));
+        assert_eq!(yas_git::debug_status_recomputes(&info.git_dir), 0);
         watch.stop();
     }
 

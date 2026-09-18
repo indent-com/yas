@@ -8725,6 +8725,10 @@ export const YAS_SCHEMA = {
           "layout": "StateWatch Extensions: optional tag WATCH_REFS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_STATUS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_REF_PREFIXES_EXTENSION value count:u16 followed by unique strictly raw-byte-ascending prefix:bytes_u16 entries; empty/absent prefix list means every ref"
         },
         {
+          "name": "watch_status_selection",
+          "layout": "Additional optional Git WATCH StateWatch extension: tag WATCH_STATUS_SELECTION_EXTENSION, REQUIRED clear, value exactly one u8 of flags admitting WATCH_STATUS_UNTRACKED and WATCH_STATUS_IGNORED in addition to tracked status; unknown bits are invalid and IGNORED requires UNTRACKED, so valid values are 0, 1, and 3. Absence admits both classes for compatibility; selection only applies with the WATCH_STATUS dataset and is enforced before collection budgets. Older servers may ignore this optional extension"
+        },
+        {
           "name": "query_endpoint",
           "layout": "kind:u8,reserved:[u8;3]=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId; COMMIT,TREE,MERGE_BASE require object; EMPTY,INDEX,WORKTREE forbid object; MERGE_BASE is valid only as the left endpoint"
         },
@@ -15501,7 +15505,7 @@ export const YAS_GOLDEN_VECTORS = {
     },
     {
       "name": "git.watch_options.payload",
-      "hex": "0100000000000000130000004a0000000000000000100000000000003a000000010000000200000032000200000002000000f401030000001e00000002000b00726566732f68656164732f0d00726566732f72656d6f7465732f"
+      "hex": "0100000000000000130000005300000000000000001000000000000043000000010000000200000032000200000002000000f401030000001e00000002000b00726566732f68656164732f0d00726566732f72656d6f7465732f040000000100000001"
     },
     {
       "name": "git.unwatch.payload",

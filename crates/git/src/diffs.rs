@@ -2382,9 +2382,9 @@ fn append_text_patch(
 
 /// STATUS records for the state stream: staged = HEAD×INDEX, unstaged =
 /// INDEX×WORKTREE, joined by path; conflicts from index stages.
-/// `untracked`/`ignored` are the engine's superset demand across
-/// subscribers; `caches` carries the engine's HEAD-flatten memo and
-/// worktree stat cache.
+/// `untracked`/`ignored` select one independently bounded status segment;
+/// `caches` carries the engine's shared HEAD-flatten memo and worktree stat
+/// cache across selections.
 pub(crate) fn append_status_records(
     repo: &gix::Repository,
     untracked: bool,

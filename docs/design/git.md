@@ -119,9 +119,11 @@ paths, revision, and capability flags. `CLOSE` is idempotent. A terminal
 
 `WATCH` subscribes to selected HEAD, refs, remotes, in-progress operation,
 index/worktree status, upstreams, stashes, and worktree-generation state. A
-status-selection extension independently admits untracked and ignored entries;
-the server applies it before walking and serializing status. Its absence admits
-both for compatibility with clients that predate selection. The server publishes
+status-selection extension admits untracked and, with untracked enabled, ignored
+entries; the server applies it before walking and serializing status. Its absence
+admits both for compatibility with clients that predate selection. Each requested
+selection has independent collection budgets, including when other watches on
+the same repository request more classes. The server publishes
 typed State records with revision/credit semantics; clients do not parse `.git`
 or rebuild state from a lossy event log. Reconnect can resume from a retained
 repository revision and otherwise receives a staged snapshot.
@@ -189,6 +191,14 @@ the rename-over an editor performs, the same reason
 one file: its siblings are ignored rather than falling into the
 "unclassifiable, recompute anyway" case. A `config` change re-resolves the
 path and moves the watch with it.
+
+Ignore pruning only excludes untracked paths. Index-tracked files and their
+ancestor directories remain watched even when they match ignore rules; index
+edits reconcile those exceptions. Status snapshots are collected once per
+distinct requested selection with independent entry and scan budgets, sharing
+HEAD and worktree stat caches. A broader subscription cannot consume a narrower
+subscription's status budget. Watched logs observe refs, operation pseudo-refs,
+and upstream/remote configuration without requesting worktree status.
 
 `PATCH` rows come from a plain line diff (`imara-diff`, already in
 the tree via gix) with intraline span refinement on modified line pairs —

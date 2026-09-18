@@ -3,15 +3,15 @@
 //! opens — a crate-level registry keyed by canonical gitdir attaches every
 //! `start_state` of one repo to the same engine, so N opens cost one
 //! thread, one repository handle, and one set of watchers. The engine cuts
-//! each snapshot once, at the superset of subscriber demands, and runs at
-//! the minimum requested settle window; per-open state (requested flags,
-//! ack window, identical-snapshot suppression) lives on each subscriber,
-//! whose snapshots are filtered from the shared computation. Every
+//! each status selection once with its own budgets, sharing HEAD and stat
+//! caches, and runs at the minimum requested settle window; per-open state
+//! (requested flags, ack window, identical-snapshot suppression) lives on
+//! each subscriber, whose snapshot uses its selected status segment. Every
 //! snapshot is complete — the client obligation is "replace the map" —
 //! and pacing is coalescing per subscriber: at most one snapshot in
 //! flight, the latest state wins once acked.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
@@ -99,6 +99,27 @@ impl Default for StateOptions {
             ref_prefixes: Vec::new(),
             refs_latency: crate::env_latency("YAS_GIT_REFS_LATENCY_MS", 50, 1000),
             status_latency: crate::env_latency("YAS_GIT_STATUS_LATENCY_MS", 500, 10_000),
+        }
+    }
+}
+
+/// Cumulative status classes. Each selection has an independent entry and
+/// scan budget, so a broader subscriber cannot crowd out a narrower one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StatusSelection {
+    Tracked,
+    Untracked,
+    Ignored,
+}
+
+impl StateOptions {
+    fn status_selection(&self) -> StatusSelection {
+        if !self.untracked {
+            StatusSelection::Tracked
+        } else if !self.ignored {
+            StatusSelection::Untracked
+        } else {
+            StatusSelection::Ignored
         }
     }
 }
@@ -304,13 +325,11 @@ struct Subscriber {
     gone: bool,
 }
 
-/// The union of subscriber demands: what the shared computation must
-/// cover so every subscriber's filtered view is complete.
+/// The live subscriber demands. Non-status segments cover their union;
+/// status is collected separately for each requested selection.
 #[derive(Clone, PartialEq, Eq, Default)]
 struct Demand {
-    status: bool,
-    untracked: bool,
-    ignored: bool,
+    status: BTreeSet<StatusSelection>,
     tracking: bool,
     remotes: bool,
     /// Union of subscriber prefix filters; empty means every ref, and an
@@ -318,8 +337,7 @@ struct Demand {
     ref_prefixes: Vec<String>,
 }
 
-/// One computed snapshot, cut at the superset demand and assembled per
-/// subscriber from these segments.
+/// One computed snapshot, assembled per subscriber from shared segments.
 struct Parts {
     /// HEAD/refs/op/pseudo-ref/stash records — every subscriber gets these.
     base: Vec<OwnedGitStateRecord>,
@@ -328,9 +346,8 @@ struct Parts {
     tracking: Option<Vec<OwnedGitStateRecord>>,
     /// STATE_REMOTE records; present when any subscriber wants REMOTES.
     remotes: Option<Vec<OwnedGitStateRecord>>,
-    /// STATUS records at the superset untracked/ignored demand, plus the
-    /// truncation flag.
-    status: Option<(Vec<OwnedGitStateRecord>, bool)>,
+    /// STATUS records and truncation, independently bounded per selection.
+    status: BTreeMap<StatusSelection, (Vec<OwnedGitStateRecord>, bool)>,
     /// The demand the segments were computed under.
     demand: Demand,
 }
@@ -418,8 +435,8 @@ struct Engine {
     /// records unless the fingerprinted status inputs (HEAD, index,
     /// info/exclude) moved.
     status_dirty: bool,
-    /// The last computed status segment and the inputs it derives from.
-    status_memo: Option<StatusMemo>,
+    /// The last computed status segments and the inputs they derive from.
+    status_memos: BTreeMap<StatusSelection, StatusMemo>,
     /// HEAD-flatten memo and worktree stat cache for the status pipeline.
     status_caches: crate::diffs::StatusCaches,
     /// Ahead/behind memoized by the immutable `(tip, upstream)` oid pair
@@ -462,9 +479,6 @@ struct StatusMemo {
     head: Option<gix::ObjectId>,
     index_sig: Option<FileSig>,
     exclude_sig: Option<FileSig>,
-    /// The `(untracked, ignored)` superset the records were computed at;
-    /// a demand change past it recomputes.
-    demand: (bool, bool),
     records: Vec<OwnedGitStateRecord>,
     truncated: bool,
 }
@@ -521,7 +535,7 @@ impl Engine {
             refs_due: None,
             status_due: None,
             status_dirty: true,
-            status_memo: None,
+            status_memos: BTreeMap::new(),
             status_caches: Default::default(),
             ahead_behind: Default::default(),
             parts: None,
@@ -632,11 +646,11 @@ impl Engine {
                         gone: false,
                     },
                 );
-                self.recompute_windows();
+                self.subscribers_changed();
             }
             EngineMsg::Detach { sub_id } => {
                 if self.subs.remove(&sub_id).is_some() {
-                    self.recompute_windows();
+                    self.subscribers_changed();
                 }
             }
             EngineMsg::Ack { sub_id, state_id } => {
@@ -674,7 +688,7 @@ impl Engine {
     fn reap(&mut self) {
         if self.subs.values().any(|s| s.gone) {
             self.subs.retain(|_, s| !s.gone);
-            self.recompute_windows();
+            self.subscribers_changed();
         }
     }
 
@@ -683,7 +697,9 @@ impl Engine {
     /// coalesce through their own ack windows. Only status-requesting
     /// subscribers vote on the status window — a log-only open's default
     /// must not drag recomputation faster than any status client wants.
-    fn recompute_windows(&mut self) {
+    /// Evict inactive status selections immediately: their files may change
+    /// while ignore pruning suppresses events, before anyone reattaches.
+    fn subscribers_changed(&mut self) {
         let defaults = StateOptions::default();
         self.refs_latency = self
             .subs
@@ -698,6 +714,16 @@ impl Engine {
             .map(|s| s.opts.status_latency)
             .min()
             .unwrap_or(defaults.status_latency);
+        let demand = self.demand();
+        self.status_memos
+            .retain(|selection, _| demand.status.contains(selection));
+        if self
+            .parts
+            .as_ref()
+            .is_some_and(|parts| parts.demand != demand)
+        {
+            self.parts = None;
+        }
     }
 
     // -- watches ------------------------------------------------------------
@@ -1047,12 +1073,10 @@ impl Engine {
 
     /// The worktree directories that can still affect `git status`, root
     /// included: the gitdir subtree always can (ref moves arrive through
-    /// the worktree watch — `gitdir_covered`), and every other directory
-    /// can unless the exclude stack marks it ignored. Pruning an ignored
-    /// directory is sound by git's own rule — no negation re-includes a
-    /// path under an excluded directory — so any negation that matters is
-    /// one matching the directory itself, and then the stack does not
-    /// mark it ignored. Symlinks do not count as directories, matching
+    /// the worktree watch — `gitdir_covered`), as can directories containing
+    /// tracked paths, regardless of ignore rules. The rest can be pruned
+    /// when ignored: no negation re-includes an untracked path under an
+    /// excluded directory. Symlinks do not count as directories, matching
     /// the watcher's no-follow config.
     fn watchable_dirs(&mut self, workdir: &Path, prune: bool) -> BTreeSet<PathBuf> {
         let mut set = BTreeSet::from([workdir.to_path_buf()]);
@@ -1266,13 +1290,15 @@ impl Engine {
             status_side = true;
         }
         let workdir = self.workdir.clone();
+        let index_path = self.local.index_path();
         for path in paths {
             self.note_event_dir(path);
-            if self.is_exclude_source(path) {
+            if self.is_exclude_source(path) || path == &index_path {
                 // An ignore-source edit changes classifications the
                 // previous snapshot baked in: rebuild the stack AND
                 // recompute status. The pruning the watch set was cut
-                // with may have changed too, so reconcile it.
+                // with may have changed too, so reconcile it. Index edits
+                // can add or remove tracked exceptions to that pruning.
                 self.excludes = None;
                 if let Some(arms) = &mut self.watch {
                     arms.worktree_stale = true;
@@ -1375,7 +1401,9 @@ impl Engine {
             .any(|s| s.opts.status && s.opts.ignored && !s.gone)
     }
 
-    /// Definitively ignored? A deleted path's dir-vs-file reading is
+    /// Definitively ignorable and untracked? Tracked paths and their
+    /// ancestor directories remain observable regardless of ignore rules.
+    /// A deleted path's dir-vs-file reading is
     /// unknowable, so it counts as ignored only when BOTH interpretations
     /// are (`target/` ignores the directory but not a file named
     /// `target`). Any failure — stack build, non-decodable path — reads
@@ -1408,10 +1436,18 @@ impl Engine {
                 .map(|platform| platform.is_excluded())
                 .unwrap_or(false)
         };
-        match mode {
+        let ignored = match mode {
             Some(mode) => excluded(mode),
             None => excluded(Mode::FILE) && excluded(Mode::DIR),
+        };
+        if !ignored {
+            return false;
         }
+        let Ok(index) = self.local.index_or_empty() else {
+            return false;
+        };
+        let rel = gix::path::to_unix_separators_on_windows(rel);
+        index.entry_index_by_path(rel.as_ref()).is_err() && !index.path_is_directory(rel.as_ref())
     }
 
     /// (Re)build the exclude stack from the engine repository. Left `None`
@@ -1453,9 +1489,9 @@ impl Engine {
         let mut demand = Demand::default();
         let mut wants_all_refs = false;
         for sub in self.subs.values().filter(|s| s.opts.wants_state && !s.gone) {
-            demand.status |= sub.opts.status;
-            demand.untracked |= sub.opts.untracked;
-            demand.ignored |= sub.opts.ignored;
+            if sub.opts.status {
+                demand.status.insert(sub.opts.status_selection());
+            }
             demand.tracking |= sub.opts.tracking;
             demand.remotes |= sub.opts.remotes;
             if sub.opts.ref_prefixes.is_empty() {
@@ -1529,8 +1565,8 @@ impl Engine {
         self.parts = Some(parts);
     }
 
-    /// Cut the snapshot segments once, at the superset of subscriber
-    /// demands; per-subscriber assembly filters from here.
+    /// Cut each requested segment once. Status selections have independent
+    /// budgets; filtering an already-truncated superset would lose entries.
     fn compute_parts(&mut self, demand: Demand) -> Parts {
         if self.local_stale {
             self.refresh_local();
@@ -1562,18 +1598,27 @@ impl Engine {
             );
             records
         });
-        let want_status = demand.status;
-        let status = want_status.then(|| {
-            status_segment(
-                repo,
-                &demand,
-                &self.repo.budgets,
-                &mut self.status_dirty,
-                &mut self.status_memo,
-                &mut self.status_caches,
-                self.repo.gitdir.as_ref(),
-            )
-        });
+        let status = demand
+            .status
+            .iter()
+            .map(|&selection| {
+                (
+                    selection,
+                    status_segment(
+                        repo,
+                        selection,
+                        &self.repo.budgets,
+                        self.status_dirty,
+                        &mut self.status_memos,
+                        &mut self.status_caches,
+                        self.repo.gitdir.as_ref(),
+                    ),
+                )
+            })
+            .collect();
+        if !demand.status.is_empty() {
+            self.status_dirty = false;
+        }
         Parts {
             base,
             refs_truncated,
@@ -1585,17 +1630,15 @@ impl Engine {
     }
 }
 
-/// One open's snapshot from the shared parts: segments the open did not
-/// request are dropped, and status records are filtered to the letters
-/// its flags admit.
+/// One open's snapshot from the shared parts, using its independently
+/// bounded status selection.
 fn assemble(parts: &Parts, opts: &StateOptions) -> (u8, Vec<OwnedGitStateRecord>) {
     let mut flags = 0u8;
     if parts.refs_truncated {
         flags |= GIT_STATE_REFS_TRUNCATED;
     }
     // The base was cut at the union of prefix demands; an open that asked
-    // for less gets the difference filtered out here, the same way STATUS
-    // narrows below.
+    // for less gets the difference filtered out here.
     let mut records =
         if opts.ref_prefixes.is_empty() || opts.ref_prefixes == parts.demand.ref_prefixes {
             parts.base.clone()
@@ -1615,12 +1658,9 @@ fn assemble(parts: &Parts, opts: &StateOptions) -> (u8, Vec<OwnedGitStateRecord>
         records.extend_from_slice(remotes);
     }
     if opts.status
-        && let Some((status, truncated)) = &parts.status
+        && let Some((status, truncated)) = parts.status.get(&opts.status_selection())
     {
-        filter_status(status, opts.untracked, opts.ignored, &mut records);
-        // Conservative: the superset walk's truncation may or may not
-        // have cost this subscriber entries; over-reporting TRUNCATED is
-        // harmless, under-reporting would lie.
+        records.extend_from_slice(status);
         if *truncated {
             flags |= GIT_STATE_STATUS_TRUNCATED;
         }
@@ -1628,11 +1668,6 @@ fn assemble(parts: &Parts, opts: &StateOptions) -> (u8, Vec<OwnedGitStateRecord>
     (flags, records)
 }
 
-/// Copy STATUS records, dropping or blanking porcelain letters the open's
-/// flags do not admit: '?' needs UNTRACKED, '!' needs IGNORED. A staged
-/// letter beside a filtered worktree letter survives with the worktree
-/// side blanked (the delete-then-recreate case); a record left with two
-/// blanks disappears entirely.
 /// Copy records, keeping only `STATE_REF`s whose name matches one of
 /// `prefixes`. Non-ref records pass through untouched — HEAD, the
 /// operation, stash and remote records are not what a prefix filter is
@@ -1658,68 +1693,30 @@ fn filter_refs(
     );
 }
 
-fn filter_status(
-    records: &[OwnedGitStateRecord],
-    untracked: bool,
-    ignored: bool,
-    out: &mut Vec<OwnedGitStateRecord>,
-) {
-    if untracked && ignored {
-        out.extend_from_slice(records);
-        return;
-    }
-    let admit = |letter: u8| match letter {
-        b'?' => untracked,
-        b'!' => ignored,
-        _ => true,
-    };
-    for record in records {
-        let mut record = record.clone();
-        if let OwnedGitStateRecord::Status {
-            staged, unstaged, ..
-        } = &mut record
-        {
-            if !admit(*staged) {
-                *staged = b' ';
-            }
-            if !admit(*unstaged) {
-                *unstaged = b' ';
-            }
-            if *staged == b' ' && *unstaged == b' ' {
-                continue;
-            }
-        }
-        out.push(record);
-    }
-}
-
 /// The STATUS segment through the engine's memo: worktree events set
 /// `dirty`; HEAD, the index file, and `info/exclude` are fingerprinted so
 /// a pure ref settle (branch created, tag pushed) reuses the previous
-/// records verbatim. A demand change past what the memo holds recomputes.
+/// records verbatim. Each selection has its own memo and budgets.
 fn status_segment(
     repo: &gix::Repository,
-    demand: &Demand,
+    selection: StatusSelection,
     budgets: &Budgets,
-    dirty: &mut bool,
-    memo: &mut Option<StatusMemo>,
+    dirty: bool,
+    memos: &mut BTreeMap<StatusSelection, StatusMemo>,
     caches: &mut crate::diffs::StatusCaches,
     key: &Path,
 ) -> (Vec<OwnedGitStateRecord>, bool) {
     let head = repo.head_id().ok().map(|id| id.detach());
     let index_sig = file_sig(&repo.index_path());
     let exclude_sig = file_sig(&repo.common_dir().join("info").join("exclude"));
-    let demand_pair = (demand.untracked, demand.ignored);
-    if !*dirty
-        && let Some(memo) = memo.as_ref()
+    if !dirty
+        && let Some(memo) = memos.get(&selection)
         && memo.head == head
         && memo.index_sig == index_sig
         && memo.exclude_sig == exclude_sig
-        && memo.demand == demand_pair
     {
         return (memo.records.clone(), memo.truncated);
     }
-    *dirty = false;
     *status_recomputes()
         .lock()
         .unwrap()
@@ -1729,22 +1726,24 @@ fn status_segment(
     let mut flags = 0u8;
     crate::diffs::append_status_records(
         repo,
-        demand.untracked,
-        demand.ignored,
+        selection != StatusSelection::Tracked,
+        selection == StatusSelection::Ignored,
         budgets,
         caches,
         &mut records,
         &mut flags,
     );
     let truncated = flags & GIT_STATE_STATUS_TRUNCATED != 0;
-    *memo = Some(StatusMemo {
-        head,
-        index_sig,
-        exclude_sig,
-        demand: demand_pair,
-        records: records.clone(),
-        truncated,
-    });
+    memos.insert(
+        selection,
+        StatusMemo {
+            head,
+            index_sig,
+            exclude_sig,
+            records: records.clone(),
+            truncated,
+        },
+    );
     (records, truncated)
 }
 
