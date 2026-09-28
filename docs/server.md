@@ -78,6 +78,10 @@ connections that are no longer needed.
 | `YAS_NOTIFICATION_TIMEOUT_MIN_MS`    | `1000`                                                        | Lower clamp for positive application notification timeouts                            |
 | `YAS_NOTIFICATION_TIMEOUT_MAX_MS`    | `86400000`                                                    | Upper clamp for positive application notification timeouts                            |
 
+A terminal never inherits a `YAS_SOCK` from the server's own environment that
+names a different server; `YAS_EXPORT_SOCK` replaces it with this server's
+socket.
+
 ### Named instances
 
 Every server has a name. `yas server` uses `default`; `yas server --name NAME`

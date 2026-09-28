@@ -1564,6 +1564,9 @@ future REPLAY operations. REPLACE does not merge with the old command, cwd,
 environment, deadline, or application association. It can therefore restart a
 terminal with any argv or shell command, any valid cwd, and any environment the
 server OS can represent. REPLAY has no launch bytes; REPLACE requires them.
+The stored launch record belongs to the terminal, not to the connection that
+created it, so any client that can see the terminal can REPLAY it. A terminal
+that was never started from a launch record answers REPLAY with `UNSUPPORTED`.
 
 RESTART is valid for RUNNING and EXITED terminals. For an EXITED terminal both
 cutover modes simply start the new generation. For a RUNNING terminal the

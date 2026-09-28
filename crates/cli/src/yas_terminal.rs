@@ -116,14 +116,27 @@ pub(crate) async fn cmd_start(
         extensions: Extensions(create_extensions),
     };
     let mut client = NativeClient::connect(on, hub).await?;
-    let result: terminal::CreateResult = client
-        .request_typed(
+    let prefix = client
+        .request_result(
             family::TERMINAL,
             terminal::request_kind::CREATE,
-            &create,
+            create.encode().map_err(wire_error)?,
             true,
         )
         .await?;
+    match prefix.status {
+        Status::Ok => {}
+        Status::NotFound if !request.shell && !request.command.is_empty() => {
+            return Err(format!("{}: command not found", request.command[0]));
+        }
+        status => {
+            return Err(format!(
+                "YAS Terminal CREATE failed with {status:?}: {}",
+                format_result_detail(&prefix.detail)
+            ));
+        }
+    }
+    let result = terminal::CreateResult::decode(&prefix.body).map_err(wire_error)?;
     let id = terminal_id(result.terminal_handle)?;
     outln!("{id}");
     Ok(id)

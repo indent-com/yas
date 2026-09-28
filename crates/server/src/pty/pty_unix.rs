@@ -41,9 +41,10 @@ pub struct ChildSpec<'a> {
 ///
 /// `Derived` preserves the default YAS terminal behavior. `Server` and
 /// `Empty` are the native YAS launch variants. `Server` receives the live
-/// session environment before the request's exact entries; `Empty` remains
-/// byte-for-byte exact. Neither receives terminal, PATH, locale, or YAS
-/// variables unless the launch explicitly supplies them.
+/// session environment and the server's `YAS_SOCK`/`PATH` rules (see
+/// [`build_child_env`]) before the request's exact entries; `Empty` remains
+/// byte-for-byte exact. Neither receives terminal or locale variables unless
+/// the launch explicitly supplies them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ChildEnvironmentBase {
     #[default]
@@ -114,9 +115,16 @@ impl ChildSpec<'_> {
 /// client entry always wins, whichever layer would otherwise have set the key.
 /// This is the precedence the process family already documents for
 /// `PROCESS_SPAWN` (`command_for` in `process.rs`).
+///
+/// `yas_sock` is set only when the server exports its socket; `own_sock` is
+/// the path it listens on either way. A `Server` base never forwards an
+/// inherited `YAS_SOCK` naming some other server, since `yas` inside the
+/// terminal would then drive that server instead of this one.
+#[allow(clippy::too_many_arguments)]
 fn build_child_env(
     session_env: Option<&crate::app_env::SessionEnv>,
     yas_sock: Option<&str>,
+    own_sock: Option<&str>,
     path_dir: Option<&str>,
     overrides: &[(String, String)],
     removals: &[String],
@@ -157,6 +165,9 @@ fn build_child_env(
                 env.retain(|(candidate, _)| candidate.as_slice() != key.as_bytes());
                 env.push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
             }
+        }
+        if base == ChildEnvironmentBase::Server {
+            apply_server_yas_env(&mut env, yas_sock, own_sock, path_dir);
         }
         // The request is the final authority, including over session values.
         for (key, value) in entries {
@@ -252,6 +263,78 @@ fn build_child_env(
     env.into_iter()
         .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
         .collect()
+}
+
+/// The `YAS_SOCK` and `PATH` rules for a `Server` base environment; see
+/// [`build_child_env`].
+fn apply_server_yas_env(
+    env: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    yas_sock: Option<&str>,
+    own_sock: Option<&str>,
+    path_dir: Option<&str>,
+) {
+    env.retain(|(key, value)| {
+        key.as_slice() != b"YAS_SOCK"
+            || own_sock.is_some_and(|own| value.as_slice() == own.as_bytes())
+    });
+    if let Some(sock) = yas_sock {
+        env.retain(|(key, _)| key.as_slice() != b"YAS_SOCK");
+        env.push((b"YAS_SOCK".to_vec(), sock.as_bytes().to_vec()));
+    }
+    if let Some(dir) = path_dir {
+        match env.iter_mut().find(|(key, _)| key.as_slice() == b"PATH") {
+            Some((_, value)) => {
+                if !value
+                    .split(|byte| *byte == b':')
+                    .any(|entry| entry == dir.as_bytes())
+                {
+                    if !value.is_empty() {
+                        value.push(b':');
+                    }
+                    value.extend_from_slice(dir.as_bytes());
+                }
+            }
+            None => env.push((b"PATH".to_vec(), dir.as_bytes().to_vec())),
+        }
+    }
+}
+
+/// The environment a terminal child of this server is started with.
+fn spawn_child_env(
+    spec: &ChildSpec<'_>,
+    state: &AppState,
+    session_env: Option<&crate::app_env::SessionEnv>,
+) -> Vec<CString> {
+    let yas_sock = state
+        .config
+        .export_sock
+        .then(|| state.config.ipc_path.as_str());
+    let path_dir = state.config.inject_path.then(exe_dir).flatten();
+    build_child_env(
+        session_env,
+        yas_sock,
+        Some(state.config.ipc_path.as_str()),
+        path_dir,
+        spec.env,
+        spec.env_remove,
+        spec.environment_base,
+        spec.exact_env,
+    )
+}
+
+/// Whether `spec` names an argv program that cannot be found on the PATH the
+/// child would run with, so a failed spawn can be reported as not found
+/// rather than as a generic failure.
+pub fn launch_program_missing(
+    spec: ChildSpec<'_>,
+    state: &AppState,
+    session_env: Option<&crate::app_env::SessionEnv>,
+) -> bool {
+    let Some(program) = spec.argv.and_then(|argv| argv.first()) else {
+        return false;
+    };
+    let env = spawn_child_env(&spec, state, session_env);
+    resolve_in_path(program, child_path(&env).as_deref()).is_none()
 }
 
 /// Everything the child needs to `execve`, built entirely before `fork()`.
@@ -1002,20 +1085,7 @@ pub fn spawn_pty(
 
     // Build the child's environment before fork() to avoid calling
     // set_var/remove_var after fork in a multi-threaded process (UB per POSIX).
-    let yas_sock = state
-        .config
-        .export_sock
-        .then(|| state.config.ipc_path.as_str());
-    let path_dir = state.config.inject_path.then(exe_dir).flatten();
-    let child_env = build_child_env(
-        session_env,
-        yas_sock,
-        path_dir,
-        spec.env,
-        spec.env_remove,
-        spec.environment_base,
-        spec.exact_env,
-    );
+    let child_env = spawn_child_env(&spec, &state, session_env);
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -1144,6 +1214,7 @@ pub fn spawn_pty(
         exit_status: yas_terminal_model::EXIT_STATUS_UNKNOWN,
         command: list_command.map(str::to_owned),
         spec: spec.to_owned_spec(),
+        native_launch: None,
         osc7_cwd: None,
         journal: crate::journal::CommandJournal::default(),
         osc_carry: Vec::new(),
@@ -1184,20 +1255,7 @@ pub fn respawn_child(
     }
 
     // Build the child's environment before fork() (same rationale as spawn_pty).
-    let yas_sock = state
-        .config
-        .export_sock
-        .then(|| state.config.ipc_path.as_str());
-    let path_dir = state.config.inject_path.then(exe_dir).flatten();
-    let child_env = build_child_env(
-        session_env,
-        yas_sock,
-        path_dir,
-        spec.env,
-        spec.env_remove,
-        spec.environment_base,
-        spec.exact_env,
-    );
+    let child_env = spawn_child_env(&spec, &state, session_env);
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -1286,8 +1344,8 @@ pub fn respawn_child(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildEnvironmentBase, ChildSpec, PtyHandle, build_child_env, child_path,
-        collect_exit_status, plan_exec, reap_zombies, resolve_in_path,
+        ChildEnvironmentBase, ChildSpec, PtyHandle, apply_server_yas_env, build_child_env,
+        child_path, collect_exit_status, plan_exec, reap_zombies, resolve_in_path,
     };
     use std::collections::HashMap;
     use std::ffi::CString;
@@ -1476,6 +1534,7 @@ mod tests {
         build_child_env(
             Some(&session_env),
             yas_sock,
+            None,
             path_dir,
             &[],
             &[],
@@ -1873,6 +1932,7 @@ mod tests {
             Some(&session_env),
             None,
             None,
+            None,
             &[],
             &[],
             ChildEnvironmentBase::Empty,
@@ -1904,6 +1964,7 @@ mod tests {
         );
         let env = raw_child_env(build_child_env(
             Some(&session_env),
+            None,
             None,
             None,
             &[],
@@ -1951,6 +2012,7 @@ mod tests {
             Some(&session_env),
             Some("/tmp/yas-test/ipc.sock"),
             None,
+            None,
             &overrides(&[
                 // A plain addition.
                 ("YAS_PROBE", "hello"),
@@ -1988,6 +2050,7 @@ mod tests {
         std::fs::write(&program, b"#!/bin/sh\n").unwrap();
 
         let env = build_child_env(
+            None,
             None,
             None,
             None,
@@ -2150,6 +2213,75 @@ mod tests {
             env.get("DBUS_SESSION_BUS_ADDRESS").map(String::as_str),
             Some("unix:path=/tmp/yas-test/desktop-bus")
         );
+    }
+
+    fn server_env(
+        inherited: &[(&str, &str)],
+        yas_sock: Option<&str>,
+        own_sock: Option<&str>,
+        path_dir: Option<&str>,
+    ) -> HashMap<String, String> {
+        let mut env = inherited
+            .iter()
+            .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .collect();
+        apply_server_yas_env(&mut env, yas_sock, own_sock, path_dir);
+        env.into_iter()
+            .map(|(key, value)| {
+                (
+                    String::from_utf8(key).unwrap(),
+                    String::from_utf8(value).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_env_drops_a_yas_sock_naming_another_server() {
+        let env = server_env(
+            &[("YAS_SOCK", "/run/other.sock")],
+            None,
+            Some("/run/own.sock"),
+            None,
+        );
+        assert!(!env.contains_key("YAS_SOCK"));
+
+        let env = server_env(
+            &[("YAS_SOCK", "/run/own.sock")],
+            None,
+            Some("/run/own.sock"),
+            None,
+        );
+        assert_eq!(
+            env.get("YAS_SOCK").map(String::as_str),
+            Some("/run/own.sock")
+        );
+
+        let env = server_env(
+            &[("YAS_SOCK", "/run/other.sock")],
+            Some("/run/own.sock"),
+            Some("/run/own.sock"),
+            None,
+        );
+        assert_eq!(
+            env.get("YAS_SOCK").map(String::as_str),
+            Some("/run/own.sock")
+        );
+    }
+
+    #[test]
+    fn server_env_appends_the_binary_dir_to_path_once() {
+        let env = server_env(&[("PATH", "/usr/bin:/bin")], None, None, Some("/opt/yas"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin:/opt/yas")
+        );
+        let env = server_env(&[("PATH", "/opt/yas:/bin")], None, None, Some("/opt/yas"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/opt/yas:/bin"));
+        let env = server_env(&[], None, None, Some("/opt/yas"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/opt/yas"));
+        let env = server_env(&[("PATH", "/bin")], None, None, None);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
     }
 
     #[test]

@@ -600,7 +600,8 @@ pub enum Command {
         fd_channel: Option<i32>,
 
         /// Export the server socket path as YAS_SOCK in spawned terminals
-        /// (or set YAS_EXPORT_SOCK=1)
+        /// (or set YAS_EXPORT_SOCK=1). Without it, terminals still never
+        /// inherit a YAS_SOCK that names a different server
         #[arg(long)]
         export_sock: bool,
 
