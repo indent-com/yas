@@ -1361,15 +1361,21 @@ mod tests {
         let server = Server::new(false, true);
         let runtime = Runtime::new(server.clone());
         let session = runtime.session([15; 16], None).unwrap();
+        // A character device (the null device) rather than a pipe; /dev/stdin
+        // names fd 0 on Linux and macOS alike, where /proc does not exist.
         let mut request = spawn_request(
-            vec![executable("readlink"), b"/proc/self/fd/0".to_vec()],
+            vec![
+                executable("sh"),
+                b"-c".to_vec(),
+                b"if [ -c /dev/stdin ]; then echo character-device; else echo other; fi".to_vec(),
+            ],
             Vec::new(),
         );
         request.flags = schema::process::SPAWN_STDIN_NULL as u16;
         let mut attachment = session.spawn(&request, None).await.unwrap();
         assert_eq!(attachment.stdin_window, 0);
         let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
-        assert_eq!(output, b"/dev/null\n");
+        assert_eq!(output, b"character-device\n");
         assert_eq!(exit.code, 0);
         session.shutdown().await;
         server.shutdown().await;
