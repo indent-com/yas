@@ -555,4 +555,11 @@ yas surface focus 1                                # give it keyboard/pointer fo
 yas surface record 1 --output video.h264           # record until Ctrl+C
 yas surface record 1 --duration 10 --output v.h264 # record 10 seconds
 yas surface record 1 --frames 30 --output v.h264   # record 30 frames
+yas surface record 1 --codec h264-444              # also announce H.264 4:4:4
 ```
+
+`record` without `--output` writes `surface-ID.h264`, or `surface-ID.obu` when
+the server picks AV1. `--codec h264-444`/`av1-444` announce 4:4:4 chroma; the
+server still falls back to 4:2:0 unless its `YAS_CHROMA` setting and encoder
+allow 4:4:4. `capture --scale` resizes the surface at that scale before
+capturing; there is no image quality setting.
