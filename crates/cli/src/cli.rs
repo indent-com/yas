@@ -429,7 +429,8 @@ pub enum Command {
         long_about = "Open the terminal UI in the browser\n\n\
             Opens the browser on the local yas server, with that server's named\n\
             remotes reachable through its Relay. Manage remotes with\n\
-            `yas remote add/remove` or through the Remotes dialog in the browser.\n\n\
+            `yas remote add/remove` or through the Remotes dialog in the browser.\n\
+            `--on` and `--hub` are refused: the UI always starts from the local server.\n\n\
             Examples:\n\
               yas open                        # local + all configured remotes\n\
               yas remote add rabbit ssh:rabbit\n\
