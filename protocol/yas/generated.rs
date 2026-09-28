@@ -358,6 +358,7 @@ pub const EXTENSION_SUPPORT_WASMI: u64 = 2;
 pub const EXTENSION_SUPPORT_QUICKJS: u64 = 4;
 pub const EXTENSION_SUPPORT_COMMAND_PROVIDER: u64 = 8;
 pub const SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION: u64 = 1;
+pub const GOAWAY_REASON_EXTENSION: u64 = 1;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "HELLO", class: 1, kind: 0, direction: 0, sensitive: 0, compression: 2, datagram: 0, layout: "ClientHello; ResultPrefix + ServerHello" },
 super::OperationMetadata { name: "PING", class: 1, kind: 1, direction: 2, sensitive: 0, compression: 0, datagram: 0, layout: "sender_monotonic_ns:u64; ResultPrefix + receiver_receive_ns:u64,receiver_send_ns:u64" },
@@ -406,6 +407,7 @@ super::ConstantMetadata { name: "EXTENSION_SUPPORT_WASMI", value: 2 },
 super::ConstantMetadata { name: "EXTENSION_SUPPORT_QUICKJS", value: 4 },
 super::ConstantMetadata { name: "EXTENSION_SUPPORT_COMMAND_PROVIDER", value: 8 },
 super::ConstantMetadata { name: "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION", value: 1 },
+super::ConstantMetadata { name: "GOAWAY_REASON_EXTENSION", value: 1 },
 ];
 }
 pub mod transfer {

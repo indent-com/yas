@@ -162,6 +162,9 @@ yas terminal attach "$ID"    # drive it from here; Ctrl-] detaches
 yas quit                     # shut down the server
 ```
 
+A disconnected CLI exits with `yas: disconnected by the YAS server: REASON`
+when the disconnecting client gave a reason.
+
 Terminals persist until closed or the daemon exits. Clean up when done.
 
 `attach` needs a real tty on stdin and repaints the remote grid in the
