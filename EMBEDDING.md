@@ -338,6 +338,20 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   `Absent`, `Hash`) through a staged commit, mkdir -p, rename, remove, symlink.
 - **KV and environment** (`kv`): get/put/delete with preconditions, list,
   watch; the server environment (`ENV_GET`).
+- **Terminals** (`terminal`): PTYs that belong to the server, not the
+  session, with the IDs `yas terminal list` shows. `start_terminal` with a
+  `TerminalCommand` (a program, a shell command line or the default shell;
+  cwd, env, size, tag, deadline), then type into it (`write_terminal`), read
+  its screen as text, resize, signal, restart, close, and wait for it to exit.
+  When its shell reports commands (OSC 133,
+  [docs/shell-integration.md](docs/shell-integration.md)):
+  `wait_terminal_command`, `terminal_commands` (exit codes, command lines)
+  and `terminal_output` (what one command printed); `terminal_cwd` with
+  OSC 7.
+- **Surfaces** (`surface`): the windows GUI programs map on the server's
+  compositor. List them, capture one as PNG or AVIF, click, scroll, press keys
+  (`key_combo("ctrl+c")`, `typed_keys("hello{enter}")`) or enter text,
+  resize, focus and close them: `yas surface`, for programs that drive GUIs.
 - **Errors** (`Error`): connection failures, lost sessions, server statuses
   (`is_not_found`, `is_conflict`), timeouts, unsupported operations,
   protocol violations.

@@ -1148,3 +1148,333 @@ async fn every_session_on_the_read_only_socket_is_read_only() {
     assert!(viewer.open_root(directory.path(), false).await.is_err());
     assert!(viewer.env_var("PATH").await.is_err());
 }
+
+/// Poll the terminal's screen until it shows `needle`; answers the screen.
+async fn wait_for_screen(client: &Client, id: u64, needle: &str) -> String {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let screen = client.terminal_screen(id).await.unwrap();
+        if screen.contains(needle) {
+            return screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{needle:?} never showed; the screen:\n{screen}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminals_take_keystrokes_show_their_screen_and_report_their_exit() {
+    use yas_client::terminal::{ExitRecord, TerminalCommand, TerminalStatus};
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let id = client
+        .start_terminal(
+            &TerminalCommand::new("sh")
+                .env("PS1", "$ ")
+                .env("YAS_CLIENT_TERMINAL", "typed")
+                .size(10, 60)
+                .tag("client-test"),
+        )
+        .await
+        .unwrap();
+    let info = client.terminal(id).await.unwrap();
+    assert_eq!((info.rows, info.cols), (10, 60));
+    assert_eq!(info.tag.as_deref(), Some("client-test"));
+    assert!(info.is_running(), "{info:?}");
+    assert!(
+        client
+            .terminals()
+            .await
+            .unwrap()
+            .iter()
+            .any(|terminal| terminal.id == id)
+    );
+
+    client
+        .write_terminal(id, b"echo $YAS_CLIENT_TERMINAL-$((6 * 7))\r")
+        .await
+        .unwrap();
+    wait_for_screen(&client, id, "typed-42").await;
+    client.resize_terminal(id, 12, 70).await.unwrap();
+    client.write_terminal(id, b"stty size\r").await.unwrap();
+    wait_for_screen(&client, id, "12 70").await;
+    assert_eq!(client.terminal(id).await.unwrap().cols, 70);
+
+    // Another session sees the same terminal; a read-only one cannot type.
+    let viewer = server
+        .connect_with(&HelloOptions::named("terminal-viewer").read_only(true))
+        .await
+        .unwrap();
+    assert!(
+        viewer
+            .terminal_screen(id)
+            .await
+            .unwrap()
+            .contains("typed-42")
+    );
+    let typed = viewer.write_terminal(id, b"exit\r").await.unwrap_err();
+    assert!(matches!(typed, Error::Unsupported(_)), "{typed:?}");
+
+    let waiter = tokio::spawn(async move { viewer.wait_terminal_exit(id).await });
+    client.write_terminal(id, b"exit 3\r").await.unwrap();
+    let exited = tokio::time::timeout(TIMEOUT, waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            exited.status,
+            TerminalStatus::Exited(Some(ExitRecord::Code { code: 3, .. }))
+        ),
+        "{exited:?}"
+    );
+    client.close_terminal(id).await.unwrap();
+    assert!(client.terminal(id).await.unwrap_err().is_not_found());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminals_restart_take_signals_and_keep_deadlines() {
+    use yas_client::terminal::{
+        ExitReason, ExitRecord, SignalKind, TerminalCommand, TerminalStatus,
+    };
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let id = client
+        .start_terminal(&TerminalCommand::new("sh").args(["-c", "echo run-$$; exec sleep 600"]))
+        .await
+        .unwrap();
+    wait_for_screen(&client, id, "run-").await;
+    let generation = client.terminal(id).await.unwrap().generation;
+    client.restart_terminal(id).await.unwrap();
+    let restarted = client.terminal(id).await.unwrap();
+    assert!(restarted.generation > generation, "{restarted:?}");
+    assert!(restarted.is_running(), "{restarted:?}");
+
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move { client.wait_terminal_exit(id).await })
+    };
+    client
+        .signal_terminal(id, SignalKind::Terminate)
+        .await
+        .unwrap();
+    let exited = tokio::time::timeout(TIMEOUT, waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            exited.status,
+            TerminalStatus::Exited(Some(ExitRecord::Signal {
+                reason: ExitReason::Terminate,
+                ..
+            }))
+        ),
+        "{exited:?}"
+    );
+    client.close_terminal(id).await.unwrap();
+
+    let started = Instant::now();
+    let id = client
+        .start_terminal(
+            &TerminalCommand::shell_command("sleep 600").deadline(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap();
+    let exited = tokio::time::timeout(TIMEOUT, client.wait_terminal_exit(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!exited.is_running(), "{exited:?}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+    client.close_terminal(id).await.unwrap();
+    assert!(client.close_terminal(id).await.unwrap_err().is_not_found());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_whose_shell_reports_its_commands_answers_journal_output_and_cwd() {
+    use yas_client::terminal::TerminalCommand;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    // What a shell with OSC 7 and OSC 133 integration prints for one command
+    // (`echo journal`, exit 7), with the command held open for a moment.
+    let script = r#"printf '\033]7;file://localhost%s\007' "$PWD"
+printf '\033]133;A\007$ \033]133;B\007echo journal\r\n\033]133;C\007'
+echo journal-output
+sleep 3
+printf '\033]133;D;7\007\033]133;A\007$ \033]133;B\007'
+exec sleep 600"#;
+    let id = client
+        .start_terminal(
+            &TerminalCommand::new("sh")
+                .args(["-c", script])
+                .current_dir(directory.path()),
+        )
+        .await
+        .unwrap();
+    wait_for_screen(&client, id, "journal-output").await;
+    let running = client
+        .wait_terminal_command(id, None, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert!(matches!(running, Error::Timeout(_)), "{running:?}");
+    let record = client
+        .wait_terminal_command(id, None, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(record.exit_code, 7, "{record:?}");
+    let commands = client.terminal_commands(id, 10).await.unwrap();
+    assert!(commands.contains(&record), "{commands:?}");
+    let again = client
+        .wait_terminal_command(id, Some(record.index), Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(again, record);
+    let output = client
+        .terminal_output(id, Some(record.index), 4096)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.text);
+    assert!(text.contains("journal-output"), "{output:?}");
+    assert!(!output.truncated && !output.evicted, "{output:?}");
+    let cwd = client.terminal_cwd(id).await.unwrap();
+    assert_eq!(
+        std::fs::canonicalize(String::from_utf8(cwd).unwrap()).unwrap(),
+        std::fs::canonicalize(directory.path()).unwrap()
+    );
+    // Nothing else starts: waiting for the next command finds none.
+    let waited = client
+        .wait_terminal_command(id, None, Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    assert!(waited.is_not_found(), "{waited:?}");
+    client.close_terminal(id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn surfaces_are_none_without_the_compositor() {
+    use yas_client::surface::CaptureFormat;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert!(client.surfaces().await.unwrap().is_empty());
+    let missing = client
+        .capture_surface(1, CaptureFormat::Png)
+        .await
+        .unwrap_err();
+    assert!(missing.is_not_found(), "{missing:?}");
+}
+
+/// Against a real window: build the compositor's probe client
+/// (`cargo build -p yas-compositor --example paste_probe`) and run with
+/// `YAS_CLIENT_TEST_PASTE_PROBE=target/debug/examples/paste_probe`. Skipped
+/// without it: the probe is a development example, not a test binary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn surfaces_capture_take_input_and_close_with_the_paste_probe() {
+    use yas_client::surface::{CaptureFormat, PointerButton, key_combo, typed_keys};
+    let Some(probe) = std::env::var_os("YAS_CLIENT_TEST_PASTE_PROBE") else {
+        eprintln!("skipped: YAS_CLIENT_TEST_PASTE_PROBE names no paste_probe build");
+        return;
+    };
+    let server = tokio::time::timeout(TIMEOUT, HostedServer::start(options().compositor(true)))
+        .await
+        .expect("hosted server start timed out")
+        .expect("hosted server starts");
+    let client = server.connect().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("probe.log");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let wait_for_log = |needle: &'static str| {
+        let read_log = &read_log;
+        async move {
+            let deadline = Instant::now() + TIMEOUT;
+            while !read_log().contains(needle) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the probe never logged {needle:?}:\n{}",
+                    read_log()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let probe_process = client
+        .spawn(
+            Command::new("sh")
+                .args(["-c", r#"exec "$0" > "$1" 2>&1"#])
+                .arg(&probe)
+                .arg(&log),
+        )
+        .await
+        .unwrap();
+    wait_for_log("READY").await;
+    let deadline = Instant::now() + TIMEOUT;
+    let surface = loop {
+        let surfaces = client.surfaces().await.unwrap();
+        if let Some(surface) = surfaces
+            .into_iter()
+            .find(|surface| surface.app_id == "paste-probe")
+        {
+            break surface;
+        }
+        assert!(Instant::now() < deadline, "no paste-probe surface");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(surface.title, "paste-probe");
+    assert!(surface.width > 0 && surface.height > 0, "{surface:?}");
+    assert_eq!(client.surface(surface.id).await.unwrap().id, surface.id);
+
+    let png = client
+        .capture_surface(surface.id, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
+
+    client.focus_surface(surface.id).await.unwrap();
+    client
+        .click_surface(surface.id, 10, 10, PointerButton::Left)
+        .await
+        .unwrap();
+    client.scroll_surface(surface.id, 0.0, 1.0).await.unwrap();
+    client
+        .press_surface_keys(surface.id, &key_combo("a").unwrap())
+        .await
+        .unwrap();
+    wait_for_log(" down").await;
+    wait_for_log(" up").await;
+    client
+        .press_surface_keys(surface.id, &typed_keys("Hi{enter}").unwrap())
+        .await
+        .unwrap();
+    client.type_surface_text(surface.id, "é").await.unwrap();
+    client.resize_surface(surface.id, 320, 240).await.unwrap();
+
+    // A read-only session sees the window but cannot send it input.
+    let viewer = server
+        .connect_with(&HelloOptions::named("surface-viewer").read_only(true))
+        .await
+        .unwrap();
+    assert!(
+        viewer
+            .surfaces()
+            .await
+            .unwrap()
+            .iter()
+            .any(|seen| seen.id == surface.id)
+    );
+    let clicked = viewer
+        .click_surface(surface.id, 1, 1, PointerButton::Left)
+        .await
+        .unwrap_err();
+    assert!(matches!(clicked, Error::Unsupported(_)), "{clicked:?}");
+
+    client.close_surface(surface.id).await.unwrap();
+    wait_for_log("TOPLEVEL-CLOSE").await;
+    probe_process.signal(Signal::Terminate).await.unwrap();
+    assert!(client.surface(0).await.unwrap_err().is_not_found());
+}

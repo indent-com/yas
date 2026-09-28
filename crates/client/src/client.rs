@@ -192,6 +192,8 @@ struct Inner {
     outbound: mpsc::UnboundedSender<Frame>,
     next_request_id: AtomicU32,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The session clock that input events' `client_monotonic_ns` count on.
+    started: std::time::Instant,
 }
 
 impl Drop for Inner {
@@ -276,6 +278,7 @@ impl Client {
                 outbound,
                 next_request_id: AtomicU32::new(3),
                 tasks: vec![writer, reader],
+                started: std::time::Instant::now(),
             }),
         }
     }
@@ -394,6 +397,11 @@ impl Client {
             )
             .await?;
         Ok(R::decode(&reply.prefix.body)?)
+    }
+
+    /// Nanoseconds on this session's clock, for input events.
+    pub(crate) fn monotonic_ns(&self) -> u64 {
+        u64::try_from(self.inner.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     pub(crate) fn release(&self, route: Route) {

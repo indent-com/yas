@@ -2,9 +2,10 @@
 //!
 //! `yas-client` connects to a YAS server (the same way the `yas` CLI does)
 //! and drives its families from async Rust: non-PTY [processes](process),
-//! [files](fs), and the [key-value store](kv) and environment. On Unix it
-//! can also [host](host) a private server as a child process, reachable
-//! through the connections it hands out.
+//! [files](fs), the [key-value store](kv) and environment,
+//! [terminals](terminal) and GUI [surfaces](surface). On Unix it can also
+//! [host] a private server as a child process, reachable through the
+//! connections it hands out.
 //!
 //! # Connecting
 //!
@@ -65,6 +66,8 @@ pub mod kv;
 pub mod native;
 pub mod process;
 pub mod state;
+pub mod surface;
+pub mod terminal;
 pub mod transfer;
 pub mod transport;
 
