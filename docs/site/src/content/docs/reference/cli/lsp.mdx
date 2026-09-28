@@ -9,7 +9,7 @@ sidebar:
 
 Query language servers on the server (https://docs.yas.run/code/language-servers)
 
-Language servers are discovered by project markers (Cargo.toml, go.mod, tsconfig.json, …), spawned lazily, and stay warm across invocations. Positions are 1-based PATH:LINE:COL. First calls in a fresh workspace may report "warming up" — retry, or run `yas lsp wait`.
+Language servers are discovered by project markers (Cargo.toml, go.mod, tsconfig.json, …), spawned lazily, and stay warm across invocations. Positions are 1-based PATH:LINE:COL. First calls in a fresh workspace may exit 2 with `Busy: Warming` — retry, or run `yas lsp wait`.
 
 ```text
 Usage: yas lsp [OPTIONS] <COMMAND>

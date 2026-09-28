@@ -178,8 +178,8 @@ See [Remotes](/remote/remotes) for the target forms and how to set a default tar
 These commands run on the server, next to the code, and suit agent tool calls:
 
 - `yas fs cat`, `find`, `grep`, and `write` read, locate, search, and write files. `fs grep` exits 1 when nothing matches, like `grep`. `fs write --if-hash H` writes only if the file is unchanged. See [Files](/code/files).
-- `yas git status`, `log`, `diff`, `show`, and `blame` read repositories without running `git`. See [Git](/code/git).
-- `yas lsp def`, `refs`, `hover`, `diag`, and `rename` ask a language server that stays warm between calls. `yas lsp diag --wait` after an edit shows the resulting errors. A first call in a new workspace can exit 2 while the server is warming up; run `yas lsp wait` once. See [Language servers](/code/language-servers).
+- `yas git status`, `log`, `diff`, `show`, and `blame` read repositories without running `git`. Run them inside a worktree, or pass `--repo`. A relative path resolves against the shell's directory. See [Git](/code/git).
+- `yas lsp def`, `refs`, `hover`, `diag`, and `rename` ask a language server that stays warm between calls. `yas lsp diag` prints the published diagnostics and exits 1 when there are any. `yas lsp diag --wait` after an edit waits for the next diagnostics and shows the resulting errors. A first call in a new workspace can exit 2 with `Busy: Warming`. Run `yas lsp wait` once before it. See [Language servers](/code/language-servers).
 - `yas kv get` and `put` give scripts scratch storage on the server. See [Key-value store](/code/key-value-store).
 
 ```bash

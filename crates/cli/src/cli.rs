@@ -381,7 +381,7 @@ pub enum Command {
     /// Language servers are discovered by project markers (Cargo.toml,
     /// go.mod, tsconfig.json, …), spawned lazily, and stay warm across
     /// invocations. Positions are 1-based PATH:LINE:COL. First calls in
-    /// a fresh workspace may report "warming up" — retry, or run
+    /// a fresh workspace may exit 2 with `Busy: Warming` — retry, or run
     /// `yas lsp wait`.
     Lsp {
         #[command(subcommand)]

@@ -36,18 +36,44 @@ yas fs grep hello
 
 ```text
 src/greeting.rs:2:pub fn hello(name: &str) -> String {
-src/main.rs:6:    println!("{}", greet::hello(name));
+src/main.rs:6:    println!("{}", greet::hello(nme));
 ```
 
 Each line is the path, the 1-based line number, and the matching line. `grep` exits 1 when nothing
 matches.
 
+`grep` and `find` skip `.git` and files that `.gitignore` excludes. They search other dotfiles, such
+as `.env` and `.github/`:
+
+```bash
+yas fs grep target
+```
+
+```text
+.gitignore:1:/target
+```
+
 - `-s` matches case exactly.
 - `-e` treats the pattern as a regular expression, as in `yas fs grep -e 'fn\s+\w+'`.
 - `-w` matches whole words only.
 - `-l` prints only the paths that contain a match.
-- `--no-ignore` also searches files that `.gitignore` excludes, such as `target/`.
+- `-m N` stops after `N` matching files and prints every match in them. `0`, the default, means no
+  limit.
+- `--no-ignore` also searches `.git` and files that `.gitignore` excludes, such as `target/`.
+  Results stay in path order.
 - `--json` prints one object per match.
+
+`-m 1` stops after the first file that matches and prints all of its matches:
+
+```bash
+yas fs grep -m 1 name --root src
+```
+
+```text
+greeting.rs:1:/// Build a greeting for `name`.
+greeting.rs:2:pub fn hello(name: &str) -> String {
+greeting.rs:3:    format!("Hi, {name}!")
+```
 
 ```bash
 yas fs grep hello --json
@@ -58,7 +84,7 @@ yas fs grep hello --json
 ```
 
 `line` and `endLine` are 1-based. `col` and `endCol` are 0-based byte offsets into the line.
-`ignored` is `true` for a match in a gitignored file.
+`ignored` is `true` for a match in a gitignored file or in `.git`, which only `--no-ignore` returns.
 
 `find` fuzzy-matches file paths and prints the best matches first:
 
@@ -68,10 +94,6 @@ yas fs find grt
 
 ```text
 src/greeting.rs
-.git/refs/tags
-.git/refs/tags/v0.1
-.git/description
-.git/refs/heads/feature
 ```
 
 `-n` sets the number of results, 50 by default.
@@ -151,10 +173,10 @@ d            0 .
 f            8 .gitignore
 f          148 Cargo.lock
 f           59 Cargo.toml
-f           56 README.md
+f           55 README.md
 d            0 src
 f           99 src/greeting.rs
-f          114 src/main.rs
+f          113 src/main.rs
 watching for changes (ctrl-c to stop)…
 ~ d .
 + f new.txt
@@ -164,7 +186,8 @@ watching for changes (ctrl-c to stop)…
 ~ d .
 ```
 
-This output came from creating `new.txt`, renaming it, and deleting it in another shell.
+This output came from creating `new.txt`, renaming it, and deleting it in another shell. A relative
+path resolves against your shell's current directory.
 
 The snapshot lines give the type (`d` directory, `f` file), the size in bytes, and the path. After
 the snapshot, `+` marks a new entry, `~` a changed entry, `>` a rename, and `-` a removal. The
@@ -180,10 +203,6 @@ directory `.` shows as changed each time its list of children changes.
 
 <Aside type="note" title="Limits">
 
-- `grep` and `find` include files inside `.git` in their results. `yas fs grep -l name` in a fresh
-  repository lists every sample hook. Filter the output or narrow `--root`.
-- `grep -m` sets the size of each page of results, and `grep` keeps fetching pages. `-m 1` fails
-  with an `Invalid` error.
 - The server refuses writes when it runs with `YAS_FS_WRITE=0`, and disables `yas fs` entirely with
   `YAS_FS=0`. See [Environment variables](/reference/environment-variables).
 - `sync` stops with an error when the tree holds more than `YAS_FS_MAX_ENTRIES` entries, one

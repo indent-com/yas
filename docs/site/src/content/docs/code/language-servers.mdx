@@ -24,7 +24,10 @@ Positions are `PATH:LINE:COL`, with 1-based lines and columns. The examples use 
 7  }
 ```
 
-A cold language server needs time to index. The first query fails until it is ready:
+Paths are relative to `--root`, the workspace directory. It defaults to your shell's current
+directory, and a relative `--root` resolves against it.
+
+A cold language server needs time to index. The first query exits 2 until it is ready:
 
 ```text
 yas: LSP query failed with Busy: Warming
@@ -55,6 +58,7 @@ src/greeting.rs:2:8
 | Command                     | Prints                                                       |
 | --------------------------- | ------------------------------------------------------------ |
 | `def PATH:LINE:COL`         | Where the symbol is defined                                  |
+| `hover PATH:LINE:COL`       | The type and docs of the symbol, as the server's markup      |
 | `refs PATH:LINE:COL`        | Every use of the symbol. `--declaration` adds the definition |
 | `signature PATH:LINE:COL`   | The signature of the call around the position, then its docs |
 | `complete PATH:LINE:COL`    | Completions as tab-separated label, kind, and detail         |
@@ -85,6 +89,28 @@ hello	2	fn(&str) -> String
 The symbol lines give the kind, the name, and the location. In the completion line, `2` is the
 language server's numeric completion kind.
 
+`hover` prints the markup the language server returns, usually Markdown:
+
+```bash
+yas lsp hover src/main.rs:6:28
+```
+
+````text
+```rust
+demo::greet
+```
+
+```rust
+pub fn hello(name: &str) -> String
+```
+
+---
+
+Build a greeting for `name`.
+````
+
+`--json` prints one object with `format`, such as `markdown`, and `text`.
+
 ## Plan a rename
 
 `rename` prints the edits and never applies them:
@@ -102,13 +128,15 @@ Each line is a file, a start and end position, and the replacement text. `--json
 object per line with a `newText` field. Apply the edits yourself, or use **Rename** in the browser
 editor, which applies them.
 
-## Watch diagnostics
+## Diagnostics
 
-`diagnostics --watch` prints current diagnostics and reprints them as they change. It shows files
-the language server has opened, so run a query against a file first:
+`diagnostics`, or `diag`, prints the diagnostics the language servers have published and exits. It
+exits 1 when there are any and 0 when there are none. A language server that has not started yet
+has published nothing, so run `yas lsp wait` first:
 
 ```bash
-yas lsp diagnostics --watch
+yas lsp wait
+yas lsp diagnostics
 ```
 
 ```text
@@ -118,6 +146,12 @@ src/main.rs:6:33: hint: [E0425] a local variable with a similar name exists: `na
 
 Each line is the position, the severity, the code in brackets, and the message. `--json` adds the
 `source`, such as `rustc`.
+
+- `--wait` waits for indexing to finish, then for the next diagnostics the language server
+  publishes, and prints them. Run it after editing a file to see the errors the edit caused. When
+  the server sends no update for 5 seconds, it prints the current diagnostics.
+- `--watch` prints the current diagnostics and reprints them as they change.
+- A path argument limits the output to one file or directory.
 
 ## See and stop language servers
 
@@ -178,11 +212,8 @@ The server reads the file each time it resolves a language server for a file, so
 language servers started afterward. See
 [Configuration files](/reference/configuration-files).
 
-<Aside type="note" title="Limits in this release">
+<Aside type="note" title="Limits">
 
-- `yas lsp hover` fails with `Internal: no detail`. Hover in the browser editor shows nothing.
-- `diagnostics` without `--watch` prints nothing. Use `--watch`.
-- `--root` defaults to your shell's current directory. The help text says the server's.
 - The server disables `yas lsp` with `YAS_LSP=0`. `YAS_LSP_IDLE_SECS` and other limits are listed
   in [Environment variables](/reference/environment-variables).
 
