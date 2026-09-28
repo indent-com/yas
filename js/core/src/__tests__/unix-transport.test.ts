@@ -8,6 +8,8 @@ import { BunUnixSocketTransport } from "../transports/unix-bun";
 import { NodeUnixSocketTransport } from "../transports/unix";
 import type { AbstractUnixSocketTransport } from "../transports/unix-base";
 import type { UnixSocketTransportOptions } from "../transports/unix-base";
+import { YasConnection } from "../yas/session";
+import { YAS_PREFACE } from "../yas/wire";
 
 // These tests exercise real AF_UNIX sockets on POSIX.  The transport is
 // intentionally local-only, so we skip on platforms where
@@ -45,24 +47,17 @@ for (const { name, skip, make } of suites) {
     let sockPath: string;
     let server: Server;
     let lastClient: Socket | null = null;
-    const clientMessages: Buffer[] = [];
+    let clientBytes = Buffer.alloc(0);
 
     beforeEach(async () => {
       tmp = mkdtempSync(join(tmpdir(), "yas-unix-transport-"));
       sockPath = join(tmp, "yas.sock");
-      clientMessages.length = 0;
+      clientBytes = Buffer.alloc(0);
       lastClient = null;
       server = createServer((socket) => {
         lastClient = socket;
-        let buf = Buffer.alloc(0);
         socket.on("data", (chunk: Buffer) => {
-          buf = buf.byteLength === 0 ? chunk : Buffer.concat([buf, chunk]);
-          while (buf.byteLength >= 4) {
-            const len = buf.readUInt32LE(0);
-            if (buf.byteLength < 4 + len) break;
-            clientMessages.push(Buffer.from(buf.subarray(4, 4 + len)));
-            buf = buf.subarray(4 + len);
-          }
+          clientBytes = Buffer.concat([clientBytes, chunk]);
         });
       });
       await new Promise<void>((resolve) => server.listen(sockPath, resolve));
@@ -72,13 +67,6 @@ for (const { name, skip, make } of suites) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(tmp, { recursive: true, force: true });
     });
-
-    function framed(payload: Uint8Array): Buffer {
-      const out = Buffer.alloc(4 + payload.byteLength);
-      out.writeUInt32LE(payload.byteLength, 0);
-      out.set(payload, 4);
-      return out;
-    }
 
     async function waitFor<T>(
       probe: () => T | null | undefined,
@@ -110,46 +98,51 @@ for (const { name, skip, make } of suites) {
       t.close();
     });
 
-    it("sends length-prefixed frames", async () => {
+    it("is a YAS byte-stream transport", () => {
+      const t = make(sockPath);
+      expect(t.yasFraming).toBe("stream");
+      t.close();
+    });
+
+    it("writes bytes unchanged", async () => {
       const t = make(sockPath);
       t.connect();
       await waitFor(() => t.status === "connected");
       t.send(new Uint8Array([1, 2, 3]));
-      await waitFor(() => clientMessages.length > 0);
-      expect(Array.from(clientMessages[0]!)).toEqual([1, 2, 3]);
+      t.send(new Uint8Array([4]));
+      await waitFor(() => clientBytes.byteLength === 4);
+      expect(Array.from(clientBytes)).toEqual([1, 2, 3, 4]);
       t.close();
     });
 
-    it("decodes length-prefixed frames from the server", async () => {
+    it("delivers server bytes unchanged across chunk boundaries", async () => {
       const t = make(sockPath);
-      const received: ArrayBuffer[] = [];
-      t.addEventListener("message", (d) => received.push(d));
+      const received: number[] = [];
+      t.addEventListener("message", (d) => received.push(...new Uint8Array(d)));
       t.connect();
       await waitFor(() => t.status === "connected");
       await waitFor(() => lastClient !== null);
-      lastClient!.write(framed(new Uint8Array([0xaa, 0xbb])));
-      lastClient!.write(framed(new Uint8Array([0xcc])));
-      await waitFor(() => received.length === 2);
-      expect(Array.from(new Uint8Array(received[0]!))).toEqual([0xaa, 0xbb]);
-      expect(Array.from(new Uint8Array(received[1]!))).toEqual([0xcc]);
+      const whole = [0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+      for (const byte of whole) lastClient!.write(Uint8Array.of(byte));
+      await waitFor(() => received.length === whole.length);
+      expect(received).toEqual(whole);
       t.close();
     });
 
-    it("handles split reads across frame boundaries", async () => {
-      const t = make(sockPath);
-      const received: ArrayBuffer[] = [];
-      t.addEventListener("message", (d) => received.push(d));
-      t.connect();
-      await waitFor(() => t.status === "connected");
-      await waitFor(() => lastClient !== null);
-      const whole = framed(new Uint8Array([1, 2, 3, 4, 5]));
-      // Deliver one byte at a time — the framer must wait for the full frame.
-      for (let i = 0; i < whole.byteLength; i++) {
-        lastClient!.write(whole.subarray(i, i + 1));
-      }
-      await waitFor(() => received.length === 1);
-      expect(Array.from(new Uint8Array(received[0]!))).toEqual([1, 2, 3, 4, 5]);
-      t.close();
+    it("starts a YAS session with the raw preface and a framed HELLO", async () => {
+      const t = make(sockPath, { reconnect: false });
+      const connection = new YasConnection(t);
+      const hello = connection.connect();
+      hello.catch(() => {});
+      await waitFor(() => clientBytes.byteLength > YAS_PREFACE.length + 4);
+      expect(Array.from(clientBytes.subarray(0, YAS_PREFACE.length))).toEqual(
+        Array.from(YAS_PREFACE),
+      );
+      const frameLength = clientBytes.readUInt32LE(YAS_PREFACE.length);
+      await waitFor(
+        () => clientBytes.byteLength === YAS_PREFACE.length + 4 + frameLength,
+      );
+      connection.close();
     });
 
     it("send() is a no-op before connected", async () => {
@@ -157,7 +150,7 @@ for (const { name, skip, make } of suites) {
       // Intentionally do not call connect().
       t.send(new Uint8Array([1]));
       await new Promise((r) => setTimeout(r, 20));
-      expect(clientMessages).toHaveLength(0);
+      expect(clientBytes.byteLength).toBe(0);
       t.close();
     });
 
