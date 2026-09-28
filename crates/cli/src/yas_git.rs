@@ -40,7 +40,7 @@ impl Repository {
                 family::GIT,
                 git::request_kind::OPEN,
                 &Open {
-                    source: RepositorySource::PlatformPath(path.as_bytes().to_vec()),
+                    source: RepositorySource::PlatformPath(client_path(path)),
                     extensions: Extensions::default(),
                 },
                 true,
@@ -611,10 +611,29 @@ async fn cmd_show(
     let mut repository = Repository::open(on, hub, &repo).await?;
     let (revision, path) = split_revision_path(&spec);
     let object = repository.resolve_one(revision).await?;
-    let records = repository
+    match path {
+        None => {
+            let commit = commit_object(&mut repository, &object)
+                .await
+                .ok_or_else(|| format!("'{revision}' did not resolve to a commit"))?;
+            std::io::stdout()
+                .write_all(&commit)
+                .map_err(|error| format!("writing stdout: {error}"))?;
+            repository.close().await?;
+            return Ok(0);
+        }
+        Some("") => {
+            let records = tree_entries(&mut repository, object, "").await?;
+            print_tree_entries(records, false);
+            repository.close().await?;
+            return Ok(0);
+        }
+        Some(_) => {}
+    }
+    let records = match repository
         .query(
             QueryBody::Blob {
-                object,
+                object: object.clone(),
                 path: path.map(fs_path).transpose()?,
                 offset: 0,
                 max_bytes: max_len,
@@ -623,7 +642,21 @@ async fn cmd_show(
             1,
             1,
         )
-        .await?;
+        .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            let Some(path) = path else {
+                return Err(error);
+            };
+            let Ok(records) = tree_entries(&mut repository, object, path).await else {
+                return Err(error);
+            };
+            print_tree_entries(records, false);
+            repository.close().await?;
+            return Ok(0);
+        }
+    };
     let content = records.into_iter().find_map(|record| match record {
         QueryRecord::Blob(content) => Some(content),
         _ => None,
@@ -650,18 +683,30 @@ async fn cmd_ls_tree(
     let mut repository = Repository::open(on, hub, &repo).await?;
     let (revision, path) = split_revision_path(&spec);
     let tree = repository.resolve_one(revision).await?;
-    let records = repository
+    let records = tree_entries(&mut repository, tree, path.unwrap_or("")).await?;
+    print_tree_entries(records, json);
+    repository.close().await?;
+    Ok(0)
+}
+
+async fn tree_entries(
+    repository: &mut Repository,
+    tree: ObjectId,
+    path: &str,
+) -> Result<Vec<QueryRecord>, String> {
+    repository
         .query(
             QueryBody::Tree {
                 tree,
-                path: path.map(fs_path).transpose()?.unwrap_or(FsPath {
-                    components: Vec::new(),
-                }),
+                path: fs_path(path)?,
             },
             git::MAX_QUERY_RECORDS as u16,
             MAX_COLLECTED_RECORDS,
         )
-        .await?;
+        .await
+}
+
+fn print_tree_entries(records: Vec<QueryRecord>, json: bool) {
     for record in records {
         if let QueryRecord::TreeEntry(entry) = record {
             let kind = match entry.entry_kind {
@@ -684,8 +729,70 @@ async fn cmd_ls_tree(
             }
         }
     }
-    repository.close().await?;
-    Ok(0)
+}
+
+/// The commit object in `git cat-file commit` layout, rebuilt from the LOG
+/// record because BLOB serves only blobs.
+async fn commit_object(repository: &mut Repository, object: &ObjectId) -> Option<Vec<u8>> {
+    let records = repository
+        .query(
+            QueryBody::Log {
+                spec: object_hex(object).into_bytes(),
+                tips: Vec::new(),
+                hides: Vec::new(),
+                path: None,
+                flags: yas_wire::schema::git::LOG_FULL_MESSAGE as u16,
+            },
+            1,
+            1,
+        )
+        .await
+        .ok()?;
+    records.into_iter().find_map(|record| match record {
+        QueryRecord::Commit(commit) => Some(render_commit(&commit)),
+        _ => None,
+    })
+}
+
+fn render_commit(commit: &git::CommitRecord) -> Vec<u8> {
+    fn signature(out: &mut Vec<u8>, role: &str, name: &[u8], email: &[u8], time: i64, tz: i16) {
+        out.extend_from_slice(role.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(name);
+        out.extend_from_slice(b" <");
+        out.extend_from_slice(email);
+        let sign = if tz < 0 { '-' } else { '+' };
+        let minutes = tz.unsigned_abs();
+        out.extend_from_slice(
+            format!("> {time} {sign}{:02}{:02}\n", minutes / 60, minutes % 60).as_bytes(),
+        );
+    }
+    let mut out = format!("tree {}\n", object_hex(&commit.tree)).into_bytes();
+    for parent in &commit.parents {
+        out.extend_from_slice(format!("parent {}\n", object_hex(parent)).as_bytes());
+    }
+    signature(
+        &mut out,
+        "author",
+        &commit.author_name,
+        &commit.author_email,
+        commit.authored_unix_seconds,
+        commit.author_timezone_minutes,
+    );
+    signature(
+        &mut out,
+        "committer",
+        &commit.committer_name,
+        &commit.committer_email,
+        commit.committed_unix_seconds,
+        commit.committer_timezone_minutes,
+    );
+    out.push(b'\n');
+    out.extend_from_slice(&commit.message);
+    if !commit.message.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    out
 }
 
 async fn cmd_ls_files(
@@ -885,7 +992,7 @@ async fn cmd_discover(
         &mut client,
         0,
         QueryBody::Discover {
-            source: RepositorySource::PlatformPath(path.into_bytes()),
+            source: RepositorySource::PlatformPath(client_path(&path)),
             max_depth: u16::from(depth),
             flags,
         },
@@ -1179,6 +1286,15 @@ fn print_diff(diff: &git::DiffRecord, json: bool) {
     }
 }
 
+/// Relative repository paths name the client's working directory, as FS and
+/// LSP roots do.
+fn client_path(path: &str) -> Vec<u8> {
+    std::path::absolute(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+        .into_bytes()
+}
+
 fn fs_path(path: &str) -> Result<FsPath, String> {
     let normalized = path.replace('\\', "/");
     if normalized.starts_with('/') {
@@ -1265,6 +1381,49 @@ fn wire_error(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_object_uses_cat_file_layout() {
+        let oid = |byte| ObjectId {
+            algorithm: yas_wire::schema::git::OBJECT_SHA1 as u8,
+            bytes: vec![byte; 20],
+        };
+        let commit = git::CommitRecord {
+            flags: 0,
+            object: oid(1),
+            tree: oid(0xab),
+            parents: vec![oid(0xcd)],
+            authored_unix_seconds: 1_700_000_000,
+            author_timezone_minutes: -330,
+            committed_unix_seconds: 1_700_000_100,
+            committer_timezone_minutes: 60,
+            author_name: b"A U".to_vec(),
+            author_email: b"a@example.com".to_vec(),
+            committer_name: b"C".to_vec(),
+            committer_email: b"c@example.com".to_vec(),
+            message: b"subject\n\nbody".to_vec(),
+        };
+        assert_eq!(
+            String::from_utf8(render_commit(&commit)).unwrap(),
+            format!(
+                "tree {}\nparent {}\nauthor A U <a@example.com> 1700000000 -0530\n\
+                 committer C <c@example.com> 1700000100 +0100\n\nsubject\n\nbody\n",
+                "ab".repeat(20),
+                "cd".repeat(20)
+            )
+        );
+    }
+
+    #[test]
+    fn relative_repository_paths_resolve_against_client_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(client_path("."), cwd.to_string_lossy().as_bytes());
+        assert_eq!(
+            client_path("sub"),
+            cwd.join("sub").to_string_lossy().as_bytes()
+        );
+        assert_eq!(client_path("/abs/repo"), b"/abs/repo");
+    }
 
     #[test]
     fn revision_path_and_ranges_match_git_cli_spellings() {
