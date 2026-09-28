@@ -41,6 +41,27 @@ const MAX_OPUS_PACKET: usize = 4000;
 /// Default Opus bitrate in bits/sec.
 pub const DEFAULT_BITRATE: i32 = 64_000;
 
+/// The Opus bitrate in bits/sec that `YAS_AUDIO_BITRATE` configures, or
+/// [`DEFAULT_BITRATE`] when it is unset or not a positive integer.
+pub fn configured_bitrate() -> i32 {
+    std::env::var("YAS_AUDIO_BITRATE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|&bitrate| bitrate > 0)
+        .unwrap_or(DEFAULT_BITRATE)
+}
+
+/// Encoder bitrate for the current viewers: the highest bitrate any viewer
+/// asked for, or the server's configured bitrate when every viewer left the
+/// choice to the server (0 kbps).
+pub fn output_bitrate(max_native_kbps: u16, configured: i32) -> i32 {
+    if max_native_kbps == 0 {
+        configured
+    } else {
+        i32::from(max_native_kbps) * 1_000
+    }
+}
+
 /// Server-side ring buffer depth: 200 ms = 10 Opus frames at 20 ms.
 /// Also sizes the encoder -> fan-out channel (at `RING_CAPACITY * 2`),
 /// which needs slack for a briefly-descheduled fan-out task — so keep
@@ -478,6 +499,19 @@ pub fn pipewire_available() -> bool {
 /// Returns the list of required PipeWire / D-Bus binaries that are not
 /// found on `$PATH`.  Empty list means audio can run (provided
 /// libpipewire is also loadable at runtime; see `pipewire_available`).
+/// One-line reason desktop audio could not start, for normal verbosity.
+pub fn unavailable_reason(desktop_bus: bool, missing: &[&str], load_error: &str) -> String {
+    if !missing.is_empty() {
+        format!("missing on $PATH: {}", missing.join(", "))
+    } else if !load_error.is_empty() {
+        load_error.to_owned()
+    } else if !desktop_bus {
+        "no private desktop D-Bus (is dbus-daemon installed?)".to_owned()
+    } else {
+        "PipeWire is not available".to_owned()
+    }
+}
+
 pub fn missing_pipewire_binaries() -> Vec<&'static str> {
     [
         "pipewire",
@@ -1422,6 +1456,26 @@ fn consume_pcm_prefix(bytes: &mut Vec<u8>, pts_ns: &mut Option<i64>, consumed: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_reason_names_the_first_missing_dependency() {
+        assert_eq!(
+            unavailable_reason(true, &["pipewire", "pipewire-pulse"], "dlopen failed"),
+            "missing on $PATH: pipewire, pipewire-pulse"
+        );
+        assert_eq!(
+            unavailable_reason(true, &[], "libpipewire-0.3.so.0: not found"),
+            "libpipewire-0.3.so.0: not found"
+        );
+        assert!(unavailable_reason(false, &[], "").contains("D-Bus"));
+    }
+
+    #[test]
+    fn viewers_at_the_server_default_get_the_configured_bitrate() {
+        assert_eq!(output_bitrate(0, 128_000), 128_000);
+        assert_eq!(output_bitrate(0, DEFAULT_BITRATE), DEFAULT_BITRATE);
+        assert_eq!(output_bitrate(96, 128_000), 96_000);
+    }
 
     fn frame(ts: u32) -> OpusFrame {
         OpusFrame {
