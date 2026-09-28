@@ -378,6 +378,14 @@ so `run`/`update` options go before the name. `--restart`, `--persist`,
 `--detach` and `--json` written after the module are refused rather than
 handed over; put a `--` first if the extension really wants one of them.
 
+An attached `run` prints the attempt's stdout, stderr, and log output, even
+when it finishes before the CLI starts following, and exits with the
+extension's return code. A trapped or failed attempt prints
+`yas: extension NAME trapped: DETAIL` to stderr and exits 1. A detached
+transient extension keeps its name for 30 s after it stops
+(`YAS_EXT_TERMINAL_RETAIN`) so its output can be replayed; `run` refuses to
+reuse that name until then and says so.
+
 `yas ext manage` opens an inline extension picker. Move with arrows or `j`/`k`
 and use Space or a mouse click to cycle the selected action: install for new
 extensions, update then uninstall for outdated ones, or uninstall for other
