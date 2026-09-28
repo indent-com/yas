@@ -73,6 +73,10 @@ type ProcessRef = u64;
 // protocol.  The adapter maps this state to the public `yas.process` types.
 const PROCESS_SPAWN_MERGE_STDERR: u8 = process_schema::SPAWN_MERGE_STDERR as u8;
 const PROCESS_SPAWN_DETACHABLE: u8 = process_schema::SPAWN_DETACHABLE as u8;
+const PROCESS_SPAWN_LEAVE_RESIDUE: u8 = process_schema::SPAWN_LEAVE_RESIDUE as u8;
+const PROCESS_SPAWN_STDIN_NULL: u8 = process_schema::SPAWN_STDIN_NULL as u8;
+/// What a LEAVE_RESIDUE exit says when group members still held its streams.
+const RESIDUE_LEFT_RUNNING: &str = "residual process group left running";
 const PROCESS_STREAM_STDOUT: u8 = process_schema::STREAM_STDOUT_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDERR: u8 = process_schema::STREAM_STDERR_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDIN_ACCEPTING: u8 = 1 << 0;
@@ -277,6 +281,9 @@ pub(crate) struct NativeSpawnRequest {
     /// process-group descendant. Keep that group alive and represent it as the
     /// running Process until the group is actually empty.
     pub(crate) preserve_residual: bool,
+    /// LEAVE_RESIDUE: how long the streams are forwarded after the direct child exits (None:
+    /// until they close). Only read with the flag.
+    pub(crate) residue_grace: Option<Duration>,
     pub(crate) cwd: Option<Vec<u8>>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<(Vec<u8>, Vec<u8>)>,
@@ -799,6 +806,9 @@ struct Pending {
     process_id: u32,
     detachable: bool,
     preserve_residual: bool,
+    leave_residue: bool,
+    residue_grace: Option<Duration>,
+    stdin_null: bool,
     request_bytes: usize,
     endpoint: Weak<Endpoint>,
     server: Weak<ServerInner>,
@@ -901,6 +911,9 @@ struct Record {
     generation: u64,
     detachable: bool,
     preserve_residual: bool,
+    /// LEAVE_RESIDUE: the direct child's exit leaves its group alone ([`abandon_residue`]).
+    leave_residue: bool,
+    residue_grace: Option<Duration>,
     pid: ProcessId,
     argv0: Vec<u8>,
     /// Absolute launch cwd. Linux PROCESS_CWD prefers the child's live cwd
@@ -975,9 +988,20 @@ impl Manager {
         if request.process_id == 0
             || request.argv.is_empty()
             || request.argv[0].is_empty()
-            || request.flags & !(PROCESS_SPAWN_MERGE_STDERR | PROCESS_SPAWN_DETACHABLE) != 0
+            || request.flags
+                & !(PROCESS_SPAWN_MERGE_STDERR
+                    | PROCESS_SPAWN_DETACHABLE
+                    | PROCESS_SPAWN_LEAVE_RESIDUE
+                    | PROCESS_SPAWN_STDIN_NULL)
+                != 0
         {
             return Err(NativeError::Invalid("invalid Process spawn".to_owned()));
+        }
+        #[cfg(windows)]
+        if request.flags & PROCESS_SPAWN_LEAVE_RESIDUE != 0 {
+            return Err(NativeError::Invalid(
+                "LEAVE_RESIDUE needs Unix process groups".to_owned(),
+            ));
         }
         #[cfg(windows)]
         {
@@ -1028,6 +1052,9 @@ impl Manager {
             process_id: owned.process_id,
             detachable,
             preserve_residual: request.preserve_residual,
+            leave_residue: owned.flags & PROCESS_SPAWN_LEAVE_RESIDUE != 0,
+            residue_grace: request.residue_grace,
+            stdin_null: owned.flags & PROCESS_SPAWN_STDIN_NULL != 0,
             request_bytes,
             endpoint: Arc::downgrade(&self.endpoint),
             server: Arc::downgrade(&self.server.0),
@@ -1152,7 +1179,7 @@ impl Manager {
             #[cfg(windows)]
             job,
         } = spawned;
-        let stdin = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take();
         let stdout = (!merged).then(|| child.stdout.take().expect("piped stdout"));
         let stderr = (!merged).then(|| child.stderr.take().expect("piped stderr"));
         let (stdin_tx, stdin_rx) = mpsc::channel(PROCESS_MAX_UNACKED_PACKETS);
@@ -1177,6 +1204,8 @@ impl Manager {
             generation: pending.generation,
             detachable: pending.detachable,
             preserve_residual: pending.preserve_residual,
+            leave_residue: pending.leave_residue,
+            residue_grace: pending.residue_grace,
             pid,
             argv0: req.argv[0].to_vec(),
             cwd: process_cwd,
@@ -1193,13 +1222,17 @@ impl Manager {
             inner: StdMutex::new(RecordInner {
                 bindings,
                 stdin_controller,
-                stdin_tx: Some(stdin_tx),
+                stdin_tx: stdin.is_some().then_some(stdin_tx),
                 stdin_received: 0,
                 stdin_acked: 0,
                 stdin_frames: VecDeque::new(),
-                stdin_state: PROCESS_STDIN_ACCEPTING,
+                stdin_state: if stdin.is_some() {
+                    PROCESS_STDIN_ACCEPTING
+                } else {
+                    PROCESS_STDIN_CLOSED
+                },
                 stdin_closed_by_child: false,
-                stdin_writer_done: false,
+                stdin_writer_done: stdin.is_none(),
                 stdout: StreamState { next: 0 },
                 stderr: (!merged).then_some(StreamState { next: 0 }),
                 stdout_readers: 1,
@@ -1227,13 +1260,16 @@ impl Manager {
         let task_start = Arc::new(Semaphore::new(0));
         let stdin_start = task_start.clone();
         let stdin_record = record.clone();
+        // STDIN_NULL: the child has the null device, and nothing writes to it.
         let stdin_task = tokio::spawn(async move {
             let permit = stdin_start
                 .acquire()
                 .await
                 .expect("spawn task gate remains open");
             permit.forget();
-            stdin_writer(stdin_record, stdin, stdin_rx).await;
+            if let Some(stdin) = stdin {
+                stdin_writer(stdin_record, stdin, stdin_rx).await;
+            }
         });
         let stdout_start = task_start.clone();
         let stdout_record = record.clone();
@@ -1303,7 +1339,7 @@ impl Manager {
             schedule_terminate_timeout(record.clone(), PROCESS_KILL_OWNER_LOST);
         }
         if installed_bound {
-            complete_spawn_success(&pending, record.generation, merged);
+            complete_spawn_success(&pending, record.generation, merged, pending.stdin_null);
         }
         task_start.add_permits(task_count);
         if self.server.0.verbose {
@@ -1444,9 +1480,7 @@ impl Manager {
             let Some(binding) = binding_index(&inner, self.endpoint.id, process_id) else {
                 return Err(NativeError::NotFound);
             };
-            let residual_running = record.preserve_residual
-                && inner.child_outcome.is_some()
-                && !inner.tree_cleanup_done;
+            let residual_running = residual_running(&record, &inner);
             if inner.terminal_queued || (inner.child_outcome.is_some() && !residual_running) {
                 return Err(NativeError::Conflict);
             }
@@ -1713,7 +1747,7 @@ impl Manager {
         )
         .await;
         for record in &ordinary {
-            abort_pipes(record);
+            finish_pipes(record);
         }
         // Pipe abortion makes terminal publication eligible. Keep shutdown
         // bounded, but leave any unusually slow record live so its own waiter
@@ -1847,7 +1881,12 @@ fn release_pending(pending: &Arc<Pending>, keep_generation: bool) {
     }
 }
 
-fn complete_spawn_success(pending: &Arc<Pending>, process_handle: u64, merged: bool) {
+fn complete_spawn_success(
+    pending: &Arc<Pending>,
+    process_handle: u64,
+    merged: bool,
+    stdin_null: bool,
+) {
     let Some(completion) = pending.completion.lock().unwrap().take() else {
         return;
     };
@@ -1855,7 +1894,12 @@ fn complete_spawn_success(pending: &Arc<Pending>, process_handle: u64, merged: b
     let _ = sender.send(Ok(NativeStarted {
         process_id: pending.process_id,
         process_handle,
-        stdin_window: PROCESS_DEFAULT_STREAM_WINDOW,
+        // No stdin Transfer for the null device.
+        stdin_window: if stdin_null {
+            0
+        } else {
+            PROCESS_DEFAULT_STREAM_WINDOW
+        },
         stdout_window: PROCESS_DEFAULT_STREAM_WINDOW,
         stderr_window: if merged {
             0
@@ -2020,7 +2064,11 @@ fn command_for(
         command.current_dir(PathBuf::from(OsString::from_vec(cwd.clone())));
     }
     command
-        .stdin(Stdio::piped())
+        .stdin(if req.flags & PROCESS_SPAWN_STDIN_NULL != 0 {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.as_std_mut().process_group(0);
@@ -2120,7 +2168,11 @@ fn command_for(
         command.current_dir(std::str::from_utf8(cwd).expect("Windows cwd validated UTF-8"));
     }
     command
-        .stdin(Stdio::piped())
+        .stdin(if req.flags & PROCESS_SPAWN_STDIN_NULL != 0 {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Suspension closes the otherwise unavoidable race between CreateProcess
@@ -2509,7 +2561,7 @@ async fn wait_child(record: Arc<Record>, mut child: Child) {
     }
     record.mark_reaped();
     #[cfg(unix)]
-    if !record.preserve_residual {
+    if !record.preserve_residual && !record.leave_residue {
         let _ = graceful_terminate(&record);
     }
     schedule_residual_cleanup(record.clone());
@@ -2518,6 +2570,47 @@ async fn wait_child(record: Arc<Record>, mut child: Child) {
 
 fn schedule_residual_cleanup(record: Arc<Record>) {
     tokio::spawn(async move {
+        // LEAVE_RESIDUE: forward output until the streams close or the grace passes, and signal
+        // nobody.
+        if record.leave_residue {
+            let deadline = async {
+                match record.residue_grace {
+                    Some(grace) => tokio::time::sleep(grace).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(deadline);
+            let closed = loop {
+                let changed = record.changed.notified();
+                {
+                    let inner = record.inner.lock().unwrap();
+                    if inner.tree_cleanup_done {
+                        return;
+                    }
+                    if io_tasks_done(&inner) {
+                        break true;
+                    }
+                }
+                tokio::select! {
+                    _ = changed => {}
+                    _ = &mut deadline => break false,
+                }
+            };
+            if closed {
+                {
+                    let mut inner = record.inner.lock().unwrap();
+                    if inner.tree_cleanup_done {
+                        return;
+                    }
+                    inner.tree_cleanup_done = true;
+                }
+                record.changed.notify_waiters();
+                try_queue_terminal(&record);
+            } else {
+                abandon_residue(&record);
+            }
+            return;
+        }
         #[cfg(unix)]
         if record.preserve_residual {
             let mut poll = tokio::time::interval(Duration::from_millis(50));
@@ -2614,11 +2707,54 @@ fn io_tasks_done(inner: &RecordInner) -> bool {
     inner.stdin_writer_done && inner.stdout_readers == 0 && inner.stderr_readers == 0
 }
 
+/// A LEAVE_RESIDUE process whose direct child is gone stops waiting for its streams: the exit
+/// is reported, the group members still holding them keep running untracked, and the readers
+/// drain what they write to nobody (bindings leave with the exit), so a writer never blocks on a
+/// full pipe or dies of a closed one. Nothing is aborted or signalled.
+fn abandon_residue(record: &Arc<Record>) {
+    let stdin_abort = {
+        let mut inner = record.inner.lock().unwrap();
+        if inner.tree_cleanup_done {
+            return;
+        }
+        inner.tree_cleanup_done = true;
+        inner.terminate_timeout_armed = false;
+        if io_tasks_done(&inner) {
+            None
+        } else {
+            inner.cleanup_detail = RESIDUE_LEFT_RUNNING;
+            let stdin_changed = inner.stdin_state != PROCESS_STDIN_CLOSED;
+            inner.stdin_tx.take();
+            inner.stdin_state = PROCESS_STDIN_CLOSED;
+            inner.stdin_writer_done = true;
+            inner.stdout_readers = 0;
+            inner.stderr_readers = 0;
+            inner.output_aborts.clear();
+            if stdin_changed {
+                send_stdin_ack(&inner, inner.stdin_acked, PROCESS_STDIN_CLOSED);
+            }
+            inner.stdin_abort.take()
+        }
+    };
+    if let Some(abort) = stdin_abort {
+        abort.abort();
+    }
+    record.changed.notify_waiters();
+    try_queue_terminal(record);
+}
+
+/// Whether the group of a LEAVE_RESIDUE (or surface) process may still be running after its
+/// direct child exited: CONTROL still reaches it.
+fn residual_running(record: &Record, inner: &RecordInner) -> bool {
+    (record.preserve_residual || record.leave_residue)
+        && inner.child_outcome.is_some()
+        && !inner.tree_cleanup_done
+}
+
 fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
     {
         let mut inner = record.inner.lock().unwrap();
-        let residual_running =
-            record.preserve_residual && inner.child_outcome.is_some() && !inner.tree_cleanup_done;
+        let residual_running = residual_running(&record, &inner);
         if (inner.child_outcome.is_some() && !residual_running)
             || inner.terminal_queued
             || inner.terminate_timeout_armed
@@ -2633,6 +2769,11 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
         .0
         .terminate_timeout_tasks
         .fetch_add(1, Ordering::AcqRel);
+    #[cfg(unix)]
+    if record.leave_residue {
+        tokio::spawn(escalate_residue(record, cause));
+        return;
+    }
     tokio::spawn(async move {
         let finished = tokio::select! {
             _ = async {
@@ -2671,6 +2812,42 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
             .terminate_timeout_tasks
             .fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+/// TERMINATE's escalation for a LEAVE_RESIDUE process, as a shell stops a job: whatever became
+/// of the direct child, the group gets SIGKILL after the kill grace unless it is gone already,
+/// and nobody waits for streams that members which left the group still hold.
+#[cfg(unix)]
+async fn escalate_residue(record: Arc<Record>, cause: u8) {
+    tokio::time::sleep(record.server.0.policy.kill_grace).await;
+    if !process_group_absent(&record) && force_kill(&record).is_ok() {
+        let mut inner = record.inner.lock().unwrap();
+        if inner.child_outcome.is_none() && !inner.terminal_queued {
+            inner.exit_override = Some(ExitOverride {
+                reason: PROCESS_EXIT_KILLED,
+                kill_cause: cause,
+            });
+        }
+    }
+    record.wait_reaped().await;
+    // Killed members close their ends at once; only escapees keep the streams open.
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let changed = record.changed.notified();
+            if io_tasks_done(&record.inner.lock().unwrap()) {
+                return;
+            }
+            changed.await;
+        }
+    })
+    .await;
+    abandon_residue(&record);
+    #[cfg(test)]
+    record
+        .server
+        .0
+        .terminate_timeout_tasks
+        .fetch_sub(1, Ordering::AcqRel);
 }
 
 fn outcome_fields(outcome: ChildOutcome, override_: Option<ExitOverride>) -> (u8, u8, u32) {
@@ -2918,7 +3095,7 @@ async fn terminate_record(record: &Arc<Record>, cause: u8, grace: Duration) {
         };
         let _ = tokio::time::timeout(grace.max(Duration::from_millis(100)), forced).await;
     }
-    abort_pipes(record);
+    finish_pipes(record);
     let _ = tokio::time::timeout(
         grace.max(Duration::from_millis(100)),
         record.wait_tree_cleanup(),
@@ -2950,6 +3127,16 @@ async fn wait_and_force(records: &[Arc<Record>], cause: u8, grace: Duration) {
             }
         };
         let _ = tokio::time::timeout(grace.max(Duration::from_millis(100)), forced).await;
+    }
+}
+
+/// Stop waiting for a stopped record's streams: a LEAVE_RESIDUE process whose direct child is
+/// gone leaves them to its residue ([`abandon_residue`]); any other aborts them.
+fn finish_pipes(record: &Arc<Record>) {
+    if record.leave_residue && record.reaped.load(Ordering::Acquire) {
+        abandon_residue(record);
+    } else {
+        abort_pipes(record);
     }
 }
 

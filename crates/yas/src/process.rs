@@ -193,7 +193,8 @@ pub struct Spawn {
 impl Spawn {
     fn validate(&self) -> Result<()> {
         validate_operation_id(&self.operation_id)?;
-        if self.flags & !(crate::schema::process::SPAWN_FLAGS as u16) != 0 {
+        let known = crate::schema::process::SPAWN_FLAGS | crate::schema::process::SPAWN_LAUNCHER_FLAGS;
+        if self.flags & !(known as u16) != 0 {
             return Err(Error::Invalid("Process spawn flags"));
         }
         self.cwd.validate()?;
@@ -206,7 +207,24 @@ impl Spawn {
         if merged != (self.stderr_receive_credit == 0) {
             return Err(Error::Invalid("Process stderr receive credit"));
         }
-        validate_spawn_extensions(&self.extensions)
+        validate_spawn_extensions(&self.extensions)?;
+        let leave_residue = self.flags & crate::schema::process::SPAWN_LEAVE_RESIDUE as u16 != 0;
+        if !leave_residue && self.residue_grace_ns()?.is_some() {
+            return Err(Error::Invalid(
+                "Process residue grace without LEAVE_RESIDUE",
+            ));
+        }
+        Ok(())
+    }
+
+    /// How long a `LEAVE_RESIDUE` process's streams are forwarded after its direct child
+    /// exits, or None: until they close.
+    pub fn residue_grace_ns(&self) -> Result<Option<u64>> {
+        extension_u64(
+            &self.extensions,
+            crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION,
+            "Process residue grace extension",
+        )
     }
 
     pub fn surface_app_handle(&self) -> Result<Option<u64>> {
@@ -902,6 +920,9 @@ pub struct Limits {
     pub max_stream_buffer_bytes: u64,
     pub max_detached_retention_ns: u64,
     pub max_mutation_replays: u32,
+    /// SPAWN flags of `SPAWN_LAUNCHER_FLAGS` the server honours (LEAVE_RESIDUE, STDIN_NULL);
+    /// 0 from servers that predate them.
+    pub launcher_flags: u32,
 }
 
 impl Limits {
@@ -916,6 +937,7 @@ impl Limits {
         max_stream_buffer_bytes: crate::schema::process::MAX_STREAM_BUFFER_BYTES,
         max_detached_retention_ns: crate::schema::process::MAX_DETACHED_RETENTION_NS,
         max_mutation_replays: crate::schema::process::MAX_MUTATION_REPLAYS as u32,
+        launcher_flags: crate::schema::process::SPAWN_LAUNCHER_FLAGS as u32,
     };
 
     pub fn validate(self) -> Result<()> {
@@ -936,6 +958,7 @@ impl Limits {
             || self.max_detached_retention_ns == 0
             || self.max_detached_retention_ns > hard.max_detached_retention_ns
             || !valid_u32(self.max_mutation_replays, hard.max_mutation_replays)
+            || self.launcher_flags & !hard.launcher_flags != 0
         {
             return Err(Error::Invalid("Process family limit"));
         }
@@ -979,7 +1002,15 @@ impl Limits {
                 crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
                 self.max_mutation_replays,
             ),
-        ]))
+        ]
+        .into_iter()
+        .chain((self.launcher_flags != 0).then(|| {
+            limit_u32(
+                crate::schema::process::LIMIT_LAUNCHER_FLAGS,
+                self.launcher_flags,
+            )
+        }))
+        .collect()))
     }
 
     pub fn from_extensions(extensions: &Extensions) -> Result<Self> {
@@ -994,6 +1025,7 @@ impl Limits {
             crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES as u16,
             crate::schema::process::LIMIT_MAX_DETACHED_RETENTION_NS as u16,
             crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS as u16,
+            crate::schema::process::LIMIT_LAUNCHER_FLAGS as u16,
         ];
         reject_unknown_required(extensions, &known)?;
         let value = Self {
@@ -1022,6 +1054,13 @@ impl Limits {
                 extensions,
                 crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
             )?,
+            launcher_flags: if extensions.0.iter().any(|extension| {
+                extension.tag == crate::schema::process::LIMIT_LAUNCHER_FLAGS as u16
+            }) {
+                read_limit_u32(extensions, crate::schema::process::LIMIT_LAUNCHER_FLAGS)?
+            } else {
+                0
+            },
         };
         value.validate()?;
         Ok(value)
@@ -1147,8 +1186,14 @@ fn validate_spawn_extensions(extensions: &Extensions) -> Result<()> {
     let known = [
         crate::schema::process::SPAWN_SURFACE_APP_EXTENSION as u16,
         crate::schema::process::SPAWN_RESOURCE_TAG_EXTENSION as u16,
+        crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
     ];
     reject_unknown_required(extensions, &known)?;
+    extension_u64(
+        extensions,
+        crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION,
+        "Process residue grace extension",
+    )?;
     if let Some(handle) = extension_u64(
         extensions,
         crate::schema::process::SPAWN_SURFACE_APP_EXTENSION,

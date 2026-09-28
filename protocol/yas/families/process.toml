@@ -12,6 +12,7 @@ limits = [
   { name = "MAX_STREAM_BUFFER_BYTES", tag = 8, type = "u64", required = true, hard_min = 1, hard_max = 8388608 },
   { name = "MAX_DETACHED_RETENTION_NS", tag = 9, type = "u64", required = true, hard_min = 1, hard_max = 300000000000 },
   { name = "MAX_MUTATION_REPLAYS", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+  { name = "LAUNCHER_FLAGS", tag = 11, type = "u32", required = false, hard_min = 0, hard_max = 12 },
 ]
 
 [[constant]]
@@ -21,8 +22,17 @@ value = 1
 name = "SPAWN_DETACHABLE"
 value = 2
 [[constant]]
+name = "SPAWN_LEAVE_RESIDUE"
+value = 4
+[[constant]]
+name = "SPAWN_STDIN_NULL"
+value = 8
+[[constant]]
 name = "SPAWN_FLAGS"
 value = 3
+[[constant]]
+name = "SPAWN_LAUNCHER_FLAGS"
+value = 12
 
 [[constant]]
 name = "ENV_EMPTY"
@@ -170,6 +180,9 @@ value = 1
 [[constant]]
 name = "SPAWN_RESOURCE_TAG_EXTENSION"
 value = 2
+[[constant]]
+name = "SPAWN_RESIDUE_GRACE_EXTENSION"
+value = 3
 
 [[constant]]
 name = "MAX_ARGC"
@@ -247,6 +260,9 @@ value = 65536
 [[constant]]
 name = "LIMIT_MAX_MUTATION_REPLAYS"
 value = 10
+[[constant]]
+name = "LIMIT_LAUNCHER_FLAGS"
+value = 11
 
 [[request]]
 name = "WATCH"

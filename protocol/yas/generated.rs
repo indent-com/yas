@@ -2268,6 +2268,7 @@ pub const WATCH_FLAGS: u64 = 63;
 pub const ENTRY_FILE: u64 = 0;
 pub const ENTRY_DIRECTORY: u64 = 1;
 pub const ENTRY_SYMLINK: u64 = 2;
+pub const ENTRY_OTHER: u64 = 3;
 pub const ENTRY_EXECUTABLE: u64 = 1;
 pub const ENTRY_READ_ONLY: u64 = 2;
 pub const ENTRY_HIDDEN: u64 = 4;
@@ -2280,6 +2281,8 @@ pub const CONTENT_NONE: u64 = 0;
 pub const CONTENT_INLINE: u64 = 1;
 pub const ENTRY_OPERATION_ID_EXTENSION: u64 = 1;
 pub const RESULT_CONFLICT_DETAIL_EXTENSION: u64 = 1;
+pub const RESULT_OS_ERROR_EXTENSION: u64 = 2;
+pub const MAX_OS_ERROR_TEXT_BYTES: u64 = 32;
 pub const PATCH_MODE: u64 = 1;
 pub const PATCH_MODIFIED_TIME: u64 = 2;
 pub const PATCH_CONTENT: u64 = 4;
@@ -2290,6 +2293,9 @@ pub const READ_STAT: u64 = 0;
 pub const READ_HASH: u64 = 1;
 pub const READ_LINK_TARGET: u64 = 2;
 pub const READ_CONTENT: u64 = 3;
+pub const READ_LIST: u64 = 4;
+pub const READ_REALPATH: u64 = 5;
+pub const READ_STAT_ONLY: u64 = 6;
 pub const READ_NO_FOLLOW: u64 = 1;
 pub const READ_FLAGS: u64 = 1;
 pub const SEARCH_CASE_SENSITIVE: u64 = 1;
@@ -2327,6 +2333,8 @@ pub const COMMIT_SYNC_DIRECTORY: u64 = 2;
 pub const COMMIT_FLAGS: u64 = 3;
 pub const STAGE_CREATE_PARENTS: u64 = 1;
 pub const STAGE_FLAGS: u64 = 1;
+pub const STAGE_IN_PLACE: u64 = 2;
+pub const STAGE_EXTENDED_FLAGS: u64 = 2;
 pub const APPLY_ALL_OR_NONE: u64 = 1;
 pub const APPLY_FLAGS: u64 = 1;
 pub const APPLY_WRITE_INLINE: u64 = 0;
@@ -2373,6 +2381,13 @@ pub const LIMIT_MAX_STAGED_BYTES: u64 = 10;
 pub const LIMIT_MAX_BATCH_ITEMS: u64 = 11;
 pub const LIMIT_MAX_QUERY_CONCURRENCY: u64 = 12;
 pub const LIMIT_MAX_CATALOG_ENTRIES: u64 = 13;
+pub const LIMIT_CAPABILITIES: u64 = 14;
+pub const CAPABILITY_OS_ERROR: u64 = 1;
+pub const CAPABILITY_READ_LIST: u64 = 2;
+pub const CAPABILITY_READ_REALPATH: u64 = 4;
+pub const CAPABILITY_READ_STAT_ONLY: u64 = 8;
+pub const CAPABILITY_STAGE_IN_PLACE: u64 = 16;
+pub const CAPABILITY_FLAGS: u64 = 31;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "OPEN", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "flags:u16,reserved:u16=0,source:bytes_u32 containing RootSource,Extensions; ResultPrefix + root_handle:u64,root_revision:u64,path_model:u8,case_behavior:u8,reserved:u16=0,canonical_path:bytes_u32,Extensions" },
 super::OperationMetadata { name: "CLOSE", class: 1, kind: 1, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,Extensions; ResultPrefix; idempotent and invalidates root-scoped watches/stages" },
@@ -2409,6 +2424,12 @@ super::TypeMetadata { name: "apply_item_result", layout: "index:u16,status:u16,e
 super::TypeMetadata { name: "conflict_detail", layout: "path:bytes_u32 containing WirePath,current_present:u8,hash_present:u8,reserved:u16=0,current_entry_revision:u64,modified_unix_ns:i64,optional content_hash:[u8;32]; exact value of optional Core ResultPrefix detail extension tag RESULT_CONFLICT_DETAIL_EXTENSION for STAGE_WRITE or COMMIT status CONFLICT" },
 super::TypeMetadata { name: "entry_operation_id_extension", layout: "EntryRecord extension tag 1 exact value operation_id:[u8;16], nonzero; lets watchers recognize mutation echoes without suppressing them" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tags 1..12 encode max roots/session:u32,watches/root:u32,path components:u32,component bytes:u32,path bytes:u32,inline bytes:u32,query records:u32,query bytes:u32,stages/session:u32,staged bytes:u64,batch items:u32,query concurrency:u32" },
+super::TypeMetadata { name: "family_capabilities", layout: "optional family limit extension tag LIMIT_CAPABILITIES exact value capabilities:u32; bitmask of CAPABILITY_* values the server implements; absent means zero; receivers ignore unknown bits; a client uses an opt-in value only when its capability bit is set" },
+super::TypeMetadata { name: "os_error", layout: "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, and the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error" },
+super::TypeMetadata { name: "query_read_extended_record", layout: "QueryReadRecord answering the opt-in question kinds: OK content READ_LIST QueryListEntries, READ_REALPATH raw absolute canonical platform path bytes, READ_STAT_ONLY QueryStatOnly; non-OK content is empty or exactly one OsError; READ_NO_FOLLOW is valid only with READ_STAT_ONLY among these kinds" },
+super::TypeMetadata { name: "query_list_entries", layout: "repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash" },
+super::TypeMetadata { name: "query_stat_only", layout: "kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed" },
+super::TypeMetadata { name: "stage_in_place", layout: "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[
 super::LimitMetadata { name: "MAX_ROOTS_PER_SESSION", tag: 1, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 64 },
@@ -2424,6 +2445,7 @@ super::LimitMetadata { name: "MAX_STAGED_BYTES", tag: 10, value_type: super::Lim
 super::LimitMetadata { name: "MAX_BATCH_ITEMS", tag: 11, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 256 },
 super::LimitMetadata { name: "MAX_QUERY_CONCURRENCY", tag: 12, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 8 },
 super::LimitMetadata { name: "MAX_CATALOG_ENTRIES", tag: 13, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 1000000 },
+super::LimitMetadata { name: "CAPABILITIES", tag: 14, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 4294967295 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SOURCE_PLATFORM_PATH", value: 0 },
@@ -2448,6 +2470,7 @@ super::ConstantMetadata { name: "WATCH_FLAGS", value: 63 },
 super::ConstantMetadata { name: "ENTRY_FILE", value: 0 },
 super::ConstantMetadata { name: "ENTRY_DIRECTORY", value: 1 },
 super::ConstantMetadata { name: "ENTRY_SYMLINK", value: 2 },
+super::ConstantMetadata { name: "ENTRY_OTHER", value: 3 },
 super::ConstantMetadata { name: "ENTRY_EXECUTABLE", value: 1 },
 super::ConstantMetadata { name: "ENTRY_READ_ONLY", value: 2 },
 super::ConstantMetadata { name: "ENTRY_HIDDEN", value: 4 },
@@ -2460,6 +2483,8 @@ super::ConstantMetadata { name: "CONTENT_NONE", value: 0 },
 super::ConstantMetadata { name: "CONTENT_INLINE", value: 1 },
 super::ConstantMetadata { name: "ENTRY_OPERATION_ID_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "RESULT_CONFLICT_DETAIL_EXTENSION", value: 1 },
+super::ConstantMetadata { name: "RESULT_OS_ERROR_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "MAX_OS_ERROR_TEXT_BYTES", value: 32 },
 super::ConstantMetadata { name: "PATCH_MODE", value: 1 },
 super::ConstantMetadata { name: "PATCH_MODIFIED_TIME", value: 2 },
 super::ConstantMetadata { name: "PATCH_CONTENT", value: 4 },
@@ -2470,6 +2495,9 @@ super::ConstantMetadata { name: "READ_STAT", value: 0 },
 super::ConstantMetadata { name: "READ_HASH", value: 1 },
 super::ConstantMetadata { name: "READ_LINK_TARGET", value: 2 },
 super::ConstantMetadata { name: "READ_CONTENT", value: 3 },
+super::ConstantMetadata { name: "READ_LIST", value: 4 },
+super::ConstantMetadata { name: "READ_REALPATH", value: 5 },
+super::ConstantMetadata { name: "READ_STAT_ONLY", value: 6 },
 super::ConstantMetadata { name: "READ_NO_FOLLOW", value: 1 },
 super::ConstantMetadata { name: "READ_FLAGS", value: 1 },
 super::ConstantMetadata { name: "SEARCH_CASE_SENSITIVE", value: 1 },
@@ -2507,6 +2535,8 @@ super::ConstantMetadata { name: "COMMIT_SYNC_DIRECTORY", value: 2 },
 super::ConstantMetadata { name: "COMMIT_FLAGS", value: 3 },
 super::ConstantMetadata { name: "STAGE_CREATE_PARENTS", value: 1 },
 super::ConstantMetadata { name: "STAGE_FLAGS", value: 1 },
+super::ConstantMetadata { name: "STAGE_IN_PLACE", value: 2 },
+super::ConstantMetadata { name: "STAGE_EXTENDED_FLAGS", value: 2 },
 super::ConstantMetadata { name: "APPLY_ALL_OR_NONE", value: 1 },
 super::ConstantMetadata { name: "APPLY_FLAGS", value: 1 },
 super::ConstantMetadata { name: "APPLY_WRITE_INLINE", value: 0 },
@@ -2553,6 +2583,13 @@ super::ConstantMetadata { name: "LIMIT_MAX_STAGED_BYTES", value: 10 },
 super::ConstantMetadata { name: "LIMIT_MAX_BATCH_ITEMS", value: 11 },
 super::ConstantMetadata { name: "LIMIT_MAX_QUERY_CONCURRENCY", value: 12 },
 super::ConstantMetadata { name: "LIMIT_MAX_CATALOG_ENTRIES", value: 13 },
+super::ConstantMetadata { name: "LIMIT_CAPABILITIES", value: 14 },
+super::ConstantMetadata { name: "CAPABILITY_OS_ERROR", value: 1 },
+super::ConstantMetadata { name: "CAPABILITY_READ_LIST", value: 2 },
+super::ConstantMetadata { name: "CAPABILITY_READ_REALPATH", value: 4 },
+super::ConstantMetadata { name: "CAPABILITY_READ_STAT_ONLY", value: 8 },
+super::ConstantMetadata { name: "CAPABILITY_STAGE_IN_PLACE", value: 16 },
+super::ConstantMetadata { name: "CAPABILITY_FLAGS", value: 31 },
 ];
 }
 pub mod git {
@@ -3747,7 +3784,10 @@ pub const STATE_ACK: u16 = 0x0001;
 }
 pub const SPAWN_MERGE_STDERR: u64 = 1;
 pub const SPAWN_DETACHABLE: u64 = 2;
+pub const SPAWN_LEAVE_RESIDUE: u64 = 4;
+pub const SPAWN_STDIN_NULL: u64 = 8;
 pub const SPAWN_FLAGS: u64 = 3;
+pub const SPAWN_LAUNCHER_FLAGS: u64 = 12;
 pub const ENV_EMPTY: u64 = 0;
 pub const ENV_SESSION: u64 = 1;
 pub const CWD_SERVER_DEFAULT: u64 = 0;
@@ -3793,6 +3833,7 @@ pub const STREAM_STDOUT_CONTENT_KIND: u64 = 1;
 pub const STREAM_STDERR_CONTENT_KIND: u64 = 2;
 pub const SPAWN_SURFACE_APP_EXTENSION: u64 = 1;
 pub const SPAWN_RESOURCE_TAG_EXTENSION: u64 = 2;
+pub const SPAWN_RESIDUE_GRACE_EXTENSION: u64 = 3;
 pub const MAX_ARGC: u64 = 1024;
 pub const MAX_ARG_BYTES: u64 = 1048576;
 pub const MAX_ARG_LEN: u64 = 65536;
@@ -3818,6 +3859,7 @@ pub const LIMIT_MAX_STREAM_BUFFER_BYTES: u64 = 8;
 pub const LIMIT_MAX_DETACHED_RETENTION_NS: u64 = 9;
 pub const MAX_MUTATION_REPLAYS: u64 = 65536;
 pub const LIMIT_MAX_MUTATION_REPLAYS: u64 = 10;
+pub const LIMIT_LAUNCHER_FLAGS: u64 = 11;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "WATCH", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "StateWatch; ResultPrefix + StateWatchResult" },
 super::OperationMetadata { name: "UNWATCH", class: 1, kind: 1, direction: 0, sensitive: 0, compression: 0, datagram: 0, layout: "subscription_id:u32; ResultPrefix" },
@@ -3848,11 +3890,15 @@ super::LimitMetadata { name: "MAX_PENDING_SPAWNS", tag: 7, value_type: super::Li
 super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES", tag: 8, value_type: super::LimitValueType::U64, required: true, hard_min: 1, hard_max: 8388608 },
 super::LimitMetadata { name: "MAX_DETACHED_RETENTION_NS", tag: 9, value_type: super::LimitValueType::U64, required: true, hard_min: 1, hard_max: 300000000000 },
 super::LimitMetadata { name: "MAX_MUTATION_REPLAYS", tag: 10, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 65536 },
+super::LimitMetadata { name: "LAUNCHER_FLAGS", tag: 11, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 12 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SPAWN_MERGE_STDERR", value: 1 },
 super::ConstantMetadata { name: "SPAWN_DETACHABLE", value: 2 },
+super::ConstantMetadata { name: "SPAWN_LEAVE_RESIDUE", value: 4 },
+super::ConstantMetadata { name: "SPAWN_STDIN_NULL", value: 8 },
 super::ConstantMetadata { name: "SPAWN_FLAGS", value: 3 },
+super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS", value: 12 },
 super::ConstantMetadata { name: "ENV_EMPTY", value: 0 },
 super::ConstantMetadata { name: "ENV_SESSION", value: 1 },
 super::ConstantMetadata { name: "CWD_SERVER_DEFAULT", value: 0 },
@@ -3898,6 +3944,7 @@ super::ConstantMetadata { name: "STREAM_STDOUT_CONTENT_KIND", value: 1 },
 super::ConstantMetadata { name: "STREAM_STDERR_CONTENT_KIND", value: 2 },
 super::ConstantMetadata { name: "SPAWN_SURFACE_APP_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "SPAWN_RESOURCE_TAG_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "SPAWN_RESIDUE_GRACE_EXTENSION", value: 3 },
 super::ConstantMetadata { name: "MAX_ARGC", value: 1024 },
 super::ConstantMetadata { name: "MAX_ARG_BYTES", value: 1048576 },
 super::ConstantMetadata { name: "MAX_ARG_LEN", value: 65536 },
@@ -3923,6 +3970,7 @@ super::ConstantMetadata { name: "LIMIT_MAX_STREAM_BUFFER_BYTES", value: 8 },
 super::ConstantMetadata { name: "LIMIT_MAX_DETACHED_RETENTION_NS", value: 9 },
 super::ConstantMetadata { name: "MAX_MUTATION_REPLAYS", value: 65536 },
 super::ConstantMetadata { name: "LIMIT_MAX_MUTATION_REPLAYS", value: 10 },
+super::ConstantMetadata { name: "LIMIT_LAUNCHER_FLAGS", value: 11 },
 ];
 }
 pub mod net {

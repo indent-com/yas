@@ -19044,10 +19044,14 @@ impl Session {
         request_id: u32,
         error: super::yas_fs::Error,
     ) -> Result<(), ()> {
-        let detail = match &error {
+        let mut detail = match error.kind() {
             super::yas_fs::Error::Conflict(conflict) => conflict.result_detail().map_err(|_| ())?,
             _ => Extensions::default(),
         };
+        // Optional, so clients that predate it skip it; the status is unchanged.
+        if let Some(os) = error.os_error() {
+            detail.0.push(os.result_extension().map_err(|_| ())?);
+        }
         let payload = ResultPrefix {
             status: fs_error_status(&error),
             detail,
@@ -25247,7 +25251,7 @@ impl Session {
                 let consume_stage = match &outcome {
                     Ok(_) => true,
                     Err(error) => !matches!(
-                        error,
+                        error.kind(),
                         super::yas_fs::Error::Invalid(_) | super::yas_fs::Error::NotFound
                     ),
                 };
@@ -31393,8 +31397,8 @@ const fn extension_error_status(error: &super::yas_extension::Error) -> Status {
     }
 }
 
-const fn fs_error_status(error: &super::yas_fs::Error) -> Status {
-    match error {
+fn fs_error_status(error: &super::yas_fs::Error) -> Status {
+    match error.kind() {
         super::yas_fs::Error::Unavailable | super::yas_fs::Error::Closed => Status::Unavailable,
         super::yas_fs::Error::NotFound => Status::NotFound,
         super::yas_fs::Error::Permission | super::yas_fs::Error::Io(_) => Status::Io,
@@ -31405,6 +31409,7 @@ const fn fs_error_status(error: &super::yas_fs::Error) -> Status {
         super::yas_fs::Error::Unsupported => Status::Unsupported,
         super::yas_fs::Error::Invalid(_) => Status::Invalid,
         super::yas_fs::Error::Internal => Status::Internal,
+        super::yas_fs::Error::Os(failure) => fs_error_status(&failure.error),
     }
 }
 
@@ -50384,6 +50389,11 @@ mod tests {
             yas_fs_wire::Limits::from_extensions(&descriptor.limits).unwrap(),
             yas_fs_wire::Limits::HARD,
         );
+        assert!(
+            yas_fs_wire::Limits::from_extensions(&descriptor.limits)
+                .unwrap()
+                .supports(yas_wire::schema::fs::CAPABILITY_FLAGS)
+        );
         for kind in [
             yas_wire::schema::fs::request::OPEN,
             yas_wire::schema::fs::request::WATCH,
@@ -50508,6 +50518,74 @@ mod tests {
             .await
             .status,
             Status::Ok,
+        );
+
+        // A failed FETCH keeps its status and carries the OS error as an
+        // optional detail extension.
+        write_request(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            90,
+            &yas_fs_wire::Fetch {
+                root_handle: opened.root_handle,
+                path: yas_fs_wire::Path {
+                    components: vec![b"missing.txt".to_vec()],
+                },
+                expected_hash: None,
+                initial_receive_credit: 0,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let missing = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            90,
+        )
+        .await;
+        assert_eq!(missing.status, Status::NotFound);
+        let os = yas_fs_wire::OsError::from_result_detail(&missing.detail)
+            .unwrap()
+            .expect("FS OS error detail");
+        assert_eq!(
+            (os.name.as_str(), os.operation.as_str()),
+            ("ENOENT", "open")
+        );
+        assert_eq!(os.code, libc::ENOENT);
+        write_request(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            91,
+            &yas_fs_wire::Fetch {
+                root_handle: opened.root_handle,
+                path: yas_fs_wire::Path::default(),
+                expected_hash: None,
+                initial_receive_credit: 0,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let directory = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            91,
+        )
+        .await;
+        assert_eq!(directory.status, Status::Invalid);
+        let os = yas_fs_wire::OsError::from_result_detail(&directory.detail)
+            .unwrap()
+            .expect("FS OS error detail");
+        assert_eq!(
+            (os.name.as_str(), os.operation.as_str()),
+            ("EISDIR", "read")
         );
 
         write_request(

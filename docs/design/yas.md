@@ -2851,6 +2851,66 @@ entry revision and modification time, then the optional current 32-byte hash.
 Unknown optional detail extensions are skipped; required Result detail
 extensions remain forbidden by Core.
 
+### Opt-in FS additions
+
+Optional family limit `CAPABILITIES` (tag `LIMIT_CAPABILITIES` = 14, `u32`)
+advertises the opt-in values a server implements: `CAPABILITY_OS_ERROR` (1),
+`CAPABILITY_READ_LIST` (2), `CAPABILITY_READ_REALPATH` (4),
+`CAPABILITY_READ_STAT_ONLY` (8), and `CAPABILITY_STAGE_IN_PLACE` (16);
+`CAPABILITY_FLAGS` (31) is their union. Absent means zero and receivers ignore
+unknown bits. A client sends an opt-in question kind or flag only when its bit
+is set; an older server rejects them as INVALID. Nothing changes for a client
+that sends none of them.
+
+A failed top-level FS Result whose failure came from an OS error adds optional
+ResultPrefix `detail` tag `RESULT_OS_ERROR_EXTENSION` (2), whose exact value is
+OsError: `code:i32` (the raw server-platform errno), `name:bytes_u16` (its
+symbolic name, such as ENOENT, ENOTDIR, EISDIR, EACCES, EPERM, ELOOP,
+ENAMETOOLONG, EEXIST, ENOSPC, EROFS, or UNKNOWN; 1 to 32 bytes of ASCII
+`A-Z0-9_`), and `operation:bytes_u16` (the operation the server was
+performing: open, read, write, readdir, realpath, stat, lstat, mkdir, unlink,
+rmdir, rename, link, symlink, readlink, chmod, or fsync; 1 to 32 bytes of ASCII
+`a-z0-9_`). Errors resolving a request's path, parents included, carry the
+request's operation: open for FETCH and COMMIT, readdir for READ_LIST,
+realpath for READ_REALPATH, stat or lstat for READ_STAT_ONLY. The status is
+unchanged: ENOENT is NOT_FOUND, other OS errors are IO. FETCH of a directory
+stays INVALID with `{EISDIR, read}`; COMMIT onto a directory stays CONFLICT
+with both ConflictDetail and `{EISDIR, open}`. Escaping the root is IO without
+an OsError. Windows servers name every error UNKNOWN. APPLY item details keep
+their text.
+
+READ question kinds `READ_LIST` (4), `READ_REALPATH` (5), and
+`READ_STAT_ONLY` (6) read no content and hash nothing. READ_LIST lists one
+directory level, following a final symlink to the directory; its OK content is
+`repeated kind:u8,name:bytes_u16` without dot and dot-dot, hidden names
+included, in no defined order. Each kind describes the entry itself, as a Node
+Dirent does: a symlink to a directory is ENTRY_SYMLINK. ENTRY_OTHER (3) names
+FIFOs, sockets, and devices; EntryRecord never uses it. A name is one raw
+platform component and may contain a POSIX backslash that no WirePath
+component can. A listing above the query-byte limit fails RESOURCE_EXHAUSTED.
+READ_REALPATH answers the absolute canonical platform path with every symlink
+resolved, confined like every other path. READ_STAT_ONLY answers
+`kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64`,
+with `mode` the platform mode as in EntryRecord (POSIX file-type bits
+included), following the final symlink unless READ_NO_FOLLOW, which is invalid
+with the other two. The empty path names the root for all three. A non-OK record for
+these kinds carries exactly one OsError as its content when the failure came
+from an OS error, otherwise empty content; older kinds keep empty failure
+content.
+
+STAGE_WRITE flag `STAGE_IN_PLACE` (2) makes COMMIT write like Node's
+`writeFile`: it opens the target write-only with create and truncate,
+following a final symlink (a dangling one creates the file it names), writes
+the staged bytes, and syncs them when COMMIT asks. An existing file keeps its
+inode, owner, links, and mode; a new file gets `mode`, or 0o666 when `mode` is
+zero, less the server umask. There is no temporary file and no rename, so a
+failed write can leave the file truncated or partial. The destination is
+confined to the root. Preconditions are checked against the named entry as
+before. COMMIT's result describes the file written, which is the link's
+destination entry when that lies inside the root. STAGE_CREATE_PARENTS with
+STAGE_IN_PLACE is INVALID. `STAGE_EXTENDED_FLAGS` (2) lists the stage flags
+added after the v1 baseline `STAGE_FLAGS`.
+
 ## Git family
 
 Git is family `0x0031`, version 1. It preserves the useful split between small
@@ -3168,6 +3228,22 @@ and optional Surface application handle. Its successful Result returns a
 boot-scoped `process_handle`, stdin BYTE Transfer, stdout BYTE Transfer, and
 either stderr BYTE Transfer or a merged-stream indication. The operation ID
 prevents a lost Result from spawning the child twice.
+
+SPAWN flags: `MERGE_STDERR` (1) puts stderr on stdout's pipe; `DETACHABLE` (2)
+keeps the child past its session. `STDIN_NULL` (8) gives the child the null
+device as stdin: the Result carries no stdin descriptor, so a program sees
+what a detached command sees (tools that read a piped stdin, such as ripgrep
+without a path, act as they would outside a pipe). `LEAVE_RESIDUE` (4, Unix
+only; UNSUPPORTED elsewhere) is for launchers of shell commands: when the
+direct child exits, its process group is not signalled. Output is forwarded
+until the streams close or the residue grace passes after that exit (SPAWN
+extension tag 3 `residue_grace_ns: u64`; absent, until the streams close),
+then the exit is reported; members still holding the streams are left
+running, untracked, and what they write is drained and discarded. TERMINATE,
+owner loss and shutdown still signal the group while the direct child runs;
+TERMINATE's escalation SIGKILLs members left after the kill grace and stops
+waiting for their streams. The exit's detail says `residual process group left
+running` when members held the streams.
 
 Catalog records contain argv0, native PID for diagnostics, lifecycle, owner
 session, detachable flag, stream offsets, exit record, and retention deadline.
