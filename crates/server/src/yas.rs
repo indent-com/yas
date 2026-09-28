@@ -2052,7 +2052,7 @@ async fn serve_registered<S>(
         )
     });
     let native_active_subscriptions = Arc::new(NativeYasSubscriptions::default());
-    let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel(1);
+    let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel::<String>(1);
     let native_client_registered = registration.is_some() && services.app_state.is_some();
     #[cfg(target_os = "linux")]
     let mut native_backend_owner = None;
@@ -2610,10 +2610,10 @@ async fn serve_registered<S>(
                     None => break 'session "native Channel terminal event channel closed".to_owned(),
                 },
                 disconnect = native_disconnect_rx.recv(), if native_client_registered => {
-                    if disconnect.is_none() {
+                    let Some(reason) = disconnect else {
                         break 'session "native client disconnect channel closed".to_owned();
-                    }
-                    if session.send_client_goaway().await.is_err() {
+                    };
+                    if session.send_client_goaway(&reason).await.is_err() {
                         break 'session "native client disconnect requested; GOAWAY failed".to_owned();
                     }
                     break 'session "native client disconnect requested; GOAWAY sent".to_owned();
@@ -7301,11 +7301,11 @@ impl Session {
         Ok(())
     }
 
-    async fn send_client_goaway(&self) -> Result<(), ()> {
+    async fn send_client_goaway(&self, reason: &str) -> Result<(), ()> {
         let payload = GoAway {
             status: Status::Ok,
             close_deadline_server_ns: monotonic_ns(),
-            detail: Extensions::default(),
+            detail: GoAway::reason_detail(reason),
         }
         .encode()
         .map_err(|_| ())?;
@@ -8675,7 +8675,7 @@ impl Session {
         self.send_sensitive_result_confirmed(&frame, status, Vec::new())
             .await?;
         if let Some(disconnect) = target {
-            let _ = disconnect.send(()).await;
+            let _ = disconnect.send(request.reason).await;
         }
         Ok(())
     }

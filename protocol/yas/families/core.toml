@@ -73,6 +73,10 @@ value = 8
 name = "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION"
 value = 1
 
+[[constant]]
+name = "GOAWAY_REASON_EXTENSION"
+value = 1
+
 [[request]]
 name = "HELLO"
 kind = 0x0000

@@ -956,7 +956,7 @@ struct NativeYasClient {
     identity: NativeClientIdentity,
     origin: ConnectionOrigin,
     connected_at: Instant,
-    disconnect: mpsc::Sender<()>,
+    disconnect: mpsc::Sender<String>,
     inbound_bytes: Arc<AtomicU64>,
     outbound_bytes: Arc<AtomicU64>,
     active_subscriptions: Arc<NativeYasSubscriptions>,

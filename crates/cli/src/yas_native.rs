@@ -989,11 +989,7 @@ impl NativeClient {
                 && frame.header.kind == yas_wire::core::event_kind::GOAWAY
             {
                 let goaway = GoAway::decode(&frame.payload).map_err(wire_error)?;
-                return Err(format!(
-                    "YAS server is closing with {:?}: {}",
-                    goaway.status,
-                    format_result_detail(&goaway.detail)
-                ));
+                return Err(goaway_message(&goaway));
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
@@ -1198,11 +1194,7 @@ impl NativeFrameReader {
                 && frame.header.kind == yas_wire::core::event_kind::GOAWAY
             {
                 let goaway = GoAway::decode(&frame.payload).map_err(wire_error)?;
-                return Err(format!(
-                    "YAS server is closing with {:?}: {}",
-                    goaway.status,
-                    format_result_detail(&goaway.detail)
-                ));
+                return Err(goaway_message(&goaway));
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
@@ -1388,6 +1380,17 @@ fn wire_error(error: yas_wire::Error) -> String {
     format!("YAS wire error: {error}")
 }
 
+fn goaway_message(goaway: &GoAway) -> String {
+    match goaway.reason() {
+        Some(reason) => format!("disconnected by the YAS server: {reason}"),
+        None => format!(
+            "YAS server is closing with {:?}: {}",
+            goaway.status,
+            format_result_detail(&goaway.detail)
+        ),
+    }
+}
+
 pub(crate) fn format_result_detail(detail: &Extensions) -> String {
     if detail.0.is_empty() {
         "no detail".to_string()
@@ -1411,6 +1414,27 @@ pub(crate) fn format_result_detail(detail: &Extensions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goaway_with_a_disconnect_reason_names_it() {
+        let kicked = GoAway {
+            status: yas_wire::core::Status::Ok,
+            close_deadline_server_ns: 0,
+            detail: GoAway::reason_detail("Removed by an administrator"),
+        };
+        assert_eq!(
+            goaway_message(&kicked),
+            "disconnected by the YAS server: Removed by an administrator"
+        );
+        let closing = GoAway {
+            detail: Extensions::default(),
+            ..kicked
+        };
+        assert_eq!(
+            goaway_message(&closing),
+            "YAS server is closing with Ok: no detail"
+        );
+    }
     use yas_wire::core::{FamilyDescriptor, Operation, RuntimeState, SessionUpdate};
 
     fn test_server_hello() -> ServerHello {
