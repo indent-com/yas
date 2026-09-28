@@ -60,6 +60,9 @@ const REQUEST_BYTES_PER_EXTRA_PROCESS: usize = 64 * 1024;
 const OUTBOUND_TRANSFERS_BASE: usize = 32;
 /// Operation replays a session retains at the default maxima.
 const OPERATION_REPLAYS_BASE: usize = 256;
+/// Native events (output, stdin progress, exits) a session's endpoint queues
+/// for its dispatcher at the default maxima: five for each of 16 processes.
+const ENDPOINT_EVENTS_BASE: usize = 80;
 
 /// Process family maxima a server enforces and advertises in HELLO.
 ///
@@ -240,6 +243,18 @@ impl ProcessMaxima {
             self.per_session
                 .saturating_sub(Self::DEFAULT.per_session)
                 .saturating_mul(2),
+        )
+    }
+
+    /// Native events a session's endpoint queues for its dispatcher: the
+    /// base, plus the same five for each process above the default
+    /// per-session maximum. A full queue loses an exit, so a session that
+    /// owns more processes needs a queue that grows with them.
+    pub(crate) fn endpoint_events(&self) -> usize {
+        ENDPOINT_EVENTS_BASE.saturating_add(
+            self.per_session
+                .saturating_sub(Self::DEFAULT.per_session)
+                .saturating_mul(ENDPOINT_EVENTS_BASE / Self::DEFAULT.per_session),
         )
     }
 
@@ -3565,6 +3580,7 @@ mod maxima_tests {
         assert_eq!(defaults.outbound_transfers(), 32);
         assert_eq!(defaults.operation_replays(), 256);
         assert_eq!(defaults.exit_replays(), 64);
+        assert_eq!(defaults.endpoint_events(), 80);
         assert_eq!(defaults.limits(), {
             let mut limits = yas_wire::process::Limits::DEFAULT;
             limits.max_mutation_replays = 256;
@@ -3593,6 +3609,7 @@ mod maxima_tests {
         assert_eq!(maxima.outbound_transfers(), 32 + 2 * (1024 - 16));
         assert_eq!(maxima.operation_replays(), 2 * 1024 + 64 + 256);
         assert_eq!(maxima.exit_replays(), 4096);
+        assert_eq!(maxima.endpoint_events(), 80 + 5 * (1024 - 16));
         let limits = maxima.limits();
         assert_eq!(limits.max_processes_per_session, 1024);
         assert_eq!(limits.max_pending_waits, 1024);

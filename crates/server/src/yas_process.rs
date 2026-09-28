@@ -315,7 +315,7 @@ impl Runtime {
         }
         let (manager, events, endpoint_closed) = self
             .server
-            .native_endpoint_with_session(owner_session, ROUTE_EVENTS);
+            .native_endpoint_with_session(owner_session, self.server.maxima().endpoint_events());
         let (closed, _) = watch::channel(None);
         let inner = Arc::new(SessionInner {
             server: self.server.clone(),
