@@ -702,7 +702,7 @@ pub struct RemoteEntry {
 }
 
 /// Read `yas.remotes` and return ordered enabled `(name, uri)` pairs.
-/// If the file does not exist, provisions it with `local = local` (0600).
+/// A missing file is an empty list; reading never creates it.
 /// Disabled entries are filtered out — use [`read_remotes_full`] to keep them.
 pub fn read_remotes() -> Vec<(String, String)> {
     read_remotes_full()
@@ -714,18 +714,13 @@ pub fn read_remotes() -> Vec<(String, String)> {
 
 /// Read `yas.remotes` including disabled entries.
 pub fn read_remotes_full() -> Vec<RemoteEntry> {
-    let path = remotes_path();
-    let contents = match std::fs::read_to_string(&path) {
+    read_remotes_at(&remotes_path())
+}
+
+fn read_remotes_at(path: &std::path::Path) -> Vec<RemoteEntry> {
+    let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let default = vec![RemoteEntry {
-                name: "local".to_string(),
-                uri: "local".to_string(),
-                disabled: false,
-            }];
-            write_remotes(&default);
-            return default;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
         Err(e) => {
             eprintln!("yas: could not read {}: {e}", path.display());
             return vec![];
@@ -1156,6 +1151,14 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_missing_remotes_file_does_not_create_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("yas.remotes");
+        assert!(read_remotes_at(&path).is_empty());
+        assert!(!path.exists());
+    }
 
     #[cfg(unix)]
     #[test]
