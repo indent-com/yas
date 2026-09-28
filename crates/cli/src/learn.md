@@ -511,12 +511,17 @@ and `YAS_NET=0` govern it. The proxy ends with the process.
 
 ```bash
 yas clipboard list                            # list available MIME types
-yas clipboard get                             # read clipboard (text/plain)
+yas clipboard get                             # read clipboard as plain text
 yas clipboard get --mime image/png > shot.png # read specific MIME type
 yas clipboard set "hello"                     # set clipboard from argument
 echo "hello" | yas clipboard set              # set clipboard from stdin
 yas clipboard set --mime image/png < shot.png # set specific MIME type
 ```
+
+`set` offers text as `text/plain;charset=utf-8`. A plain-text `get`
+(`text/plain`, with or without a charset, or `UTF8_STRING`) reads whichever
+plain-text variant the owner offered, so set-then-get round-trips; other MIME
+types must match a listed type exactly.
 
 ## GUI surfaces
 
