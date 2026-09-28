@@ -59,6 +59,8 @@ yas terminal send "$ID" "\x03"     # Ctrl+C
 ```
 
 Supports C-style escapes: `\n`, `\t`, `\r`, `\\`, `\0`, `\xHH`. Use `-` to read from stdin.
+Sending to an exited terminal fails with a nonzero exit instead of dropping the
+input.
 
 `\n` sends CR (0x0D), which is what a real terminal sends for Enter. This works
 regardless of whether the program is in canonical or raw mode. `\r` also sends
