@@ -2221,9 +2221,11 @@ impl Decode for ConflictDetail {
 /// `READ_REALPATH` or `READ_STAT_ONLY` answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OsError {
-    /// Raw OS error number on the server platform.
+    /// Raw OS error number on the server platform: errno on POSIX, the Win32
+    /// or Winsock error code on Windows.
     pub code: i32,
-    /// Symbolic errno name (`ENOENT`, `ENOTDIR`, …) or `UNKNOWN`.
+    /// Symbolic errno name (`ENOENT`, `ENOTDIR`, …) or `UNKNOWN`; on
+    /// Windows the name libuv (and so Node) gives the code.
     pub name: String,
     /// The operation the server was performing (`open`, `read`, `readdir`, …).
     pub operation: String,

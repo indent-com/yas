@@ -950,7 +950,7 @@ fn os_io(operation: &'static str) -> impl Fn(io::Error) -> Error {
 fn os_error(code: i32, operation: &'static str) -> wire::OsError {
     wire::OsError {
         code,
-        name: errno_name(code).to_owned(),
+        name: errno_name(code, operation).to_owned(),
         operation: operation.to_owned(),
     }
 }
@@ -1014,21 +1014,89 @@ const ERRNO_NAMES: &[(i32, &str)] = &[
 ];
 
 #[cfg(unix)]
-fn errno_name(code: i32) -> &'static str {
+fn errno_name(code: i32, _operation: &str) -> &'static str {
     ERRNO_NAMES
         .iter()
         .find(|(value, _)| *value == code)
         .map_or("UNKNOWN", |(_, name)| name)
 }
 
-#[cfg(not(unix))]
-fn errno_name(_code: i32) -> &'static str {
+#[cfg(windows)]
+fn errno_name(code: i32, operation: &str) -> &'static str {
+    win32_errno_name(code, operation).unwrap_or("UNKNOWN")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn errno_name(_code: i32, _operation: &str) -> &'static str {
     "UNKNOWN"
 }
 
+/// The name libuv gives a Win32 or Winsock error code (`uv_translate_sys_error`),
+/// so the one Node reports for it; a Windows server keeps the code itself.
+/// `ERROR_DIRECTORY` is ENOTDIR while listing a directory, as libuv's scandir
+/// and opendir say, and ENOENT otherwise. `ERROR_INVALID_FUNCTION` is EISDIR:
+/// reading a directory's handle fails with it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win32_errno_name(code: i32, operation: &str) -> Option<&'static str> {
+    Some(match code {
+        1 => "EISDIR",
+        267 if operation == "readdir" => "ENOTDIR",
+        2 | 3 | 15 | 123 | 126 | 161 | 203 | 267 | 4392 | 11001 | 11004 => "ENOENT",
+        4 | 10024 => "EMFILE",
+        5 | 1314 => "EPERM",
+        6 | 1004 => "EBADF",
+        8 | 14 => "ENOMEM",
+        13 | 87 | 122 | 1464 | 10022 | 10046 => "EINVAL",
+        17 => "EXDEV",
+        19 => "EROFS",
+        23 | 31 | 110 | 156 | 205 | 1101 | 1102 | 1103 | 1104 | 1106 | 1111 | 1117 | 1129
+        | 1165 | 1166 | 1393 => "EIO",
+        32 | 33 | 231 => "EBUSY",
+        39 | 82 | 112 | 277 | 1100 => "ENOSPC",
+        50 => "ENOTSUP",
+        64 | 10054 => "ECONNRESET",
+        80 | 183 => "EEXIST",
+        109 => "EOF",
+        111 | 206 => "ENAMETOOLONG",
+        121 | 10060 => "ETIMEDOUT",
+        145 => "ENOTEMPTY",
+        193 => "EFTYPE",
+        208 => "E2BIG",
+        230 | 233 | 10058 => "EPIPE",
+        232 | 10035 => "EAGAIN",
+        740 | 1920 | 10013 => "EACCES",
+        995 | 10004 => "ECANCELED",
+        998 | 10014 => "EFAULT",
+        1113 => "ECHARSET",
+        1921 => "ELOOP",
+        1225 | 10061 => "ECONNREFUSED",
+        1227 | 10048 => "EADDRINUSE",
+        1231 | 10051 => "ENETUNREACH",
+        1232 | 10065 => "EHOSTUNREACH",
+        1236 | 10053 => "ECONNABORTED",
+        2250 | 10057 => "ENOTCONN",
+        10037 => "EALREADY",
+        10038 => "ENOTSOCK",
+        10040 => "EMSGSIZE",
+        10043 => "EPROTONOSUPPORT",
+        10044 => "ESOCKTNOSUPPORT",
+        10047 => "EAFNOSUPPORT",
+        10049 => "EADDRNOTAVAIL",
+        10055 => "ENOBUFS",
+        10056 => "EISCONN",
+        _ => return None,
+    })
+}
+
+/// The OS error of a directory read, or opened for writing, when the server
+/// finds it is one before any system call fails: EISDIR on POSIX, and on
+/// Windows `ERROR_INVALID_FUNCTION`, what ReadFile of a directory fails with
+/// (EISDIR by its name).
 #[cfg(unix)]
 const EISDIR: Option<i32> = Some(libc::EISDIR);
-#[cfg(not(unix))]
+#[cfg(windows)]
+const EISDIR: Option<i32> = Some(1);
+#[cfg(not(any(unix, windows)))]
 const EISDIR: Option<i32> = None;
 
 /// Attach the OS error a check made without a system call stands for (a
@@ -2436,7 +2504,9 @@ fn commit_in_place(
     }
     let mut file = match options.open(target) {
         Ok(file) => file,
-        Err(error) if error.raw_os_error().is_some() && error.raw_os_error() == EISDIR => {
+        // open(2) of a directory for writing (Windows says ERROR_ACCESS_DENIED).
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::EISDIR) => {
             return Err(is_directory());
         }
         Err(error) => return Err(os_io("open")(error)),
@@ -3264,6 +3334,40 @@ mod tests {
             cursor = page.next_cursor;
         }
         assert_eq!(matches, 3);
+    }
+
+    #[test]
+    fn windows_error_codes_take_the_names_libuv_gives_them() {
+        for (code, name) in [
+            (1, "EISDIR"),
+            (2, "ENOENT"),
+            (3, "ENOENT"),
+            (123, "ENOENT"),
+            (5, "EPERM"),
+            (1314, "EPERM"),
+            (32, "EBUSY"),
+            (17, "EXDEV"),
+            (19, "EROFS"),
+            (80, "EEXIST"),
+            (183, "EEXIST"),
+            (112, "ENOSPC"),
+            (145, "ENOTEMPTY"),
+            (206, "ENAMETOOLONG"),
+            (998, "EFAULT"),
+            (1921, "ELOOP"),
+            (10013, "EACCES"),
+            (10054, "ECONNRESET"),
+            (10061, "ECONNREFUSED"),
+        ] {
+            assert_eq!(win32_errno_name(code, "open"), Some(name), "code {code}");
+        }
+        // ERROR_DIRECTORY: listing something that is not a directory.
+        assert_eq!(win32_errno_name(267, "readdir"), Some("ENOTDIR"));
+        assert_eq!(win32_errno_name(267, "open"), Some("ENOENT"));
+        // Codes libuv has no name for stay UNKNOWN, as in Node.
+        assert_eq!(win32_errno_name(0, "open"), None);
+        assert_eq!(win32_errno_name(53, "stat"), None);
+        assert_eq!(win32_errno_name(-1, "open"), None);
     }
 
     #[cfg(unix)]

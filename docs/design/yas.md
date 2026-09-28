@@ -2876,11 +2876,15 @@ realpath for READ_REALPATH, stat or lstat for READ_STAT_ONLY. The status is
 unchanged: ENOENT is NOT_FOUND, other OS errors are IO. FETCH of a directory
 stays INVALID with `{EISDIR, read}`; COMMIT onto a directory stays CONFLICT
 with both ConflictDetail and `{EISDIR, open}`. Escaping the root is IO without
-an OsError. Windows servers name every error UNKNOWN. APPLY item details keep
-their text; an APPLY Result whose items failed because of OS errors adds
-optional ApplyResult extension `APPLY_RESULT_OS_ERRORS_EXTENSION` (1), whose
-value is `repeated index:u16,OsError`, one entry per such item in ascending
-index order (part of `CAPABILITY_OS_ERROR`). A MKDIR under a file is
+an OsError. A Windows server's `code` is the Win32 or Winsock error code, and
+its name the one libuv gives that code (which Node reports), or UNKNOWN where
+libuv has none; ERROR_DIRECTORY (267) is ENOTDIR for readdir and ENOENT
+otherwise, and FETCH or COMMIT of a directory is `{1, EISDIR}`
+(ERROR_INVALID_FUNCTION, what reading a directory fails with). APPLY item
+details keep their text; an APPLY Result whose items failed because of OS errors
+adds optional ApplyResult extension `APPLY_RESULT_OS_ERRORS_EXTENSION` (1),
+whose value is `repeated index:u16,OsError`, one entry per such item in
+ascending index order (part of `CAPABILITY_OS_ERROR`). A MKDIR under a file is
 `{ENOTDIR, mkdir}`, a REMOVE of nothing `{ENOENT, unlink}`.
 
 READ question kinds `READ_LIST` (4), `READ_REALPATH` (5), and
