@@ -393,7 +393,7 @@ Without any of the above, the compositor falls back to CPU rendering and softwar
 | `wireplumber`          | Session manager (optional, started if available)  |
 | `xwayland-satellite`   | X11 applications (optional, started if available) |
 
-Audio is disabled automatically when PipeWire is not installed or `libpipewire-0.3.so.0` is not resolvable via `ld.so` (set `LD_LIBRARY_PATH` if you have it in a non-default location), or explicitly with `YAS_AUDIO=0`.
+Audio is disabled automatically when PipeWire is not installed or `libpipewire-0.3.so.0` is not resolvable via `ld.so` (set `LD_LIBRARY_PATH` if you have it in a non-default location); the server then prints one `[audio] desktop audio unavailable` line naming the reason (`-v` for details). `YAS_AUDIO=0` stops desktop audio from being offered or streamed to viewers, even when PipeWire still runs for camera, microphone, or portals. `YAS_AUDIO_BITRATE` (bits/sec, default 64000) is the Opus bitrate viewers get when they leave the bitrate at the server's default.
 
 X11 applications run through `xwayland-satellite`, which yas starts once per session when the binary is on `PATH` and exports the resulting `DISPLAY` to every terminal. Wayland stays the first choice for anything that speaks it; X11 is the fallback behind it. Without the binary, sessions are Wayland-only and no `DISPLAY` is exported. Set `YAS_XWAYLAND=0` to opt out.
 

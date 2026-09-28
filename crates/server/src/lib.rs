@@ -1360,7 +1360,7 @@ struct MprisBackendState {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct MediaBackendState {
-    pipewire_available: bool,
+    audio_output_available: bool,
     microphone_available: bool,
     camera_available: bool,
     screencasts: Vec<MediaBackendScreencast>,
@@ -1497,6 +1497,13 @@ struct SharedCompositor {
     /// `None` when PipeWire is not available or `YAS_AUDIO=0`.
     #[cfg(target_os = "linux")]
     audio_pipeline: Option<audio::AudioPipeline>,
+    /// False under `YAS_AUDIO=0`: the PipeWire runtime may still run for
+    /// media input or portals, but desktop audio is not offered to viewers.
+    #[cfg(target_os = "linux")]
+    audio_output_enabled: bool,
+    /// Opus bitrate in bits/sec for viewers that leave it to the server.
+    #[cfg(target_os = "linux")]
+    audio_bitrate: i32,
     /// Private session bus whose activation environment points at this
     /// compositor. Desktop portals spawned through it map inside yas rather
     /// than escaping to the host compositor.
@@ -1900,7 +1907,7 @@ impl SharedCompositor {
             .collect::<Vec<_>>();
         screencasts.sort_unstable_by_key(|session| session.session_id);
         MediaBackendState {
-            pipewire_available: self.audio_pipeline.is_some(),
+            audio_output_available: self.audio_pipeline.is_some() && self.audio_output_enabled,
             microphone_available: microphone,
             camera_available: camera,
             screencasts,
@@ -5959,11 +5966,13 @@ impl Session {
             #[cfg(target_os = "linux")]
             let audio_broadcast = audio::AudioBroadcast::new();
             #[cfg(target_os = "linux")]
+            let audio_output_enabled = std::env::var("YAS_AUDIO").map_or(true, |v| v != "0");
+            #[cfg(target_os = "linux")]
+            let audio_bitrate = audio::configured_bitrate();
+            #[cfg(target_os = "linux")]
             let audio_pipeline = {
                 let desktop_bus_address = desktop_bus.as_ref().map(|bus| bus.address().to_owned());
-                let audio_disabled = std::env::var("YAS_AUDIO")
-                    .map(|v| v == "0")
-                    .unwrap_or(false);
+                let audio_disabled = !audio_output_enabled;
                 let media_input_enabled = std::env::var("YAS_MEDIA_INPUT")
                     .map_or(true, |value| value != "0")
                     && (std::env::var("YAS_MEDIA_MICROPHONE").map_or(true, |value| value != "0")
@@ -5977,10 +5986,7 @@ impl Session {
                     let runtime_dir = std::path::Path::new(&handle.socket_name)
                         .parent()
                         .unwrap_or(std::path::Path::new("/tmp"));
-                    let bitrate = std::env::var("YAS_AUDIO_BITRATE")
-                        .ok()
-                        .and_then(|v| v.parse::<i32>().ok())
-                        .unwrap_or(0);
+                    let bitrate = audio_bitrate;
                     // Wrap in block_in_place so the thread::sleep calls
                     // inside spawn() don't stall the tokio runtime.
                     let broadcast = audio_broadcast.clone();
@@ -6009,6 +6015,16 @@ impl Session {
                         }
                     })
                 } else {
+                    if !verbose && !audio_disabled {
+                        eprintln!(
+                            "[audio] desktop audio unavailable: {}; -v for details, YAS_AUDIO=0 to silence",
+                            audio::unavailable_reason(
+                                desktop_bus_address.is_some(),
+                                &audio::missing_pipewire_binaries(),
+                                &audio_pw::load_error(),
+                            )
+                        );
+                    }
                     if verbose && (!audio_disabled || media_input_enabled || screencast_enabled) {
                         let missing = audio::missing_pipewire_binaries();
                         let load_err = audio_pw::load_error();
@@ -6081,6 +6097,10 @@ impl Session {
                 native_sizes: FxHashMap::default(),
                 #[cfg(target_os = "linux")]
                 audio_pipeline,
+                #[cfg(target_os = "linux")]
+                audio_output_enabled,
+                #[cfg(target_os = "linux")]
+                audio_bitrate,
                 #[cfg(target_os = "linux")]
                 desktop_bus,
                 #[cfg(target_os = "linux")]
@@ -12715,11 +12735,12 @@ async fn tick(state: &AppState) -> TickOutcome {
     // for seconds and must not hold the session mutex or park the tick loop.
     //
     #[cfg(target_os = "linux")]
-    let audio_restart_bitrate: i32 = i32::from(
-        sess.compositor
-            .as_ref()
-            .map_or(0, |cs| cs.audio_broadcast.max_native_bitrate_kbps()),
-    ) * 1_000;
+    let audio_restart_bitrate: i32 = sess.compositor.as_ref().map_or(0, |cs| {
+        audio::output_bitrate(
+            cs.audio_broadcast.max_native_bitrate_kbps(),
+            cs.audio_bitrate,
+        )
+    });
     #[cfg(target_os = "linux")]
     {
         let camera_results = sess

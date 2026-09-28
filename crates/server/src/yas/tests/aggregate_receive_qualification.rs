@@ -923,7 +923,7 @@ async fn every_retaining_family_shares_one_live_session_budget() {
             .as_mut()
             .unwrap()
             .native_media_state_override = Some(super::super::super::MediaBackendState {
-            pipewire_available: true,
+            audio_output_available: true,
             microphone_available: true,
             camera_available: false,
             screencasts: Vec::new(),
