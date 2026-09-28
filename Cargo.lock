@@ -8153,6 +8153,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "russh",
  "rustls",
  "rustls-native-certs",
  "serde",

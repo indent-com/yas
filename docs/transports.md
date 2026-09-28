@@ -433,6 +433,29 @@ exact. If yas is not installed on the remote, it is auto-installed to
 resolve its path again instead of freezing the predicted candidate into an
 explicit override. Connection retries with back-off handle the startup window.
 
+**Without socket forwarding.** Some SSH servers will not forward to Unix
+sockets at all (OpenSSH's `AllowStreamLocalForwarding no`, answered as
+"administratively prohibited", or servers without the channel type), and some
+hosts have no POSIX shell to run the socket search (Windows). Then the client
+runs [`yas connect --stdio`](#standard-io-yas-connect---stdio) on the remote
+over an exec channel and speaks YAS through its stdin and stdout:
+
+- On a POSIX host it first checks that `yas` runs (including from
+  `~/.local/bin`) and installs it only when it is missing and installing is
+  allowed. An explicit socket stays exact (`YAS_SOCK`).
+- With no shell it runs a plain `yas connect --stdio` (with
+  `--on socket:PATH` for an explicit socket), after `yas --version` confirms
+  that `yas` is on the PATH of non-interactive commands there.
+- The pool remembers per connection that only exec works, so later sessions
+  skip the failing attempts.
+
+Embedders choose with `yas_ssh::SshOptions::mode`: `Auto` (the default, as
+above), `Socket` (forwarding only), or `Exec` (only run
+`SshOptions::remote_command`, `yas connect --stdio` by default: no socket
+search, no install, no POSIX shell needed). A refused host key is
+`Error::HostKey { host, port, fingerprint, .. }`, naming the key the server
+presented.
+
 **Host keys** are trust-on-first-use against `~/.ssh/known_hosts`, overridable
 with `YAS_SSH_KNOWN_HOSTS`. A host with no entry is recorded and accepted; a
 host that already has one must match it, under any algorithm. Everything else

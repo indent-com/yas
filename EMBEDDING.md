@@ -336,7 +336,12 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
 - **SSH** (`ssh`, re-exported `yas-ssh`): `SshOptions::in_memory(HostKeyPolicy::Pinned(keys))`
   with `with_private_key(text, passphrase)` authenticates with keys held in
   memory and trusts only pinned host keys, touching no `~/.ssh` file; pass
-  `SshPool::with_options(options)` as `ConnectOptions::ssh`.
+  `SshPool::with_options(options)` as `ConnectOptions::ssh`. Hosts whose sshd
+  does not forward to sockets, or that have no POSIX shell (Windows), are
+  reached by running `yas connect --stdio` there: automatically in
+  `SshMode::Auto`, only that way in `SshMode::Exec` (`SshOptions::remote_command`
+  overrides the command). A refused host key is `ssh::Error::HostKey`, with the
+  presented key's `fingerprint`.
 - **Hosting** (`host`, Unix): `HostedServer::start(HostOptions::new("yas"))` runs
   a private `yas server --fd-channel` child in a 0700 directory (own state,
   cache and runtime directories by default); `connect()` hands it a fresh

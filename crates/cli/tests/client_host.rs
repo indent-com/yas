@@ -3,6 +3,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/ssh_server.rs"]
+mod ssh_server;
+
 use std::time::{Duration, Instant};
 
 use yas_client::fs::{EntryKind, Precondition, WriteOptions};
@@ -902,4 +905,198 @@ async fn connect_stdio_reports_an_unreachable_server_on_stderr_only() {
         String::from_utf8_lossy(&output.stderr).starts_with("yas: "),
         "{output:?}"
     );
+}
+
+mod over_ssh {
+    use std::sync::Arc;
+
+    use yas_client::ssh::{HostKeyPolicy, SshMode, SshOptions, SshPool};
+    use yas_client::{Client, ConnectOptions};
+
+    use super::ssh_server::{self, TestSshServer};
+    use super::{Command, TIMEOUT, start};
+
+    /// What exec'd commands see: this build's `yas` first on PATH, a home
+    /// of their own (nothing reaches the real ~/.local), and no proxy.
+    fn exec_env(home: &std::path::Path) -> Vec<(String, String)> {
+        let bin = std::path::Path::new(env!("CARGO_BIN_EXE_yas"))
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        let path = std::env::var("PATH").unwrap_or_default();
+        vec![
+            ("PATH".into(), format!("{bin}:{path}")),
+            ("HOME".into(), home.display().to_string()),
+            ("YAS_PROXY".into(), "0".into()),
+        ]
+    }
+
+    async fn ssh_server(streamlocal: bool, home: &std::path::Path) -> TestSshServer {
+        TestSshServer::start(ssh_server::Options {
+            client_key: ssh_server::key(0x33).public_key().clone(),
+            streamlocal,
+            env: exec_env(home),
+        })
+        .await
+    }
+
+    fn ssh_options(server: &TestSshServer, mode: SshMode) -> SshOptions {
+        let mut ssh = SshOptions::in_memory(HostKeyPolicy::Pinned(vec![server.host_key.clone()]));
+        ssh.keys.push(Arc::new(ssh_server::key(0x33)));
+        ssh.port = Some(server.port);
+        ssh.install = false;
+        ssh.mode = mode;
+        ssh
+    }
+
+    fn connect_options(ssh: SshOptions) -> ConnectOptions {
+        let mut options = ConnectOptions::named("ssh-test");
+        options.ssh = Some(SshPool::with_options(ssh));
+        options
+    }
+
+    async fn echo(client: &Client, word: &str) -> String {
+        let output = client
+            .spawn(Command::new("echo").arg(word))
+            .await
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_mode_uses_the_socket_when_the_ssh_server_forwards_it() {
+        let hosted = start().await;
+        let home = tempfile::tempdir().unwrap();
+        let server = ssh_server(true, home.path()).await;
+        let options = connect_options(ssh_options(&server, SshMode::Auto));
+        let target = format!("ssh:127.0.0.1:{}", hosted.socket_path().display());
+        let client = tokio::time::timeout(TIMEOUT, Client::connect(Some(&target), &options))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echo(&client, "forwarded").await, "forwarded\n");
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests.streamlocal,
+            [hosted.socket_path().display().to_string()]
+        );
+        assert!(requests.exec.is_empty(), "{requests:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_mode_runs_connect_stdio_when_forwarding_is_refused() {
+        let hosted = start().await;
+        let home = tempfile::tempdir().unwrap();
+        let server = ssh_server(false, home.path()).await;
+        let options = connect_options(ssh_options(&server, SshMode::Auto));
+        let target = format!("ssh:127.0.0.1:{}", hosted.socket_path().display());
+        let client = tokio::time::timeout(TIMEOUT, Client::connect(Some(&target), &options))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.server_name(), hosted.name());
+        assert_eq!(echo(&client, "exec'd").await, "exec'd\n");
+
+        // The pool remembers: a second session goes straight to exec.
+        let second = tokio::time::timeout(TIMEOUT, Client::connect(Some(&target), &options))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echo(&second, "again").await, "again\n");
+        assert_ne!(second.session_id(), client.session_id());
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.streamlocal.len(), 1, "{requests:?}");
+        let [probe, relays @ ..] = requests.exec.as_slice() else {
+            panic!("{requests:?}");
+        };
+        assert!(probe.contains("command -v yas"), "{probe}");
+        assert_eq!(relays.len(), 2, "{requests:?}");
+        for relay in relays {
+            assert!(
+                relay.contains("exec yas connect --stdio --no-start"),
+                "{relay}"
+            );
+            assert!(relay.contains("YAS_SOCK="), "{relay}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exec_mode_runs_a_plain_command_and_never_forwards() {
+        let hosted = start().await;
+        let home = tempfile::tempdir().unwrap();
+        let server = ssh_server(true, home.path()).await;
+        let options = connect_options(ssh_options(&server, SshMode::Exec));
+        let target = format!("ssh:127.0.0.1:{}", hosted.socket_path().display());
+        let client = tokio::time::timeout(TIMEOUT, Client::connect(Some(&target), &options))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echo(&client, "plain").await, "plain\n");
+        let requests = server.requests.lock().unwrap();
+        assert!(requests.streamlocal.is_empty(), "{requests:?}");
+        assert_eq!(
+            requests.exec,
+            [
+                "yas --version".to_string(),
+                format!(
+                    "yas --on socket:{} connect --stdio",
+                    hosted.socket_path().display()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exec_mode_says_when_yas_is_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let server = TestSshServer::start(ssh_server::Options {
+            client_key: ssh_server::key(0x33).public_key().clone(),
+            streamlocal: false,
+            env: vec![
+                ("PATH".into(), "/nonexistent".into()),
+                ("HOME".into(), home.path().display().to_string()),
+            ],
+        })
+        .await;
+        let pool = SshPool::with_options(ssh_options(&server, SshMode::Exec));
+        let error = pool.connect_yas("127.0.0.1", None, None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`yas --version` did not run on 127.0.0.1"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_host_key_names_the_presented_fingerprint() {
+        let home = tempfile::tempdir().unwrap();
+        let server = ssh_server(true, home.path()).await;
+        let mut ssh = ssh_options(&server, SshMode::Auto);
+        let other = ssh_server::key(0x44).public_key().clone();
+        ssh.host_keys = HostKeyPolicy::Pinned(vec![other]);
+        let error = SshPool::with_options(ssh)
+            .connect_yas("127.0.0.1", None, Some("/nonexistent.sock"))
+            .await
+            .unwrap_err();
+        match error {
+            yas_client::ssh::Error::HostKey {
+                host,
+                port,
+                fingerprint,
+                ..
+            } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, server.port);
+                assert_eq!(fingerprint, yas_client::ssh::fingerprint(&server.host_key));
+            }
+            other => panic!("expected a HostKey error, got {other}"),
+        }
+    }
 }
