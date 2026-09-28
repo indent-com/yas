@@ -3280,9 +3280,11 @@ stderr stream has no stderr descriptor or credit.
 
 Process STATE ADD/REPLACE records are complete `ProcessRecord` values; REMOVE
 identifies handle and generation. Exit is a portable kind/reason plus native
-code and UTF-8 detail. Every mutating request uses a nonzero 128-bit operation
-ID. Spawned children are therefore deduplicated independently of frame request
-IDs, which are only connection-local.
+code and UTF-8 detail. The code keeps its bits: a Windows exit code is a DWORD,
+so an NTSTATUS such as 0xC0000005 is negative as the `i32`. Every mutating
+request uses a nonzero 128-bit operation ID. Spawned children are therefore
+deduplicated independently of frame request IDs, which are only
+connection-local.
 
 Required Process family-limit tag 10 is the nonzero `u32`
 `max_mutation_replays` bound. An identical SPAWN replays its byte-identical

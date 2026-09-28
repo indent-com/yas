@@ -400,7 +400,9 @@ pub struct ExitStatus {
     /// Why.
     pub reason: ExitReason,
     /// Exit code for [`ExitKind::Code`], signal number for
-    /// [`ExitKind::Signal`], else 0.
+    /// [`ExitKind::Signal`], else 0. A Windows exit code is a DWORD kept bit
+    /// for bit: `raw_code as u32` gives it back (0xC0000005 for an access
+    /// violation, which is negative here).
     pub raw_code: i32,
     /// Server monotonic time of the exit, in nanoseconds.
     pub exited_server_ns: u64,
@@ -424,7 +426,8 @@ impl ExitStatus {
         self.code() == Some(0)
     }
 
-    /// The exit code, if it returned one.
+    /// The exit code, if it returned one (on Windows, a DWORD's bits: see
+    /// [`ExitStatus::raw_code`]).
     pub fn code(&self) -> Option<i32> {
         (self.kind == ExitKind::Code).then_some(self.raw_code)
     }
@@ -438,6 +441,10 @@ impl ExitStatus {
 impl std::fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind {
+            // Only a Windows exit code is negative: an NTSTATUS, read in hex.
+            ExitKind::Code if self.raw_code < 0 => {
+                write!(f, "exit code 0x{:08X}", self.raw_code as u32)
+            }
             ExitKind::Code => write!(f, "exit code {}", self.raw_code),
             ExitKind::Signal => write!(f, "signal {} ({:?})", self.raw_code, self.reason),
             ExitKind::Killed => write!(f, "killed ({:?})", self.reason),
@@ -1058,6 +1065,27 @@ pub(crate) fn os_bytes(value: &OsStr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_windows_exit_code_reads_as_its_dword() {
+        let exit = |raw_code| ExitStatus {
+            kind: ExitKind::Code,
+            reason: ExitReason::Unknown,
+            raw_code,
+            exited_server_ns: 1,
+            detail: String::new(),
+        };
+        assert_eq!(
+            exit(0xC000_0005_u32 as i32).to_string(),
+            "exit code 0xC0000005"
+        );
+        assert_eq!(
+            exit(0xC000_0005_u32 as i32).code().map(|code| code as u32),
+            Some(0xC000_0005)
+        );
+        assert_eq!(exit(3).to_string(), "exit code 3");
+        assert!(!exit(-1).success());
+    }
 
     #[test]
     fn environment_goes_on_the_wire_sorted_with_the_last_value_of_each_key() {

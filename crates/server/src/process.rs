@@ -3189,18 +3189,22 @@ fn try_queue_terminal(record: &Arc<Record>) {
     }
 }
 
+/// The exit record's `code` keeps the native code bit for bit: a Windows exit
+/// code is a DWORD, and the NTSTATUS ones (0xC0000005 for an access violation,
+/// 0xC000013A after Ctrl+C) are negative as an `i32`. POSIX exit codes and
+/// signal numbers are small.
 fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeExit {
     match reason {
         PROCESS_EXIT_RETURNED => NativeExit {
             kind: wire::ExitKind::Code,
             reason: process_schema::EXIT_REASON_UNKNOWN as u8,
-            code: i32::try_from(code).unwrap_or(i32::MAX),
+            code: code as i32,
             detail: detail.to_vec(),
         },
         PROCESS_EXIT_SIGNALLED => NativeExit {
             kind: wire::ExitKind::Signal,
             reason: portable_signal_reason(code),
-            code: i32::try_from(code).unwrap_or(i32::MAX),
+            code: code as i32,
             detail: detail.to_vec(),
         },
         PROCESS_EXIT_KILLED => NativeExit {
@@ -3496,6 +3500,37 @@ fn os_error_detail(error: io::Error) -> &'static str {
         Some(libc::EPERM) => "permission denied signaling process group",
         Some(libc::EINVAL) => "invalid signal",
         _ => "process control failed",
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    #[test]
+    fn an_exit_code_keeps_its_bits() {
+        for code in [
+            0u32,
+            1,
+            255,
+            0x7FFF_FFFF,
+            0xC000_0005,
+            0xC000_013A,
+            u32::MAX,
+        ] {
+            let exit = native_exit(PROCESS_EXIT_RETURNED, 0, code, b"");
+            assert_eq!(exit.kind, wire::ExitKind::Code);
+            assert_eq!(exit.code as u32, code);
+        }
+        assert_eq!(
+            native_exit(PROCESS_EXIT_RETURNED, 0, 0xC000_0005, b"").code,
+            -1_073_741_819
+        );
+        let signalled = native_exit(PROCESS_EXIT_SIGNALLED, 0, 9, b"");
+        assert_eq!(
+            (signalled.kind, signalled.code),
+            (wire::ExitKind::Signal, 9)
+        );
     }
 }
 
