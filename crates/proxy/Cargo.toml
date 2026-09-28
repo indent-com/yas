@@ -21,7 +21,7 @@ futures-util = "0.3"
 bytes = "1"
 rand = "0.10"
 url = "2"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json = "1"
 yas-webrtc-forwarder = { workspace = true }
 yas-composite-transport = { workspace = true }

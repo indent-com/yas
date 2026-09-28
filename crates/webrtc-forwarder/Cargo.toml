@@ -27,7 +27,7 @@ base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 str0m = "0.23.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 hmac = "0.13"
 pbkdf2 = "0.13"
 sha1 = "0.11"

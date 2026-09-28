@@ -44,7 +44,7 @@ yas-uplink = { workspace = true }
 yas-ssh = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
 url = "2"
 rustls-native-certs = "0.8"
