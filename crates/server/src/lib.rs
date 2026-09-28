@@ -462,8 +462,9 @@ pub struct Config {
     /// Skip compositor initialization (e.g. for share-only mode).
     pub skip_compositor: bool,
     /// Export the server's IPC path as `YAS_SOCK` in spawned terminals so
-    /// `yas` invocations inside them target this server.  Off by default:
-    /// `YAS_*` is otherwise stripped from child environments.
+    /// `yas` invocations inside them target this server.  Off by default,
+    /// though an inherited `YAS_SOCK` naming another server is dropped either
+    /// way.
     pub export_sock: bool,
     /// Append the directory holding the running server binary to `PATH` in
     /// spawned terminals, so `yas` is callable inside them (Unix only; the
@@ -1075,6 +1076,10 @@ struct Pty {
     /// this a terminal created with an argv, an environment, or both came back
     /// from a restart as a bare login shell.
     spec: pty::OwnedChildSpec,
+    /// The native YAS launch this terminal was created or last replaced
+    /// with. Terminal Restart replays it for any client that can see the
+    /// terminal, not only the connection that created it.
+    native_launch: Option<yas_wire::terminal::Launch>,
     /// Working directory last reported by the shell via OSC 7, already
     /// validated by `parse_osc7_url` (docs/protocol.md, "Working directory
     /// tracking").  Last write wins; None until shell integration first

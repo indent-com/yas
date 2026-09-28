@@ -3849,9 +3849,6 @@ impl TerminalCatalogue {
 struct TerminalRuntime {
     catalogue: TerminalCatalogue,
     app_handles: HashMap<u64, u64>,
-    /// Exact native launch records. Terminals created outside this connection
-    /// predate its launch catalogue and intentionally have no replayable launch.
-    launches: HashMap<u64, yas_terminal::Launch>,
     operations: HashMap<[u8; 16], TerminalOperationReplay>,
     next_view_id: u32,
     views: HashMap<u32, TerminalView>,
@@ -4956,7 +4953,6 @@ impl TerminalRuntime {
         Self {
             catalogue,
             app_handles: HashMap::new(),
-            launches: HashMap::new(),
             operations: HashMap::new(),
             next_view_id: 1,
             views: HashMap::new(),
@@ -14473,35 +14469,50 @@ impl Session {
                     // engine initializes this field at zero, so creation sets
                     // the first public generation explicitly.
                     pty.generation = 1;
+                    pty.native_launch = Some(request.launch.clone());
                     pty.deadline = prepared.deadline_after_ns.and_then(|ns| {
                         std::time::Instant::now().checked_add(Duration::from_nanos(ns))
                     });
                 }
-                pty.and_then(|pty| {
-                    let lifecycle = session.note_terminal_created(pty_id, pty.generation)?;
-                    debug_assert_eq!(lifecycle.backend_id(), pty_id);
-                    debug_assert_eq!(lifecycle.generation(), pty.generation);
-                    let handle = lifecycle.terminal_handle();
-                    session.ptys.insert(pty_id, pty);
-                    Some((handle, pty_id))
-                })
+                match pty {
+                    Some(pty) => session
+                        .note_terminal_created(pty_id, pty.generation)
+                        .map(|lifecycle| {
+                            debug_assert_eq!(lifecycle.backend_id(), pty_id);
+                            debug_assert_eq!(lifecycle.generation(), pty.generation);
+                            let handle = lifecycle.terminal_handle();
+                            session.ptys.insert(pty_id, pty);
+                            (handle, pty_id)
+                        })
+                        .ok_or(Status::ResourceExhausted),
+                    None if super::pty::launch_program_missing(
+                        prepared.spec.borrowed(&argv),
+                        &state,
+                        session_env.as_ref(),
+                    ) =>
+                    {
+                        Err(Status::NotFound)
+                    }
+                    None => Err(Status::ResourceExhausted),
+                }
             } else {
-                None
+                Err(Status::ResourceExhausted)
             }
         };
-        let Some((terminal_handle, pty_id)) = created else {
-            self.record_terminal_replay(
-                yas_wire::schema::terminal::request::CREATE,
-                request.operation_id,
-                fingerprint,
-                Status::ResourceExhausted,
-                Vec::new(),
-                None,
-                None,
-            );
-            return self
-                .send_sensitive_result(&frame, Status::ResourceExhausted, Vec::new())
-                .await;
+        let (terminal_handle, pty_id) = match created {
+            Ok(created) => created,
+            Err(status) => {
+                self.record_terminal_replay(
+                    yas_wire::schema::terminal::request::CREATE,
+                    request.operation_id,
+                    fingerprint,
+                    status,
+                    Vec::new(),
+                    None,
+                    None,
+                );
+                return self.send_sensitive_result(&frame, status, Vec::new()).await;
+            }
         };
         let initial_view_result = if let Some(initial_view) = initial_view {
             match self
@@ -14537,7 +14548,6 @@ impl Session {
         };
         self.refresh_terminal_catalogue().await;
         let terminal = self.native.as_mut().ok_or(())?;
-        terminal.launches.insert(terminal_handle, request.launch);
         if let Some(app_handle) = app_handle {
             terminal.app_handles.insert(terminal_handle, app_handle);
         }
@@ -14659,11 +14669,14 @@ impl Session {
             return self.send_result(&frame, Status::NotFound, Vec::new()).await;
         };
         let launch = match request.launch_mode {
-            yas_terminal::LaunchMode::Replay => self
-                .native
-                .as_ref()
-                .and_then(|terminal| terminal.launches.get(&request.terminal_handle))
-                .cloned(),
+            yas_terminal::LaunchMode::Replay => {
+                let state = self.native.as_ref().ok_or(())?.state.clone();
+                let session = state.session.lock().await;
+                session
+                    .ptys
+                    .get(&pty_id)
+                    .and_then(|pty| pty.native_launch.clone())
+            }
             yas_terminal::LaunchMode::Replace => request.launch.take(),
         };
         let Some(mut launch) = launch else {
@@ -14756,7 +14769,7 @@ impl Session {
                 .send_sensitive_result(&frame, Status::NotFound, Vec::new())
                 .await;
         }
-        let (succeeded, invalidated_views) = {
+        let (failure, invalidated_views) = {
             let mut session = state.session.lock().await;
             let current = session.ptys.get(&pty_id).ok_or(())?;
             let (rows, cols) = current.driver.size();
@@ -14807,15 +14820,25 @@ impl Session {
                     .ok_or(())?;
                 debug_assert_eq!(lifecycle.backend_id(), pty_id);
                 debug_assert_eq!(lifecycle.generation(), generation);
-                (true, true)
+                (None, true)
             } else {
                 let invalidated = request.cutover_mode == yas_terminal::CutoverMode::StopThenStart;
                 if invalidated {
                     session.native_terminal_views.refresh_backend(pty_id);
                 }
-                (false, invalidated)
+                let status = if super::pty::launch_program_missing(
+                    prepared.spec.borrowed(&argv),
+                    &state,
+                    session_env.as_ref(),
+                ) {
+                    Status::NotFound
+                } else {
+                    Status::Io
+                };
+                (Some(status), invalidated)
             }
         };
+        let succeeded = failure.is_none();
         let receipts = if invalidated_views {
             let terminal = self.native.as_mut().ok_or(())?;
             terminal
@@ -14834,7 +14857,7 @@ impl Session {
             Vec::new()
         };
         self.drain_terminal_frame_receipts(receipts).await?;
-        if !succeeded {
+        if let Some(status) = failure {
             if request.cutover_mode == yas_terminal::CutoverMode::StopThenStart
                 && self.refresh_terminal_catalogue().await
             {
@@ -14844,20 +14867,20 @@ impl Session {
                 yas_wire::schema::terminal::request::RESTART,
                 request.operation_id,
                 fingerprint,
-                Status::Io,
+                status,
                 Vec::new(),
                 None,
                 Some(request.terminal_handle),
             );
-            return self
-                .send_sensitive_result(&frame, Status::Io, Vec::new())
-                .await;
+            return self.send_sensitive_result(&frame, status, Vec::new()).await;
+        }
+        if request.launch_mode == yas_terminal::LaunchMode::Replace
+            && let Some(pty) = state.session.lock().await.ptys.get_mut(&pty_id)
+        {
+            pty.native_launch = Some(launch);
         }
         self.refresh_terminal_catalogue().await;
         let terminal = self.native.as_mut().ok_or(())?;
-        if request.launch_mode == yas_terminal::LaunchMode::Replace {
-            terminal.launches.insert(request.terminal_handle, launch);
-        }
         match app_handle {
             Some(app_handle) => {
                 terminal
@@ -14990,7 +15013,6 @@ impl Session {
             return self.send_result(&frame, Status::NotFound, Vec::new()).await;
         }
         if let Some(terminal) = self.native.as_mut() {
-            terminal.launches.remove(&request.terminal_handle);
             terminal.app_handles.remove(&request.terminal_handle);
         }
         if self.refresh_terminal_catalogue().await {
@@ -27591,9 +27613,6 @@ impl Session {
             };
             terminal
                 .app_handles
-                .retain(|handle, _| snapshot.records.contains_key(handle));
-            terminal
-                .launches
                 .retain(|handle, _| snapshot.records.contains_key(handle));
             // And the deduplication entries that named those terminals: the
             // replay guarantee runs to the end of the affected resource's
@@ -53613,7 +53632,7 @@ mod tests {
             )
             .await
             .status,
-            Status::Io,
+            Status::NotFound,
         );
         {
             let shared = state.session.lock().await;
@@ -53682,7 +53701,7 @@ mod tests {
             )
             .await
             .status,
-            Status::Io,
+            Status::NotFound,
         );
         {
             let shared = state.session.lock().await;
@@ -53811,6 +53830,148 @@ mod tests {
             Status::Ok,
         );
 
+        drop(client);
+        timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+        process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_restart_replays_across_connections_and_missing_programs_are_not_found() {
+        let process_service = super::super::process::Server::new(false, true);
+        let state = super::super::tests::process_transport::test_state(process_service.clone());
+        let (mut creator, creator_codec, _, creator_task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut creator_frames = Vec::new();
+        write_request(
+            &mut creator,
+            &creator_codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x5a; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"/bin/sh".to_vec(),
+                        b"-c".to_vec(),
+                        b"exit 3".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let created = next_terminal_result(
+            &mut creator,
+            &creator_codec,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &mut creator_frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+        drop(creator);
+        timeout(TEST_TIMEOUT, creator_task).await.unwrap().unwrap();
+
+        let (mut client, codec, _, task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut frames = Vec::new();
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::RESTART,
+            11,
+            &yas_terminal::Restart {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0x5b; 16],
+                launch_mode: yas_terminal::LaunchMode::Replay,
+                cutover_mode: yas_terminal::CutoverMode::StopThenStart,
+                launch: None,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let restarted = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::RESTART,
+            11,
+            &mut frames,
+        )
+        .await;
+        assert_eq!(restarted.status, Status::Ok);
+        let restarted = yas_terminal::RestartResult::decode(&restarted.body).unwrap();
+        assert!(restarted.generation > created.generation);
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            13,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x5d; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"definitely-not-a-yas-terminal-program".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CREATE,
+                13,
+                &mut frames,
+            )
+            .await
+            .status,
+            Status::NotFound,
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CLOSE,
+            12,
+            &yas_terminal::Close {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0x5c; 16],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CLOSE,
+                12,
+                &mut frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
         drop(client);
         timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
         process_service.shutdown().await;

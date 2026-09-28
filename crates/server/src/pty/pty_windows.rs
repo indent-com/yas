@@ -513,6 +513,16 @@ fn exact_environment_block(spec: &ChildSpec<'_>) -> Option<Vec<u16>> {
     Some(block)
 }
 
+/// Windows resolves the program inside `CreateProcessW`, so a missing one is
+/// not distinguished from any other spawn failure.
+pub fn launch_program_missing(
+    _spec: ChildSpec<'_>,
+    _state: &AppState,
+    _session_env: Option<&crate::app_env::SessionEnv>,
+) -> bool {
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pty(
     shell: &str,
@@ -692,6 +702,7 @@ pub fn spawn_pty(
         exit_status: yas_terminal_model::EXIT_STATUS_UNKNOWN,
         command: list_command.map(str::to_owned),
         spec: spec.to_owned_spec(),
+        native_launch: None,
         osc7_cwd: None,
         journal: crate::journal::CommandJournal::default(),
         osc_carry: Vec::new(),
