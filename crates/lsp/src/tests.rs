@@ -959,6 +959,106 @@ fn definition_transcodes_utf16_to_bytes() {
     }
 }
 
+/// HOVER projects the described LOCATION before its MARKUP; the server
+/// family pairs them in that order. Without a reported range the target
+/// is the empty range at the queried position.
+#[test]
+fn hover_location_precedes_markup() {
+    let root = tmp_root("hover");
+    std::fs::write(root.join("a.rs"), "x\naé𝄞b\n").unwrap();
+    let serve = |mut reader: BufReader<Box<dyn Read + Send>>, mut writer: Box<dyn Write + Send>| {
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            match msg {
+                rpc::RpcMsg::Request { id, method, params } => {
+                    let reply = match method.as_str() {
+                        "initialize" => rpc::response(
+                            &id,
+                            json!({ "capabilities": {
+                                "positionEncoding": "utf-16",
+                                "hoverProvider": true,
+                            } }),
+                        ),
+                        "shutdown" => rpc::response(&id, Value::Null),
+                        "textDocument/hover" if params["position"]["line"] == 1 => rpc::response(
+                            &id,
+                            json!({
+                                "contents": { "kind": "markdown", "value": "**é**" },
+                                "range": { "start": { "line": 1, "character": 1 },
+                                           "end": { "line": 1, "character": 2 } },
+                            }),
+                        ),
+                        "textDocument/hover" => {
+                            rpc::response(&id, json!({ "contents": "plain x" }))
+                        }
+                        _ => rpc::error_response(&id, -32601, "unhandled in fake"),
+                    };
+                    let _ = rpc::write_msg(writer.as_mut(), &reply);
+                }
+                rpc::RpcMsg::Notification { method, .. } => {
+                    if method == "exit" {
+                        return;
+                    }
+                }
+                rpc::RpcMsg::Response { .. } => {}
+            }
+        }
+    };
+    let backend = testutil::pipe_backend(test_spec(), root.clone(), test_budgets(), serve);
+    wait_ready(&backend);
+    let att = attach(&root, &backend, 0, dummy_sink());
+
+    let (sink, rx) = collector();
+    run_query(&att, 5, LSP_QUERY_HOVER, 0, 1, 1, "a.rs", "", &sink);
+    let records = wait_for(&rx, |msg| {
+        query_response(msg)
+            .filter(|r| r.nonce == 5)
+            .map(|r| r.records)
+    });
+    match &query_records(&records).collect::<Vec<_>>()[..] {
+        [
+            QueryRecord::Location {
+                line,
+                column,
+                end_line,
+                end_column,
+                path,
+                ..
+            },
+            QueryRecord::Markup { markdown, text },
+        ] => {
+            assert_eq!((*line, *column, *end_line, *end_column), (1, 1, 1, 3));
+            assert_eq!(path, &root.join("a.rs"));
+            assert!(*markdown);
+            assert_eq!(text, "**é**");
+        }
+        other => panic!("unexpected ranged hover records: {other:?}"),
+    }
+
+    let (sink, rx) = collector();
+    run_query(&att, 6, LSP_QUERY_HOVER, 0, 0, 0, "a.rs", "", &sink);
+    let records = wait_for(&rx, |msg| {
+        query_response(msg)
+            .filter(|r| r.nonce == 6)
+            .map(|r| r.records)
+    });
+    match &query_records(&records).collect::<Vec<_>>()[..] {
+        [
+            QueryRecord::Location {
+                line,
+                column,
+                end_line,
+                end_column,
+                ..
+            },
+            QueryRecord::Markup { text, .. },
+        ] => {
+            assert_eq!((*line, *column, *end_line, *end_column), (0, 0, 0, 0));
+            assert_eq!(text, "plain x");
+        }
+        other => panic!("unexpected rangeless hover records: {other:?}"),
+    }
+}
+
 /// yas advertises `definition.linkSupport`, so rust-analyzer and gopls
 /// answer with `LocationLink[]` (`targetUri` + `targetSelectionRange`,
 /// with `targetRange` the fallback) rather than plain `Location[]`. That
