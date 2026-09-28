@@ -296,6 +296,14 @@ yas-client = { path = "../yas/crates/client" }
 tokio = { version = "1", features = ["full"] }
 ```
 
+Its TLS (`wss://`, TURN), QUIC (`wt://`) and uplink crypto run on ring by
+default. A program built on aws-lc-rs, rustls's own default, keeps ring out of
+its binary with
+`default-features = false, features = ["aws-lc-rs"]`. The TLS clients YAS
+makes use the program's process-wide rustls provider when it installed one
+(`CryptoProvider::install_default`), else the feature's (aws-lc-rs when both
+are on), so they don't panic in a program that has both.
+
 `Client::connect(target, &ConnectOptions)` accepts every target the CLI does
 (`local[:NAME]`, `socket:PATH`, `ssh:[USER@]HOST`, `tcp:`, `ws(s)://`,
 `wt://`, `uplink:`, `share:`, remote names); `Client::from_stream` speaks YAS

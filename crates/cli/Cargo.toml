@@ -21,7 +21,7 @@ x264 = ["yas-server/x264"]
 openh264 = ["yas-server/openh264"]
 
 [dependencies]
-yas-client = { workspace = true }
+yas-client = { workspace = true, features = ["ring"] }
 yas-wire = { workspace = true }
 yas-webserver = { workspace = true }
 tokio = { version = "1", features = ["full"] }
@@ -37,10 +37,10 @@ serde = { version = "1", features = ["derive"] }
 time = { version = "0.3", features = ["formatting"] }
 yas-server = { workspace = true }
 yas-edge = { workspace = true }
-yas-proxy = { workspace = true }
-yas-webrtc-forwarder = { workspace = true }
+yas-proxy = { workspace = true, features = ["ring"] }
+yas-webrtc-forwarder = { workspace = true, features = ["ring"] }
 yas-composite-transport = { workspace = true }
-yas-uplink = { workspace = true }
+yas-uplink = { workspace = true, features = ["ring"] }
 yas-ssh = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

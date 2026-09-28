@@ -7,11 +7,26 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["ring"]
+# The crypto provider for handshake randomness and datagram keys (HKDF,
+# AES-256-GCM): one of them is needed. With both, aws-lc-rs is used. The Noise
+# handshake uses ring's AES-GCM and SHA-256 with `ring`, and snow's own
+# (wire-compatible) Rust implementations otherwise.
+ring = ["dep:ring", "snow/ring-accelerated"]
+aws-lc-rs = ["dep:aws-lc-rs"]
+
 [dependencies]
 base64 = "0.23"
-ring = "0.17"
+ring = { version = "0.17", optional = true }
+aws-lc-rs = { version = "1.18", optional = true, default-features = false, features = [
+    "aws-lc-sys",
+    "prebuilt-nasm",
+] }
 zeroize = "1"
-snow = { version = "0.10", features = ["ring-accelerated"] }
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver-crypto",
+] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 tokio = { version = "1", features = ["io-util", "time"] }
 

@@ -844,30 +844,6 @@ async fn tcp_relay_task(
     }
 }
 
-// --- Cached TLS config ---
-
-/// Returns a shared `ClientConfig` with system root certs, built once and
-/// cached for the lifetime of the process.  Avoids re-parsing PEM root
-/// certificates (and the base64 + memmove overhead that entails) on every
-/// TURN-over-TLS allocation.
-fn cached_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
-    use std::sync::OnceLock;
-    static TLS_CONFIG: OnceLock<std::sync::Arc<rustls::ClientConfig>> = OnceLock::new();
-    TLS_CONFIG
-        .get_or_init(|| {
-            let mut root_store = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs().certs {
-                root_store.add(cert).ok();
-            }
-            std::sync::Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            )
-        })
-        .clone()
-}
-
 // --- Public TurnRelay ---
 
 pub struct TurnRelay {
@@ -920,7 +896,7 @@ impl TurnRelay {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let tcp = tokio::net::TcpStream::connect(server_addr).await?;
         let io = if tls {
-            let connector = tokio_rustls::TlsConnector::from(cached_tls_config());
+            let connector = tokio_rustls::TlsConnector::from(crate::tls::client_config());
             let server_name = rustls::pki_types::ServerName::try_from(hostname.to_owned())?;
             let tls_stream = connector.connect(server_name, tcp).await?;
             TcpIo::Tls(Box::new(tls_stream))

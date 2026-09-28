@@ -1055,9 +1055,14 @@ async fn connect_ws_mode(
             .max_message_size(Some(64 * 1024))
             .max_frame_size(Some(64 * 1024))
     });
-    let (mut ws, response) = tokio_tungstenite::connect_async_with_config(request, config, false)
-        .await
-        .map_err(|e| format!("{uri}: {e}"))?;
+    let (mut ws, response) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        config,
+        false,
+        Some(yas_webrtc_forwarder::tls::websocket_connector()),
+    )
+    .await
+    .map_err(|e| format!("{uri}: {e}"))?;
     if mode == WsMode::Yas
         && response
             .headers()
@@ -1110,29 +1115,114 @@ async fn connect_wt(
         .map(|(connection, _)| connection)
 }
 
+/// A WebTransport client as web-transport-quinn's `ClientBuilder` makes one
+/// (TLS 1.3, ALPN h3, quinn's transport defaults, a fresh UDP socket), on
+/// YAS's rustls provider rather than the builder's own choice, which panics in
+/// a program with both providers compiled in and no process-wide default.
+/// With `cert_hash`, the server's certificate is the one with that SHA-256
+/// (an edge's self-signed one); otherwise the platform's roots vouch for it.
+fn wt_client(cert_hash: Option<&[u8]>) -> Result<web_transport_quinn::Client, String> {
+    use web_transport_quinn as wt;
+
+    let provider = yas_webrtc_forwarder::tls::provider();
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("wt: tls: {e}"))?;
+    let mut crypto = match cert_hash {
+        Some(hash) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(CertificateHash {
+                provider,
+                hash: hash.to_vec(),
+            }))
+            .with_no_client_auth(),
+        None => builder
+            .with_root_certificates(yas_webrtc_forwarder::tls::native_roots())
+            .with_no_client_auth(),
+    };
+    crypto.alpn_protocols = vec![wt::ALPN.as_bytes().to_vec()];
+    let crypto = wt::quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .map_err(|e| format!("wt: quic: {e}"))?;
+    let config = wt::quinn::ClientConfig::new(Arc::new(crypto));
+    let endpoint = wt::quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+        .map_err(|e| format!("wt: udp socket: {e}"))?;
+    Ok(wt::Client::new(endpoint, config))
+}
+
+/// Accepts exactly the certificate whose SHA-256 is `hash`, as
+/// web-transport-quinn's `with_server_certificate_hashes` does: the
+/// handshake's signatures are still checked, with the certificate's key.
+#[derive(Debug)]
+struct CertificateHash {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    hash: Vec<u8>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CertificateHash {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if web_transport_quinn::crypto::sha256(&self.provider, end_entity).as_ref() == self.hash {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 async fn connect_wt_with_session(
     rest: &str,
     passphrase: Option<&str>,
     cert_hash: &Option<Vec<u8>>,
 ) -> Result<(UpstreamConn, web_transport_quinn::Session), String> {
-    use web_transport_quinn as wt;
-
     // Build the URL for the WT session (must use https: scheme).
     let (host, port) = parse_wt_host_port(rest)?;
     let url: url::Url = format!("https://{host}:{port}/")
         .parse()
         .map_err(|e| format!("wt: url: {e}"))?;
 
-    // Build the client with appropriate certificate verification.
-    let client: wt::Client = if let Some(hash) = cert_hash {
-        wt::ClientBuilder::new()
-            .with_server_certificate_hashes(vec![hash.clone()])
-            .map_err(|e| format!("wt: client build: {e}"))?
-    } else {
-        wt::ClientBuilder::new()
-            .with_system_roots()
-            .map_err(|e| format!("wt: client build: {e}"))?
-    };
+    let client = wt_client(cert_hash.as_deref())?;
 
     let session = client
         .connect(url)
@@ -1952,9 +2042,8 @@ pub fn run(verbose: bool) {
         .build()
         .expect("yas-proxy: tokio runtime")
         .block_on(async move {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .ok(); // may already be installed by the CLI's runtime
+            // The build's provider, unless the CLI's runtime installed one.
+            yas_webrtc_forwarder::tls::install_default_provider();
 
             let activity = Activity::new();
             let share_pool = Arc::new(ShareSessionPool::default());
@@ -2599,5 +2688,82 @@ mod tests {
         let mut bytes = [0; 8];
         peer.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"datagram");
+    }
+
+    /// A WebTransport server with a self-signed certificate, as an edge's, on
+    /// the build's provider; it answers the passphrase handshake with 1 for
+    /// "secret".
+    async fn self_signed_wt_server() -> (u16, Vec<u8>) {
+        use web_transport_quinn as wt;
+        let provider = yas_webrtc_forwarder::tls::provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key.into())
+            .unwrap();
+        tls.alpn_protocols = vec![wt::ALPN.as_bytes().to_vec()];
+        let quic = wt::quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let endpoint = wt::quinn::Endpoint::server(
+            wt::quinn::ServerConfig::with_crypto(Arc::new(quic)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        let mut server = wt::Server::new(endpoint);
+        tokio::spawn(async move {
+            while let Some(request) = server.accept().await {
+                tokio::spawn(async move {
+                    let Ok(session) = request.ok().await else {
+                        return;
+                    };
+                    let Ok((mut send, mut recv)) = session.accept_bi().await else {
+                        return;
+                    };
+                    let mut length = [0; 2];
+                    recv.read_exact(&mut length).await.unwrap();
+                    let mut passphrase = vec![0; u16::from_le_bytes(length) as usize];
+                    recv.read_exact(&mut passphrase).await.unwrap();
+                    send.write_all(&[u8::from(passphrase == b"secret")])
+                        .await
+                        .unwrap();
+                    session.closed().await;
+                });
+            }
+        });
+        let hash = wt::crypto::sha256(&provider, cert.cert.der())
+            .as_ref()
+            .to_vec();
+        (port, hash)
+    }
+
+    #[tokio::test]
+    async fn wt_connects_to_the_certificate_with_the_pinned_hash_only() {
+        let (port, hash) = self_signed_wt_server().await;
+        let rest = format!("127.0.0.1:{port}");
+
+        connect_wt(&rest, Some("secret"), &Some(hash.clone()))
+            .await
+            .expect("the pinned certificate");
+        let error = connect_wt(&rest, Some("wrong"), &Some(hash.clone()))
+            .await
+            .err()
+            .expect("the passphrase is checked");
+        assert!(error.contains("auth rejected"), "{error}");
+
+        let mut other = hash.clone();
+        other[0] ^= 1;
+        let error = connect_wt(&rest, Some("secret"), &Some(other))
+            .await
+            .err()
+            .expect("another certificate's hash");
+        assert!(error.contains("wt: connect"), "{error}");
+        let error = connect_wt(&rest, Some("secret"), &None)
+            .await
+            .err()
+            .expect("the platform's roots don't vouch for a self-signed certificate");
+        assert!(error.contains("wt: connect"), "{error}");
     }
 }

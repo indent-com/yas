@@ -30,7 +30,7 @@ yas-lsp = { workspace = true }
 yas-terminal-driver = { workspace = true }
 yas-terminal-model = { workspace = true }
 yas-fonts = { workspace = true }
-yas-proxy = { workspace = true }
+yas-proxy = { workspace = true, features = ["ring"] }
 yas-webserver = { workspace = true }
 yas-wire = { workspace = true }
 yas-compositor = { workspace = true }

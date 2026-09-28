@@ -8327,6 +8327,7 @@ dependencies = [
  "futures-util",
  "libc",
  "rand 0.10.2",
+ "rcgen",
  "reqwest",
  "rustls",
  "rustls-native-certs",
@@ -8451,6 +8452,7 @@ dependencies = [
 name = "yas-uplink"
 version = "0.3.1"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
  "ring",
  "serde_json",

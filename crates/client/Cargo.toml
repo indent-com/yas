@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["ring"]
+# The crypto provider for TLS (`wss://`, TURN), QUIC (`wt://`) and the uplink:
+# one of them is needed. `default-features = false, features = ["aws-lc-rs"]`
+# keeps ring out of a program that uses aws-lc-rs. With both, aws-lc-rs is used
+# unless the program installed a process-wide rustls default.
+ring = ["yas-proxy/ring", "yas-webrtc-forwarder/ring"]
+aws-lc-rs = ["yas-proxy/aws-lc-rs", "yas-webrtc-forwarder/aws-lc-rs"]
+
 [dependencies]
 yas-wire = { workspace = true }
 yas-proxy = { workspace = true }
@@ -19,7 +28,7 @@ rand = "0.10"
 blake3 = { version = "1", default-features = false, features = ["std"] }
 bytes = "1"
 url = "2"
-web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.12", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 tempfile = "3"

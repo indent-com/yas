@@ -13,6 +13,7 @@ pub mod ice;
 mod peer;
 pub use peer::{BoxedRead, BoxedWrite};
 pub mod signaling;
+pub mod tls;
 pub mod turn;
 
 use ed25519_dalek::SigningKey;

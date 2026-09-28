@@ -570,8 +570,13 @@ async fn setup_rtc(
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_SIGNAL_TEXT_BYTES))
         .max_frame_size(Some(MAX_SIGNAL_TEXT_BYTES));
-    let (ws, _) =
-        tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
+    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+        &ws_url,
+        Some(ws_config),
+        false,
+        Some(crate::tls::websocket_connector()),
+    )
+    .await?;
     let (mut ws_write, mut ws_read) = ws.split();
 
     let _my_session_id = loop {
