@@ -236,7 +236,8 @@ server's own KV store — see below.
 attached backend workspace; they are never transferred by the edge.
 
 Special key: `yas.target = <uri-or-name>` — sets the default for non-browser
-CLI commands. Browsers discover Relay routes from the home server and keep the
+CLI commands. A name is resolved against the home server's catalogue (below)
+on each connection. Browsers discover Relay routes from the home server and keep the
 active route set in the attached backend workspace.
 
 ### The Relay catalogue — the `remotes` KV key
@@ -252,11 +253,15 @@ two catalogues rather than one shared home-directory file; and KV already has
 watching, compare-and-swap and a client-facing family, so editing a remote
 needed no transport of its own.
 
-Managed with `yas remote add/remove/toggle/list`, which now reach the target
-server rather than this machine's home directory — `yas --on dev remote add`
-edits `dev`'s catalogue — and from the browser's Remotes panel. A server that
+Managed with `yas remote add/remove/toggle/list`, which now reach a server
+rather than this machine's home directory: the home server by default (not
+`yas.target`), or the `--on` server, so `yas --on dev remote add` edits `dev`'s
+catalogue. Also managed from the browser's Remotes panel. A server that
 finds no `remotes` key at startup imports a pre-KV `yas.remotes` file once, if
-there is one.
+there is one. The CLI resolves a bare target name (`--on NAME`, `YAS_TARGET`,
+`yas.target`) by reading this key from the home server (`YAS_SOCK`, else the
+default local instance) and dialing the stored URI itself; it no longer reads
+the file.
 
 **The stored URIs carry credentials, and every client of the server can read
 them**: a `share:` passphrase, an `ssh:` host reference. That is the trade for
@@ -318,7 +323,7 @@ All yas components share a common URI vocabulary for addressing yas server insta
 | `share:passphrase`          | CLI, `yas.remotes`            | Native read-only WebRTC share             |
 | `share:passphrase?hub=URL`  | `yas.remotes`                 | WebRTC via custom hub URL                 |
 | `proxy:uri`                 | CLI (`--on`)                  | Explicitly route through yas proxy-daemon |
-| `name`                      | CLI (`--on`), yas.conf        | Named remote from yas.remotes             |
+| `name`                      | CLI (`--on`), yas.conf        | Named remote on the home server           |
 
 Set `YAS_PROXY=0` to bypass proxy routing and connect directly for `ssh:`,
 `tcp:`, `ws:`, `wss:`, and `wt:` URIs.
