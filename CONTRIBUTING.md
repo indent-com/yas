@@ -280,11 +280,12 @@ Most Rust crates are one or two source files. The CLI crate (`yas-cli`) is split
 | `crates/compositor/src/render.rs`          | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer               |
 | `crates/compositor/src/vulkan_render.rs`   | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                       |
 | `crates/webrtc-forwarder/src/`             | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                 |
-| `crates/cli/src/yas_*.rs`                  | Typed native family clients used by terminal, surface, FS, Git, LSP, KV, and other CLI commands                   |
+| `crates/cli/src/yas_*.rs`                  | CLI commands over the native session (`yas_native.rs` re-exports `yas_client::native`)                            |
 | `crates/cli/src/main.rs`                   | Dispatch, embedded server/edge                                                                                    |
 | `crates/cli/src/cli.rs`                    | Clap struct definitions                                                                                           |
 | `crates/cli/src/interactive.rs`            | Browser mode                                                                                                      |
-| `crates/cli/src/transport.rs`              | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                       |
+| `crates/cli/src/transport.rs`              | CLI connect policy (current executable, `YAS_PROXY`) over `yas_client::transport`                                 |
+| `crates/client/src/`                       | `yas-client`: transports, native session, concurrent `Client`, Process/FS/KV/Env APIs, hosted servers             |
 | `crates/cli/src/yas_net.rs`                | Native YAS Net/Transfer client shared by `forward` and `socks`                                                    |
 | `crates/cli/src/forward.rs`                | `yas forward`: spec grammar, TCP/UDP/TLS listeners, `yas.forwards`                                                |
 | `crates/cli/src/socks.rs`                  | `yas socks`: SOCKS5 CONNECT proxy over the relay                                                                  |

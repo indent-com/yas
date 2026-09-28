@@ -17,7 +17,7 @@ const RECEIVE_WINDOW: u64 = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(31);
 
 pub(super) async fn connect(on: Option<&str>, hub: &str) -> Result<MessageChannel, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let listener = client
         .snapshot(family::CHANNEL)
         .await?

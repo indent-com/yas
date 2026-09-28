@@ -178,6 +178,45 @@ pub(crate) enum Error {
     Io(String),
     Closed,
     Internal,
+    /// An error caused by an OS error, with its errno and operation. Match on
+    /// [`Error::kind`], never on this variant's absence.
+    Os(Box<OsFailure>),
+}
+
+/// The family error an OS error maps to, and that OS error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OsFailure {
+    pub(crate) error: Error,
+    pub(crate) os: wire::OsError,
+}
+
+impl Error {
+    /// The error as the family maps it, without OS detail. Every status
+    /// mapping and `match` uses this, so OS detail never changes behaviour.
+    pub(crate) fn kind(&self) -> &Self {
+        match self {
+            Self::Os(failure) => &failure.error,
+            error => error,
+        }
+    }
+
+    /// The OS error behind this error, if it came from one.
+    pub(crate) fn os_error(&self) -> Option<&wire::OsError> {
+        match self {
+            Self::Os(failure) => Some(&failure.os),
+            _ => None,
+        }
+    }
+
+    fn with_os(self, os: wire::OsError) -> Self {
+        match self {
+            Self::Os(mut failure) => {
+                failure.os = os;
+                Self::Os(failure)
+            }
+            error => Self::Os(Box::new(OsFailure { error, os })),
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -194,6 +233,7 @@ impl std::fmt::Display for Error {
             Self::Io(detail) => formatter.write_str(detail),
             Self::Closed => formatter.write_str("filesystem session is closed"),
             Self::Internal => formatter.write_str("filesystem internal error"),
+            Self::Os(failure) => failure.error.fmt(formatter),
         }
     }
 }
@@ -263,7 +303,7 @@ impl Runtime {
             return Ok(root);
         }
         let handle = next_nonzero(&self.inner.next_root).ok_or(Error::ResourceExhausted)?;
-        let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
+        let metadata = fs::symlink_metadata(&path).map_err(os_io("lstat"))?;
         let root = Arc::new(Root {
             handle,
             canonical_path: os_path_bytes(&path),
@@ -359,7 +399,7 @@ impl Session {
         path: &wire::Path,
     ) -> Result<PathBuf, Error> {
         let opened = self.opened(root_handle)?;
-        confined_existing(&opened.root, path, true)
+        confined_existing(&opened.root, path, true, "open")
     }
 
     pub(crate) async fn watch(&self, request: &wire::Watch) -> Result<Watch, Error> {
@@ -473,26 +513,9 @@ impl Session {
         let root = opened.root;
         let path = request.path.clone();
         let expected_hash = request.expected_hash;
-        tokio::task::spawn_blocking(move || {
-            // Follow the final link. A caller asking for a path's content
-            // means the file, not the sixty bytes of text that say where the
-            // file is — and the mirror already reports a symlink as a symlink,
-            // with its target, so nothing needs this to answer that question.
-            // A target outside the root is still refused, as everywhere else.
-            let absolute = confined_existing(&root, &path, true)?;
-            let (bytes, modified_unix_ns) = read_content_bounded(&absolute, MAX_FETCH_BYTES, true)?;
-            let content_hash = *blake3::hash(&bytes).as_bytes();
-            if expected_hash.is_some_and(|expected| expected != content_hash) {
-                return Err(conflict_for(&root, &path));
-            }
-            Ok(FileContent {
-                bytes,
-                content_hash,
-                modified_unix_ns,
-            })
-        })
-        .await
-        .map_err(|_| Error::Internal)?
+        tokio::task::spawn_blocking(move || fetch_content(&root, &path, expected_hash))
+            .await
+            .map_err(|_| Error::Internal)?
     }
 
     pub(crate) async fn read(&self, request: &wire::Read) -> Result<QueryData, Error> {
@@ -536,6 +559,9 @@ impl Session {
         if opened.read_only {
             return Err(Error::Permission);
         }
+        if request.in_place() && request.flags & schema::fs::STAGE_CREATE_PARENTS as u16 != 0 {
+            return Err(Error::Invalid("FS STAGE_IN_PLACE with CREATE_PARENTS"));
+        }
         let mut stages = self.inner.stages.lock().unwrap();
         if stages.len() >= wire::Limits::HARD.max_stages_per_session as usize
             || stages
@@ -551,14 +577,14 @@ impl Session {
         let staging_handle =
             next_nonzero(&self.inner.next_stage).ok_or(Error::ResourceExhausted)?;
         let directory = self.staging_root()?.join("uploads");
-        fs::create_dir_all(&directory).map_err(map_io)?;
+        fs::create_dir_all(&directory).map_err(os_io("mkdir"))?;
         set_private_directory(&directory)?;
         let temp_path = unique_temp_path(&directory, "upload")?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
-            .map_err(map_io)?;
+            .map_err(os_io("open"))?;
         stages.insert(
             staging_handle,
             Stage {
@@ -605,7 +631,7 @@ impl Session {
             .as_mut()
             .ok_or(Error::Closed)?
             .write_all(data)
-            .map_err(map_io)?;
+            .map_err(os_io("write"))?;
         stage.hasher.update(data);
         stage.received = next;
         Ok(next)
@@ -626,7 +652,7 @@ impl Session {
             return Err(Error::Conflict(conflict_detail(&stage.root, &stage.path)));
         }
         if let Some(mut file) = stage.file.take() {
-            file.flush().map_err(map_io)?;
+            file.flush().map_err(os_io("write"))?;
         }
         stage.sealed = true;
         Ok(())
@@ -755,7 +781,7 @@ impl Session {
                     return Ok(path);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(map_io(error)),
+                Err(error) => return Err(os_io("mkdir")(error)),
             }
         }
         Err(Error::ResourceExhausted)
@@ -909,8 +935,181 @@ fn map_io(error: io::Error) -> Error {
     }
 }
 
+/// Map an OS error as `map_io` does and keep its errno and `operation`.
+fn os_io(operation: &'static str) -> impl Fn(io::Error) -> Error {
+    move |error| {
+        let os = error.raw_os_error().map(|code| os_error(code, operation));
+        let mapped = map_io(error);
+        match os {
+            Some(os) => mapped.with_os(os),
+            None => mapped,
+        }
+    }
+}
+
+fn os_error(code: i32, operation: &'static str) -> wire::OsError {
+    wire::OsError {
+        code,
+        name: errno_name(code, operation).to_owned(),
+        operation: operation.to_owned(),
+    }
+}
+
+/// Symbolic names of the common OS errors, first name first where two share
+/// a number (`ENOTSUP` and `EOPNOTSUPP` on Linux).
+#[cfg(unix)]
+const ERRNO_NAMES: &[(i32, &str)] = &[
+    (libc::EPERM, "EPERM"),
+    (libc::ENOENT, "ENOENT"),
+    (libc::ESRCH, "ESRCH"),
+    (libc::EINTR, "EINTR"),
+    (libc::EIO, "EIO"),
+    (libc::ENXIO, "ENXIO"),
+    (libc::E2BIG, "E2BIG"),
+    (libc::ENOEXEC, "ENOEXEC"),
+    (libc::EBADF, "EBADF"),
+    (libc::ECHILD, "ECHILD"),
+    (libc::EAGAIN, "EAGAIN"),
+    (libc::ENOMEM, "ENOMEM"),
+    (libc::EACCES, "EACCES"),
+    (libc::EFAULT, "EFAULT"),
+    (libc::EBUSY, "EBUSY"),
+    (libc::EEXIST, "EEXIST"),
+    (libc::EXDEV, "EXDEV"),
+    (libc::ENODEV, "ENODEV"),
+    (libc::ENOTDIR, "ENOTDIR"),
+    (libc::EISDIR, "EISDIR"),
+    (libc::EINVAL, "EINVAL"),
+    (libc::ENFILE, "ENFILE"),
+    (libc::EMFILE, "EMFILE"),
+    (libc::ENOTTY, "ENOTTY"),
+    (libc::ETXTBSY, "ETXTBSY"),
+    (libc::EFBIG, "EFBIG"),
+    (libc::ENOSPC, "ENOSPC"),
+    (libc::ESPIPE, "ESPIPE"),
+    (libc::EROFS, "EROFS"),
+    (libc::EMLINK, "EMLINK"),
+    (libc::EPIPE, "EPIPE"),
+    (libc::EDOM, "EDOM"),
+    (libc::ERANGE, "ERANGE"),
+    (libc::EDEADLK, "EDEADLK"),
+    (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+    (libc::ENOLCK, "ENOLCK"),
+    (libc::ENOSYS, "ENOSYS"),
+    (libc::ENOTEMPTY, "ENOTEMPTY"),
+    (libc::ELOOP, "ELOOP"),
+    (libc::EWOULDBLOCK, "EWOULDBLOCK"),
+    (libc::ENOTSUP, "ENOTSUP"),
+    (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+    (libc::EOVERFLOW, "EOVERFLOW"),
+    (libc::ECANCELED, "ECANCELED"),
+    (libc::EILSEQ, "EILSEQ"),
+    (libc::EDQUOT, "EDQUOT"),
+    (libc::ESTALE, "ESTALE"),
+    (libc::ETIMEDOUT, "ETIMEDOUT"),
+    (libc::ECONNREFUSED, "ECONNREFUSED"),
+    (libc::ECONNRESET, "ECONNRESET"),
+    (libc::EADDRINUSE, "EADDRINUSE"),
+    (libc::ENOTCONN, "ENOTCONN"),
+];
+
+#[cfg(unix)]
+fn errno_name(code: i32, _operation: &str) -> &'static str {
+    ERRNO_NAMES
+        .iter()
+        .find(|(value, _)| *value == code)
+        .map_or("UNKNOWN", |(_, name)| name)
+}
+
+#[cfg(windows)]
+fn errno_name(code: i32, operation: &str) -> &'static str {
+    win32_errno_name(code, operation).unwrap_or("UNKNOWN")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn errno_name(_code: i32, _operation: &str) -> &'static str {
+    "UNKNOWN"
+}
+
+/// The name libuv gives a Win32 or Winsock error code (`uv_translate_sys_error`),
+/// so the one Node reports for it; a Windows server keeps the code itself.
+/// `ERROR_DIRECTORY` is ENOTDIR while listing a directory, as libuv's scandir
+/// and opendir say, and ENOENT otherwise. `ERROR_INVALID_FUNCTION` is EISDIR:
+/// reading a directory's handle fails with it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win32_errno_name(code: i32, operation: &str) -> Option<&'static str> {
+    Some(match code {
+        1 => "EISDIR",
+        267 if operation == "readdir" => "ENOTDIR",
+        2 | 3 | 15 | 123 | 126 | 161 | 203 | 267 | 4392 | 11001 | 11004 => "ENOENT",
+        4 | 10024 => "EMFILE",
+        5 | 1314 => "EPERM",
+        6 | 1004 => "EBADF",
+        8 | 14 => "ENOMEM",
+        13 | 87 | 122 | 1464 | 10022 | 10046 => "EINVAL",
+        17 => "EXDEV",
+        19 => "EROFS",
+        23 | 31 | 110 | 156 | 205 | 1101 | 1102 | 1103 | 1104 | 1106 | 1111 | 1117 | 1129
+        | 1165 | 1166 | 1393 => "EIO",
+        32 | 33 | 231 => "EBUSY",
+        39 | 82 | 112 | 277 | 1100 => "ENOSPC",
+        50 => "ENOTSUP",
+        64 | 10054 => "ECONNRESET",
+        80 | 183 => "EEXIST",
+        109 => "EOF",
+        111 | 206 => "ENAMETOOLONG",
+        121 | 10060 => "ETIMEDOUT",
+        145 => "ENOTEMPTY",
+        193 => "EFTYPE",
+        208 => "E2BIG",
+        230 | 233 | 10058 => "EPIPE",
+        232 | 10035 => "EAGAIN",
+        740 | 1920 | 10013 => "EACCES",
+        995 | 10004 => "ECANCELED",
+        998 | 10014 => "EFAULT",
+        1113 => "ECHARSET",
+        1921 => "ELOOP",
+        1225 | 10061 => "ECONNREFUSED",
+        1227 | 10048 => "EADDRINUSE",
+        1231 | 10051 => "ENETUNREACH",
+        1232 | 10065 => "EHOSTUNREACH",
+        1236 | 10053 => "ECONNABORTED",
+        2250 | 10057 => "ENOTCONN",
+        10037 => "EALREADY",
+        10038 => "ENOTSOCK",
+        10040 => "EMSGSIZE",
+        10043 => "EPROTONOSUPPORT",
+        10044 => "ESOCKTNOSUPPORT",
+        10047 => "EAFNOSUPPORT",
+        10049 => "EADDRNOTAVAIL",
+        10055 => "ENOBUFS",
+        10056 => "EISCONN",
+        _ => return None,
+    })
+}
+
+/// The OS error of a directory read, or opened for writing, when the server
+/// finds it is one before any system call fails: EISDIR on POSIX, and on
+/// Windows `ERROR_INVALID_FUNCTION`, what ReadFile of a directory fails with
+/// (EISDIR by its name).
+#[cfg(unix)]
+const EISDIR: Option<i32> = Some(libc::EISDIR);
+#[cfg(windows)]
+const EISDIR: Option<i32> = Some(1);
+#[cfg(not(any(unix, windows)))]
+const EISDIR: Option<i32> = None;
+
+/// Attach the OS error a check made without a system call stands for (a
+/// directory read or opened for writing is EISDIR on POSIX).
+fn synthetic_os(error: Error, code: Option<i32>, operation: &'static str) -> Error {
+    match code {
+        Some(code) => error.with_os(os_error(code, operation)),
+        None => error,
+    }
+}
+
 fn canonical_root(path: PathBuf) -> Result<PathBuf, Error> {
-    let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
+    let metadata = fs::symlink_metadata(&path).map_err(os_io("lstat"))?;
     if metadata.file_type().is_symlink() {
         let parent = path
             .parent()
@@ -918,9 +1117,11 @@ fn canonical_root(path: PathBuf) -> Result<PathBuf, Error> {
         let name = path
             .file_name()
             .ok_or(Error::Invalid("FS symlink root has no name"))?;
-        return Ok(fs::canonicalize(parent).map_err(map_io)?.join(name));
+        return Ok(fs::canonicalize(parent)
+            .map_err(os_io("realpath"))?
+            .join(name));
     }
-    fs::canonicalize(path).map_err(map_io)
+    fs::canonicalize(path).map_err(os_io("realpath"))
 }
 
 #[cfg(unix)]
@@ -1058,11 +1259,14 @@ fn joined_path(root: &Root, relative: &wire::Path) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-/// Confine an existing target without following the final symlink.
+/// Confine an existing target, following the final symlink only when asked.
+/// OS errors carry `operation`: the operation the request performs, which
+/// is what an OS error resolving its path means to the caller.
 fn confined_existing(
     root: &Root,
     relative: &wire::Path,
     follow_final: bool,
+    operation: &'static str,
 ) -> Result<PathBuf, Error> {
     let target = joined_path(root, relative)?;
     if target == root.path {
@@ -1071,13 +1275,13 @@ fn confined_existing(
     let parent = target
         .parent()
         .ok_or(Error::Invalid("FS target has no parent"))?;
-    let parent = fs::canonicalize(parent).map_err(map_io)?;
+    let parent = fs::canonicalize(parent).map_err(os_io(operation))?;
     if !parent.starts_with(&root.path) {
         return Err(Error::Permission);
     }
-    let metadata = fs::symlink_metadata(&target).map_err(map_io)?;
+    let metadata = fs::symlink_metadata(&target).map_err(os_io(operation))?;
     if follow_final && metadata.file_type().is_symlink() {
-        let canonical = fs::canonicalize(&target).map_err(map_io)?;
+        let canonical = fs::canonicalize(&target).map_err(os_io(operation))?;
         if !canonical.starts_with(&root.path) {
             return Err(Error::Permission);
         }
@@ -1108,8 +1312,32 @@ fn metadata_mode(_metadata: &fs::Metadata) -> u32 {
     0
 }
 
+fn fetch_content(
+    root: &Root,
+    path: &wire::Path,
+    expected_hash: Option<[u8; 32]>,
+) -> Result<FileContent, Error> {
+    // Follow the final link. A caller asking for a path's content
+    // means the file, not the sixty bytes of text that say where the
+    // file is — and the mirror already reports a symlink as a symlink,
+    // with its target, so nothing needs this to answer that question.
+    // A target outside the root is still refused, as everywhere else.
+    // OS errors resolving the path carry "open", as open(2) of it would.
+    let absolute = confined_existing(root, path, true, "open")?;
+    let (bytes, modified_unix_ns) = read_content_bounded(&absolute, MAX_FETCH_BYTES, true)?;
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    if expected_hash.is_some_and(|expected| expected != content_hash) {
+        return Err(conflict_for(root, path));
+    }
+    Ok(FileContent {
+        bytes,
+        content_hash,
+        modified_unix_ns,
+    })
+}
+
 fn read_link_bytes(path: &OsPath) -> Result<Vec<u8>, Error> {
-    let target = fs::read_link(path).map_err(map_io)?;
+    let target = fs::read_link(path).map_err(os_io("readlink"))?;
     Ok(os_path_bytes(&target))
 }
 
@@ -1123,7 +1351,7 @@ fn read_content_bounded(
     } else {
         fs::symlink_metadata(path)
     }
-    .map_err(map_io)?;
+    .map_err(os_io("open"))?;
     if metadata.file_type().is_symlink() && !follow_final {
         let bytes = read_link_bytes(path)?;
         if bytes.len() as u64 > maximum {
@@ -1132,16 +1360,21 @@ fn read_content_bounded(
         return Ok((bytes, metadata_time(&metadata)));
     }
     if !metadata.is_file() {
-        return Err(Error::Invalid("FS content target is not a file"));
+        let error = Error::Invalid("FS content target is not a file");
+        return Err(if metadata.is_dir() {
+            synthetic_os(error, EISDIR, "read")
+        } else {
+            error
+        });
     }
     if metadata.len() > maximum {
         return Err(Error::TooLarge);
     }
-    let file = File::open(path).map_err(map_io)?;
+    let file = File::open(path).map_err(os_io("open"))?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(map_io)?;
+        .map_err(os_io("read"))?;
     if bytes.len() as u64 > maximum {
         return Err(Error::TooLarge);
     }
@@ -1149,11 +1382,11 @@ fn read_content_bounded(
 }
 
 fn hash_file(path: &OsPath) -> Result<[u8; 32], Error> {
-    let mut file = File::open(path).map_err(map_io)?;
+    let mut file = File::open(path).map_err(os_io("open"))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(map_io)?;
+        let read = file.read(&mut buffer).map_err(os_io("read"))?;
         if read == 0 {
             break;
         }
@@ -1232,18 +1465,10 @@ fn observe_remove(root: &Root, path: &wire::Path) -> u64 {
     })
 }
 
-fn stat_entry(
-    root: &Root,
-    path: &wire::Path,
-    inline_max: usize,
-    include_content: bool,
-) -> Result<wire::EntryRecord, Error> {
-    let absolute = confined_existing(root, path, false)?;
-    let metadata = fs::symlink_metadata(&absolute).map_err(map_io)?;
-    let file_type = metadata.file_type();
+/// EXECUTABLE, READ_ONLY and HIDDEN, from the metadata and the name.
+fn entry_flags(path: &wire::Path, metadata: &fs::Metadata) -> u8 {
     let mut flags = 0u8;
-    let mode = metadata_mode(&metadata);
-    if mode & 0o111 != 0 {
+    if metadata_mode(metadata) & 0o111 != 0 {
         flags |= schema::fs::ENTRY_EXECUTABLE as u8;
     }
     if metadata.permissions().readonly() {
@@ -1256,6 +1481,20 @@ fn stat_entry(
     {
         flags |= schema::fs::ENTRY_HIDDEN as u8;
     }
+    flags
+}
+
+fn stat_entry(
+    root: &Root,
+    path: &wire::Path,
+    inline_max: usize,
+    include_content: bool,
+) -> Result<wire::EntryRecord, Error> {
+    let absolute = confined_existing(root, path, false, "lstat")?;
+    let metadata = fs::symlink_metadata(&absolute).map_err(os_io("lstat"))?;
+    let file_type = metadata.file_type();
+    let mut flags = entry_flags(path, &metadata);
+    let mode = metadata_mode(&metadata);
     let body = if file_type.is_file() {
         let byte_len = metadata.len();
         let content_hash = hash_file(&absolute)?;
@@ -1334,7 +1573,7 @@ fn translate_watch_event(
                         }
                         mutations.push(wire::StateMutation::Complete(entry));
                     }
-                    Err(Error::NotFound) => {
+                    Err(error) if *error.kind() == Error::NotFound => {
                         let operation_id = root.operation_echoes.lock().unwrap().remove(&path);
                         mutations.push(wire::StateMutation::Remove(wire::RemoveRecord {
                             path: path.clone(),
@@ -1428,7 +1667,7 @@ fn sync_open_error(error: sync::OpenError) -> Error {
 }
 
 fn status_for(error: &Error) -> u16 {
-    match error {
+    match error.kind() {
         Error::NotFound => schema::core::status::NOT_FOUND,
         Error::Permission => schema::core::status::IO,
         Error::Conflict(_) => schema::core::status::CONFLICT,
@@ -1437,6 +1676,7 @@ fn status_for(error: &Error) -> u16 {
         Error::Invalid(_) => schema::core::status::INVALID,
         Error::Unavailable | Error::Closed => schema::core::status::UNAVAILABLE,
         Error::Io(_) | Error::Internal => schema::core::status::INTERNAL,
+        Error::Os(failure) => status_for(&failure.error),
     }
 }
 
@@ -1456,7 +1696,14 @@ fn read_questions(root: &Root, questions: &[wire::ReadQuestion]) -> Result<Query
                 question_index: u16::try_from(index).map_err(|_| Error::TooLarge)?,
                 status: status_for(&error),
                 path: None,
-                content: Vec::new(),
+                // Only the opt-in kinds answer failures with their OS error:
+                // older clients require empty content on every failure.
+                content: match error.os_error() {
+                    Some(os) if question.answers_os_errors() => {
+                        os.encode().map_err(|_| Error::Internal)?
+                    }
+                    _ => Vec::new(),
+                },
             },
         };
         let encoded = wire::QueryRecord::Read(record.clone())
@@ -1484,8 +1731,8 @@ fn read_question(root: &Root, question: &wire::ReadQuestion) -> Result<Vec<u8>, 
             .encode()
             .map_err(|_| Error::Internal),
         kind if kind == schema::fs::READ_HASH as u16 => {
-            let absolute = confined_existing(root, &question.path, !no_follow)?;
-            let metadata = fs::symlink_metadata(&absolute).map_err(map_io)?;
+            let absolute = confined_existing(root, &question.path, !no_follow, "open")?;
+            let metadata = fs::symlink_metadata(&absolute).map_err(os_io("lstat"))?;
             let hash = if metadata.file_type().is_symlink() && no_follow {
                 *blake3::hash(&read_link_bytes(&absolute)?).as_bytes()
             } else {
@@ -1494,16 +1741,97 @@ fn read_question(root: &Root, question: &wire::ReadQuestion) -> Result<Vec<u8>, 
             Ok(hash.to_vec())
         }
         kind if kind == schema::fs::READ_LINK_TARGET as u16 => {
-            let absolute = confined_existing(root, &question.path, false)?;
+            let absolute = confined_existing(root, &question.path, false, "readlink")?;
             read_link_bytes(&absolute)
         }
         kind if kind == schema::fs::READ_CONTENT as u16 => {
-            let absolute = confined_existing(root, &question.path, !no_follow)?;
+            let absolute = confined_existing(root, &question.path, !no_follow, "open")?;
             read_content_bounded(&absolute, wire::MAX_QUERY_BYTES as u64, !no_follow)
                 .map(|value| value.0)
         }
+        kind if kind == schema::fs::READ_LIST as u16 && !no_follow => {
+            list_directory(root, &question.path)
+        }
+        kind if kind == schema::fs::READ_REALPATH as u16 && !no_follow => {
+            real_path(root, &question.path)
+        }
+        kind if kind == schema::fs::READ_STAT_ONLY as u16 => {
+            stat_only(root, &question.path, !no_follow)
+        }
         _ => Err(Error::Invalid("unknown FS READ question")),
     }
+}
+
+fn entry_kind(file_type: fs::FileType) -> u8 {
+    if file_type.is_symlink() {
+        schema::fs::ENTRY_SYMLINK as u8
+    } else if file_type.is_dir() {
+        schema::fs::ENTRY_DIRECTORY as u8
+    } else if file_type.is_file() {
+        schema::fs::ENTRY_FILE as u8
+    } else {
+        schema::fs::ENTRY_OTHER as u8
+    }
+}
+
+/// `READ_LIST`: one directory level, following a final symlink to the
+/// directory like readdir(3), each kind from the entry itself (Node Dirent).
+fn list_directory(root: &Root, path: &wire::Path) -> Result<Vec<u8>, Error> {
+    let directory = confined_existing(root, path, true, "readdir")?;
+    let mut entries = Vec::new();
+    let mut bytes = 0usize;
+    for entry in fs::read_dir(&directory).map_err(os_io("readdir"))? {
+        let entry = entry.map_err(os_io("readdir"))?;
+        // d_type, or lstat when the filesystem does not report it. An entry
+        // removed since readdir returned it is skipped, as a later readdir
+        // would not return it.
+        let kind = match entry.file_type() {
+            Ok(file_type) => entry_kind(file_type),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(os_io("lstat")(error)),
+        };
+        let entry = wire::ListEntry {
+            kind,
+            name: component_bytes(&entry.file_name()),
+        };
+        bytes = bytes.saturating_add(entry.encoded_len());
+        if bytes > wire::MAX_QUERY_BYTES {
+            return Err(Error::TooLarge);
+        }
+        entries.push(entry);
+    }
+    wire::ListEntry::encode_list(&entries).map_err(|_| Error::Internal)
+}
+
+/// `READ_REALPATH`: the canonical platform path, every symlink resolved,
+/// confined like every other path.
+fn real_path(root: &Root, path: &wire::Path) -> Result<Vec<u8>, Error> {
+    let resolved = confined_existing(root, path, true, "realpath")?;
+    let canonical = fs::canonicalize(&resolved).map_err(os_io("realpath"))?;
+    if !root.single_file && !canonical.starts_with(&root.path) {
+        return Err(Error::Permission);
+    }
+    Ok(os_path_bytes(&canonical))
+}
+
+/// `READ_STAT_ONLY`: metadata without reading or hashing content.
+fn stat_only(root: &Root, path: &wire::Path, follow: bool) -> Result<Vec<u8>, Error> {
+    let operation = if follow { "stat" } else { "lstat" };
+    let absolute = confined_existing(root, path, follow, operation)?;
+    let metadata = if follow {
+        fs::metadata(&absolute)
+    } else {
+        fs::symlink_metadata(&absolute)
+    }
+    .map_err(os_io(operation))?;
+    wire::StatOnly {
+        kind: entry_kind(metadata.file_type()),
+        mode: metadata_mode(&metadata),
+        size: metadata.len(),
+        modified_unix_ns: metadata_time(&metadata),
+    }
+    .encode()
+    .map_err(|_| Error::Internal)
 }
 
 fn decode_cursor(cursor: &[u8]) -> Result<usize, Error> {
@@ -2004,7 +2332,14 @@ fn check_precondition(
     }
 }
 
-fn mutation_target(root: &Root, path: &wire::Path, create_parents: bool) -> Result<PathBuf, Error> {
+/// Confine the target of a mutation. OS errors resolving its parent carry
+/// `operation`, the operation the mutation performs.
+fn mutation_target(
+    root: &Root,
+    path: &wire::Path,
+    create_parents: bool,
+    operation: &'static str,
+) -> Result<PathBuf, Error> {
     let target = joined_path(root, path)?;
     if target == root.path && !root.single_file {
         return Err(Error::Invalid("cannot replace an FS directory root"));
@@ -2015,7 +2350,7 @@ fn mutation_target(root: &Root, path: &wire::Path, create_parents: bool) -> Resu
     if create_parents {
         create_parents_confined(root, parent)?;
     }
-    let canonical_parent = fs::canonicalize(parent).map_err(map_io)?;
+    let canonical_parent = fs::canonicalize(parent).map_err(os_io(operation))?;
     let allowed = if root.single_file {
         root.path
             .parent()
@@ -2046,12 +2381,12 @@ fn create_parents_confined(root: &Root, parent: &OsPath) -> Result<(), Error> {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => return Err(Error::Permission),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(map_io)?;
+                fs::create_dir(&current).map_err(os_io("mkdir"))?;
             }
-            Err(error) => return Err(map_io(error)),
+            Err(error) => return Err(os_io("lstat")(error)),
         }
     }
-    let canonical = fs::canonicalize(parent).map_err(map_io)?;
+    let canonical = fs::canonicalize(parent).map_err(os_io("realpath"))?;
     if !canonical.starts_with(&root.path) {
         return Err(Error::Permission);
     }
@@ -2066,7 +2401,10 @@ fn commit_stage(
     let _mutation = MUTATION_LOCK.lock().unwrap();
     check_precondition(&stage.root, &stage.path, &stage.precondition)?;
     let create_parents = stage.flags & schema::fs::STAGE_CREATE_PARENTS as u16 != 0;
-    let target = mutation_target(&stage.root, &stage.path, create_parents)?;
+    let target = mutation_target(&stage.root, &stage.path, create_parents, "open")?;
+    if stage.flags & schema::fs::STAGE_IN_PLACE as u16 != 0 {
+        return commit_in_place(&stage, &target, operation_id, flags);
+    }
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(Error::Conflict(conflict_detail(&stage.root, &stage.path)));
     }
@@ -2100,6 +2438,134 @@ fn commit_stage(
     })
 }
 
+/// Where a write through `target` lands: `target` itself, or the file its
+/// final symlinks lead to, created there when missing as open(2) with
+/// O_CREAT would. The destination is confined like every other path.
+fn in_place_destination(root: &Root, target: &OsPath) -> Result<PathBuf, Error> {
+    let confine = |path: PathBuf| {
+        if root.single_file || path.starts_with(&root.path) {
+            Ok(path)
+        } else {
+            Err(Error::Permission)
+        }
+    };
+    let mut current = target.to_path_buf();
+    // Linux follows at most 40 links; canonicalize reports the loop below.
+    for _ in 0..40 {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&current).map_err(os_io("open"))?;
+                let parent = current
+                    .parent()
+                    .ok_or(Error::Invalid("FS target has no parent"))?;
+                current = parent.join(link);
+            }
+            Ok(_) => return confine(fs::canonicalize(&current).map_err(os_io("open"))?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = current
+                    .file_name()
+                    .ok_or(Error::Invalid("FS in-place target has no name"))?
+                    .to_owned();
+                let parent = current
+                    .parent()
+                    .ok_or(Error::Invalid("FS target has no parent"))?;
+                let parent = fs::canonicalize(parent).map_err(os_io("open"))?;
+                return confine(parent.join(name));
+            }
+            Err(error) => return Err(os_io("open")(error)),
+        }
+    }
+    Err(fs::canonicalize(target).map_or_else(os_io("open"), |_| {
+        Error::Invalid("FS in-place symlink chain is too long")
+    }))
+}
+
+/// COMMIT of a `STAGE_IN_PLACE` stage: open(2) the target write-only with
+/// O_CREAT|O_TRUNC through a final symlink and write the bytes, as Node's
+/// writeFile does. The file keeps its inode, owner and mode; no temporary
+/// file, no rename, so a failure can leave it truncated or partly written.
+fn commit_in_place(
+    stage: &Stage,
+    target: &OsPath,
+    operation_id: [u8; 16],
+    flags: u16,
+) -> Result<wire::CommitResult, Error> {
+    let destination = in_place_destination(&stage.root, target)?;
+    let is_directory = || synthetic_os(conflict_for(&stage.root, &stage.path), EISDIR, "open");
+    if fs::metadata(&destination).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(is_directory());
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if stage.mode != 0 { stage.mode } else { 0o666 });
+    }
+    let mut file = match options.open(target) {
+        Ok(file) => file,
+        // open(2) of a directory for writing (Windows says ERROR_ACCESS_DENIED).
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::EISDIR) => {
+            return Err(is_directory());
+        }
+        Err(error) => return Err(os_io("open")(error)),
+    };
+    let mut source = File::open(&stage.temp_path).map_err(os_io("open"))?;
+    io::copy(&mut source, &mut file).map_err(os_io("write"))?;
+    file.flush().map_err(os_io("write"))?;
+    if flags & schema::fs::COMMIT_SYNC_DATA as u16 != 0 {
+        file.sync_all().map_err(os_io("fsync"))?;
+    }
+    drop(file);
+    if flags & schema::fs::COMMIT_SYNC_DIRECTORY as u16 != 0
+        && let Some(parent) = destination.parent()
+    {
+        sync_directory(parent)?;
+    }
+    // Report the file written: through a symlink inside the root that is
+    // the link's destination entry, not the link.
+    let written = if stage.root.single_file {
+        stage.path.clone()
+    } else {
+        relative_path(&stage.root, &destination).unwrap_or_else(|_| stage.path.clone())
+    };
+    mark_operation(&stage.root, &written, operation_id);
+    // The bytes are known and verified, so nothing is read back: a
+    // write-only file answers as Node's writeFile would.
+    let metadata = fs::metadata(&destination).map_err(os_io("stat"))?;
+    let named =
+        fs::symlink_metadata(joined_path(&stage.root, &written)?).map_err(os_io("lstat"))?;
+    let entry_revision = if named.is_file() {
+        observe_entry(
+            &stage.root,
+            wire::EntryRecord {
+                path: written.clone(),
+                entry_revision: 1,
+                flags: entry_flags(&written, &named),
+                mode: metadata_mode(&named),
+                modified_unix_ns: metadata_time(&named),
+                body: wire::EntryBody::File {
+                    byte_len: named.len(),
+                    content_hash: stage.content_hash,
+                    inline_content: None,
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .entry_revision
+    } else {
+        // A single-file root that is itself a symlink: the link's entry.
+        stat_entry(&stage.root, &written, 0, false)?.entry_revision
+    };
+    Ok(wire::CommitResult {
+        root_revision: stage.root.revision.load(Ordering::Acquire).max(1),
+        entry_revision,
+        modified_unix_ns: metadata_time(&metadata),
+        content_hash: stage.content_hash,
+    })
+}
+
 fn apply_items(
     root: &Root,
     operation_id: [u8; 16],
@@ -2107,8 +2573,15 @@ fn apply_items(
 ) -> Result<wire::ApplyResult, Error> {
     let _mutation = MUTATION_LOCK.lock().unwrap();
     let mut results = Vec::with_capacity(items.len());
+    let mut os_errors = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let outcome = apply_one(root, operation_id, item);
+        if let Err(error) = &outcome
+            && !matches!(error.kind(), Error::Conflict(_))
+            && let Some(os) = error.os_error()
+        {
+            os_errors.push((index as u16, os.clone()));
+        }
         let result = match outcome {
             Ok(entry) => wire::ApplyItemResult {
                 index: index as u16,
@@ -2118,29 +2591,36 @@ fn apply_items(
                 content_hash: entry_hash(&entry),
                 detail: String::new(),
             },
-            Err(Error::Conflict(detail)) => wire::ApplyItemResult {
-                index: index as u16,
-                status: schema::core::status::CONFLICT,
-                entry_revision: detail.current_entry_revision,
-                modified_unix_ns: detail.modified_unix_ns,
-                content_hash: detail.current_hash,
-                detail: "filesystem precondition failed".to_owned(),
-            },
-            Err(error) => wire::ApplyItemResult {
-                index: index as u16,
-                status: status_for(&error),
-                entry_revision: 0,
-                modified_unix_ns: 0,
-                content_hash: None,
-                detail: bounded_detail(&error.to_string()),
+            Err(error) => match error.kind() {
+                Error::Conflict(detail) => wire::ApplyItemResult {
+                    index: index as u16,
+                    status: schema::core::status::CONFLICT,
+                    entry_revision: detail.current_entry_revision,
+                    modified_unix_ns: detail.modified_unix_ns,
+                    content_hash: detail.current_hash,
+                    detail: "filesystem precondition failed".to_owned(),
+                },
+                _ => wire::ApplyItemResult {
+                    index: index as u16,
+                    status: status_for(&error),
+                    entry_revision: 0,
+                    modified_unix_ns: 0,
+                    content_hash: None,
+                    detail: bounded_detail(&error.to_string()),
+                },
             },
         };
         results.push(result);
     }
+    // Optional, so clients that predate it skip it; each item's status is unchanged.
+    let extensions = match wire::ApplyResult::os_errors_extension(&os_errors) {
+        Ok(Some(extension)) => Extensions(vec![extension]),
+        _ => Extensions::default(),
+    };
     Ok(wire::ApplyResult {
         root_revision: root.revision.load(Ordering::Acquire).max(1),
         items: results,
-        extensions: Extensions::default(),
+        extensions,
     })
 }
 
@@ -2169,13 +2649,13 @@ fn apply_one(
             mode,
         } => {
             check_precondition(root, path, precondition)?;
-            let target = mutation_target(root, path, *create_parents)?;
+            let target = mutation_target(root, path, *create_parents, "mkdir")?;
             let mut builder = fs::DirBuilder::new();
             set_directory_builder_mode(&mut builder, *mode);
             match builder.create(&target) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists && target.is_dir() => {}
-                Err(error) => return Err(map_io(error)),
+                Err(error) => return Err(os_io("mkdir")(error)),
             }
             mark_operation(root, path, operation_id);
             stat_entry(root, path, 0, false)
@@ -2186,16 +2666,17 @@ fn apply_one(
             flags,
         } => {
             check_precondition(root, path, precondition)?;
-            let target = mutation_target(root, path, false)?;
-            let metadata = fs::symlink_metadata(&target).map_err(map_io)?;
+            let target = mutation_target(root, path, false, "unlink")?;
+            // Resolving the request's path is the request's operation.
+            let metadata = fs::symlink_metadata(&target).map_err(os_io("unlink"))?;
             if metadata.is_dir() {
                 if flags & schema::fs::REMOVE_RECURSIVE as u16 != 0 {
-                    fs::remove_dir_all(&target).map_err(map_io)?;
+                    fs::remove_dir_all(&target).map_err(os_io("rmdir"))?;
                 } else {
-                    fs::remove_dir(&target).map_err(map_io)?;
+                    fs::remove_dir(&target).map_err(os_io("rmdir"))?;
                 }
             } else {
-                fs::remove_file(&target).map_err(map_io)?;
+                fs::remove_file(&target).map_err(os_io("unlink"))?;
             }
             let revision = observe_remove(root, path);
             mark_operation(root, path, operation_id);
@@ -2208,9 +2689,9 @@ fn apply_one(
             create_parents,
         } => {
             check_precondition(root, from, precondition)?;
-            let source = confined_existing(root, from, false)?;
-            let target = mutation_target(root, to, *create_parents)?;
-            fs::rename(source, target).map_err(map_io)?;
+            let source = confined_existing(root, from, false, "rename")?;
+            let target = mutation_target(root, to, *create_parents, "rename")?;
+            fs::rename(source, target).map_err(os_io("rename"))?;
             observe_remove(root, from);
             mark_operation(root, to, operation_id);
             stat_entry(root, to, 0, false)
@@ -2222,7 +2703,7 @@ fn apply_one(
             create_parents,
         } => {
             check_precondition(root, path, precondition)?;
-            let link = mutation_target(root, path, *create_parents)?;
+            let link = mutation_target(root, path, *create_parents, "symlink")?;
             atomic_symlink(target, &link)?;
             mark_operation(root, path, operation_id);
             stat_entry(root, path, 0, false)
@@ -2234,11 +2715,11 @@ fn apply_one(
             create_parents,
         } => {
             check_precondition(root, target, precondition)?;
-            let source_path = confined_existing(root, source, false)?;
+            let source_path = confined_existing(root, source, false, "link")?;
             if !fs::symlink_metadata(&source_path).is_ok_and(|metadata| metadata.is_file()) {
                 return Err(Error::Invalid("FS hardlink source is not a file"));
             }
-            let target_path = mutation_target(root, target, *create_parents)?;
+            let target_path = mutation_target(root, target, *create_parents, "link")?;
             atomic_hardlink(&source_path, &target_path)?;
             mark_operation(root, target, operation_id);
             stat_entry(root, target, 0, false)
@@ -2272,7 +2753,7 @@ fn atomic_write(
     mode: u32,
     content: &[u8],
 ) -> Result<(), Error> {
-    let target = mutation_target(root, path, create_parents)?;
+    let target = mutation_target(root, path, create_parents, "open")?;
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(Error::Conflict(conflict_detail(root, path)));
     }
@@ -2300,7 +2781,7 @@ fn atomic_replace(
                 Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
                 Ok(_) => None,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => return Err(map_io(error)),
+                Err(error) => return Err(os_io("lstat")(error)),
             }
         };
         // Creation must never expose bytes with broader permissions than the destination.
@@ -2313,19 +2794,20 @@ fn atomic_replace(
     };
     #[cfg(not(unix))]
     let _ = mode;
-    let mut temp = builder.tempfile_in(parent).map_err(map_io)?;
-    write(temp.as_file_mut()).map_err(map_io)?;
-    temp.as_file_mut().flush().map_err(map_io)?;
+    let mut temp = builder.tempfile_in(parent).map_err(os_io("open"))?;
+    write(temp.as_file_mut()).map_err(os_io("write"))?;
+    temp.as_file_mut().flush().map_err(os_io("write"))?;
     #[cfg(unix)]
     if let Some(permissions) = permissions {
         temp.as_file()
             .set_permissions(permissions)
-            .map_err(map_io)?;
+            .map_err(os_io("chmod"))?;
     }
     if sync_data {
-        temp.as_file().sync_all().map_err(map_io)?;
+        temp.as_file().sync_all().map_err(os_io("fsync"))?;
     }
-    temp.persist(target).map_err(|error| map_io(error.error))?;
+    temp.persist(target)
+        .map_err(|error| os_io("rename")(error.error))?;
     Ok(())
 }
 
@@ -2335,8 +2817,8 @@ fn atomic_hardlink(source: &OsPath, target: &OsPath) -> Result<(), Error> {
         .ok_or(Error::Invalid("FS target has no parent"))?;
     let temp = unique_temp_path(parent, "yas-hardlink")?;
     let result = fs::hard_link(source, &temp)
-        .map_err(map_io)
-        .and_then(|()| fs::rename(&temp, target).map_err(map_io));
+        .map_err(os_io("link"))
+        .and_then(|()| fs::rename(&temp, target).map_err(os_io("rename")));
     if result.is_err() {
         let _ = fs::remove_file(temp);
     }
@@ -2352,8 +2834,8 @@ fn atomic_symlink(target: &[u8], link: &OsPath) -> Result<(), Error> {
         .ok_or(Error::Invalid("FS target has no parent"))?;
     let temp = unique_temp_path(parent, "yas-symlink")?;
     let result = symlink(OsString::from_vec(target.to_vec()), &temp)
-        .map_err(map_io)
-        .and_then(|()| fs::rename(&temp, link).map_err(map_io));
+        .map_err(os_io("symlink"))
+        .and_then(|()| fs::rename(&temp, link).map_err(os_io("rename")));
     if result.is_err() {
         let _ = fs::remove_file(temp);
     }
@@ -2370,8 +2852,8 @@ fn atomic_symlink(target: &[u8], link: &OsPath) -> Result<(), Error> {
         .ok_or(Error::Invalid("FS target has no parent"))?;
     let temp = unique_temp_path(parent, "yas-symlink")?;
     let result = symlink_file(target, &temp)
-        .map_err(map_io)
-        .and_then(|()| fs::rename(&temp, link).map_err(map_io));
+        .map_err(os_io("symlink"))
+        .and_then(|()| fs::rename(&temp, link).map_err(os_io("rename")));
     if result.is_err() {
         let _ = fs::remove_file(temp);
     }
@@ -2398,7 +2880,7 @@ fn set_directory_builder_mode(_builder: &mut fs::DirBuilder, _mode: u32) {}
 fn sync_directory(path: &OsPath) -> Result<(), Error> {
     File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(map_io)
+        .map_err(os_io("fsync"))
 }
 
 #[cfg(not(unix))]
@@ -2421,7 +2903,7 @@ fn conflict_for(root: &Root, path: &wire::Path) -> Error {
 #[cfg(unix)]
 fn set_private_directory(path: &OsPath) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(map_io)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(os_io("chmod"))
 }
 
 #[cfg(not(unix))]
@@ -2432,6 +2914,8 @@ fn set_private_directory(_path: &OsPath) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use yas_wire::Decode as _;
 
     struct TestDir(PathBuf);
 
@@ -2517,7 +3001,8 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&outside.0, directory.0.join("escape")).unwrap();
         let root = test_root(&directory);
-        let error = confined_existing(&root, &path(&[b"escape", b"secret"]), false).unwrap_err();
+        let error =
+            confined_existing(&root, &path(&[b"escape", b"secret"]), false, "lstat").unwrap_err();
         assert_eq!(error, Error::Permission);
     }
 
@@ -2850,5 +3335,470 @@ mod tests {
             cursor = page.next_cursor;
         }
         assert_eq!(matches, 3);
+    }
+
+    #[test]
+    fn windows_error_codes_take_the_names_libuv_gives_them() {
+        for (code, name) in [
+            (1, "EISDIR"),
+            (2, "ENOENT"),
+            (3, "ENOENT"),
+            (123, "ENOENT"),
+            (5, "EPERM"),
+            (1314, "EPERM"),
+            (32, "EBUSY"),
+            (17, "EXDEV"),
+            (19, "EROFS"),
+            (80, "EEXIST"),
+            (183, "EEXIST"),
+            (112, "ENOSPC"),
+            (145, "ENOTEMPTY"),
+            (206, "ENAMETOOLONG"),
+            (998, "EFAULT"),
+            (1921, "ELOOP"),
+            (10013, "EACCES"),
+            (10054, "ECONNRESET"),
+            (10061, "ECONNREFUSED"),
+        ] {
+            assert_eq!(win32_errno_name(code, "open"), Some(name), "code {code}");
+        }
+        // ERROR_DIRECTORY: listing something that is not a directory.
+        assert_eq!(win32_errno_name(267, "readdir"), Some("ENOTDIR"));
+        assert_eq!(win32_errno_name(267, "open"), Some("ENOENT"));
+        // Codes libuv has no name for stay UNKNOWN, as in Node.
+        assert_eq!(win32_errno_name(0, "open"), None);
+        assert_eq!(win32_errno_name(53, "stat"), None);
+        assert_eq!(win32_errno_name(-1, "open"), None);
+    }
+
+    #[cfg(unix)]
+    fn os_of(error: &Error) -> (i32, &str, &str) {
+        let os = error.os_error().expect("OS error detail");
+        (os.code, os.name.as_str(), os.operation.as_str())
+    }
+
+    #[cfg(unix)]
+    fn read_one(root: &Root, kind: u64, flags: u64, components: &[&[u8]]) -> wire::QueryReadRecord {
+        let question = wire::ReadQuestion {
+            kind: kind as u16,
+            flags: flags as u16,
+            path: path(components),
+        };
+        let data = read_questions(root, &[question]).unwrap();
+        let Some(wire::QueryRecord::Read(record)) = data.records.into_iter().next() else {
+            panic!("READ answered without a READ record");
+        };
+        record
+    }
+
+    #[cfg(unix)]
+    fn record_os(record: &wire::QueryReadRecord) -> (i32, String, String) {
+        let os = record.os_error().unwrap().expect("READ record OS error");
+        (os.code, os.name, os.operation)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failures_keep_their_kind_and_carry_os_errors() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        fs::write(directory.0.join("file.txt"), b"x").unwrap();
+        fs::create_dir(directory.0.join("dir")).unwrap();
+        symlink("loop", directory.0.join("loop")).unwrap();
+        symlink("nowhere", directory.0.join("dangling")).unwrap();
+
+        let missing = fetch_content(&root, &path(&[b"missing"]), None).unwrap_err();
+        assert_eq!(*missing.kind(), Error::NotFound);
+        assert_eq!(status_for(&missing), schema::core::status::NOT_FOUND);
+        assert_eq!(missing.to_string(), "filesystem entry not found");
+        assert_eq!(os_of(&missing), (libc::ENOENT, "ENOENT", "open"));
+
+        let dangling = fetch_content(&root, &path(&[b"dangling"]), None).unwrap_err();
+        assert_eq!(os_of(&dangling), (libc::ENOENT, "ENOENT", "open"));
+
+        let is_dir = fetch_content(&root, &path(&[b"dir"]), None).unwrap_err();
+        assert!(matches!(is_dir.kind(), Error::Invalid(_)));
+        assert_eq!(os_of(&is_dir), (libc::EISDIR, "EISDIR", "read"));
+        let root_dir = fetch_content(&root, &path(&[]), None).unwrap_err();
+        assert_eq!(os_of(&root_dir), (libc::EISDIR, "EISDIR", "read"));
+
+        let not_dir = fetch_content(&root, &path(&[b"file.txt", b"x"]), None).unwrap_err();
+        assert!(matches!(not_dir.kind(), Error::Io(_)));
+        assert_eq!(os_of(&not_dir), (libc::ENOTDIR, "ENOTDIR", "open"));
+        let deeper = fetch_content(&root, &path(&[b"file.txt", b"x", b"y"]), None).unwrap_err();
+        assert_eq!(os_of(&deeper), (libc::ENOTDIR, "ENOTDIR", "open"));
+
+        let looped = fetch_content(&root, &path(&[b"loop"]), None).unwrap_err();
+        assert_eq!(os_of(&looped), (libc::ELOOP, "ELOOP", "open"));
+        let through_loop = fetch_content(&root, &path(&[b"loop", b"x"]), None).unwrap_err();
+        assert_eq!(os_of(&through_loop), (libc::ELOOP, "ELOOP", "open"));
+
+        let long = vec![b'n'; 300];
+        let too_long = fetch_content(&root, &path(&[&long]), None).unwrap_err();
+        assert_eq!(
+            os_of(&too_long),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG", "open")
+        );
+
+        let secret = directory.0.join("secret");
+        fs::write(&secret, b"secret").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything: the EACCES case only exists for other users.
+        if File::open(&secret).is_err() {
+            let denied = fetch_content(&root, &path(&[b"secret"]), None).unwrap_err();
+            assert_eq!(*denied.kind(), Error::Permission);
+            assert_eq!(os_of(&denied), (libc::EACCES, "EACCES", "open"));
+        }
+
+        // Errors that are not OS errors carry none.
+        let escape = directory.0.join("escape");
+        symlink("/", &escape).unwrap();
+        let escaped = fetch_content(&root, &path(&[b"escape"]), None).unwrap_err();
+        assert_eq!(escaped, Error::Permission);
+        assert!(escaped.os_error().is_none());
+
+        // APPLY item details stay the io::Error text they always were.
+        let result = apply_items(
+            &root,
+            [9; 16],
+            &[wire::ApplyItem::Mkdir {
+                path: path(&[b"file.txt"]),
+                precondition: wire::Precondition::Any,
+                create_parents: false,
+                mode: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.items[0].status, schema::core::status::INTERNAL);
+        assert!(result.items[0].detail.ends_with("(os error 17)"));
+        let os = result.os_errors().unwrap();
+        assert_eq!(os.len(), 1);
+        assert_eq!((os[0].0, os[0].1.name.as_str()), (0, "EEXIST"));
+        assert_eq!(os[0].1.operation, "mkdir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_reports_each_failed_items_os_error() {
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        fs::write(directory.0.join("file"), b"x").unwrap();
+        let mkdir = |components: &[&[u8]]| wire::ApplyItem::Mkdir {
+            path: path(components),
+            precondition: wire::Precondition::Any,
+            create_parents: false,
+            mode: 0,
+        };
+        let remove = |components: &[&[u8]]| wire::ApplyItem::Remove {
+            path: path(components),
+            precondition: wire::Precondition::Any,
+            flags: 0,
+        };
+        let items = [
+            mkdir(&[b"made"]),
+            mkdir(&[b"file", b"under"]),
+            mkdir(&[b"missing", b"deeper"]),
+            mkdir(&[b"made"]),
+            remove(&[b"gone"]),
+            remove(&[b"file"]),
+        ];
+        let result = apply_items(&root, [7; 16], &items).unwrap();
+        let statuses: Vec<u16> = result.items.iter().map(|item| item.status).collect();
+        assert_eq!(statuses[0], schema::core::status::OK);
+        assert_eq!(
+            statuses[3],
+            schema::core::status::OK,
+            "an existing directory is made"
+        );
+        assert_eq!(statuses[5], schema::core::status::OK);
+        let named: Vec<(u16, String, String)> = result
+            .os_errors()
+            .unwrap()
+            .into_iter()
+            .map(|(index, os)| (index, os.name, os.operation))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (1, "ENOTDIR".to_owned(), "mkdir".to_owned()),
+                (2, "ENOENT".to_owned(), "mkdir".to_owned()),
+                (4, "ENOENT".to_owned(), "unlink".to_owned()),
+            ]
+        );
+        // Every item succeeding carries no extension.
+        let result = apply_items(&root, [8; 16], &[mkdir(&[b"other"])]).unwrap();
+        assert!(result.extensions.0.is_empty());
+        assert!(result.os_errors().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_list_reports_entry_kinds_like_node_dirents() {
+        use std::os::unix::fs::symlink;
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        let listed = directory.0.join("d");
+        fs::create_dir(&listed).unwrap();
+        fs::write(listed.join("file"), b"f").unwrap();
+        fs::write(listed.join(".hidden"), b"h").unwrap();
+        fs::create_dir(listed.join("sub")).unwrap();
+        symlink("sub", listed.join("link-dir")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(listed.join("sock")).unwrap();
+        symlink("d", directory.0.join("d-link")).unwrap();
+
+        let names = |record: &wire::QueryReadRecord| {
+            assert_eq!(record.status, schema::core::status::OK);
+            let mut entries = wire::ListEntry::decode_list(&record.content)
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.name, entry.kind))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let expected = vec![
+            (b".hidden".to_vec(), schema::fs::ENTRY_FILE as u8),
+            (b"file".to_vec(), schema::fs::ENTRY_FILE as u8),
+            (b"link-dir".to_vec(), schema::fs::ENTRY_SYMLINK as u8),
+            (b"sock".to_vec(), schema::fs::ENTRY_OTHER as u8),
+            (b"sub".to_vec(), schema::fs::ENTRY_DIRECTORY as u8),
+        ];
+        let record = read_one(&root, schema::fs::READ_LIST, 0, &[b"d"]);
+        assert_eq!(record.path, Some(path(&[b"d"])));
+        assert_eq!(names(&record), expected);
+        // A final symlink to a directory is followed, as readdir(3) does.
+        assert_eq!(
+            names(&read_one(&root, schema::fs::READ_LIST, 0, &[b"d-link"])),
+            expected
+        );
+        let top = names(&read_one(&root, schema::fs::READ_LIST, 0, &[]));
+        assert!(top.contains(&(b"d".to_vec(), schema::fs::ENTRY_DIRECTORY as u8)));
+        assert!(top.contains(&(b"d-link".to_vec(), schema::fs::ENTRY_SYMLINK as u8)));
+
+        let not_dir = read_one(&root, schema::fs::READ_LIST, 0, &[b"d", b"file"]);
+        assert_eq!(not_dir.status, schema::core::status::INTERNAL);
+        assert_eq!(not_dir.path, None);
+        assert_eq!(
+            record_os(&not_dir),
+            (libc::ENOTDIR, "ENOTDIR".into(), "readdir".into())
+        );
+        let missing = read_one(&root, schema::fs::READ_LIST, 0, &[b"d", b"gone"]);
+        assert_eq!(missing.status, schema::core::status::NOT_FOUND);
+        assert_eq!(
+            record_os(&missing),
+            (libc::ENOENT, "ENOENT".into(), "readdir".into())
+        );
+        let missing_parent = read_one(&root, schema::fs::READ_LIST, 0, &[b"gone", b"x"]);
+        assert_eq!(
+            record_os(&missing_parent),
+            (libc::ENOENT, "ENOENT".into(), "readdir".into())
+        );
+        // Older question kinds keep empty failure content.
+        let old = read_one(&root, schema::fs::READ_STAT, 0, &[b"d", b"gone"]);
+        assert_eq!(old.status, schema::core::status::NOT_FOUND);
+        assert!(old.content.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_realpath_resolves_every_symlink_inside_the_root() {
+        use std::os::unix::fs::symlink;
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        fs::create_dir(directory.0.join("real")).unwrap();
+        fs::write(directory.0.join("real/target.txt"), b"t").unwrap();
+        symlink("real", directory.0.join("a")).unwrap();
+        symlink("a/target.txt", directory.0.join("b")).unwrap();
+        symlink("/", directory.0.join("out")).unwrap();
+        let expected = os_path_bytes(&root.path.join("real").join("target.txt"));
+
+        for components in [
+            &[&b"b"[..]][..],
+            &[b"a", b"target.txt"],
+            &[b"real", b"target.txt"],
+        ] {
+            let record = read_one(&root, schema::fs::READ_REALPATH, 0, components);
+            assert_eq!(record.status, schema::core::status::OK);
+            assert_eq!(record.content, expected);
+        }
+        let top = read_one(&root, schema::fs::READ_REALPATH, 0, &[]);
+        assert_eq!(top.content, os_path_bytes(&root.path));
+        let dir = read_one(&root, schema::fs::READ_REALPATH, 0, &[b"a"]);
+        assert_eq!(dir.content, os_path_bytes(&root.path.join("real")));
+
+        let missing = read_one(&root, schema::fs::READ_REALPATH, 0, &[b"a", b"nope"]);
+        assert_eq!(missing.status, schema::core::status::NOT_FOUND);
+        assert_eq!(
+            record_os(&missing),
+            (libc::ENOENT, "ENOENT".into(), "realpath".into())
+        );
+        let escaped = read_one(&root, schema::fs::READ_REALPATH, 0, &[b"out"]);
+        assert_eq!(escaped.status, schema::core::status::IO);
+        assert!(escaped.content.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_stat_only_follows_unless_no_follow_and_reads_nothing() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        let big = File::create(directory.0.join("big")).unwrap();
+        big.set_len(5 << 30).unwrap();
+        drop(big);
+        symlink("big", directory.0.join("link")).unwrap();
+        symlink("nowhere", directory.0.join("dangling")).unwrap();
+        let locked = directory.0.join("locked");
+        fs::write(&locked, b"1234567").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let stat = |flags: u64, components: &[&[u8]]| {
+            let record = read_one(&root, schema::fs::READ_STAT_ONLY, flags, components);
+            assert_eq!(record.status, schema::core::status::OK, "{components:?}");
+            wire::StatOnly::decode(&record.content).unwrap()
+        };
+        let followed = stat(0, &[b"link"]);
+        assert_eq!(followed.kind, schema::fs::ENTRY_FILE as u8);
+        assert_eq!(followed.size, 5 << 30);
+        assert_eq!(followed.mode & 0o170000, 0o100000);
+        let link = stat(schema::fs::READ_NO_FOLLOW, &[b"link"]);
+        assert_eq!(link.kind, schema::fs::ENTRY_SYMLINK as u8);
+        assert_eq!(link.size, 3);
+        assert_eq!(stat(0, &[]).kind, schema::fs::ENTRY_DIRECTORY as u8);
+        // Unreadable content does not matter: nothing is opened.
+        let unreadable = stat(0, &[b"locked"]);
+        assert_eq!((unreadable.size, unreadable.mode & 0o777), (7, 0));
+        assert_eq!(
+            stat(schema::fs::READ_NO_FOLLOW, &[b"dangling"]).kind,
+            schema::fs::ENTRY_SYMLINK as u8
+        );
+        let dangling = read_one(&root, schema::fs::READ_STAT_ONLY, 0, &[b"dangling"]);
+        assert_eq!(dangling.status, schema::core::status::NOT_FOUND);
+        assert_eq!(
+            record_os(&dangling),
+            (libc::ENOENT, "ENOENT".into(), "stat".into())
+        );
+        let not_dir = read_one(
+            &root,
+            schema::fs::READ_STAT_ONLY,
+            schema::fs::READ_NO_FOLLOW,
+            &[b"big", b"x"],
+        );
+        assert_eq!(
+            record_os(&not_dir),
+            (libc::ENOTDIR, "ENOTDIR".into(), "lstat".into())
+        );
+        // Asked of the old STAT, the same big file would be hashed in full.
+        assert!(wire::Limits::HARD.supports(schema::fs::CAPABILITY_FLAGS));
+    }
+
+    #[cfg(unix)]
+    fn sealed_stage(root: &Arc<Root>, components: &[&[u8]], mode: u32, bytes: &[u8]) -> Stage {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let staging = std::env::temp_dir().join(format!(
+            "yas-fs-in-place-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&staging, bytes).unwrap();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(bytes);
+        Stage {
+            root: root.clone(),
+            path: path(components),
+            precondition: wire::Precondition::Any,
+            flags: schema::fs::STAGE_IN_PLACE as u16,
+            mode,
+            byte_len: bytes.len() as u64,
+            content_hash: *blake3::hash(bytes).as_bytes(),
+            temp_path: staging,
+            file: None,
+            hasher,
+            received: bytes.len() as u64,
+            sealed: true,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_in_place_keeps_the_inode_and_writes_through_symlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let directory = TestDir::new();
+        let root = Arc::new(test_root(&directory));
+        let target = directory.0.join("target.txt");
+        fs::write(&target, b"old and longer contents").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = fs::metadata(&target).unwrap().ino();
+        symlink("target.txt", directory.0.join("link")).unwrap();
+
+        let stage = sealed_stage(&root, &[b"link"], 0o600, b"new");
+        let result = commit_stage(stage, [4; 16], schema::fs::COMMIT_SYNC_DATA as u16).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let metadata = fs::metadata(&target).unwrap();
+        assert_eq!(metadata.ino(), inode);
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        assert!(
+            fs::symlink_metadata(directory.0.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(result.content_hash, *blake3::hash(b"new").as_bytes());
+        assert_eq!(
+            root.operation_echoes
+                .lock()
+                .unwrap()
+                .get(&path(&[b"target.txt"])),
+            Some(&[4; 16])
+        );
+
+        // A new file is created where it is named, without a temporary.
+        let stage = sealed_stage(&root, &[b"fresh"], 0, b"fresh bytes");
+        commit_stage(stage, [5; 16], 0).unwrap();
+        assert_eq!(fs::read(directory.0.join("fresh")).unwrap(), b"fresh bytes");
+        // Through a dangling symlink, the file it names is created.
+        symlink("made-by-link", directory.0.join("pending")).unwrap();
+        let stage = sealed_stage(&root, &[b"pending"], 0, b"via link");
+        commit_stage(stage, [6; 16], 0).unwrap();
+        assert_eq!(
+            fs::read(directory.0.join("made-by-link")).unwrap(),
+            b"via link"
+        );
+
+        // A write-only file is written without being read back.
+        let write_only = directory.0.join("write-only");
+        fs::write(&write_only, b"previous").unwrap();
+        fs::set_permissions(&write_only, fs::Permissions::from_mode(0o200)).unwrap();
+        let result = commit_stage(
+            sealed_stage(&root, &[b"write-only"], 0, b"blind"),
+            [11; 16],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.content_hash, *blake3::hash(b"blind").as_bytes());
+        let metadata = fs::metadata(&write_only).unwrap();
+        assert_eq!(
+            (metadata.permissions().mode() & 0o7777, metadata.len()),
+            (0o200, 5)
+        );
+        fs::set_permissions(&write_only, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&write_only).unwrap(), b"blind");
+
+        fs::create_dir(directory.0.join("dir")).unwrap();
+        symlink("dir", directory.0.join("dir-link")).unwrap();
+        for components in [&[&b"dir"[..]][..], &[b"dir-link"]] {
+            let stage = sealed_stage(&root, components, 0, b"x");
+            let error = commit_stage(stage, [7; 16], 0).unwrap_err();
+            assert!(matches!(error.kind(), Error::Conflict(_)));
+            assert_eq!(os_of(&error), (libc::EISDIR, "EISDIR", "open"));
+        }
+        let stage = sealed_stage(&root, &[b"nope", b"file"], 0, b"x");
+        let error = commit_stage(stage, [8; 16], 0).unwrap_err();
+        assert_eq!(*error.kind(), Error::NotFound);
+        assert_eq!(os_of(&error), (libc::ENOENT, "ENOENT", "open"));
+        let stage = sealed_stage(&root, &[b"target.txt", b"file"], 0, b"x");
+        let error = commit_stage(stage, [10; 16], 0).unwrap_err();
+        assert_eq!(os_of(&error), (libc::ENOTDIR, "ENOTDIR", "open"));
     }
 }

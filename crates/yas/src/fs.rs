@@ -4,8 +4,8 @@ use crate::prelude::*;
 
 use crate::codec::{
     Decode, Decoder, Encode, Error, Extension, Extensions, Result, limit_u32, limit_u64,
-    put_bytes_u16, put_bytes_u32, put_i64, put_len_u16, put_len_u32, put_string_u32, put_u16,
-    put_u32, put_u64, read_limit_u32, read_limit_u64, reject_unknown_required_extensions,
+    put_bytes_u16, put_bytes_u32, put_i32, put_i64, put_len_u16, put_len_u32, put_string_u32,
+    put_u16, put_u32, put_u64, read_limit_u32, read_limit_u64, reject_unknown_required_extensions,
 };
 use crate::state::{Record, RecordKind, Watch as StateWatch};
 use crate::transfer::{
@@ -44,6 +44,9 @@ pub struct Limits {
     pub max_batch_items: u32,
     pub max_query_concurrency: u32,
     pub max_catalog_entries: u32,
+    /// `CAPABILITY_*` bits of the opt-in FS values the server implements; 0 from servers
+    /// that predate them. Unknown bits are kept and ignored.
+    pub capabilities: u32,
 }
 
 impl Limits {
@@ -61,7 +64,13 @@ impl Limits {
         max_batch_items: crate::schema::fs::MAX_BATCH_ITEMS as u32,
         max_query_concurrency: crate::schema::fs::MAX_QUERY_CONCURRENCY as u32,
         max_catalog_entries: crate::schema::fs::MAX_CATALOG_ENTRIES as u32,
+        capabilities: crate::schema::fs::CAPABILITY_FLAGS as u32,
     };
+
+    /// Whether every bit of `capability` (a `CAPABILITY_*` value) is advertised.
+    pub fn supports(self, capability: u64) -> bool {
+        u64::from(self.capabilities) & capability == capability
+    }
 
     pub fn validate(self) -> Result<()> {
         let hard = Self::HARD;
@@ -92,57 +101,65 @@ impl Limits {
 
     pub fn to_extensions(self) -> Result<Extensions> {
         self.validate()?;
-        Ok(Extensions(vec![
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_ROOTS_PER_SESSION,
-                self.max_roots_per_session,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_WATCHES_PER_ROOT,
-                self.max_watches_per_root,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_PATH_COMPONENTS,
-                self.max_path_components,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_COMPONENT_BYTES,
-                self.max_component_bytes,
-            ),
-            limit_u32(crate::schema::fs::LIMIT_MAX_PATH_BYTES, self.max_path_bytes),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_INLINE_BYTES,
-                self.max_inline_bytes,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_QUERY_RECORDS,
-                self.max_query_records,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_QUERY_BYTES,
-                self.max_query_bytes,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_STAGES_PER_SESSION,
-                self.max_stages_per_session,
-            ),
-            limit_u64(
-                crate::schema::fs::LIMIT_MAX_STAGED_BYTES,
-                self.max_staged_bytes,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_BATCH_ITEMS,
-                self.max_batch_items,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_QUERY_CONCURRENCY,
-                self.max_query_concurrency,
-            ),
-            limit_u32(
-                crate::schema::fs::LIMIT_MAX_CATALOG_ENTRIES,
-                self.max_catalog_entries,
-            ),
-        ]))
+        Ok(Extensions(
+            vec![
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_ROOTS_PER_SESSION,
+                    self.max_roots_per_session,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_WATCHES_PER_ROOT,
+                    self.max_watches_per_root,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_PATH_COMPONENTS,
+                    self.max_path_components,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_COMPONENT_BYTES,
+                    self.max_component_bytes,
+                ),
+                limit_u32(crate::schema::fs::LIMIT_MAX_PATH_BYTES, self.max_path_bytes),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_INLINE_BYTES,
+                    self.max_inline_bytes,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_QUERY_RECORDS,
+                    self.max_query_records,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_QUERY_BYTES,
+                    self.max_query_bytes,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_STAGES_PER_SESSION,
+                    self.max_stages_per_session,
+                ),
+                limit_u64(
+                    crate::schema::fs::LIMIT_MAX_STAGED_BYTES,
+                    self.max_staged_bytes,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_BATCH_ITEMS,
+                    self.max_batch_items,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_QUERY_CONCURRENCY,
+                    self.max_query_concurrency,
+                ),
+                limit_u32(
+                    crate::schema::fs::LIMIT_MAX_CATALOG_ENTRIES,
+                    self.max_catalog_entries,
+                ),
+            ]
+            .into_iter()
+            .chain(
+                (self.capabilities != 0)
+                    .then(|| limit_u32(crate::schema::fs::LIMIT_CAPABILITIES, self.capabilities)),
+            )
+            .collect(),
+        ))
     }
 
     pub fn from_extensions(extensions: &Extensions) -> Result<Self> {
@@ -162,6 +179,7 @@ impl Limits {
                 crate::schema::fs::LIMIT_MAX_BATCH_ITEMS as u16,
                 crate::schema::fs::LIMIT_MAX_QUERY_CONCURRENCY as u16,
                 crate::schema::fs::LIMIT_MAX_CATALOG_ENTRIES as u16,
+                crate::schema::fs::LIMIT_CAPABILITIES as u16,
             ],
             "unknown required FS family limit",
         )?;
@@ -209,6 +227,15 @@ impl Limits {
                 extensions,
                 crate::schema::fs::LIMIT_MAX_CATALOG_ENTRIES,
             )?,
+            capabilities: if extensions
+                .0
+                .iter()
+                .any(|extension| extension.tag == crate::schema::fs::LIMIT_CAPABILITIES as u16)
+            {
+                read_limit_u32(extensions, crate::schema::fs::LIMIT_CAPABILITIES)?
+            } else {
+                0
+            },
         };
         value.validate()?;
         Ok(value)
@@ -1144,12 +1171,21 @@ pub struct ReadQuestion {
 
 impl ReadQuestion {
     fn validate(&self) -> Result<()> {
-        if self.kind > crate::schema::fs::READ_CONTENT as u16
+        let no_follow = self.flags & crate::schema::fs::READ_NO_FOLLOW as u16 != 0;
+        if self.kind > crate::schema::fs::READ_STAT_ONLY as u16
             || self.flags & !(crate::schema::fs::READ_FLAGS as u16) != 0
+            || (no_follow
+                && (self.kind == crate::schema::fs::READ_LIST as u16
+                    || self.kind == crate::schema::fs::READ_REALPATH as u16))
         {
             return Err(Error::Invalid("FS READ question"));
         }
         self.path.validate()
+    }
+
+    /// Whether a non-OK answer to this question may carry an [`OsError`] as its content.
+    pub fn answers_os_errors(&self) -> bool {
+        self.kind >= crate::schema::fs::READ_LIST as u16
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -1451,7 +1487,9 @@ impl Encode for QueryReadRecord {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
         if self.status > crate::schema::core::status::INTERNAL
             || (self.status == crate::schema::core::status::OK && self.path.is_none())
-            || (self.status != crate::schema::core::status::OK && !self.content.is_empty())
+            || (self.status != crate::schema::core::status::OK
+                && !self.content.is_empty()
+                && OsError::decode(&self.content).is_err())
             || self.content.len() > MAX_QUERY_BYTES
         {
             return Err(Error::Invalid("FS READ result record"));
@@ -1464,6 +1502,131 @@ impl Encode for QueryReadRecord {
             put_bytes_u32(out, &path.encode()?)?;
         }
         put_bytes_u32(out, &self.content)
+    }
+}
+
+impl QueryReadRecord {
+    /// The OS error of a failed answer to a `READ_LIST`, `READ_REALPATH` or
+    /// `READ_STAT_ONLY` question; None for OK records and failures without one.
+    pub fn os_error(&self) -> Result<Option<OsError>> {
+        if self.status == crate::schema::core::status::OK || self.content.is_empty() {
+            return Ok(None);
+        }
+        OsError::decode(&self.content).map(Some)
+    }
+}
+
+/// One entry of an OK `READ_LIST` answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListEntry {
+    /// `ENTRY_FILE`, `ENTRY_DIRECTORY`, `ENTRY_SYMLINK` or `ENTRY_OTHER`, of the entry
+    /// itself: a symlink to a directory is `ENTRY_SYMLINK`.
+    pub kind: u8,
+    /// One raw platform-name component. POSIX names may contain a backslash, which a
+    /// WirePath component cannot.
+    pub name: Vec<u8>,
+}
+
+impl ListEntry {
+    fn validate(&self) -> Result<()> {
+        if self.kind > crate::schema::fs::ENTRY_OTHER as u8
+            || self.name.is_empty()
+            || self.name.len() > usize::from(u16::MAX)
+            || self.name == b"."
+            || self.name == b".."
+            || self.name.contains(&0)
+            || self.name.contains(&b'/')
+        {
+            return Err(Error::Invalid("FS READ_LIST entry"));
+        }
+        Ok(())
+    }
+
+    /// Encoded size of this entry inside a `READ_LIST` answer.
+    pub fn encoded_len(&self) -> usize {
+        3 + self.name.len()
+    }
+
+    /// Encode a whole OK `READ_LIST` answer.
+    pub fn encode_list(entries: &[Self]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for entry in entries {
+            entry.validate()?;
+            out.push(entry.kind);
+            put_bytes_u16(&mut out, &entry.name)?;
+        }
+        if out.len() > MAX_QUERY_BYTES {
+            return Err(limit(
+                "FS READ_LIST bytes",
+                out.len() as u64,
+                MAX_QUERY_BYTES as u64,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Decode the content of an OK `READ_LIST` answer.
+    pub fn decode_list(input: &[u8]) -> Result<Vec<Self>> {
+        if input.len() > MAX_QUERY_BYTES {
+            return Err(Error::Invalid("FS READ_LIST bytes"));
+        }
+        let mut decoder = Decoder::new(input);
+        let mut entries = Vec::new();
+        while !decoder.is_empty() {
+            let entry = Self {
+                kind: decoder.u8()?,
+                name: decoder.len_bytes_u16()?.to_vec(),
+            };
+            entry.validate()?;
+            entries.push(entry);
+        }
+        decoder.finish()?;
+        Ok(entries)
+    }
+}
+
+/// Content of an OK `READ_STAT_ONLY` answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatOnly {
+    /// `ENTRY_FILE`, `ENTRY_DIRECTORY`, `ENTRY_SYMLINK` or `ENTRY_OTHER`.
+    pub kind: u8,
+    pub mode: u32,
+    pub size: u64,
+    pub modified_unix_ns: i64,
+}
+
+impl Encode for StatOnly {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        if self.kind > crate::schema::fs::ENTRY_OTHER as u8 {
+            return Err(Error::Invalid("FS READ_STAT_ONLY kind"));
+        }
+        out.push(self.kind);
+        out.push(0);
+        put_u16(out, 0);
+        put_u32(out, self.mode);
+        put_u64(out, self.size);
+        put_i64(out, self.modified_unix_ns);
+        Ok(())
+    }
+}
+
+impl Decode for StatOnly {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let kind = decoder.u8()?;
+        if decoder.u8()? != 0 || decoder.u16()? != 0 {
+            return Err(Error::Invalid("FS READ_STAT_ONLY reserved field"));
+        }
+        let value = Self {
+            kind,
+            mode: decoder.u32()?,
+            size: decoder.u64()?,
+            modified_unix_ns: decoder.i64()?,
+        };
+        decoder.finish()?;
+        let mut ignored = Vec::new();
+        value.encode_to(&mut ignored)?;
+        Ok(value)
     }
 }
 
@@ -2053,6 +2216,98 @@ impl Decode for ConflictDetail {
     }
 }
 
+/// The OS error behind a failed FS operation: the value of Result detail extension
+/// `RESULT_OS_ERROR_EXTENSION`, and the content of a failed `READ_LIST`,
+/// `READ_REALPATH` or `READ_STAT_ONLY` answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OsError {
+    /// Raw OS error number on the server platform: errno on POSIX, the Win32
+    /// or Winsock error code on Windows.
+    pub code: i32,
+    /// Symbolic errno name (`ENOENT`, `ENOTDIR`, …) or `UNKNOWN`; on
+    /// Windows the name libuv (and so Node) gives the code.
+    pub name: String,
+    /// The operation the server was performing (`open`, `read`, `readdir`, …).
+    pub operation: String,
+}
+
+impl OsError {
+    fn validate(&self) -> Result<()> {
+        let text = |value: &str, valid: fn(u8) -> bool| {
+            !value.is_empty()
+                && value.len() <= crate::schema::fs::MAX_OS_ERROR_TEXT_BYTES as usize
+                && value.bytes().all(valid)
+        };
+        if !text(&self.name, |byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+        }) || !text(&self.operation, |byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+        }) {
+            return Err(Error::Invalid("FS OS error"));
+        }
+        Ok(())
+    }
+
+    pub fn result_extension(&self) -> Result<Extension> {
+        Ok(Extension {
+            tag: crate::schema::fs::RESULT_OS_ERROR_EXTENSION as u16,
+            required: false,
+            value: self.encode()?,
+        })
+    }
+
+    /// The OS error in a failed Result's `ResultPrefix.detail`, if any.
+    pub fn from_result_detail(detail: &Extensions) -> Result<Option<Self>> {
+        detail.validate()?;
+        if detail.0.iter().any(|extension| extension.required) {
+            return Err(Error::Invalid("required FS Result detail extension"));
+        }
+        detail
+            .0
+            .iter()
+            .find(|extension| extension.tag == crate::schema::fs::RESULT_OS_ERROR_EXTENSION as u16)
+            .map(|extension| Self::decode(&extension.value))
+            .transpose()
+    }
+}
+
+impl Encode for OsError {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.validate()?;
+        put_i32(out, self.code);
+        put_bytes_u16(out, self.name.as_bytes())?;
+        put_bytes_u16(out, self.operation.as_bytes())
+    }
+}
+
+impl Decode for OsError {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let value = Self::decode_from(&mut decoder)?;
+        decoder.finish()?;
+        Ok(value)
+    }
+}
+
+impl OsError {
+    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self> {
+        let code = decoder.i32()?;
+        let name = decoder.len_bytes_u16()?;
+        let operation = decoder.len_bytes_u16()?;
+        let value = Self {
+            code,
+            name: ::core::str::from_utf8(name)
+                .map_err(|_| Error::Invalid("FS OS error name"))?
+                .to_owned(),
+            operation: ::core::str::from_utf8(operation)
+                .map_err(|_| Error::Invalid("FS OS error operation"))?
+                .to_owned(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageWrite {
     pub root_handle: u64,
@@ -2066,6 +2321,13 @@ pub struct StageWrite {
     pub extensions: Extensions,
 }
 
+impl StageWrite {
+    /// Whether COMMIT writes this stage in place (`STAGE_IN_PLACE`).
+    pub fn in_place(&self) -> bool {
+        self.flags & crate::schema::fs::STAGE_IN_PLACE as u16 != 0
+    }
+}
+
 impl Encode for StageWrite {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
         handle(self.root_handle, "zero FS root handle")?;
@@ -2077,7 +2339,10 @@ impl Encode for StageWrite {
                 crate::schema::fs::MAX_STAGED_BYTES,
             ));
         }
-        if self.flags & !(crate::schema::fs::STAGE_FLAGS as u16) != 0 {
+        let known = crate::schema::fs::STAGE_FLAGS | crate::schema::fs::STAGE_EXTENDED_FLAGS;
+        if self.flags & !(known as u16) != 0
+            || (self.in_place() && self.flags & crate::schema::fs::STAGE_CREATE_PARENTS as u16 != 0)
+        {
             return Err(Error::Invalid("FS STAGE_WRITE flags"));
         }
         reject_unknown_required(&self.extensions, &[])?;
@@ -2629,6 +2894,59 @@ impl Encode for ApplyResult {
     }
 }
 
+impl ApplyResult {
+    /// The OS errors behind failed items (`APPLY_RESULT_OS_ERRORS_EXTENSION`), by item index;
+    /// empty when there are none or the server predates them.
+    pub fn os_errors(&self) -> Result<Vec<(u16, OsError)>> {
+        let Some(extension) = self.extensions.0.iter().find(|extension| {
+            extension.tag == crate::schema::fs::APPLY_RESULT_OS_ERRORS_EXTENSION as u16
+        }) else {
+            return Ok(Vec::new());
+        };
+        let mut decoder = Decoder::new(&extension.value);
+        let mut errors: Vec<(u16, OsError)> = Vec::new();
+        while decoder.remaining() > 0 {
+            let index = decoder.u16()?;
+            let os = OsError::decode_from(&mut decoder)?;
+            let failed = self
+                .items
+                .iter()
+                .any(|item| item.index == index && item.status != crate::schema::core::status::OK);
+            if !failed || errors.last().is_some_and(|(last, _)| *last >= index) {
+                return Err(Error::Invalid("FS APPLY OS errors"));
+            }
+            errors.push((index, os));
+        }
+        if errors.is_empty() {
+            return Err(Error::Invalid("FS APPLY OS errors"));
+        }
+        Ok(errors)
+    }
+
+    /// The `APPLY_RESULT_OS_ERRORS_EXTENSION` carrying `errors` (ascending indices), or None
+    /// when there are none.
+    pub fn os_errors_extension(errors: &[(u16, OsError)]) -> Result<Option<Extension>> {
+        if errors.is_empty() {
+            return Ok(None);
+        }
+        let mut value = Vec::new();
+        let mut last = None;
+        for (index, os) in errors {
+            if last.is_some_and(|last| last >= *index) {
+                return Err(Error::Invalid("FS APPLY OS errors"));
+            }
+            last = Some(*index);
+            put_u16(&mut value, *index);
+            os.encode_to(&mut value)?;
+        }
+        Ok(Some(Extension {
+            tag: crate::schema::fs::APPLY_RESULT_OS_ERRORS_EXTENSION as u16,
+            required: false,
+            value,
+        }))
+    }
+}
+
 impl Decode for ApplyResult {
     fn decode(input: &[u8]) -> Result<Self> {
         let mut decoder = Decoder::new(input);
@@ -2955,5 +3273,288 @@ mod tests {
             extensions: Extensions::default(),
         };
         truncations::<Apply>(&apply.encode().unwrap());
+    }
+
+    #[test]
+    fn capabilities_are_an_optional_forward_compatible_limit() {
+        assert_eq!(
+            Limits::HARD.capabilities,
+            crate::schema::fs::CAPABILITY_FLAGS as u32
+        );
+        assert!(Limits::HARD.supports(
+            crate::schema::fs::CAPABILITY_OS_ERROR | crate::schema::fs::CAPABILITY_STAGE_IN_PLACE
+        ));
+        let extensions = Limits::HARD.to_extensions().unwrap();
+        let capabilities = extensions
+            .0
+            .iter()
+            .find(|extension| extension.tag == crate::schema::fs::LIMIT_CAPABILITIES as u16)
+            .unwrap();
+        assert!(!capabilities.required);
+        // A server that predates capabilities omits the tag; clients read zero.
+        let mut old = Limits::HARD;
+        old.capabilities = 0;
+        let old_extensions = old.to_extensions().unwrap();
+        assert!(
+            old_extensions
+                .0
+                .iter()
+                .all(|extension| extension.tag != crate::schema::fs::LIMIT_CAPABILITIES as u16)
+        );
+        let decoded = Limits::from_extensions(&old_extensions).unwrap();
+        assert_eq!(decoded.capabilities, 0);
+        assert!(!decoded.supports(crate::schema::fs::CAPABILITY_READ_LIST));
+        // Unknown future bits survive and do not invalidate the limits.
+        let mut future = Limits::HARD;
+        future.capabilities = u32::MAX;
+        let future = Limits::from_extensions(&future.to_extensions().unwrap()).unwrap();
+        assert_eq!(future.capabilities, u32::MAX);
+    }
+
+    #[test]
+    fn apply_os_errors_name_failed_items_in_order() {
+        let failed = |index: u16, status: u16| ApplyItemResult {
+            index,
+            status,
+            entry_revision: if status == crate::schema::core::status::OK {
+                1
+            } else {
+                0
+            },
+            modified_unix_ns: 0,
+            content_hash: None,
+            detail: String::new(),
+        };
+        let os = |name: &str| OsError {
+            code: 2,
+            name: name.into(),
+            operation: "mkdir".into(),
+        };
+        let mut result = ApplyResult {
+            root_revision: 1,
+            items: vec![
+                failed(0, crate::schema::core::status::OK),
+                failed(1, crate::schema::core::status::NOT_FOUND),
+                failed(2, crate::schema::core::status::IO),
+            ],
+            extensions: Extensions::default(),
+        };
+        assert!(result.os_errors().unwrap().is_empty());
+        assert!(ApplyResult::os_errors_extension(&[]).unwrap().is_none());
+        let errors = vec![(1, os("ENOENT")), (2, os("ENOTDIR"))];
+        result.extensions = Extensions(vec![
+            ApplyResult::os_errors_extension(&errors).unwrap().unwrap(),
+        ]);
+        let decoded = ApplyResult::decode(&result.encode().unwrap()).unwrap();
+        assert_eq!(decoded.os_errors().unwrap(), errors);
+        // Out of order, or naming an item that succeeded, is invalid.
+        assert!(ApplyResult::os_errors_extension(&[(2, os("EIO")), (1, os("EIO"))]).is_err());
+        result.extensions = Extensions(vec![
+            ApplyResult::os_errors_extension(&[(0, os("EIO"))])
+                .unwrap()
+                .unwrap(),
+        ]);
+        assert!(result.os_errors().is_err());
+    }
+
+    #[test]
+    fn os_error_detail_and_read_records_are_exact() {
+        let os = OsError {
+            code: 20,
+            name: "ENOTDIR".into(),
+            operation: "readdir".into(),
+        };
+        let bytes = os.encode().unwrap();
+        truncations::<OsError>(&bytes);
+        assert_eq!(OsError::decode(&bytes).unwrap(), os);
+        for bad in [
+            OsError {
+                code: 1,
+                name: String::new(),
+                operation: "open".into(),
+            },
+            OsError {
+                code: 1,
+                name: "enoent".into(),
+                operation: "open".into(),
+            },
+            OsError {
+                code: 1,
+                name: "ENOENT".into(),
+                operation: "Open".into(),
+            },
+            OsError {
+                code: 1,
+                name: "E".repeat(33),
+                operation: "open".into(),
+            },
+        ] {
+            assert!(bad.encode().is_err());
+        }
+
+        let conflict = ConflictDetail {
+            path: path(b"dir"),
+            current_present: false,
+            current_entry_revision: 0,
+            modified_unix_ns: 0,
+            current_hash: None,
+        };
+        let detail = Extensions(vec![
+            conflict.result_extension().unwrap(),
+            os.result_extension().unwrap(),
+        ]);
+        assert_eq!(
+            OsError::from_result_detail(&detail).unwrap(),
+            Some(os.clone())
+        );
+        assert_eq!(
+            ConflictDetail::from_result_detail(&detail).unwrap(),
+            Some(conflict)
+        );
+        assert_eq!(
+            OsError::from_result_detail(&Extensions::default()).unwrap(),
+            None
+        );
+
+        let failed = QueryReadRecord {
+            question_index: 1,
+            status: crate::schema::core::status::IO,
+            path: None,
+            content: bytes.clone(),
+        };
+        let decoded = QueryReadRecord::decode(&failed.encode().unwrap()).unwrap();
+        assert_eq!(decoded.os_error().unwrap(), Some(os));
+        let plain = QueryReadRecord {
+            content: Vec::new(),
+            ..failed.clone()
+        };
+        assert_eq!(plain.os_error().unwrap(), None);
+        let garbage = QueryReadRecord {
+            content: b"not an os error".to_vec(),
+            ..failed
+        };
+        assert!(garbage.encode().is_err());
+    }
+
+    #[test]
+    fn opt_in_read_questions_and_answers_round_trip() {
+        let question = |kind: u64, flags: u64| ReadQuestion {
+            kind: kind as u16,
+            flags: flags as u16,
+            path: path(b"dir"),
+        };
+        let read = Read {
+            root_handle: 1,
+            initial_receive_credit: 0,
+            questions: vec![
+                question(crate::schema::fs::READ_LIST, 0),
+                question(crate::schema::fs::READ_REALPATH, 0),
+                question(crate::schema::fs::READ_STAT_ONLY, 0),
+                question(
+                    crate::schema::fs::READ_STAT_ONLY,
+                    crate::schema::fs::READ_NO_FOLLOW,
+                ),
+            ],
+            extensions: Extensions::default(),
+        };
+        truncations::<Read>(&read.encode().unwrap());
+        assert!(read.questions.iter().all(ReadQuestion::answers_os_errors));
+        assert!(!question(crate::schema::fs::READ_CONTENT, 0).answers_os_errors());
+        for invalid in [
+            question(crate::schema::fs::READ_STAT_ONLY + 1, 0),
+            question(
+                crate::schema::fs::READ_LIST,
+                crate::schema::fs::READ_NO_FOLLOW,
+            ),
+            question(
+                crate::schema::fs::READ_REALPATH,
+                crate::schema::fs::READ_NO_FOLLOW,
+            ),
+        ] {
+            let read = Read {
+                questions: vec![invalid],
+                ..read.clone()
+            };
+            assert!(read.encode().is_err());
+        }
+
+        let entries = vec![
+            ListEntry {
+                kind: crate::schema::fs::ENTRY_SYMLINK as u8,
+                name: b"link-to-dir".to_vec(),
+            },
+            ListEntry {
+                kind: crate::schema::fs::ENTRY_OTHER as u8,
+                name: b".fifo\\raw".to_vec(),
+            },
+            ListEntry {
+                kind: crate::schema::fs::ENTRY_FILE as u8,
+                name: vec![0xff],
+            },
+        ];
+        let bytes = ListEntry::encode_list(&entries).unwrap();
+        assert_eq!(
+            bytes.len(),
+            entries.iter().map(ListEntry::encoded_len).sum::<usize>()
+        );
+        assert_eq!(ListEntry::decode_list(&bytes).unwrap(), entries);
+        assert_eq!(ListEntry::decode_list(&[]).unwrap(), Vec::new());
+        assert!(ListEntry::decode_list(&bytes[..bytes.len() - 1]).is_err());
+        for name in [&b""[..], b".", b"..", b"a/b", b"a\0b"] {
+            assert!(
+                ListEntry::encode_list(&[ListEntry {
+                    kind: 0,
+                    name: name.to_vec(),
+                }])
+                .is_err()
+            );
+        }
+        assert!(
+            ListEntry::encode_list(&[ListEntry {
+                kind: crate::schema::fs::ENTRY_OTHER as u8 + 1,
+                name: b"x".to_vec(),
+            }])
+            .is_err()
+        );
+
+        let stat = StatOnly {
+            kind: crate::schema::fs::ENTRY_FILE as u8,
+            mode: 0o100644,
+            size: 5 << 30,
+            modified_unix_ns: -3,
+        };
+        let bytes = stat.encode().unwrap();
+        assert_eq!(bytes.len(), 24);
+        truncations::<StatOnly>(&bytes);
+        assert_eq!(StatOnly::decode(&bytes).unwrap(), stat);
+        let mut reserved = bytes.clone();
+        reserved[1] = 1;
+        assert!(StatOnly::decode(&reserved).is_err());
+    }
+
+    #[test]
+    fn stage_in_place_is_an_extended_flag_exclusive_with_create_parents() {
+        let stage = StageWrite {
+            root_handle: 1,
+            path: path(b"file"),
+            precondition: Precondition::Any,
+            flags: crate::schema::fs::STAGE_IN_PLACE as u16,
+            mode: 0,
+            byte_len: 3,
+            content_hash: [2; 32],
+            initial_receive_credit: 1024,
+            extensions: Extensions::default(),
+        };
+        assert!(stage.in_place());
+        truncations::<StageWrite>(&stage.encode().unwrap());
+        assert_eq!(StageWrite::decode(&stage.encode().unwrap()).unwrap(), stage);
+        let both = StageWrite {
+            flags: (crate::schema::fs::STAGE_IN_PLACE | crate::schema::fs::STAGE_CREATE_PARENTS)
+                as u16,
+            ..stage.clone()
+        };
+        assert!(both.encode().is_err());
+        let unknown = StageWrite { flags: 4, ..stage };
+        assert!(unknown.encode().is_err());
     }
 }

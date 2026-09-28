@@ -3,6 +3,14 @@
 //! Provides connection pooling, ssh-agent authentication, `~/.ssh/config`
 //! parsing, and `direct-streamlocal` channel forwarding for connecting to
 //! remote yas-servers without shelling out to the system `ssh` binary.
+//!
+//! By default a pool behaves like `ssh`: ssh-agent, then key files, with
+//! host keys pinned in `~/.ssh/known_hosts` (trust on first use). A service
+//! holding credentials in memory builds its pool with
+//! [`SshPool::with_options`] instead: private keys (or a password) passed as
+//! values, host keys pinned by the caller ([`HostKeyPolicy::Pinned`]) or
+//! checked by a callback ([`HostKeyPolicy::Verify`]), and no file, agent or
+//! `~/.ssh/config` access unless asked for.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +34,194 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("ssh: {0}")]
     Other(String),
+    /// The server's host key was refused: not pinned, rejected by the
+    /// [`HostKeyPolicy::Verify`] callback, or different from the one in
+    /// known_hosts. `fingerprint` (`SHA256:…`) is the key it presented.
+    #[error("ssh: {message}")]
+    HostKey {
+        host: String,
+        port: u16,
+        fingerprint: String,
+        message: String,
+    },
+}
+
+// ── Caller-supplied credentials and host-key policy ────────────────────
+
+/// What a [`HostKeyPolicy::Verify`] callback is asked about.
+#[derive(Debug)]
+pub struct HostKeyCheck<'a> {
+    /// The host as connected to (after `~/.ssh/config` resolution, if used).
+    pub host: &'a str,
+    /// The TCP port.
+    pub port: u16,
+    /// The key the server presented.
+    pub key: &'a keys::PublicKey,
+}
+
+impl HostKeyCheck<'_> {
+    /// The presented key as an OpenSSH public-key line (`ssh-ed25519 AAAA…`).
+    pub fn openssh(&self) -> String {
+        public_key_openssh(self.key)
+    }
+
+    /// The presented key's `SHA256:…` fingerprint.
+    pub fn fingerprint(&self) -> String {
+        fingerprint(self.key)
+    }
+}
+
+/// How a pool decides whether to trust a server's host key.
+#[derive(Clone, Default)]
+pub enum HostKeyPolicy {
+    /// `~/.ssh/known_hosts` (or `YAS_SSH_KNOWN_HOSTS`): unknown hosts are
+    /// learned and recorded, changed keys are refused.
+    #[default]
+    KnownHosts,
+    /// Accept exactly these keys (any host). Nothing is read or written.
+    Pinned(Vec<keys::PublicKey>),
+    /// Ask the callback; `true` accepts. Use it to pin into your own store
+    /// (trust on first use) or to compare fingerprints.
+    Verify(Arc<dyn Fn(&HostKeyCheck<'_>) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for HostKeyPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KnownHosts => f.write_str("KnownHosts"),
+            Self::Pinned(keys) => f
+                .debug_tuple("Pinned")
+                .field(&keys.iter().map(fingerprint).collect::<Vec<_>>())
+                .finish(),
+            Self::Verify(_) => f.write_str("Verify(..)"),
+        }
+    }
+}
+
+/// Credentials and policy for an [`SshPool`].
+#[derive(Clone, Debug)]
+pub struct SshOptions {
+    /// Private keys tried in order before anything else.
+    pub keys: Vec<Arc<keys::PrivateKey>>,
+    /// A password tried after the keys.
+    pub password: Option<String>,
+    /// Try ssh-agent (`SSH_AUTH_SOCK`).
+    pub agent: bool,
+    /// Try `~/.ssh/id_*` and `IdentityFile`s from `~/.ssh/config`.
+    pub key_files: bool,
+    /// Read `~/.ssh/config` (Hostname, User, Port, IdentityFile).
+    pub config_file: bool,
+    /// Host-key trust.
+    pub host_keys: HostKeyPolicy,
+    /// Port when neither the URI nor `~/.ssh/config` names one (default 22).
+    pub port: Option<u16>,
+    /// Install YAS on the remote (`curl https://yas.run | sh` into
+    /// `~/.local`) and start its server when no socket answers. Installing
+    /// happens only when `yas` is not found there.
+    pub install: bool,
+    /// How to reach the remote server: its socket, a command, or both.
+    pub mode: SshMode,
+    /// The command [`SshMode::Exec`] runs on the remote, verbatim, through
+    /// the user's login shell. Default: `yas connect --stdio` (plus
+    /// `--on socket:PATH` when the URI names a socket).
+    pub remote_command: Option<String>,
+}
+
+/// How [`SshPool::connect_yas`] reaches the remote YAS server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SshMode {
+    /// Forward to the remote YAS socket (`direct-streamlocal`), starting its
+    /// server (and installing YAS, with [`SshOptions::install`]) when none
+    /// answers. When the SSH server refuses stream-local forwarding, or no
+    /// socket path can be worked out because the host has no POSIX shell (as
+    /// on Windows), run `yas connect --stdio` over an exec channel instead.
+    #[default]
+    Auto,
+    /// Only forward to the socket.
+    Socket,
+    /// Only run [`SshOptions::remote_command`] and speak YAS over its stdin
+    /// and stdout. Needs neither a POSIX shell nor stream-local forwarding:
+    /// Windows hosts, locked-down `sshd`s. Nothing is installed or started
+    /// beyond what that command does (`yas connect --stdio` starts the
+    /// user's server when none runs).
+    Exec,
+}
+
+impl Default for SshOptions {
+    /// Behave like `ssh`: agent, key files, `~/.ssh/config`, known_hosts.
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            password: None,
+            agent: true,
+            key_files: true,
+            config_file: true,
+            host_keys: HostKeyPolicy::KnownHosts,
+            port: None,
+            install: true,
+            mode: SshMode::Auto,
+            remote_command: None,
+        }
+    }
+}
+
+impl SshOptions {
+    /// Only what the caller passes: no agent, no key files, no
+    /// `~/.ssh/config`, and host keys pinned to `host_keys`.
+    pub fn in_memory(host_keys: HostKeyPolicy) -> Self {
+        Self {
+            agent: false,
+            key_files: false,
+            config_file: false,
+            host_keys,
+            ..Self::default()
+        }
+    }
+
+    /// Add a private key in OpenSSH (or PEM) text form.
+    pub fn with_private_key(mut self, text: &str, passphrase: Option<&str>) -> Result<Self, Error> {
+        self.keys
+            .push(Arc::new(keys::decode_secret_key(text, passphrase)?));
+        Ok(self)
+    }
+
+    /// Set a password.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+}
+
+/// Parse an OpenSSH public key: `ssh-ed25519 AAAA… [comment]`, a
+/// `known_hosts`-style `host ssh-ed25519 AAAA…` line, or bare base64.
+pub fn parse_public_key(text: &str) -> Result<keys::PublicKey, Error> {
+    let text = text.trim();
+    if let Ok(key) = keys::PublicKey::from_openssh(text) {
+        return Ok(key);
+    }
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    // known_hosts line: hosts, algorithm, base64
+    if fields.len() >= 3
+        && let Ok(key) = keys::PublicKey::from_openssh(&fields[1..].join(" "))
+    {
+        return Ok(key);
+    }
+    let base64 = fields
+        .iter()
+        .find(|field| field.starts_with("AAAA"))
+        .copied()
+        .unwrap_or(text);
+    Ok(keys::parse_public_key_base64(base64)?)
+}
+
+/// A key's `SHA256:…` fingerprint, as `ssh-keygen -l` prints it.
+pub fn fingerprint(key: &keys::PublicKey) -> String {
+    key.fingerprint(keys::HashAlg::Sha256).to_string()
+}
+
+/// A key as an OpenSSH public-key line (without comment).
+pub fn public_key_openssh(key: &keys::PublicKey) -> String {
+    key.to_openssh().unwrap_or_default()
 }
 
 // ── Shell scripts run on the remote ────────────────────────────────────
@@ -238,6 +434,7 @@ fn expand_tilde(path: &str) -> String {
 struct SshHandler {
     host: String,
     port: u16,
+    policy: HostKeyPolicy,
 }
 
 impl client::Handler for SshHandler {
@@ -257,6 +454,33 @@ impl client::Handler for SshHandler {
                 "SSH host certificates are not supported".into(),
             ));
         };
+        match &self.policy {
+            HostKeyPolicy::KnownHosts => {}
+            HostKeyPolicy::Pinned(pinned) => {
+                // Comments are labels, not identity.
+                if pinned
+                    .iter()
+                    .any(|key| key.key_data() == server_public_key.key_data())
+                {
+                    return Ok(true);
+                }
+                return Err(self.refused(
+                    server_public_key,
+                    format!("is not one of the {} pinned key(s)", pinned.len()),
+                ));
+            }
+            HostKeyPolicy::Verify(verify) => {
+                let check = HostKeyCheck {
+                    host: &self.host,
+                    port: self.port,
+                    key: server_public_key,
+                };
+                if verify(&check) {
+                    return Ok(true);
+                }
+                return Err(self.refused(server_public_key, "was rejected".to_string()));
+            }
+        }
         let path = known_hosts_path().ok_or_else(|| {
             Error::Other(
                 "cannot verify host keys: no home directory for ~/.ssh/known_hosts. \
@@ -329,15 +553,31 @@ impl client::Handler for SshHandler {
             return Ok(true);
         }
 
-        Err(Error::Other(format!(
-            "host key for {}:{} does not match the {} key(s) recorded in {}! \
-             This could indicate a man-in-the-middle attack. Remove the old \
-             entry to continue.",
-            self.host,
-            self.port,
-            recorded.len(),
-            path.display()
-        )))
+        Err(self.refused(
+            server_public_key,
+            format!(
+                "does not match the {} key(s) recorded in {}! This could \
+                 indicate a man-in-the-middle attack. Remove the old entry to \
+                 continue.",
+                recorded.len(),
+                path.display()
+            ),
+        ))
+    }
+}
+
+impl SshHandler {
+    fn refused(&self, key: &keys::PublicKey, why: String) -> Error {
+        let fingerprint = fingerprint(key);
+        Error::HostKey {
+            message: format!(
+                "host key {fingerprint} for {}:{} {why}",
+                self.host, self.port
+            ),
+            host: self.host.clone(),
+            port: self.port,
+            fingerprint,
+        }
     }
 }
 
@@ -368,12 +608,35 @@ pub struct SshPool {
 struct PoolInner {
     /// Cached connections keyed by `"user@host:port"`.
     connections: Mutex<HashMap<String, CachedConnection>>,
+    options: SshOptions,
+}
+
+impl std::fmt::Debug for SshPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshPool")
+            .field("host_keys", &self.inner.options.host_keys)
+            .field("keys", &self.inner.options.keys.len())
+            .finish_non_exhaustive()
+    }
 }
 
 struct CachedConnection {
     handle: client::Handle<SshHandler>,
     /// Resolved native YAS socket path (cached after first resolution).
     remote_socket: Option<String>,
+    /// How sessions reach this host once only exec works (the command is
+    /// built per call: each may name its own socket).
+    exec: Option<ExecRoute>,
+    /// `yas --version` ran there (checked once per connection).
+    plain_yas: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecRoute {
+    /// `sh` runs: `yas connect --stdio` with ~/.local/bin and `YAS_SOCK`.
+    Posix,
+    /// No POSIX shell: a plain `yas connect --stdio`.
+    Plain,
 }
 
 impl Default for SshPool {
@@ -384,11 +647,23 @@ impl Default for SshPool {
 
 impl SshPool {
     pub fn new() -> Self {
+        Self::with_options(SshOptions::default())
+    }
+
+    /// A pool whose connections all use `options` (credentials, host-key
+    /// policy). Pools share nothing; use one per credential set.
+    pub fn with_options(options: SshOptions) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 connections: Mutex::new(HashMap::new()),
+                options,
             }),
         }
+    }
+
+    /// The options this pool connects with.
+    pub fn options(&self) -> &SshOptions {
+        &self.inner.options
     }
 
     /// Open a `direct-streamlocal` channel to a remote yas-server.
@@ -424,13 +699,20 @@ impl SshPool {
         remote_socket: Option<&str>,
     ) -> Result<tokio::io::DuplexStream, Error> {
         let socket_is_explicit = remote_socket.is_some();
-        let config = resolve_ssh_config(host);
+        let options = &self.inner.options;
+        let config = if options.config_file {
+            resolve_ssh_config(host)
+        } else {
+            ResolvedConfig::default()
+        };
+        // An explicit "host:port" is not an SSH URI form (":" introduces the
+        // socket path there), so ports come from options or ~/.ssh/config.
         let effective_host = config.hostname.as_deref().unwrap_or(host);
         let effective_user = user
             .map(String::from)
             .or(config.user.clone())
             .unwrap_or_else(current_username);
-        let effective_port = config.port.unwrap_or(22);
+        let effective_port = config.port.or(options.port).unwrap_or(22);
 
         let key = format!("{effective_user}@{effective_host}:{effective_port}");
 
@@ -447,9 +729,14 @@ impl SshPool {
             // Release the lock while establishing the TCP + SSH connection —
             // this can take seconds (DNS, handshake, auth).
             drop(conns);
-            let handle =
-                establish_connection(effective_host, effective_port, &effective_user, &config)
-                    .await?;
+            let handle = establish_connection(
+                effective_host,
+                effective_port,
+                &effective_user,
+                &config,
+                options,
+            )
+            .await?;
             conns = self.inner.connections.lock().await;
             // Another task may have raced us for the same key — prefer the
             // existing live connection to avoid duplicates.
@@ -463,12 +750,42 @@ impl SshPool {
                     CachedConnection {
                         handle,
                         remote_socket: None,
+                        exec: None,
+                        plain_yas: false,
                     },
                 );
             }
         }
 
         let cached = conns.get_mut(&key).unwrap();
+        let host_label = effective_host;
+
+        if options.mode == SshMode::Exec {
+            let command = match &options.remote_command {
+                Some(command) if remote_socket.is_some() => {
+                    return Err(Error::Other(format!(
+                        "an SSH URI socket path cannot be combined with the custom remote command `{command}`"
+                    )));
+                }
+                Some(command) => command.clone(),
+                None => plain_remote_command(remote_socket)?,
+            };
+            if options.remote_command.is_none() && !cached.plain_yas {
+                require_plain_yas(&cached.handle, host_label).await?;
+                cached.plain_yas = true;
+            }
+            return open_exec(&cached.handle, &command).await;
+        }
+        if options.mode == SshMode::Auto
+            && let Some(route) = cached.exec
+        {
+            // An earlier connection learned that only a command gets through.
+            let command = match route {
+                ExecRoute::Posix => posix_remote_command(remote_socket, options.install),
+                ExecRoute::Plain => plain_remote_command(remote_socket)?,
+            };
+            return open_exec(&cached.handle, &command).await;
+        }
 
         // Resolve remote socket path if not cached and not explicitly provided.
         let socket_path = if let Some(explicit) = remote_socket {
@@ -476,53 +793,233 @@ impl SshPool {
         } else if let Some(cached_path) = cached.remote_socket.as_ref() {
             cached_path.clone()
         } else {
-            let path = exec_command(&cached.handle, &socket_search_script()).await?;
-            let path = path.trim().to_string();
+            let found = exec_command(&cached.handle, &socket_search_script()).await;
+            let path = found
+                .as_ref()
+                .map(|path| path.trim().to_string())
+                .unwrap_or_default();
             if path.is_empty() {
-                return Err(Error::Other(
-                    "could not determine remote YAS socket path".to_string(),
-                ));
+                if options.mode == SshMode::Auto {
+                    // No POSIX shell ran the search (a Windows host, say):
+                    // a plain `yas connect --stdio` is the way in.
+                    let command = plain_remote_command(None)?;
+                    require_plain_yas(&cached.handle, host_label).await?;
+                    cached.plain_yas = true;
+                    let stream = open_exec(&cached.handle, &command).await?;
+                    cached.exec = Some(ExecRoute::Plain);
+                    return Ok(stream);
+                }
+                return Err(found.err().unwrap_or_else(|| {
+                    Error::Other("could not determine remote YAS socket path".to_string())
+                }));
             }
             cached.remote_socket = Some(path.clone());
             path
         };
 
-        // Try to open the channel. If it fails, install + start and retry.
-        let channel = match cached
+        let auto = options.mode == SshMode::Auto;
+        let mut last_err = match cached
             .handle
             .channel_open_direct_streamlocal(&socket_path)
             .await
         {
-            Ok(ch) => ch,
-            Err(_first_err) => {
-                // Install yas if missing and (re)start the server.
-                let _ = exec_command(
-                    &cached.handle,
-                    &install_and_start_script_for(&socket_path, socket_is_explicit),
-                )
-                .await;
-                // Retry with back-off: the server needs a moment to create
-                // the socket after starting.
-                let mut last_err = _first_err;
-                for attempt in 0..10 {
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
-                    match cached
-                        .handle
-                        .channel_open_direct_streamlocal(&socket_path)
-                        .await
-                    {
-                        Ok(ch) => return Ok(bridge_channel(ch)),
-                        Err(e) => last_err = e,
-                    }
+            Ok(channel) => return Ok(bridge_channel(channel)),
+            Err(error) => error,
+        };
+        if !forwarding_refused(&last_err) {
+            if !options.install {
+                return Err(Error::Other(format!(
+                    "cannot reach the YAS socket {socket_path} on {host_label}: {last_err}"
+                )));
+            }
+            // Nobody answers on the socket: install yas if it is missing and
+            // start its server, then retry with back-off while the server
+            // creates the socket.
+            let _ = exec_command(
+                &cached.handle,
+                &install_and_start_script_for(&socket_path, socket_is_explicit),
+            )
+            .await;
+            for attempt in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                match cached
+                    .handle
+                    .channel_open_direct_streamlocal(&socket_path)
+                    .await
+                {
+                    Ok(channel) => return Ok(bridge_channel(channel)),
+                    Err(error) => last_err = error,
                 }
+                if forwarding_refused(&last_err) {
+                    break;
+                }
+            }
+            if !forwarding_refused(&last_err) {
                 return Err(Error::Other(format!(
                     "failed to connect to {socket_path} after install: {last_err}"
                 )));
             }
-        };
-
-        Ok(bridge_channel(channel))
+        }
+        if !auto {
+            return Err(Error::Other(format!(
+                "{host_label} does not forward to the YAS socket {socket_path} ({last_err}); \
+                 SshMode::Auto or SshMode::Exec would run `yas connect --stdio` there instead"
+            )));
+        }
+        // The SSH server does not forward to sockets at all (OpenSSH's
+        // AllowStreamLocalForwarding no, or no support for it): have a remote
+        // yas relay the session over an exec channel. Install it first only
+        // if it is missing and installing is allowed.
+        if !posix_yas_present(&cached.handle).await {
+            if !options.install {
+                return Err(Error::Other(format!(
+                    "{host_label} does not forward to sockets and has no yas to run \
+                     (installing is off)"
+                )));
+            }
+            let _ = exec_command(
+                &cached.handle,
+                &install_and_start_script_for(&socket_path, socket_is_explicit),
+            )
+            .await;
+            if !posix_yas_present(&cached.handle).await {
+                return Err(Error::Other(format!(
+                    "{host_label} does not forward to sockets, and installing yas there failed"
+                )));
+            }
+        }
+        let command = posix_remote_command(remote_socket, options.install);
+        let stream = open_exec(&cached.handle, &command).await?;
+        cached.exec = Some(ExecRoute::Posix);
+        Ok(stream)
     }
+}
+
+/// Whether a failed `direct-streamlocal` open means the SSH server will not
+/// forward to Unix sockets at all, rather than that nobody listens there.
+fn forwarding_refused(error: &russh::Error) -> bool {
+    matches!(
+        error,
+        russh::Error::ChannelOpenFailure(
+            russh::ChannelOpenFailure::AdministrativelyProhibited
+                | russh::ChannelOpenFailure::UnknownChannelType
+        )
+    )
+}
+
+/// `yas connect --stdio`, naming the URI's socket when it has one. The
+/// command goes through whatever shell the remote user has (cmd.exe too),
+/// so a socket path must not need quoting.
+fn plain_remote_command(socket: Option<&str>) -> Result<String, Error> {
+    let Some(socket) = socket else {
+        return Ok("yas connect --stdio".to_string());
+    };
+    if socket.is_empty()
+        || !socket
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/\\._-:~+@%,".contains(c))
+    {
+        return Err(Error::Other(format!(
+            "the socket path {socket:?} cannot be passed to a remote command unquoted"
+        )));
+    }
+    Ok(format!("yas --on socket:{socket} connect --stdio"))
+}
+
+/// `yas connect --stdio` through `sh`, finding a yas installed in
+/// `~/.local/bin` and keeping an explicit socket exact, as the start script
+/// does. Without `start`, it only connects to a running server.
+fn posix_remote_command(socket: Option<&str>, start: bool) -> String {
+    let socket_override = socket
+        .map(|path| format!("YAS_SOCK=\"{}\" ", dq_escape(path)))
+        .unwrap_or_default();
+    let no_start = if start { "" } else { " --no-start" };
+    let script = format!(
+        "PATH=\"$HOME/.local/bin:$PATH\"; export PATH; \
+         {socket_override}exec yas connect --stdio{no_start}"
+    );
+    format!("sh -c {}", sq_escape(&script))
+}
+
+/// Whether `yas` runs on a POSIX remote (including `~/.local/bin`).
+async fn posix_yas_present(handle: &client::Handle<SshHandler>) -> bool {
+    let probe = sh_probe();
+    exec_command(handle, &probe)
+        .await
+        .is_ok_and(|output| output.trim() == "present")
+}
+
+fn sh_probe() -> String {
+    format!(
+        "sh -c {}",
+        sq_escape(
+            "PATH=\"$HOME/.local/bin:$PATH\"; command -v yas >/dev/null 2>&1 && echo present"
+        )
+    )
+}
+
+/// Fail clearly when a plain `yas` does not run on the remote: without a
+/// POSIX shell nothing can be installed, and a missing command would
+/// otherwise only show as a session that closes during HELLO.
+async fn require_plain_yas(handle: &client::Handle<SshHandler>, host: &str) -> Result<(), Error> {
+    let version = exec_command(handle, "yas --version")
+        .await
+        .unwrap_or_default();
+    if version.trim_start().starts_with("yas") {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "`yas --version` did not run on {host}: install YAS there and put it on the PATH \
+         of non-interactive SSH commands"
+    )))
+}
+
+/// Run `command` on an exec channel and bridge its stdin/stdout to a
+/// `DuplexStream`. Half-closes travel both ways: when the caller stops
+/// writing, the command sees EOF on stdin and may still answer.
+async fn open_exec(
+    handle: &client::Handle<SshHandler>,
+    command: &str,
+) -> Result<tokio::io::DuplexStream, Error> {
+    let mut channel = handle.channel_open_session().await?;
+    channel.exec(true, command.as_bytes()).await?;
+    let mut early = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Success) => break,
+            Some(russh::ChannelMsg::Failure) => {
+                return Err(Error::Other(format!(
+                    "the SSH server refused to run `{command}`"
+                )));
+            }
+            Some(russh::ChannelMsg::Data { data }) => early.extend_from_slice(&data),
+            Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
+                return Err(Error::Other(format!(
+                    "the SSH channel closed before `{command}` started"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let stream = channel.into_stream();
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let (mut sr, mut sw) = tokio::io::split(server);
+        let (mut cr, mut cw) = tokio::io::split(stream);
+        let up = async {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+            let _ = cw.shutdown().await;
+        };
+        let down = async {
+            if sw.write_all(&early).await.is_ok() {
+                let _ = tokio::io::copy(&mut cr, &mut sw).await;
+            }
+            let _ = sw.shutdown().await;
+        };
+        tokio::join!(up, down);
+    });
+    Ok(client)
 }
 
 /// Bridge an SSH channel to a `DuplexStream` so callers get a standard
@@ -548,6 +1045,7 @@ async fn establish_connection(
     port: u16,
     user: &str,
     config: &ResolvedConfig,
+    options: &SshOptions,
 ) -> Result<client::Handle<SshHandler>, Error> {
     let ssh_config = client::Config {
         // Detect dead connections behind NATs/firewalls instead of hanging
@@ -561,23 +1059,56 @@ async fn establish_connection(
     let handler = SshHandler {
         host: host.to_string(),
         port,
+        policy: options.host_keys.clone(),
     };
 
     let mut handle = client::connect(Arc::new(ssh_config), (host, port), handler).await?;
+    let mut tried = Vec::new();
 
-    // Try ssh-agent first.
-    if try_agent_auth(&mut handle, user).await {
-        return Ok(handle);
+    // Caller-supplied keys first.
+    if !options.keys.is_empty() {
+        tried.push("supplied keys");
+        for key in &options.keys {
+            let hash_alg = handle.best_supported_rsa_hash().await.ok().flatten();
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::clone(key), hash_alg.flatten());
+            match handle.authenticate_publickey(user, key_with_hash).await {
+                Ok(russh::client::AuthResult::Success) => return Ok(handle),
+                Ok(_) => continue,
+                Err(e) => log::debug!("supplied key auth failed: {e}"),
+            }
+        }
     }
 
-    // Fall back to key files.
-    if try_key_file_auth(&mut handle, user, config).await? {
-        return Ok(handle);
+    if let Some(password) = &options.password {
+        tried.push("password");
+        if let Ok(russh::client::AuthResult::Success) =
+            handle.authenticate_password(user, password.clone()).await
+        {
+            return Ok(handle);
+        }
+    }
+
+    if options.agent {
+        tried.push("ssh-agent");
+        if try_agent_auth(&mut handle, user).await {
+            return Ok(handle);
+        }
+    }
+
+    if options.key_files {
+        tried.push("key files");
+        if try_key_file_auth(&mut handle, user, config).await? {
+            return Ok(handle);
+        }
     }
 
     Err(Error::Other(format!(
-        "authentication failed for {user}@{host}:{port} \
-         (tried ssh-agent and key files)"
+        "authentication failed for {user}@{host}:{port} (tried {})",
+        if tried.is_empty() {
+            "nothing: no credentials configured".to_string()
+        } else {
+            tried.join(", ")
+        }
     )))
 }
 
@@ -686,6 +1217,12 @@ async fn exec_command(handle: &client::Handle<SshHandler>, cmd: &str) -> Result<
         match msg {
             russh::ChannelMsg::Data { data } => output.extend_from_slice(&data),
             russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+            // The server would not run it: no Close need follow.
+            russh::ChannelMsg::Failure => {
+                return Err(Error::Other(
+                    "the SSH server refused an exec request".into(),
+                ));
+            }
             _ => continue,
         }
     }
@@ -839,6 +1376,58 @@ mod tests {
     }
 
     #[test]
+    fn plain_remote_command_passes_only_paths_that_need_no_quoting() {
+        assert_eq!(plain_remote_command(None).unwrap(), "yas connect --stdio");
+        assert_eq!(
+            plain_remote_command(Some("/run/user/1000/yas/yas-default.sock")).unwrap(),
+            "yas --on socket:/run/user/1000/yas/yas-default.sock connect --stdio"
+        );
+        assert_eq!(
+            plain_remote_command(Some(r"\\.\pipe\yas-default")).unwrap(),
+            r"yas --on socket:\\.\pipe\yas-default connect --stdio"
+        );
+        for unsafe_path in ["/tmp/a b.sock", "/tmp/$(x).sock", "/tmp/a'b", ""] {
+            assert!(
+                plain_remote_command(Some(unsafe_path)).is_err(),
+                "{unsafe_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_remote_command_quotes_an_explicit_socket_through_both_shells() {
+        let command = posix_remote_command(Some("/tmp/owner's-$(touch nope).sock"), false);
+        assert!(command.starts_with("sh -c '"), "{command}");
+        assert!(
+            command.contains("owner'\"'\"'s-\\$(touch nope).sock"),
+            "{command}"
+        );
+        assert!(
+            command.ends_with("exec yas connect --stdio --no-start'"),
+            "{command}"
+        );
+        let automatic = posix_remote_command(None, true);
+        assert!(!automatic.contains("YAS_SOCK"), "{automatic}");
+        assert!(
+            automatic.ends_with("exec yas connect --stdio'"),
+            "{automatic}"
+        );
+        assert!(automatic.contains("$HOME/.local/bin"), "{automatic}");
+    }
+
+    #[test]
+    fn only_prohibited_or_unknown_channels_mean_forwarding_is_refused() {
+        use russh::ChannelOpenFailure as Failure;
+        let open = |failure| russh::Error::ChannelOpenFailure(failure);
+        assert!(forwarding_refused(&open(
+            Failure::AdministrativelyProhibited
+        )));
+        assert!(forwarding_refused(&open(Failure::UnknownChannelType)));
+        assert!(!forwarding_refused(&open(Failure::ConnectFailed)));
+        assert!(!forwarding_refused(&russh::Error::Disconnect));
+    }
+
+    #[test]
     fn explicit_start_quotes_a_single_quote_through_both_shells() {
         let path = "/tmp/owner's-$(touch nope).sock";
         let script = install_and_start_script_for(path, true);
@@ -883,6 +1472,7 @@ mod tests {
         let mut h = SshHandler {
             host: "example.test".into(),
             port: 22,
+            policy: HostKeyPolicy::KnownHosts,
         };
         futures_lite_block_on(h.check_server_key(&key(presented).into()))
     }
@@ -986,6 +1576,80 @@ mod tests {
             assert!(lines[0].starts_with("other.test"));
             assert!(lines[1].starts_with("example.test"));
         });
+    }
+
+    fn check_with(policy: HostKeyPolicy, presented: &str) -> Result<bool, Error> {
+        let mut h = SshHandler {
+            host: "example.test".into(),
+            port: 2222,
+            policy,
+        };
+        futures_lite_block_on(h.check_server_key(&key(presented).into()))
+    }
+
+    #[test]
+    fn pinned_keys_accept_only_themselves_and_touch_no_file() {
+        with_known_hosts(None, |path| {
+            let pinned = HostKeyPolicy::Pinned(vec![parse_public_key(KEY_A).unwrap()]);
+            assert!(check_with(pinned.clone(), KEY_A).unwrap());
+            let err = check_with(pinned.clone(), KEY_B).expect_err("unpinned key");
+            assert!(
+                format!("{err}").contains("not one of the 1 pinned"),
+                "{err}"
+            );
+            assert!(check_with(pinned, KEY_RSA).is_err());
+            let commented =
+                HostKeyPolicy::Pinned(vec![parse_public_key(&format!("{KEY_A} me@host")).unwrap()]);
+            assert!(
+                check_with(commented, KEY_A).unwrap(),
+                "comments are not identity"
+            );
+            assert!(!path.exists(), "pinning must not write known_hosts");
+        });
+    }
+
+    #[test]
+    fn verify_callback_sees_host_port_and_fingerprint() {
+        let expected = fingerprint(&key(KEY_A));
+        let policy = HostKeyPolicy::Verify(Arc::new(move |check: &HostKeyCheck<'_>| {
+            check.host == "example.test" && check.port == 2222 && check.fingerprint() == expected
+        }));
+        assert!(check_with(policy.clone(), KEY_A).unwrap());
+        assert!(check_with(policy, KEY_B).is_err());
+    }
+
+    #[test]
+    fn public_keys_parse_from_every_common_form() {
+        let bare = KEY_A.split_whitespace().nth(1).unwrap();
+        let a = parse_public_key(KEY_A).unwrap();
+        let data = |text: &str| parse_public_key(text).unwrap().key_data().clone();
+        assert_eq!(data(&format!("{KEY_A} me@host")), *a.key_data());
+        assert_eq!(data(&format!("example.test {KEY_A}")), *a.key_data());
+        assert_eq!(data(bare), *a.key_data());
+        assert!(fingerprint(&a).starts_with("SHA256:"));
+        assert_eq!(public_key_openssh(&a), KEY_A);
+    }
+
+    /// A throwaway key generated for this test only.
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACCgwmK3xYT+8Vx7J/rtA3C9cN3wlVh5V30Yyif+grok4gAAAJD1M1av9TNW\nrwAAAAtzc2gtZWQyNTUxOQAAACCgwmK3xYT+8Vx7J/rtA3C9cN3wlVh5V30Yyif+grok4g\nAAAEC8hSGyHNl8/0lO+hkgzJEZEkENc4U0+GcCfUiDHc1e36DCYrfFhP7xXHsn+u0DcL1w\n3fCVWHlXfRjKJ/6CuiTiAAAADHlhcy1zc2ggdGVzdAE=\n-----END OPENSSH PRIVATE KEY-----\n";
+    const TEST_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKDCYrfFhP7xXHsn+u0DcL1w3fCVWHlXfRjKJ/6CuiTi yas-ssh test";
+
+    #[test]
+    fn in_memory_private_keys_load_from_text() {
+        let options = SshOptions::in_memory(HostKeyPolicy::Pinned(Vec::new()))
+            .with_private_key(TEST_PRIVATE_KEY, None)
+            .unwrap();
+        assert_eq!(options.keys.len(), 1);
+        assert!(!options.agent && !options.key_files && !options.config_file);
+        assert_eq!(
+            options.keys[0].public_key(),
+            &parse_public_key(TEST_PUBLIC_KEY).unwrap()
+        );
+        assert!(
+            SshOptions::default()
+                .with_private_key("not a key", None)
+                .is_err()
+        );
     }
 
     #[test]

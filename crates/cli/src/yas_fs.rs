@@ -31,7 +31,7 @@ struct Root {
 
 impl Root {
     async fn open(on: Option<&str>, hub: &str, path: &str, writable: bool) -> Result<Self, String> {
-        let mut client = NativeClient::connect(on, hub).await?;
+        let mut client = crate::yas_native::connect(on, hub).await?;
         let opened: OpenResult = client
             .request_typed(
                 family::FS,
@@ -69,6 +69,7 @@ impl Root {
             )
             .await
             .map(|_| ())
+            .map_err(String::from)
     }
 }
 

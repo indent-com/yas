@@ -75,6 +75,66 @@ pub struct ConnectOpts {
     pub hub: String,
 }
 
+/// Process family maxima. Each flag overrides its environment variable; the
+/// defaults are the values YAS has always enforced.
+#[derive(Args, Clone, Debug, Default)]
+pub struct ProcessMaximaOpts {
+    /// Live processes per session [env: YAS_PROCESS_MAX_PER_SESSION; default 16, at most 16384]
+    #[arg(long, value_name = "N")]
+    pub process_max_per_session: Option<usize>,
+
+    /// Process generations server-wide [env: YAS_PROCESS_MAX; default 64, at most 65536]
+    #[arg(long, value_name = "N")]
+    pub process_max: Option<usize>,
+
+    /// Spawns in flight per session [env: YAS_PROCESS_MAX_PENDING_SPAWNS; default 8, at most 4096]
+    #[arg(long, value_name = "N")]
+    pub process_max_pending_spawns: Option<usize>,
+
+    /// Largest process stream buffer (stdin window) [env: YAS_PROCESS_STREAM_BUFFER_MAX; default 8 MiB, at most 1 GiB]
+    #[arg(long, value_name = "BYTES")]
+    pub process_stream_buffer_max: Option<u64>,
+
+    /// Environment entries per spawn [env: YAS_PROCESS_MAX_ENV; default 256, at most 16384]
+    #[arg(long, value_name = "N")]
+    pub process_max_env: Option<usize>,
+
+    /// Pending process WAITs per session [env: YAS_PROCESS_MAX_WAITS; default 32, at most 65536]
+    #[arg(long, value_name = "N")]
+    pub process_max_waits: Option<usize>,
+
+    /// Pending process ATTACH/CONTROL operations per session [env: YAS_PROCESS_MAX_OPERATIONS; default 16, at most 16384]
+    #[arg(long, value_name = "N")]
+    pub process_max_operations: Option<usize>,
+}
+
+impl ProcessMaximaOpts {
+    /// The environment's maxima with these flags applied, validated.
+    /// Environment warnings are printed; an out-of-range flag is an error.
+    pub fn resolve(&self) -> Result<yas_server::ProcessMaxima, String> {
+        let (mut maxima, warnings) = yas_server::ProcessMaxima::from_env();
+        for warning in warnings {
+            eprintln!("yas server: {warning}");
+        }
+        let apply = |slot: &mut usize, value: Option<usize>| {
+            if let Some(value) = value {
+                *slot = value;
+            }
+        };
+        apply(&mut maxima.per_session, self.process_max_per_session);
+        apply(&mut maxima.total, self.process_max);
+        apply(&mut maxima.pending_spawns, self.process_max_pending_spawns);
+        if let Some(value) = self.process_stream_buffer_max {
+            maxima.stream_buffer_bytes = value;
+        }
+        apply(&mut maxima.envc, self.process_max_env);
+        apply(&mut maxima.pending_waits, self.process_max_waits);
+        apply(&mut maxima.pending_operations, self.process_max_operations);
+        maxima.validate()?;
+        Ok(maxima)
+    }
+}
+
 /// Startup-only extension and native-channel deployment policy.
 #[derive(Args, Clone, Debug, Default)]
 pub struct ServerDeploymentOpts {
@@ -562,6 +622,30 @@ pub enum Command {
         listen: String,
     },
 
+    /// Carry a native YAS session over this process's stdin and stdout
+    ///
+    /// With --stdio, stdin and stdout become one YAS session with the server
+    /// (`--on` picks it; the local server by default, started if none runs).
+    /// A program that can only run commands, such as `ssh host yas connect
+    /// --stdio` or `docker exec -i CONTAINER yas connect --stdio`, then speaks
+    /// YAS to that server through the command's pipes. Nothing else is written
+    /// to stdout; errors go to stderr. When stdin ends the server is told, and
+    /// the command exits once the server closes the session.
+    ///
+    /// Examples:
+    ///   ssh host yas connect --stdio
+    ///   docker exec -i sandbox yas connect --stdio
+    ///   yas --on socket:/run/yas/app.sock connect --stdio --no-start
+    Connect {
+        /// Relay the session over stdin and stdout (the only mode)
+        #[arg(long, required = true)]
+        stdio: bool,
+
+        /// Fail instead of starting the local server when none runs
+        #[arg(long)]
+        no_start: bool,
+    },
+
     /// Print the full CLI reference (usage guide for scripts and LLM agents)
     Learn,
     /// Run the yas terminal multiplexer server
@@ -592,6 +676,14 @@ pub enum Command {
         #[cfg(unix)]
         #[arg(long)]
         fd_channel: Option<i32>,
+
+        /// Also listen on PATH, where every session is read-only whatever it
+        /// asks for: clients there watch terminals and windows but cannot
+        /// type, click, read files or run anything (or set
+        /// YAS_READ_ONLY_SOCK; Unix only)
+        #[cfg(unix)]
+        #[arg(long, value_name = "PATH", env = "YAS_READ_ONLY_SOCK")]
+        read_only_sock: Option<String>,
 
         /// Export the server socket path as YAS_SOCK in spawned terminals
         /// (or set YAS_EXPORT_SOCK=1)
@@ -673,6 +765,9 @@ pub enum Command {
         /// Disable native non-PTY child processes (or set YAS_PROCESS=0)
         #[arg(long)]
         no_processes: bool,
+
+        #[command(flatten)]
+        process_maxima: ProcessMaximaOpts,
     },
 
     /// Shut down the yas server

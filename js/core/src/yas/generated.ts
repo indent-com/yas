@@ -998,6 +998,7 @@ export const YAS_FS_WATCH_FLAGS = 63 as const;
 export const YAS_FS_ENTRY_FILE = 0 as const;
 export const YAS_FS_ENTRY_DIRECTORY = 1 as const;
 export const YAS_FS_ENTRY_SYMLINK = 2 as const;
+export const YAS_FS_ENTRY_OTHER = 3 as const;
 export const YAS_FS_ENTRY_EXECUTABLE = 1 as const;
 export const YAS_FS_ENTRY_READ_ONLY = 2 as const;
 export const YAS_FS_ENTRY_HIDDEN = 4 as const;
@@ -1010,6 +1011,9 @@ export const YAS_FS_CONTENT_NONE = 0 as const;
 export const YAS_FS_CONTENT_INLINE = 1 as const;
 export const YAS_FS_ENTRY_OPERATION_ID_EXTENSION = 1 as const;
 export const YAS_FS_RESULT_CONFLICT_DETAIL_EXTENSION = 1 as const;
+export const YAS_FS_RESULT_OS_ERROR_EXTENSION = 2 as const;
+export const YAS_FS_APPLY_RESULT_OS_ERRORS_EXTENSION = 1 as const;
+export const YAS_FS_MAX_OS_ERROR_TEXT_BYTES = 32 as const;
 export const YAS_FS_PATCH_MODE = 1 as const;
 export const YAS_FS_PATCH_MODIFIED_TIME = 2 as const;
 export const YAS_FS_PATCH_CONTENT = 4 as const;
@@ -1020,6 +1024,9 @@ export const YAS_FS_READ_STAT = 0 as const;
 export const YAS_FS_READ_HASH = 1 as const;
 export const YAS_FS_READ_LINK_TARGET = 2 as const;
 export const YAS_FS_READ_CONTENT = 3 as const;
+export const YAS_FS_READ_LIST = 4 as const;
+export const YAS_FS_READ_REALPATH = 5 as const;
+export const YAS_FS_READ_STAT_ONLY = 6 as const;
 export const YAS_FS_READ_NO_FOLLOW = 1 as const;
 export const YAS_FS_READ_FLAGS = 1 as const;
 export const YAS_FS_SEARCH_CASE_SENSITIVE = 1 as const;
@@ -1057,6 +1064,8 @@ export const YAS_FS_COMMIT_SYNC_DIRECTORY = 2 as const;
 export const YAS_FS_COMMIT_FLAGS = 3 as const;
 export const YAS_FS_STAGE_CREATE_PARENTS = 1 as const;
 export const YAS_FS_STAGE_FLAGS = 1 as const;
+export const YAS_FS_STAGE_IN_PLACE = 2 as const;
+export const YAS_FS_STAGE_EXTENDED_FLAGS = 2 as const;
 export const YAS_FS_APPLY_ALL_OR_NONE = 1 as const;
 export const YAS_FS_APPLY_FLAGS = 1 as const;
 export const YAS_FS_APPLY_WRITE_INLINE = 0 as const;
@@ -1103,6 +1112,13 @@ export const YAS_FS_LIMIT_MAX_STAGED_BYTES = 10 as const;
 export const YAS_FS_LIMIT_MAX_BATCH_ITEMS = 11 as const;
 export const YAS_FS_LIMIT_MAX_QUERY_CONCURRENCY = 12 as const;
 export const YAS_FS_LIMIT_MAX_CATALOG_ENTRIES = 13 as const;
+export const YAS_FS_LIMIT_CAPABILITIES = 14 as const;
+export const YAS_FS_CAPABILITY_OS_ERROR = 1 as const;
+export const YAS_FS_CAPABILITY_READ_LIST = 2 as const;
+export const YAS_FS_CAPABILITY_READ_REALPATH = 4 as const;
+export const YAS_FS_CAPABILITY_READ_STAT_ONLY = 8 as const;
+export const YAS_FS_CAPABILITY_STAGE_IN_PLACE = 16 as const;
+export const YAS_FS_CAPABILITY_FLAGS = 31 as const;
 export const YAS_FAMILY_GIT = 49 as const;
 export const YAS_GIT_VERSION = 1 as const;
 export const YAS_GIT_OPEN = 0 as const;
@@ -1632,7 +1648,10 @@ export const YAS_PROCESS_STATE = 0 as const;
 export const YAS_PROCESS_STATE_ACK = 1 as const;
 export const YAS_PROCESS_SPAWN_MERGE_STDERR = 1 as const;
 export const YAS_PROCESS_SPAWN_DETACHABLE = 2 as const;
+export const YAS_PROCESS_SPAWN_LEAVE_RESIDUE = 4 as const;
+export const YAS_PROCESS_SPAWN_STDIN_NULL = 8 as const;
 export const YAS_PROCESS_SPAWN_FLAGS = 3 as const;
+export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS = 12 as const;
 export const YAS_PROCESS_ENV_EMPTY = 0 as const;
 export const YAS_PROCESS_ENV_SESSION = 1 as const;
 export const YAS_PROCESS_CWD_SERVER_DEFAULT = 0 as const;
@@ -1678,6 +1697,7 @@ export const YAS_PROCESS_STREAM_STDOUT_CONTENT_KIND = 1 as const;
 export const YAS_PROCESS_STREAM_STDERR_CONTENT_KIND = 2 as const;
 export const YAS_PROCESS_SPAWN_SURFACE_APP_EXTENSION = 1 as const;
 export const YAS_PROCESS_SPAWN_RESOURCE_TAG_EXTENSION = 2 as const;
+export const YAS_PROCESS_SPAWN_RESIDUE_GRACE_EXTENSION = 3 as const;
 export const YAS_PROCESS_MAX_ARGC = 1024 as const;
 export const YAS_PROCESS_MAX_ARG_BYTES = 1048576 as const;
 export const YAS_PROCESS_MAX_ARG_LEN = 65536 as const;
@@ -1692,6 +1712,22 @@ export const YAS_PROCESS_MAX_PROCESSES = 64 as const;
 export const YAS_PROCESS_MAX_PENDING_SPAWNS = 8 as const;
 export const YAS_PROCESS_MAX_STREAM_BUFFER_BYTES = 8388608 as const;
 export const YAS_PROCESS_MAX_DETACHED_RETENTION_NS = 300000000000 as const;
+export const YAS_PROCESS_MAX_PROCESSES_PER_SESSION_EXTENDED = 16384 as const;
+export const YAS_PROCESS_MAX_PROCESSES_EXTENDED = 65536 as const;
+export const YAS_PROCESS_MAX_PENDING_SPAWNS_EXTENDED = 4096 as const;
+export const YAS_PROCESS_MAX_STREAM_BUFFER_BYTES_EXTENDED = 1073741824 as const;
+export const YAS_PROCESS_MAX_ENVC_EXTENDED = 16384 as const;
+export const YAS_PROCESS_MAX_PENDING_WAITS = 65536 as const;
+export const YAS_PROCESS_MAX_PENDING_OPERATIONS = 16384 as const;
+export const YAS_PROCESS_LEGACY_PENDING_WAITS = 32 as const;
+export const YAS_PROCESS_LEGACY_PENDING_OPERATIONS = 16 as const;
+export const YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED = 12 as const;
+export const YAS_PROCESS_LIMIT_MAX_PROCESSES_EXTENDED = 13 as const;
+export const YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS_EXTENDED = 14 as const;
+export const YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED = 15 as const;
+export const YAS_PROCESS_LIMIT_MAX_ENVC_EXTENDED = 16 as const;
+export const YAS_PROCESS_LIMIT_MAX_PENDING_WAITS = 17 as const;
+export const YAS_PROCESS_LIMIT_MAX_PENDING_OPERATIONS = 18 as const;
 export const YAS_PROCESS_LIMIT_MAX_ARGC = 1 as const;
 export const YAS_PROCESS_LIMIT_MAX_ARG_BYTES = 2 as const;
 export const YAS_PROCESS_LIMIT_MAX_ENVC = 3 as const;
@@ -1703,6 +1739,7 @@ export const YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES = 8 as const;
 export const YAS_PROCESS_LIMIT_MAX_DETACHED_RETENTION_NS = 9 as const;
 export const YAS_PROCESS_MAX_MUTATION_REPLAYS = 65536 as const;
 export const YAS_PROCESS_LIMIT_MAX_MUTATION_REPLAYS = 10 as const;
+export const YAS_PROCESS_LIMIT_LAUNCHER_FLAGS = 11 as const;
 export const YAS_FAMILY_NET = 65 as const;
 export const YAS_NET_VERSION = 1 as const;
 export const YAS_NET_OPEN = 0 as const;
@@ -2153,6 +2190,7 @@ export const YAS_FAMILY_LIMIT_POLICIES: Readonly<Record<number, readonly YasFami
     [11, 4, true, 1n, 256n],
     [12, 4, true, 1n, 8n],
     [13, 4, true, 1n, 1000000n],
+    [14, 4, false, 0n, 4294967295n],
   ],
   49: [
     [1, 4, true, 1n, 64n],
@@ -2202,6 +2240,14 @@ export const YAS_FAMILY_LIMIT_POLICIES: Readonly<Record<number, readonly YasFami
     [8, 8, true, 1n, 8388608n],
     [9, 8, true, 1n, 300000000000n],
     [10, 4, true, 1n, 65536n],
+    [11, 4, false, 0n, 12n],
+    [12, 4, false, 1n, 16384n],
+    [13, 4, false, 1n, 65536n],
+    [14, 4, false, 1n, 4096n],
+    [15, 8, false, 1n, 1073741824n],
+    [16, 4, false, 1n, 16384n],
+    [17, 4, false, 1n, 65536n],
+    [18, 4, false, 1n, 16384n],
   ],
   65: [
     [1, 4, true, 1n, 255n],
@@ -7855,6 +7901,14 @@ export const YAS_SCHEMA = {
           "required": true,
           "hard_min": 1,
           "hard_max": 1000000
+        },
+        {
+          "name": "CAPABILITIES",
+          "tag": 14,
+          "type": "u32",
+          "required": false,
+          "hard_min": 0,
+          "hard_max": 4294967295
         }
       ],
       "requests": [
@@ -8063,6 +8117,34 @@ export const YAS_SCHEMA = {
         {
           "name": "family_limits",
           "layout": "ordered optional extensions: tags 1..12 encode max roots/session:u32,watches/root:u32,path components:u32,component bytes:u32,path bytes:u32,inline bytes:u32,query records:u32,query bytes:u32,stages/session:u32,staged bytes:u64,batch items:u32,query concurrency:u32"
+        },
+        {
+          "name": "family_capabilities",
+          "layout": "optional family limit extension tag LIMIT_CAPABILITIES exact value capabilities:u32; bitmask of CAPABILITY_* values the server implements; absent means zero; receivers ignore unknown bits; a client uses an opt-in value only when its capability bit is set"
+        },
+        {
+          "name": "os_error",
+          "layout": "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error, and an entry of ApplyOsErrors"
+        },
+        {
+          "name": "apply_os_errors",
+          "layout": "repeated index:u16,OsError; exact value of optional ApplyResult extension tag APPLY_RESULT_OS_ERRORS_EXTENSION, present only when at least one item failed because of an OS error; one entry per such item, indices strictly ascending and naming non-OK items of the same Result; offered with CAPABILITY_OS_ERROR"
+        },
+        {
+          "name": "query_read_extended_record",
+          "layout": "QueryReadRecord answering the opt-in question kinds: OK content READ_LIST QueryListEntries, READ_REALPATH raw absolute canonical platform path bytes, READ_STAT_ONLY QueryStatOnly; non-OK content is empty or exactly one OsError; READ_NO_FOLLOW is valid only with READ_STAT_ONLY among these kinds"
+        },
+        {
+          "name": "query_list_entries",
+          "layout": "repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash"
+        },
+        {
+          "name": "query_stat_only",
+          "layout": "kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed"
+        },
+        {
+          "name": "stage_in_place",
+          "layout": "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID"
         }
       ],
       "constants": [
@@ -8155,6 +8237,10 @@ export const YAS_SCHEMA = {
           "value": 2
         },
         {
+          "name": "ENTRY_OTHER",
+          "value": 3
+        },
+        {
           "name": "ENTRY_EXECUTABLE",
           "value": 1
         },
@@ -8203,6 +8289,18 @@ export const YAS_SCHEMA = {
           "value": 1
         },
         {
+          "name": "RESULT_OS_ERROR_EXTENSION",
+          "value": 2
+        },
+        {
+          "name": "APPLY_RESULT_OS_ERRORS_EXTENSION",
+          "value": 1
+        },
+        {
+          "name": "MAX_OS_ERROR_TEXT_BYTES",
+          "value": 32
+        },
+        {
           "name": "PATCH_MODE",
           "value": 1
         },
@@ -8241,6 +8339,18 @@ export const YAS_SCHEMA = {
         {
           "name": "READ_CONTENT",
           "value": 3
+        },
+        {
+          "name": "READ_LIST",
+          "value": 4
+        },
+        {
+          "name": "READ_REALPATH",
+          "value": 5
+        },
+        {
+          "name": "READ_STAT_ONLY",
+          "value": 6
         },
         {
           "name": "READ_NO_FOLLOW",
@@ -8389,6 +8499,14 @@ export const YAS_SCHEMA = {
         {
           "name": "STAGE_FLAGS",
           "value": 1
+        },
+        {
+          "name": "STAGE_IN_PLACE",
+          "value": 2
+        },
+        {
+          "name": "STAGE_EXTENDED_FLAGS",
+          "value": 2
         },
         {
           "name": "APPLY_ALL_OR_NONE",
@@ -8573,6 +8691,34 @@ export const YAS_SCHEMA = {
         {
           "name": "LIMIT_MAX_CATALOG_ENTRIES",
           "value": 13
+        },
+        {
+          "name": "LIMIT_CAPABILITIES",
+          "value": 14
+        },
+        {
+          "name": "CAPABILITY_OS_ERROR",
+          "value": 1
+        },
+        {
+          "name": "CAPABILITY_READ_LIST",
+          "value": 2
+        },
+        {
+          "name": "CAPABILITY_READ_REALPATH",
+          "value": 4
+        },
+        {
+          "name": "CAPABILITY_READ_STAT_ONLY",
+          "value": 8
+        },
+        {
+          "name": "CAPABILITY_STAGE_IN_PLACE",
+          "value": 16
+        },
+        {
+          "name": "CAPABILITY_FLAGS",
+          "value": 31
         }
       ]
     },
@@ -11504,6 +11650,70 @@ export const YAS_SCHEMA = {
           "required": true,
           "hard_min": 1,
           "hard_max": 65536
+        },
+        {
+          "name": "LAUNCHER_FLAGS",
+          "tag": 11,
+          "type": "u32",
+          "required": false,
+          "hard_min": 0,
+          "hard_max": 12
+        },
+        {
+          "name": "MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "tag": 12,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
+        },
+        {
+          "name": "MAX_PROCESSES_EXTENDED",
+          "tag": 13,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 65536
+        },
+        {
+          "name": "MAX_PENDING_SPAWNS_EXTENDED",
+          "tag": 14,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 4096
+        },
+        {
+          "name": "MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "tag": 15,
+          "type": "u64",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 1073741824
+        },
+        {
+          "name": "MAX_ENVC_EXTENDED",
+          "tag": 16,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
+        },
+        {
+          "name": "MAX_PENDING_WAITS",
+          "tag": 17,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 65536
+        },
+        {
+          "name": "MAX_PENDING_OPERATIONS",
+          "tag": 18,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
         }
       ],
       "requests": [
@@ -11622,8 +11832,20 @@ export const YAS_SCHEMA = {
           "value": 2
         },
         {
+          "name": "SPAWN_LEAVE_RESIDUE",
+          "value": 4
+        },
+        {
+          "name": "SPAWN_STDIN_NULL",
+          "value": 8
+        },
+        {
           "name": "SPAWN_FLAGS",
           "value": 3
+        },
+        {
+          "name": "SPAWN_LAUNCHER_FLAGS",
+          "value": 12
         },
         {
           "name": "ENV_EMPTY",
@@ -11806,6 +12028,10 @@ export const YAS_SCHEMA = {
           "value": 2
         },
         {
+          "name": "SPAWN_RESIDUE_GRACE_EXTENSION",
+          "value": 3
+        },
+        {
           "name": "MAX_ARGC",
           "value": 1024
         },
@@ -11862,6 +12088,70 @@ export const YAS_SCHEMA = {
           "value": 300000000000
         },
         {
+          "name": "MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "value": 16384
+        },
+        {
+          "name": "MAX_PROCESSES_EXTENDED",
+          "value": 65536
+        },
+        {
+          "name": "MAX_PENDING_SPAWNS_EXTENDED",
+          "value": 4096
+        },
+        {
+          "name": "MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "value": 1073741824
+        },
+        {
+          "name": "MAX_ENVC_EXTENDED",
+          "value": 16384
+        },
+        {
+          "name": "MAX_PENDING_WAITS",
+          "value": 65536
+        },
+        {
+          "name": "MAX_PENDING_OPERATIONS",
+          "value": 16384
+        },
+        {
+          "name": "LEGACY_PENDING_WAITS",
+          "value": 32
+        },
+        {
+          "name": "LEGACY_PENDING_OPERATIONS",
+          "value": 16
+        },
+        {
+          "name": "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "value": 12
+        },
+        {
+          "name": "LIMIT_MAX_PROCESSES_EXTENDED",
+          "value": 13
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_SPAWNS_EXTENDED",
+          "value": 14
+        },
+        {
+          "name": "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "value": 15
+        },
+        {
+          "name": "LIMIT_MAX_ENVC_EXTENDED",
+          "value": 16
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_WAITS",
+          "value": 17
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_OPERATIONS",
+          "value": 18
+        },
+        {
           "name": "LIMIT_MAX_ARGC",
           "value": 1
         },
@@ -11904,6 +12194,10 @@ export const YAS_SCHEMA = {
         {
           "name": "LIMIT_MAX_MUTATION_REPLAYS",
           "value": 10
+        },
+        {
+          "name": "LIMIT_LAUNCHER_FLAGS",
+          "value": 11
         }
       ]
     },

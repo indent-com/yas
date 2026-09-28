@@ -19,7 +19,7 @@ use yas_wire::net::{
 use yas_wire::transfer::{ByteData, Close as TransferClose, Credit, Reset};
 use yas_wire::{Class, Decode, Encode, Extensions, Frame, FrameHeader, family};
 
-use crate::yas_native::{NativeClient, NativeFrameReader, NativeFrameSender};
+use crate::yas_native::{NativeFrameReader, NativeFrameSender};
 
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1";
 
@@ -96,7 +96,7 @@ impl std::fmt::Display for OpenFailure {
 
 impl Connection {
     pub(crate) async fn connect(on: Option<&str>, hub: &str) -> Result<Self, String> {
-        let client = NativeClient::connect(on, hub).await?;
+        let client = crate::yas_native::connect(on, hub).await?;
         for (class, kind) in [
             (Class::Request, net::request_kind::OPEN),
             (Class::Request, net::request_kind::CLOSE),
@@ -336,6 +336,7 @@ impl ConnectionInner {
         match self.sender.send(frame).await {
             Ok(()) => Ok(()),
             Err(error) => {
+                let error = error.to_string();
                 self.fail(error.clone());
                 Err(error)
             }
@@ -907,7 +908,7 @@ async fn read_loop(mut reader: NativeFrameReader, inner: Arc<ConnectionInner>) {
         let (frame, transport_datagram) = match reader.next_with_source().await {
             Ok(frame) => frame,
             Err(error) => {
-                inner.fail(error);
+                inner.fail(error.to_string());
                 return;
             }
         };

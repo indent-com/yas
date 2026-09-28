@@ -12,6 +12,14 @@ limits = [
   { name = "MAX_STREAM_BUFFER_BYTES", tag = 8, type = "u64", required = true, hard_min = 1, hard_max = 8388608 },
   { name = "MAX_DETACHED_RETENTION_NS", tag = 9, type = "u64", required = true, hard_min = 1, hard_max = 300000000000 },
   { name = "MAX_MUTATION_REPLAYS", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+  { name = "LAUNCHER_FLAGS", tag = 11, type = "u32", required = false, hard_min = 0, hard_max = 12 },
+  { name = "MAX_PROCESSES_PER_SESSION_EXTENDED", tag = 12, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_PROCESSES_EXTENDED", tag = 13, type = "u32", required = false, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_PENDING_SPAWNS_EXTENDED", tag = 14, type = "u32", required = false, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_STREAM_BUFFER_BYTES_EXTENDED", tag = 15, type = "u64", required = false, hard_min = 1, hard_max = 1073741824 },
+  { name = "MAX_ENVC_EXTENDED", tag = 16, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_PENDING_WAITS", tag = 17, type = "u32", required = false, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_PENDING_OPERATIONS", tag = 18, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
 ]
 
 [[constant]]
@@ -21,8 +29,17 @@ value = 1
 name = "SPAWN_DETACHABLE"
 value = 2
 [[constant]]
+name = "SPAWN_LEAVE_RESIDUE"
+value = 4
+[[constant]]
+name = "SPAWN_STDIN_NULL"
+value = 8
+[[constant]]
 name = "SPAWN_FLAGS"
 value = 3
+[[constant]]
+name = "SPAWN_LAUNCHER_FLAGS"
+value = 12
 
 [[constant]]
 name = "ENV_EMPTY"
@@ -170,6 +187,9 @@ value = 1
 [[constant]]
 name = "SPAWN_RESOURCE_TAG_EXTENSION"
 value = 2
+[[constant]]
+name = "SPAWN_RESIDUE_GRACE_EXTENSION"
+value = 3
 
 [[constant]]
 name = "MAX_ARGC"
@@ -214,6 +234,61 @@ value = 8388608
 name = "MAX_DETACHED_RETENTION_NS"
 value = 300000000000
 
+# Optional extended maxima (tags 12-18). A server configured above a
+# legacy hard maximum advertises the legacy tag clamped to it and the
+# extended tag with the real value; clients that know the extended tag use it.
+# Per-session processes and pending operations stay low enough that a session
+# can retain an operation replay for each of them within MAX_MUTATION_REPLAYS.
+[[constant]]
+name = "MAX_PROCESSES_PER_SESSION_EXTENDED"
+value = 16384
+[[constant]]
+name = "MAX_PROCESSES_EXTENDED"
+value = 65536
+[[constant]]
+name = "MAX_PENDING_SPAWNS_EXTENDED"
+value = 4096
+[[constant]]
+name = "MAX_STREAM_BUFFER_BYTES_EXTENDED"
+value = 1073741824
+[[constant]]
+name = "MAX_ENVC_EXTENDED"
+value = 16384
+[[constant]]
+name = "MAX_PENDING_WAITS"
+value = 65536
+[[constant]]
+name = "MAX_PENDING_OPERATIONS"
+value = 16384
+# What a server that does not advertise MAX_PENDING_WAITS / MAX_PENDING_OPERATIONS admits.
+[[constant]]
+name = "LEGACY_PENDING_WAITS"
+value = 32
+[[constant]]
+name = "LEGACY_PENDING_OPERATIONS"
+value = 16
+[[constant]]
+name = "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED"
+value = 12
+[[constant]]
+name = "LIMIT_MAX_PROCESSES_EXTENDED"
+value = 13
+[[constant]]
+name = "LIMIT_MAX_PENDING_SPAWNS_EXTENDED"
+value = 14
+[[constant]]
+name = "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED"
+value = 15
+[[constant]]
+name = "LIMIT_MAX_ENVC_EXTENDED"
+value = 16
+[[constant]]
+name = "LIMIT_MAX_PENDING_WAITS"
+value = 17
+[[constant]]
+name = "LIMIT_MAX_PENDING_OPERATIONS"
+value = 18
+
 [[constant]]
 name = "LIMIT_MAX_ARGC"
 value = 1
@@ -247,6 +322,9 @@ value = 65536
 [[constant]]
 name = "LIMIT_MAX_MUTATION_REPLAYS"
 value = 10
+[[constant]]
+name = "LIMIT_LAUNCHER_FLAGS"
+value = 11
 
 [[request]]
 name = "WATCH"

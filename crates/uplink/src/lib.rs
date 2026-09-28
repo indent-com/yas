@@ -6,11 +6,21 @@
 
 mod datagram;
 mod stream;
+
+// ring and aws-lc-rs share this API (rand, hkdf, aead): the uplink uses
+// whichever the build chose, aws-lc-rs when it has both.
+#[cfg(feature = "aws-lc-rs")]
+use aws_lc_rs as crypto;
+#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+use ring as crypto;
+#[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+compile_error!("yas-uplink needs a crypto provider: enable its `ring` or `aws-lc-rs` feature");
+
 pub use datagram::{DATAGRAM_OVERHEAD, DatagramReceiver, DatagramSender, datagram_pair};
 pub use stream::NoiseStream;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ring::rand::SecureRandom;
+use crypto::rand::SecureRandom;
 use std::{io, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
@@ -81,7 +91,7 @@ pub struct Identity {
 impl Identity {
     pub fn generate() -> Result<(Zeroizing<String>, PublicKey), String> {
         let mut private = Zeroizing::new([0; 32]);
-        ring::rand::SystemRandom::new()
+        crypto::rand::SystemRandom::new()
             .fill(private.as_mut())
             .map_err(|_| "cannot generate X25519 identity")?;
         let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(private.as_ref()));
@@ -210,7 +220,7 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
         }
         // Independent datagram root keys travel inside the forward-secret,
         // authenticated channel. The public handshake hash is never a key.
-        ring::rand::SystemRandom::new()
+        crypto::rand::SystemRandom::new()
             .fill(stream.datagram_keys.as_mut())
             .map_err(|_| invalid())?;
         let mut ready = Zeroizing::new(Vec::with_capacity(CONFIRM.len() + 64));

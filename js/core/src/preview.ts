@@ -4,6 +4,17 @@
 export const PREVIEW_PREFIX = "/x/";
 
 /**
+ * Where a host that frames the workspace (`mountYasWorkspace` inside an iframe
+ * on an origin of its own, with previews on) serves the workspace's document.
+ *
+ * The service worker takes every other frame navigation on its origin for a
+ * web pane, since the app is otherwise always the top-level page. A navigation
+ * to this path is the embedded app instead: never relayed, and the window it
+ * creates brokers native Net for the panes as a top-level app would.
+ */
+export const EMBED_DOCUMENT_PATH = "/.yas-embed";
+
+/**
  * A host that can be written into a request line without changing its shape.
  *
  * Every parser here runs its input through `decodeURIComponent`, so `%0d%0a`

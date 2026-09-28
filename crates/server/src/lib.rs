@@ -64,6 +64,7 @@ mod nvenc_encode;
 #[cfg(any(unix, windows))]
 mod process;
 mod pty;
+mod read_only_stream;
 mod relay;
 #[cfg(target_os = "linux")]
 mod screencast_color;
@@ -104,6 +105,7 @@ pub use ipc::{
     IpcListener, IpcStream, default_ipc_path, default_ipc_path_for, default_ipc_path_template,
 };
 pub use media_policy::MediaCodecPolicy;
+pub use process::ProcessMaxima;
 use pty::{PtyHandle, PtyWriteTarget};
 pub use server_name::ServerName;
 pub use surface_encoder::ChromaSubsampling;
@@ -446,9 +448,17 @@ pub struct Config {
     pub compositor_device: String,
     #[cfg(unix)]
     pub fd_channel: Option<std::os::unix::io::RawFd>,
+    /// A second socket where every session is read-only
+    /// (`yas server --read-only-sock PATH`): whatever its HELLO asks, a
+    /// client there gets the passive catalogue a read-only share gets. Plain
+    /// sessions only (no composite datagram pairing).
+    #[cfg(unix)]
+    pub read_only_ipc_path: Option<String>,
     pub verbose: bool,
     /// Advertise and accept the native non-PTY process family.
     pub processes: bool,
+    /// Process family maxima (`--process-max*`, `YAS_PROCESS_MAX*`).
+    pub process_maxima: ProcessMaxima,
     /// Maximum number of concurrent client connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum number of PTYs across all clients (0 = unlimited).  Counts
@@ -8543,6 +8553,14 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     };
     #[cfg(not(unix))]
     let listener = IpcListener::bind(&config.ipc_path, config.verbose).await;
+    #[cfg(unix)]
+    let read_only_listener = config.read_only_ipc_path.as_deref().map(|path| {
+        if path == config.ipc_path {
+            eprintln!("yas-server: the read-only socket must not be the server's socket ({path})");
+            std::process::exit(1);
+        }
+        IpcListener::bind(path, config.verbose, false)
+    });
 
     // The endpoint lock above deliberately permits replacement: a new server
     // on the same socket terminates its predecessor before taking over.  A
@@ -8564,7 +8582,8 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
         payload
     });
     #[cfg(any(unix, windows))]
-    let process_server = process::Server::new(config.verbose, config.processes);
+    let process_server =
+        process::Server::with_maxima(config.verbose, config.processes, config.process_maxima);
     let boot_generation = new_boot_generation();
     let logical_cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -8751,8 +8770,14 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     }
 
     #[cfg(unix)]
+    let read_only_accept = read_only_listener
+        .map(|listener| tokio::spawn(run_yas_accept_loop(listener, state.clone(), true)));
+    #[cfg(not(unix))]
+    let read_only_accept: Option<tokio::task::JoinHandle<()>> = None;
+
+    #[cfg(unix)]
     if let Some(channel_fd) = state.config.fd_channel {
-        let yas_accept = tokio::spawn(run_yas_accept_loop(listener, state.clone()));
+        let yas_accept = tokio::spawn(run_yas_accept_loop(listener, state.clone(), false));
         yas_sd_notify::notify_ready(state.config.verbose);
         let mut shutdown = state.shutdown_started.subscribe();
         tokio::select! {
@@ -8761,6 +8786,9 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
         }
         begin_server_shutdown(&state).await;
         let _ = yas_accept.await;
+        if let Some(read_only_accept) = read_only_accept {
+            let _ = read_only_accept.await;
+        }
         state.extensions.shutdown().await;
         state.process_server.shutdown().await;
         state.connections.wait_empty().await;
@@ -8770,8 +8798,11 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     }
 
     yas_sd_notify::notify_ready(state.config.verbose);
-    run_yas_accept_loop(listener, state.clone()).await;
+    run_yas_accept_loop(listener, state.clone(), false).await;
     begin_server_shutdown(&state).await;
+    if let Some(read_only_accept) = read_only_accept {
+        let _ = read_only_accept.await;
+    }
     #[cfg(any(unix, windows))]
     state.process_server.shutdown().await;
     state.extensions.shutdown().await;
@@ -8805,8 +8836,11 @@ const INGRESS_CLASSIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long half a composite transport waits for the other half.
 const INGRESS_PAIR_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Accept native sessions on `listener` until the server shuts down. With
+/// `read_only`, each session is made read-only (read_only_stream.rs) and
+/// composite transports are refused.
 #[allow(unused_mut)] // Windows' named-pipe listener advances through &mut self.
-async fn run_yas_accept_loop(mut listener: IpcListener, state: AppState) {
+async fn run_yas_accept_loop(mut listener: IpcListener, state: AppState, read_only: bool) {
     let mut shutdown = state.shutdown_started.subscribe();
     let (classified_tx, mut classified_rx) = mpsc::channel(MAX_PENDING_INGRESS);
     let mut classifying = 0usize;
@@ -8848,9 +8882,19 @@ async fn run_yas_accept_loop(mut listener: IpcListener, state: AppState) {
                 classifying -= 1;
                 let Some((origin, Some(classified))) = classified else { continue };
                 match classified {
+                    yas_composite_transport::Ingress::Direct(stream) if read_only => {
+                        spawn_yas_client(
+                            read_only_stream::ReadOnlyStream::new(stream),
+                            state.clone(),
+                            origin,
+                        );
+                    }
                     yas_composite_transport::Ingress::Direct(stream) => {
                         spawn_yas_client(stream, state.clone(), origin);
                     }
+                    // A datagram lane pairs two connections by token; the
+                    // read-only listener takes plain sessions only.
+                    yas_composite_transport::Ingress::Composite { .. } if read_only => {}
                     yas_composite_transport::Ingress::Composite { offer, stream } => {
                         // The pair's identity is the half that completes it;
                         // both halves came from the same peer, and refusing a
@@ -13107,11 +13151,11 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(1), async {
                 tokio::join!(
-                    run_yas_accept_loop(first, state.clone()),
-                    run_yas_accept_loop(second, state.clone()),
+                    run_yas_accept_loop(first, state.clone(), false),
+                    run_yas_accept_loop(second, state.clone(), true),
                     begin_server_shutdown(&state),
                 );
-                run_yas_accept_loop(late, state.clone()).await;
+                run_yas_accept_loop(late, state.clone(), false).await;
             })
             .await
             .expect("shutdown must reach every waiter, including later subscribers");
@@ -13138,8 +13182,11 @@ mod tests {
                     compositor_device: String::new(),
                     #[cfg(unix)]
                     fd_channel: None,
+                    #[cfg(unix)]
+                    read_only_ipc_path: None,
                     verbose: false,
                     processes: true,
+                    process_maxima: ProcessMaxima::DEFAULT,
                     max_connections: 0,
                     max_ptys: 0,
                     ping_interval: Duration::ZERO,

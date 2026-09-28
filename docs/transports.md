@@ -145,6 +145,57 @@ Closing the channel shuts down the server. SIGTERM, SIGINT, and native Shutdown
 requests stop both the fd-channel receiver and the ordinary socket listener;
 shutdown remains visible to either task if it starts waiting later.
 
+### Read-only socket
+
+`yas server --read-only-sock PATH` (or `YAS_READ_ONLY_SOCK`, Unix only) listens
+on a second socket where every session is read-only, whatever its HELLO asks
+for. Clients there get the catalogue a read-only share gets: they watch
+terminals and windows (their own views, scrollback, search, captures) but
+cannot type, click, resize terminals, read or write files, run processes or
+reach KV and the environment. The socket is created owner-only like the main
+one; give viewers access with its directory or mode.
+
+Before the server decodes such a session's HELLO, its first frame goes through
+the same rewrite a read-only share's does: the preface and Core HELLO are
+buffered, the required read-only-session extension is added, and every later
+byte passes unchanged. The server then advertises and enforces the restricted
+catalogue itself. A stream that is not native YAS, or whose first frame is not
+a HELLO, is closed. The socket takes plain sessions only: composite transports
+(a datagram lane paired by token) are refused there.
+
+A relay that carries clients' bytes to an ordinary socket can do the same with
+`yas_wire::read_only::ReadOnlyIngress` (re-exported as
+`yas_client::wire::read_only`): push what the client sends, forward what it
+returns.
+
+### Standard I/O (`yas connect --stdio`)
+
+`yas connect --stdio` turns its own stdin and stdout into one native YAS
+session: it connects to the server `--on` names (the default target, else the
+local server, which it starts unless `--no-start` is given) and relays bytes
+both ways without looking at them. The peer on the pipes runs the whole YAS
+handshake. This reaches YAS through anything that can run a command with pipes
+and nothing more: an SSH exec channel (`ssh host yas connect --stdio`),
+`docker exec -i CONTAINER yas connect --stdio`, or a child process.
+
+- Stdout carries only the session. Errors go to stderr, and a connection that
+  fails exits 1 before any byte is written.
+- When stdin ends, the server's side is shut down for writing. The relay keeps
+  delivering what the server still sends, and exits 0 once the server closes.
+  If whoever reads stdout goes away, it exits 0 too.
+- It refuses to run on a terminal, whose line discipline would corrupt the
+  binary stream.
+- Only the reliable stream is relayed. A server reached over WebTransport or
+  WebRTC works, but without unreliable datagrams.
+- Whatever runs the command may write its own errors to stdout before the
+  session starts: `docker exec` reports a failed exec ("OCI runtime exec
+  failed…") on stdout. A client that sees something other than the YAS preface
+  there should show those bytes rather than a protocol error.
+
+In Rust, `yas_client::transport::Transport::from_split(child_stdout,
+child_stdin)` wraps the pipes and `Client::from_transport` runs HELLO over them
+([EMBEDDING.md](../EMBEDDING.md#rust-yas-client)).
+
 ---
 
 ## WebSocket
@@ -408,6 +459,29 @@ exact. If yas is not installed on the remote, it is auto-installed to
 `~/.local/bin`. If an automatic server is not running, startup lets that server
 resolve its path again instead of freezing the predicted candidate into an
 explicit override. Connection retries with back-off handle the startup window.
+
+**Without socket forwarding.** Some SSH servers will not forward to Unix
+sockets at all (OpenSSH's `AllowStreamLocalForwarding no`, answered as
+"administratively prohibited", or servers without the channel type), and some
+hosts have no POSIX shell to run the socket search (Windows). Then the client
+runs [`yas connect --stdio`](#standard-io-yas-connect---stdio) on the remote
+over an exec channel and speaks YAS through its stdin and stdout:
+
+- On a POSIX host it first checks that `yas` runs (including from
+  `~/.local/bin`) and installs it only when it is missing and installing is
+  allowed. An explicit socket stays exact (`YAS_SOCK`).
+- With no shell it runs a plain `yas connect --stdio` (with
+  `--on socket:PATH` for an explicit socket), after `yas --version` confirms
+  that `yas` is on the PATH of non-interactive commands there.
+- The pool remembers per connection that only exec works, so later sessions
+  skip the failing attempts.
+
+Embedders choose with `yas_ssh::SshOptions::mode`: `Auto` (the default, as
+above), `Socket` (forwarding only), or `Exec` (only run
+`SshOptions::remote_command`, `yas connect --stdio` by default: no socket
+search, no install, no POSIX shell needed). A refused host key is
+`Error::HostKey { host, port, fingerprint, .. }`, naming the key the server
+presented.
 
 **Host keys** are trust-on-first-use against `~/.ssh/known_hosts`, overridable
 with `YAS_SSH_KNOWN_HOSTS`. A host with no entry is recorded and accepted; a

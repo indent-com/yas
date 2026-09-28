@@ -16,67 +16,73 @@ connections that are no longer needed.
 
 ## Configuration
 
-| Variable                             | Default                                                       | Purpose                                                                               |
-| ------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `YAS_SOCK`                           | private runtime directory; see [transports.md](transports.md) | Exact native YAS socket override; automatic paths use an owner-only directory         |
-| `YAS_SERVER_NAME`                    | `default`                                                     | Instance name (also `--name`); isolates socket, state, cache, and extension settings  |
-| `YAS_REMOTES`                        | `~/.config/yas/yas.remotes`                                   | Only the file the one-time import reads; the live catalogue is the `remotes` KV key   |
-| `YAS_RELAY`                          | `1`                                                           | `0` disables the native YAS Relay family                                              |
-| `YAS_FONTS`                          | `1`                                                           | `0` disables the native YAS Font family                                               |
-| `YAS_FONT_EXPORT`                    | enabled                                                       | `0` disables font export and empties the catalogue; OS/2 embedding restrictions apply |
-| `YAS_EDGE`                           | unset                                                         | `1` serves the browser from this process (also `--edge`); needs a passphrase          |
-| `YAS_SHARE`                          | unset                                                         | `1` publishes this server over WebRTC from this process (also `--share`)              |
-| `YAS_EDGE_PASSPHRASE`                | `YAS_PASSPHRASE`                                              | The hosted edge's own passphrase                                                      |
-| `YAS_SHARE_PASSPHRASE`               | `YAS_PASSPHRASE`                                              | The hosted share's own passphrase                                                     |
-| `YAS_FONT_DIRS`                      | platform defaults                                             | Additional server-side font scan roots                                                |
-| `SHELL`                              | `$SHELL` or `/bin/sh`                                         | Shell spawned for new PTYs                                                            |
-| `YAS_SHELL_FLAGS`                    | `li` (Unix) / `` (Windows)                                    | Shell invocation flags                                                                |
-| `YAS_SCROLLBACK`                     | `10000`                                                       | Scrollback buffer rows per PTY                                                        |
-| `YAS_TERM_JOURNAL`                   | `1`                                                           | `0` disables the OSC 133 command journal capability                                   |
-| `YAS_TERM_JOURNAL_MAX`               | `256`                                                         | Finished command records retained per PTY                                             |
-| `YAS_TERM_JOURNAL_CMD_MAX`           | `4096`                                                        | Bytes of command-line text retained per record                                        |
-| `YAS_TERM_OUTPUT_MAX`                | `1048576` (1 MiB)                                             | Server ceiling on Terminal `OUTPUT` and `WAIT` query delivery                         |
-| `YAS_EVENTS_SIZE`                    | `1048576` (1 MiB)                                             | Process-wide binary event-ring capacity                                               |
-| `YAS_EVENTS`                         | `default`                                                     | Fine-grained event activation selectors                                               |
-| `YAS_EVENTS_FILE`                    | unset                                                         | Start a persistent server-side binary event stream                                    |
-| `YAS_EVENTS_FILE_HISTORY`            | `1`                                                           | `0` excludes retained history from the startup file                                   |
-| `YAS_EVENTS_FILE_APPEND`             | `0`                                                           | `1` appends the startup file instead of truncating                                    |
-| `YAS_VAAPI_DEVICE`                   | `/dev/dri/renderD128`                                         | VA-API render node for surface encoding and camera decoding                           |
-| `YAS_COMPOSITOR_DEVICE`              | CUDA GPU when NVENC is enabled                                | Vulkan compositor render node; otherwise `YAS_VAAPI_DEVICE`                           |
-| `YAS_CUDA_DEVICE`                    | `0`                                                           | CUDA device ordinal for NVENC and NVDEC                                               |
-| `YAS_FD_CHANNEL`                     | unset                                                         | fd-channel file descriptor                                                            |
-| `YAS_EXPORT_SOCK`                    | unset                                                         | `1` exports the socket path as `YAS_SOCK` in spawned terminals (also `--export-sock`) |
-| `YAS_INJECT_PATH`                    | unset                                                         | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)    |
-| `YAS_SURFACE_ENCODERS`               | see encoder table                                             | Comma-separated encoder priority (also `--surface-encoders`)                          |
-| `YAS_SURFACE_BANDWIDTH`              | `ultra`                                                       | Ceiling on video bandwidth (adaptation only goes cheaper)                             |
-| `YAS_SURFACE_SPEED`                  | `realtime`                                                    | Encoder speed preset                                                                  |
-| `YAS_MEDIA_CAMERA_CODECS`            | all                                                           | Camera formats viewers may send (also `--camera-codecs`)                              |
-| `YAS_MEDIA_MICROPHONE_CODECS`        | all                                                           | Microphone formats viewers may send (also `--microphone-codecs`)                      |
-| `YAS_MEDIA_CAMERA_DECODERS`          | `nvdec,vaapi,vulkan,software`                                 | Camera hardware priority with implicit software fallback                              |
-| `YAS_MEDIA_CAMERA_VULKAN_DEVICE`     | unset                                                         | Optional Vulkan device index or name substring for camera decoding                    |
-| `YAS_MAX_CONNECTIONS`                | `0` (unlimited)                                               | Reject client connections past this count                                             |
-| `YAS_MAX_PTYS`                       | `0` (unlimited)                                               | Refuse `CREATE` past this many PTYs across all clients                                |
-| `YAS_PROCESS`                        | `1`                                                           | `0` disables the native Process family                                                |
-| `YAS_PROCESS_MAX_PER_CLIENT`         | `16`                                                          | Pending spawns, live watches, and unwatched owned processes per endpoint              |
-| `YAS_PROCESS_MAX`                    | `64`                                                          | Process generations server-wide                                                       |
-| `YAS_PROCESS_MAX_SPAWNING`           | `8`                                                           | Concurrent native spawn calls server-wide                                             |
-| `YAS_PROCESS_MAX_WATCHERS`           | `1024` at default process limits                              | Pending and live process watches server-wide                                          |
-| `YAS_PROCESS_MAX_WATCHERS_PER_CHILD` | `64`                                                          | Concurrent watches on one live process                                                |
-| `YAS_PROCESS_REQUEST_MAX_PER_CLIENT` | `16777216` (16 MiB)                                           | Retained process-spawn request bytes per endpoint                                     |
-| `YAS_PROCESS_REQUEST_MAX`            | `67108864` (64 MiB)                                           | Retained process-spawn request bytes server-wide                                      |
-| `YAS_PROCESS_BUFFER_MAX`             | `201326592` (192 MiB)                                         | Reserved process stream-window bytes server-wide                                      |
-| `YAS_PROCESS_OUTBOX_MAX_FRAMES`      | `65536` at default process limits                             | Queued process-family frames per endpoint before disconnect                           |
-| `YAS_PROCESS_OUTBOX_MAX_BYTES`       | `67108864` (64 MiB) at default process limits                 | Queued process-family bytes per endpoint before disconnect                            |
-| `YAS_PROCESS_KILL_GRACE`             | `2` seconds                                                   | Grace between terminating and force-killing a process group/job                       |
-| `YAS_PROCESS_DETACHED_RESULT_TTL`    | `300` seconds                                                 | Retention time for compact detachable exit results                                    |
-| `YAS_ENCODE_FENCE_TIMEOUT_MS`        | `10000`                                                       | Give up on a Vulkan encode submission after this long (`0` = wait forever)            |
-| `YAS_ENABLE_EXTERNAL_MEMORY_HOST`    | unset                                                         | Force experimental direct `wl_shm` host import when Vulkan supports it                |
-| `YAS_DISABLE_EXTERNAL_MEMORY_HOST`   | unset                                                         | Disable automatic direct `wl_shm` host import                                         |
-| `YAS_DESKTOP`                        | `1` on Linux                                                  | `0` disables the private-bus Desktop services and family                              |
-| `YAS_XWAYLAND`                       | `1` on Linux                                                  | `0` disables the X11 bridge even when `xwayland-satellite` is installed               |
-| `YAS_NOTIFICATION_TIMEOUT_MS`        | `10000`                                                       | Default low/normal notification timeout when the application requests `-1`            |
-| `YAS_NOTIFICATION_TIMEOUT_MIN_MS`    | `1000`                                                        | Lower clamp for positive application notification timeouts                            |
-| `YAS_NOTIFICATION_TIMEOUT_MAX_MS`    | `86400000`                                                    | Upper clamp for positive application notification timeouts                            |
+| Variable                             | Default                                                           | Purpose                                                                                                |
+| ------------------------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `YAS_SOCK`                           | private runtime directory; see [transports.md](transports.md)     | Exact native YAS socket override; automatic paths use an owner-only directory                          |
+| `YAS_SERVER_NAME`                    | `default`                                                         | Instance name (also `--name`); isolates socket, state, cache, and extension settings                   |
+| `YAS_REMOTES`                        | `~/.config/yas/yas.remotes`                                       | Only the file the one-time import reads; the live catalogue is the `remotes` KV key                    |
+| `YAS_RELAY`                          | `1`                                                               | `0` disables the native YAS Relay family                                                               |
+| `YAS_FONTS`                          | `1`                                                               | `0` disables the native YAS Font family                                                                |
+| `YAS_FONT_EXPORT`                    | enabled                                                           | `0` disables font export and empties the catalogue; OS/2 embedding restrictions apply                  |
+| `YAS_EDGE`                           | unset                                                             | `1` serves the browser from this process (also `--edge`); needs a passphrase                           |
+| `YAS_SHARE`                          | unset                                                             | `1` publishes this server over WebRTC from this process (also `--share`)                               |
+| `YAS_EDGE_PASSPHRASE`                | `YAS_PASSPHRASE`                                                  | The hosted edge's own passphrase                                                                       |
+| `YAS_SHARE_PASSPHRASE`               | `YAS_PASSPHRASE`                                                  | The hosted share's own passphrase                                                                      |
+| `YAS_FONT_DIRS`                      | platform defaults                                                 | Additional server-side font scan roots                                                                 |
+| `SHELL`                              | `$SHELL` or `/bin/sh`                                             | Shell spawned for new PTYs                                                                             |
+| `YAS_SHELL_FLAGS`                    | `li` (Unix) / `` (Windows)                                        | Shell invocation flags                                                                                 |
+| `YAS_SCROLLBACK`                     | `10000`                                                           | Scrollback buffer rows per PTY                                                                         |
+| `YAS_TERM_JOURNAL`                   | `1`                                                               | `0` disables the OSC 133 command journal capability                                                    |
+| `YAS_TERM_JOURNAL_MAX`               | `256`                                                             | Finished command records retained per PTY                                                              |
+| `YAS_TERM_JOURNAL_CMD_MAX`           | `4096`                                                            | Bytes of command-line text retained per record                                                         |
+| `YAS_TERM_OUTPUT_MAX`                | `1048576` (1 MiB)                                                 | Server ceiling on Terminal `OUTPUT` and `WAIT` query delivery                                          |
+| `YAS_EVENTS_SIZE`                    | `1048576` (1 MiB)                                                 | Process-wide binary event-ring capacity                                                                |
+| `YAS_EVENTS`                         | `default`                                                         | Fine-grained event activation selectors                                                                |
+| `YAS_EVENTS_FILE`                    | unset                                                             | Start a persistent server-side binary event stream                                                     |
+| `YAS_EVENTS_FILE_HISTORY`            | `1`                                                               | `0` excludes retained history from the startup file                                                    |
+| `YAS_EVENTS_FILE_APPEND`             | `0`                                                               | `1` appends the startup file instead of truncating                                                     |
+| `YAS_VAAPI_DEVICE`                   | `/dev/dri/renderD128`                                             | VA-API render node for surface encoding and camera decoding                                            |
+| `YAS_COMPOSITOR_DEVICE`              | CUDA GPU when NVENC is enabled                                    | Vulkan compositor render node; otherwise `YAS_VAAPI_DEVICE`                                            |
+| `YAS_CUDA_DEVICE`                    | `0`                                                               | CUDA device ordinal for NVENC and NVDEC                                                                |
+| `YAS_FD_CHANNEL`                     | unset                                                             | fd-channel file descriptor                                                                             |
+| `YAS_READ_ONLY_SOCK`                 | unset                                                             | Second socket where every session is read-only (also `--read-only-sock`; Unix)                         |
+| `YAS_EXPORT_SOCK`                    | unset                                                             | `1` exports the socket path as `YAS_SOCK` in spawned terminals (also `--export-sock`)                  |
+| `YAS_INJECT_PATH`                    | unset                                                             | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)                     |
+| `YAS_SURFACE_ENCODERS`               | see encoder table                                                 | Comma-separated encoder priority (also `--surface-encoders`)                                           |
+| `YAS_SURFACE_BANDWIDTH`              | `ultra`                                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                                              |
+| `YAS_SURFACE_SPEED`                  | `realtime`                                                        | Encoder speed preset                                                                                   |
+| `YAS_MEDIA_CAMERA_CODECS`            | all                                                               | Camera formats viewers may send (also `--camera-codecs`)                                               |
+| `YAS_MEDIA_MICROPHONE_CODECS`        | all                                                               | Microphone formats viewers may send (also `--microphone-codecs`)                                       |
+| `YAS_MEDIA_CAMERA_DECODERS`          | `nvdec,vaapi,vulkan,software`                                     | Camera hardware priority with implicit software fallback                                               |
+| `YAS_MEDIA_CAMERA_VULKAN_DEVICE`     | unset                                                             | Optional Vulkan device index or name substring for camera decoding                                     |
+| `YAS_MAX_CONNECTIONS`                | `0` (unlimited)                                                   | Reject client connections past this count                                                              |
+| `YAS_MAX_PTYS`                       | `0` (unlimited)                                                   | Refuse `CREATE` past this many PTYs across all clients                                                 |
+| `YAS_PROCESS`                        | `1`                                                               | `0` disables the native Process family                                                                 |
+| `YAS_PROCESS_MAX_PER_SESSION`        | `16` (at most 16384)                                              | Live processes per session (also `--process-max-per-session`; older name `YAS_PROCESS_MAX_PER_CLIENT`) |
+| `YAS_PROCESS_MAX`                    | `64` (at most 65536)                                              | Process generations server-wide (also `--process-max`)                                                 |
+| `YAS_PROCESS_MAX_PENDING_SPAWNS`     | `8` (at most 4096)                                                | Spawns in flight per session (also `--process-max-pending-spawns`)                                     |
+| `YAS_PROCESS_STREAM_BUFFER_MAX`      | `8388608` (8 MiB, at most 1 GiB)                                  | Largest process stream buffer / stdin window (also `--process-stream-buffer-max`)                      |
+| `YAS_PROCESS_MAX_ENV`                | `256` (at most 16384)                                             | Environment entries per spawn (also `--process-max-env`)                                               |
+| `YAS_PROCESS_MAX_WAITS`              | `32` (at most 65536)                                              | Pending process WAITs per session (also `--process-max-waits`)                                         |
+| `YAS_PROCESS_MAX_OPERATIONS`         | `16` (at most 16384)                                              | Pending process ATTACH/CONTROL operations per session (also `--process-max-operations`)                |
+| `YAS_PROCESS_MAX_SPAWNING`           | the pending-spawn maximum (`8`)                                   | Concurrent native spawn calls server-wide                                                              |
+| `YAS_PROCESS_MAX_WATCHERS`           | `1024` at default process limits                                  | Pending and live process watches server-wide                                                           |
+| `YAS_PROCESS_MAX_WATCHERS_PER_CHILD` | `64`                                                              | Concurrent watches on one live process                                                                 |
+| `YAS_PROCESS_REQUEST_MAX_PER_CLIENT` | `16777216` (16 MiB), plus 64 KiB per process per session above 16 | Retained process-spawn request bytes per endpoint                                                      |
+| `YAS_PROCESS_REQUEST_MAX`            | `67108864` (64 MiB), plus 64 KiB per generation above 64          | Retained process-spawn request bytes server-wide                                                       |
+| `YAS_PROCESS_BUFFER_MAX`             | `201326592` (192 MiB), or 3 MiB per generation if more            | Reserved process stream-window bytes server-wide                                                       |
+| `YAS_PROCESS_OUTBOX_MAX_FRAMES`      | `65536` at default process limits                                 | Queued process-family frames per endpoint before disconnect                                            |
+| `YAS_PROCESS_OUTBOX_MAX_BYTES`       | `67108864` (64 MiB) at default process limits                     | Queued process-family bytes per endpoint before disconnect                                             |
+| `YAS_PROCESS_KILL_GRACE`             | `2` seconds                                                       | Grace between terminating and force-killing a process group/job                                        |
+| `YAS_PROCESS_DETACHED_RESULT_TTL`    | `300` seconds                                                     | Retention time for compact detachable exit results                                                     |
+| `YAS_ENCODE_FENCE_TIMEOUT_MS`        | `10000`                                                           | Give up on a Vulkan encode submission after this long (`0` = wait forever)                             |
+| `YAS_ENABLE_EXTERNAL_MEMORY_HOST`    | unset                                                             | Force experimental direct `wl_shm` host import when Vulkan supports it                                 |
+| `YAS_DISABLE_EXTERNAL_MEMORY_HOST`   | unset                                                             | Disable automatic direct `wl_shm` host import                                                          |
+| `YAS_DESKTOP`                        | `1` on Linux                                                      | `0` disables the private-bus Desktop services and family                                               |
+| `YAS_XWAYLAND`                       | `1` on Linux                                                      | `0` disables the X11 bridge even when `xwayland-satellite` is installed                                |
+| `YAS_NOTIFICATION_TIMEOUT_MS`        | `10000`                                                           | Default low/normal notification timeout when the application requests `-1`                             |
+| `YAS_NOTIFICATION_TIMEOUT_MIN_MS`    | `1000`                                                            | Lower clamp for positive application notification timeouts                                             |
+| `YAS_NOTIFICATION_TIMEOUT_MAX_MS`    | `86400000`                                                        | Upper clamp for positive application notification timeouts                                             |
 
 ### Named instances
 

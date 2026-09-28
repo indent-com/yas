@@ -20,7 +20,7 @@ const READ_PAGE_BYTES: u32 = 8 * 1024 * 1024;
 const STATE_CREDIT: u64 = 1024 * 1024;
 
 pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut terminals = client
         .snapshot(family::TERMINAL)
         .await?
@@ -81,7 +81,7 @@ pub(crate) async fn cmd_start(
         launch,
         extensions: Extensions(create_extensions),
     };
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let result: terminal::CreateResult = client
         .request_typed(
             family::TERMINAL,
@@ -105,7 +105,7 @@ pub(crate) async fn cmd_send(
     if bytes.is_empty() {
         return Ok(());
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     client
         .send_typed_event(
             family::TERMINAL,
@@ -117,6 +117,7 @@ pub(crate) async fn cmd_send(
             true,
         )
         .await
+        .map_err(String::from)
 }
 
 pub(crate) async fn cmd_restart(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
@@ -128,7 +129,7 @@ pub(crate) async fn cmd_restart(on: Option<&str>, hub: &str, id: u64) -> Result<
         launch: None,
         extensions: Extensions::default(),
     };
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let _: terminal::RestartResult = client
         .request_typed(
             family::TERMINAL,
@@ -218,7 +219,7 @@ pub(crate) async fn cmd_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let _: terminal::ResizeResult = client
         .request_typed(
             family::TERMINAL,
@@ -245,7 +246,7 @@ pub(crate) async fn cmd_show(
     if rows.is_some() || cols.is_some() {
         cmd_resize(on, hub, id, cols.unwrap_or(80), rows.unwrap_or(24)).await?;
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let request = terminal::Read {
         terminal_handle: record.terminal_handle,
@@ -303,7 +304,7 @@ pub(crate) async fn cmd_history(
     if rows.is_some() || cols.is_some() {
         cmd_resize(on, hub, id, cols.unwrap_or(80), rows.unwrap_or(24)).await?;
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let cursor_kind;
     let cursor_a;
@@ -360,7 +361,7 @@ pub(crate) async fn cmd_history(
 }
 
 pub(crate) async fn cmd_cwd(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let query = terminal_query(
         &mut client,
@@ -393,7 +394,7 @@ pub(crate) async fn cmd_journal(
     limit: u16,
     json: bool,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if !json {
         println!("INDEX\tSTATUS\tEXIT\tMS\tSTART_SEQ\tEND_SEQ\tCOMMAND");
@@ -469,7 +470,7 @@ pub(crate) async fn cmd_output(
     max_bytes: u32,
     json: bool,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let terminal_record = find_terminal(&mut client, id).await?;
     let waited = match wait {
         Some(timeout) => {
@@ -581,7 +582,7 @@ pub(crate) async fn cmd_wait(
     timeout_secs: u64,
     pattern: Option<String>,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if record.lifecycle == terminal::Lifecycle::Exited {
         return print_terminal_exit(&record);
@@ -610,7 +611,7 @@ pub(crate) async fn cmd_mouse(
     row: u16,
     button: &str,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if record.lifecycle == terminal::Lifecycle::Exited {
         return Err(format!("pty {id} has exited"));
@@ -658,7 +659,7 @@ pub(crate) async fn cmd_grep(
     hub: &str,
     opts: crate::grep::Opts,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let records = client
         .snapshot(family::TERMINAL)
         .await?
@@ -1182,7 +1183,7 @@ async fn cmd_since(
     max_bytes: u32,
     json: bool,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let parsed = parse_cursor(cursor)?;
     let (cursor_kind, sequence, column, request_max) = match parsed {
@@ -1388,6 +1389,7 @@ pub(crate) async fn open_view(
             false,
         )
         .await
+        .map_err(String::from)
 }
 
 pub(crate) async fn close_view(client: &mut NativeClient, view_id: u32) -> Result<(), String> {
@@ -1466,7 +1468,8 @@ pub(crate) async fn send_mouse_actions(
                     },
                     true,
                 )
-                .await;
+                .await
+                .map_err(String::from);
         }
         return client
             .send_typed_event(
@@ -1481,7 +1484,8 @@ pub(crate) async fn send_mouse_actions(
                 },
                 true,
             )
-            .await;
+            .await
+            .map_err(String::from);
     }
     let actions: &[(u8, u8)] = match event {
         "down" | "press" => &[(yas_wire::schema::terminal::MOUSE_ACTION_DOWN as u8, button)],
@@ -1529,7 +1533,7 @@ async fn request_empty<Request: yas_wire::Encode>(
     request: &Request,
     sensitive: bool,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let body = client
         .request(
             family::TERMINAL,

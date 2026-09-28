@@ -1,3 +1,5 @@
+import { EMBED_DOCUMENT_PATH } from "@yas-run/core/preview";
+
 export type DesktopNotificationIdentity = {
   connectionId: string;
   bootGeneration: string;
@@ -12,6 +14,24 @@ export function topLevelDesktopSender(
   return (
     source?.type === "window" && source.frameType === "top-level" && !preview
   );
+}
+
+/**
+ * The window that brokers native Net for web panes: the top-level app, or the
+ * app a host frames at EMBED_DOCUMENT_PATH. Never a pane itself.
+ */
+export function appWindow(
+  source: { type?: string; frameType?: string; url?: string } | null,
+  preview: boolean,
+): boolean {
+  if (topLevelDesktopSender(source, preview)) return true;
+  if (source?.type !== "window" || source.frameType !== "nested" || preview)
+    return false;
+  try {
+    return new URL(source.url ?? "").pathname === EMBED_DOCUMENT_PATH;
+  } catch {
+    return false;
+  }
 }
 
 export function desktopNotificationIdentity(

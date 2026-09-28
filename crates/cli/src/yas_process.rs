@@ -35,7 +35,7 @@ pub struct RunArgs {
 }
 
 pub(crate) async fn run(on: Option<&str>, hub: &str, args: RunArgs) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     run_with_stdio(
         &mut client,
         args,
@@ -297,6 +297,7 @@ async fn receive_output_chunk<W: AsyncWrite + Unpin>(
             false,
         )
         .await
+        .map_err(String::from)
 }
 
 fn close_output(

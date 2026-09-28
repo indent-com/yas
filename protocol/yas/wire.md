@@ -622,6 +622,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | 11 | `MAX_BATCH_ITEMS` | 4 | true | 1 | 256 |
 | 12 | `MAX_QUERY_CONCURRENCY` | 4 | true | 1 | 8 |
 | 13 | `MAX_CATALOG_ENTRIES` | 4 | true | 1 | 1000000 |
+| 14 | `CAPABILITIES` | 4 | false | 0 | 4294967295 |
 
 ### Shared types
 
@@ -646,6 +647,13 @@ Every Request kind has a correlated Result with the same family and kind.
 | `conflict_detail` | path:bytes_u32 containing WirePath,current_present:u8,hash_present:u8,reserved:u16=0,current_entry_revision:u64,modified_unix_ns:i64,optional content_hash:[u8;32]; exact value of optional Core ResultPrefix detail extension tag RESULT_CONFLICT_DETAIL_EXTENSION for STAGE_WRITE or COMMIT status CONFLICT |
 | `entry_operation_id_extension` | EntryRecord extension tag 1 exact value operation_id:[u8;16], nonzero; lets watchers recognize mutation echoes without suppressing them |
 | `family_limits` | ordered optional extensions: tags 1..12 encode max roots/session:u32,watches/root:u32,path components:u32,component bytes:u32,path bytes:u32,inline bytes:u32,query records:u32,query bytes:u32,stages/session:u32,staged bytes:u64,batch items:u32,query concurrency:u32 |
+| `family_capabilities` | optional family limit extension tag LIMIT_CAPABILITIES exact value capabilities:u32; bitmask of CAPABILITY_* values the server implements; absent means zero; receivers ignore unknown bits; a client uses an opt-in value only when its capability bit is set |
+| `os_error` | code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error, and an entry of ApplyOsErrors |
+| `apply_os_errors` | repeated index:u16,OsError; exact value of optional ApplyResult extension tag APPLY_RESULT_OS_ERRORS_EXTENSION, present only when at least one item failed because of an OS error; one entry per such item, indices strictly ascending and naming non-OK items of the same Result; offered with CAPABILITY_OS_ERROR |
+| `query_read_extended_record` | QueryReadRecord answering the opt-in question kinds: OK content READ_LIST QueryListEntries, READ_REALPATH raw absolute canonical platform path bytes, READ_STAT_ONLY QueryStatOnly; non-OK content is empty or exactly one OsError; READ_NO_FOLLOW is valid only with READ_STAT_ONLY among these kinds |
+| `query_list_entries` | repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash |
+| `query_stat_only` | kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed |
+| `stage_in_place` | STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID |
 
 ## `yas.git` (`0x0031`/v1)
 
@@ -899,6 +907,14 @@ Every Request kind has a correlated Result with the same family and kind.
 | 8 | `MAX_STREAM_BUFFER_BYTES` | 8 | true | 1 | 8388608 |
 | 9 | `MAX_DETACHED_RETENTION_NS` | 8 | true | 1 | 300000000000 |
 | 10 | `MAX_MUTATION_REPLAYS` | 4 | true | 1 | 65536 |
+| 11 | `LAUNCHER_FLAGS` | 4 | false | 0 | 12 |
+| 12 | `MAX_PROCESSES_PER_SESSION_EXTENDED` | 4 | false | 1 | 16384 |
+| 13 | `MAX_PROCESSES_EXTENDED` | 4 | false | 1 | 65536 |
+| 14 | `MAX_PENDING_SPAWNS_EXTENDED` | 4 | false | 1 | 4096 |
+| 15 | `MAX_STREAM_BUFFER_BYTES_EXTENDED` | 8 | false | 1 | 1073741824 |
+| 16 | `MAX_ENVC_EXTENDED` | 4 | false | 1 | 16384 |
+| 17 | `MAX_PENDING_WAITS` | 4 | false | 1 | 65536 |
+| 18 | `MAX_PENDING_OPERATIONS` | 4 | false | 1 | 16384 |
 
 ### Shared types
 

@@ -24,7 +24,6 @@ use super::app_env::SessionEnv;
 use super::process::{self, NativeRecord, Server};
 
 const ROUTE_EVENTS: usize = 80;
-pub(crate) const MAX_EXIT_REPLAYS_PER_SESSION: usize = schema::process::MAX_PROCESSES as usize;
 
 #[derive(Clone)]
 pub(crate) struct Runtime {
@@ -210,13 +209,21 @@ struct SessionInner {
     operation_gate: Option<Arc<TestOperationGate>>,
 }
 
-#[derive(Default)]
 struct ExitReplays {
     values: HashMap<u64, ExitInfo>,
     order: VecDeque<u64>,
+    capacity: usize,
 }
 
 impl ExitReplays {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
     fn get(&self, process_handle: u64) -> Option<&ExitInfo> {
         self.values.get(&process_handle)
     }
@@ -225,7 +232,7 @@ impl ExitReplays {
         if self.values.insert(process_handle, exit).is_none() {
             self.order.push_back(process_handle);
         }
-        while self.order.len() > MAX_EXIT_REPLAYS_PER_SESSION {
+        while self.order.len() > self.capacity {
             if let Some(retired) = self.order.pop_front() {
                 self.values.remove(&retired);
             }
@@ -279,10 +286,20 @@ impl Runtime {
     }
 
     pub(crate) fn limits(&self) -> wire::Limits {
+        // LEAVE_RESIDUE needs Unix process groups; STDIN_NULL works everywhere.
+        let launcher_flags = if cfg!(unix) {
+            schema::process::SPAWN_LAUNCHER_FLAGS as u32
+        } else {
+            schema::process::SPAWN_STDIN_NULL as u32
+        };
         wire::Limits {
-            max_mutation_replays: super::yas::MAX_PROCESS_OPERATION_REPLAYS as u32,
-            ..wire::Limits::HARD
+            launcher_flags,
+            ..self.server.maxima().limits()
         }
+    }
+
+    pub(crate) fn maxima(&self) -> process::ProcessMaxima {
+        self.server.maxima()
     }
 
     pub(crate) fn session(
@@ -306,7 +323,7 @@ impl Runtime {
             session_env: StdMutex::new(session_env),
             next_process_id: AtomicU32::new(1),
             routes: StdMutex::new(HashMap::new()),
-            exits: StdMutex::new(ExitReplays::default()),
+            exits: StdMutex::new(ExitReplays::new(self.server.maxima().exit_replays())),
             closed,
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
@@ -378,6 +395,10 @@ impl Session {
             .surface_app_handle()
             .map_err(|error| Error::Invalid(error.to_string()))?
             .is_some();
+        let residue_grace = request
+            .residue_grace_ns()
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .map(std::time::Duration::from_nanos);
         let started = self
             .inner
             .manager
@@ -386,6 +407,7 @@ impl Session {
                     process_id,
                     flags,
                     preserve_residual,
+                    residue_grace,
                     cwd,
                     argv: request.argv.clone(),
                     env: request
@@ -410,9 +432,23 @@ impl Session {
             self.remove_route(process_id);
             return Err(Error::Closed("mismatched Process SPAWN reply".to_owned()));
         }
-        route
-            .process_handle
-            .store(started.process_handle, Ordering::Release);
+        {
+            // Under the routes lock, like the Exit handler: either it sees
+            // this handle and records the exit replay, or this sees the
+            // exit it already published (a process that exits before SPAWN
+            // returns) and records it here. A WAIT never misses both.
+            let _routes = self.inner.routes.lock().unwrap();
+            route
+                .process_handle
+                .store(started.process_handle, Ordering::Release);
+            if let Some(exit) = route.exit.borrow().clone() {
+                self.inner
+                    .exits
+                    .lock()
+                    .unwrap()
+                    .insert(started.process_handle, exit);
+            }
+        }
         Ok(Attachment {
             session: self.clone(),
             route,
@@ -494,6 +530,17 @@ impl Session {
         let (mut exit, temporary) =
             if let Some(route) = self.route_by_handle(request.process_handle) {
                 (route.exit.subscribe(), None)
+            } else if let Some(exit) = self
+                .inner
+                .exits
+                .lock()
+                .unwrap()
+                .get(request.process_handle)
+                .cloned()
+            {
+                // It exited between the first look and the route lookup; the
+                // replay is recorded before the route is removed.
+                return Ok(exit);
             } else {
                 match self
                     .watch_process(request.process_handle, false, true)
@@ -870,22 +917,27 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                 .map_err(|_| Error::Closed("Process semantic stream queue overflowed".to_owned()))
         }
         process::NativeEvent::Exit { process_id, exit } => {
-            let route = inner
-                .routes
-                .lock()
-                .unwrap()
-                .remove(&process_id)
-                .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
             let exit = native_exit_info(exit);
-            let process_handle = route.process_handle.load(Ordering::Acquire);
-            if process_handle != 0 {
-                inner
-                    .exits
-                    .lock()
-                    .unwrap()
-                    .insert(process_handle, exit.clone());
-            }
-            route.exit.send_replace(Some(exit.clone()));
+            let route = {
+                let mut routes = inner.routes.lock().unwrap();
+                let route = routes
+                    .get(&process_id)
+                    .cloned()
+                    .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
+                let process_handle = route.process_handle.load(Ordering::Acquire);
+                if process_handle != 0 {
+                    // Record the replay before the route disappears: a WAIT
+                    // that no longer finds the route must find the exit.
+                    inner
+                        .exits
+                        .lock()
+                        .unwrap()
+                        .insert(process_handle, exit.clone());
+                }
+                routes.remove(&process_id);
+                route.exit.send_replace(Some(exit.clone()));
+                route
+            };
             let _ = route.events.try_send(Event::Exit(exit));
             Ok(())
         }
@@ -1025,7 +1077,12 @@ mod tests {
 
     #[test]
     fn exit_replays_are_bounded_retryable_and_fifo_evicted() {
-        let mut exits = ExitReplays::default();
+        const MAX_EXIT_REPLAYS_PER_SESSION: usize = schema::process::MAX_PROCESSES as usize;
+        assert_eq!(
+            process::ProcessMaxima::DEFAULT.exit_replays(),
+            MAX_EXIT_REPLAYS_PER_SESSION
+        );
+        let mut exits = ExitReplays::new(MAX_EXIT_REPLAYS_PER_SESSION);
         for process_handle in 1..=MAX_EXIT_REPLAYS_PER_SESSION as u64 + 1 {
             exits.insert(
                 process_handle,
@@ -1110,6 +1167,209 @@ mod tests {
         };
         assert_eq!(output, b"survived");
         assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 0);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// Output and the exit of a spawned attachment, crediting output as it comes.
+    async fn output_and_exit(
+        attachment: &mut Attachment,
+        within: Duration,
+        mut acked: u64,
+    ) -> (Vec<u8>, ExitInfo) {
+        let mut output = Vec::new();
+        loop {
+            match tokio::time::timeout(within, attachment.next())
+                .await
+                .expect("an event in time")
+                .expect("the attachment is open")
+            {
+                Event::Output { stream, data, .. } => {
+                    output.extend_from_slice(&data);
+                    acked += data.len() as u64;
+                    attachment.acknowledge_output(stream, acked).unwrap();
+                }
+                Event::Exit(exit) => return (output, exit),
+                Event::StdinProgress { .. } => {}
+            }
+        }
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn residue_request(script: String, grace: Option<Duration>) -> wire::Spawn {
+        let mut request = spawn_request(
+            vec![executable("sh"), b"-c".to_vec(), script.into_bytes()],
+            Vec::new(),
+        );
+        request.flags = (schema::process::SPAWN_LEAVE_RESIDUE
+            | schema::process::SPAWN_MERGE_STDERR
+            | schema::process::SPAWN_STDIN_NULL) as u16;
+        request.stderr_receive_credit = 0;
+        if let Some(grace) = grace {
+            request.extensions = Extensions(vec![Extension {
+                tag: schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+                required: true,
+                value: (grace.as_nanos() as u64).to_le_bytes().to_vec(),
+            }]);
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn leave_residue_reports_the_exit_after_its_grace_and_leaves_the_group_running() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([11; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let started = std::time::Instant::now();
+        let mut attachment = session
+            .spawn(
+                &residue_request(
+                    format!("{sleep} 30 & echo $!; echo started; exit 3"),
+                    Some(Duration::from_millis(300)),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            attachment.stdin_window, 0,
+            "the null device has no stdin Transfer"
+        );
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        let elapsed = started.elapsed();
+        let text = String::from_utf8(output).unwrap();
+        let mut lines = text.lines();
+        let pid: i32 = lines.next().unwrap().parse().unwrap();
+        assert_eq!(lines.next(), Some("started"));
+        assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 3);
+        assert_eq!(exit.detail, b"residual process group left running");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "waited for the grace: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "did not wait for the residue: {elapsed:?}"
+        );
+        // Neither the exit, nor the session's end, nor the server's stops what was left running.
+        assert!(alive(pid), "the residue runs after the exit");
+        session.shutdown().await;
+        server.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(alive(pid), "the residue outlives its session and server");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[tokio::test]
+    async fn leave_residue_without_a_grace_forwards_output_until_the_streams_close() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([12; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let mut attachment = session
+            .spawn(
+                &residue_request(format!("({sleep} 0.4; printf later) & printf now"), None),
+                None,
+            )
+            .await
+            .unwrap();
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output, b"nowlater");
+        assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 0);
+        assert!(
+            exit.detail.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&exit.detail)
+        );
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn leave_residue_terminate_kills_the_whole_group_after_the_kill_grace() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([13; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let sh = String::from_utf8(executable("sh")).unwrap();
+        // A member that ignores SIGTERM (it reports its pid once the trap is set), and a leader
+        // waiting on a foreground child.
+        let mut attachment = session
+            .spawn(
+                &residue_request(
+                    format!("{sh} -c \"trap \\\"\\\" TERM; echo \\$\\$; {sleep} 30\" & {sleep} 30"),
+                    Some(Duration::from_millis(100)),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let (pid, acked) = loop {
+            match tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Event::Output { stream, data, .. } => {
+                    let acked = data.len() as u64;
+                    attachment.acknowledge_output(stream, acked).unwrap();
+                    let pid = String::from_utf8(data)
+                        .unwrap()
+                        .trim()
+                        .parse::<i32>()
+                        .unwrap();
+                    break (pid, acked);
+                }
+                Event::Exit(exit) => panic!("exited early: {exit:?}"),
+                Event::StdinProgress { .. } => {}
+            }
+        };
+        let started = std::time::Instant::now();
+        session
+            .control(&wire::Control {
+                process_handle: attachment.process_handle,
+                operation_id: [14; 16],
+                action: wire::ControlAction::Terminate,
+                value: 0,
+                extensions: Extensions::default(),
+            })
+            .await
+            .unwrap();
+        let (_, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), acked).await;
+        assert_eq!(exit.kind, wire::ExitKind::Signal);
+        assert_eq!(exit.code, libc::SIGTERM);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the exit waits for no residue"
+        );
+        assert!(alive(pid), "the member ignoring SIGTERM outlives it");
+        tokio::time::sleep(Duration::from_millis(2_500).saturating_sub(started.elapsed())).await;
+        assert!(!alive(pid), "the escalation killed the group");
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stdin_null_gives_the_child_the_null_device() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([15; 16], None).unwrap();
+        let mut request = spawn_request(
+            vec![executable("readlink"), b"/proc/self/fd/0".to_vec()],
+            Vec::new(),
+        );
+        request.flags = schema::process::SPAWN_STDIN_NULL as u16;
+        let mut attachment = session.spawn(&request, None).await.unwrap();
+        assert_eq!(attachment.stdin_window, 0);
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output, b"/dev/null\n");
         assert_eq!(exit.code, 0);
         session.shutdown().await;
         server.shutdown().await;

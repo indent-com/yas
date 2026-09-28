@@ -34,7 +34,7 @@ struct Repository {
 
 impl Repository {
     async fn open(on: Option<&str>, hub: &str, path: &str) -> Result<Self, String> {
-        let mut client = NativeClient::connect(on, hub).await?;
+        let mut client = crate::yas_native::connect(on, hub).await?;
         let opened: OpenResult = client
             .request_typed(
                 family::GIT,
@@ -67,6 +67,7 @@ impl Repository {
             )
             .await
             .map(|_| ())
+            .map_err(String::from)
     }
 
     async fn query(
@@ -873,7 +874,7 @@ async fn cmd_discover(
     bare: bool,
     json: bool,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut flags = 0u16;
     if nested {
         flags |= yas_wire::schema::git::DISCOVER_NESTED as u16;
@@ -1151,11 +1152,10 @@ async fn content_bytes(
     let expected = content.next_offset.saturating_sub(content.offset);
     match content.delivery {
         ContentDelivery::Inline(bytes) => Ok(bytes),
-        ContentDelivery::Transfer(descriptor) => {
-            client
-                .receive_byte_transfer(&descriptor, Some(expected), git::MAX_QUERY_BYTES as u64)
-                .await
-        }
+        ContentDelivery::Transfer(descriptor) => client
+            .receive_byte_transfer(&descriptor, Some(expected), git::MAX_QUERY_BYTES as u64)
+            .await
+            .map_err(String::from),
     }
 }
 

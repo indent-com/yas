@@ -103,19 +103,69 @@ family shares the same process authority.
 
 ## Capacity and backpressure
 
-Process family limits are selected in HELLO. Canonical hard maxima include
+Process family limits are selected in HELLO. By default a server enforces
 1,024 arguments, 1 MiB of argument bytes, 256 environment entries, 1 MiB of
 environment bytes, 16 processes per session, 64 process generations
 server-wide, 8 pending spawns, 8 MiB of buffered stream data, and five minutes
-of detached-result retention. Server policy may advertise smaller values.
+of detached-result retention. Each session also admits at most 16
+completion-held `ATTACH`/`CONTROL` operations and 32 pending `WAIT`s.
 
-Each session additionally admits at most 16 completion-held `ATTACH`/`CONTROL`
-operations and 32 pending `WAIT`s. Cancellation may settle the wire request,
-but it does not recycle admission while committed or uncancellable backend work
-is still running. One generation can arm only one terminate-escalation timer.
-Ordinary exit replies remain retryable in a 64-record per-session FIFO; older
-terminal records are evicted deterministically rather than growing with process
-churn.
+Server policy may lower them. For workloads such as an agent running many
+commands at once on one session, it may raise them up to the extended hard
+maxima:
+
+| Maximum                        | Flag                           | Environment                      | Default | At most |
+| ------------------------------ | ------------------------------ | -------------------------------- | ------- | ------- |
+| Live processes per session     | `--process-max-per-session`    | `YAS_PROCESS_MAX_PER_SESSION`    | 16      | 16384   |
+| Process generations            | `--process-max`                | `YAS_PROCESS_MAX`                | 64      | 65536   |
+| Spawns in flight per session   | `--process-max-pending-spawns` | `YAS_PROCESS_MAX_PENDING_SPAWNS` | 8       | 4096    |
+| Stream buffer (stdin window)   | `--process-stream-buffer-max`  | `YAS_PROCESS_STREAM_BUFFER_MAX`  | 8 MiB   | 1 GiB   |
+| Environment entries per SPAWN  | `--process-max-env`            | `YAS_PROCESS_MAX_ENV`            | 256     | 16384   |
+| Pending `WAIT`s per session    | `--process-max-waits`          | `YAS_PROCESS_MAX_WAITS`          | 32      | 65536   |
+| `ATTACH`/`CONTROL` per session | `--process-max-operations`     | `YAS_PROCESS_MAX_OPERATIONS`     | 16      | 16384   |
+
+Flags override the environment. `YAS_PROCESS_MAX_PER_CLIENT` is the older name
+of `YAS_PROCESS_MAX_PER_SESSION`. A malformed or out-of-range variable is
+ignored with a warning. A malformed or out-of-range flag stops the server. The
+server advertises exactly what it enforces: values above the v1 hard maxima
+travel in optional extended limit tags, and clients from before them see the v1
+maxima ([yas.md § Process family](yas.md#process-family)).
+
+The per-session capacities that bound processes grow with the configuration:
+
+- the session's outbound Transfers: 32, plus two for every process per session above 16;
+- operation replays: 256, or two per process plus the pending spawns and operations if that is more;
+- retained exit replies: the server-wide process maximum.
+
+So do the server-wide budgets:
+
+- reserved stream windows (`YAS_PROCESS_BUFFER_MAX`): at least 3 MiB per generation;
+- retained spawn-request bytes: 64 KiB for every process above the defaults.
+
+`YAS_PROCESS_MAX_SPAWNING` (concurrent native spawn calls server-wide) defaults
+to the pending-spawn maximum.
+
+A session's streams share its receive budgets, 16 MiB each way:
+
+- **stdout and stderr**: every open stream holds the receive credit its client
+  granted, and that credit comes out of the client's declared buffer. A client
+  that runs many processes on one session should use smaller windows. yas-client
+  divides three quarters of the budget between the server's per-session maximum.
+  The server sends output as far as the credit reaches, so a window smaller than
+  one 64 KiB chunk still makes progress (servers that predate configurable
+  maxima waited for credit through a whole chunk).
+- **stdin**: pipes take their windows from the server's receive budget. They
+  never take its last quarter, which stays free for requests, credit and PING
+  results. Each gets at most an equal share of the rest at the configured
+  processes per session, and at least 4 KiB.
+- A spawn whose stdin window cannot be granted at all fails with
+  `RESOURCE_EXHAUSTED`. `SPAWN_STDIN_NULL` needs no window.
+
+Cancellation may settle the wire request, but it does not recycle admission
+while committed or uncancellable backend work is still running. One generation
+can arm only one terminate-escalation timer. Ordinary exit replies remain
+retryable in a bounded per-session FIFO (64 records by default); older terminal
+records are evicted deterministically rather than growing with process churn.
 
 Admission reserves the process generation, session/global count, and required
 Transfer receive budgets before invoking the OS. Failure settles with

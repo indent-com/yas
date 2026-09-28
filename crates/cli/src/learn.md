@@ -15,6 +15,18 @@ yas run --in /src/yas --env RUST_LOG=debug -- cargo test
 Options precede the program. The program is executed directly with no shell;
 run a shell explicitly for pipes, redirects, globs, or other shell syntax.
 
+A server runs at most 16 such processes per client session and 64 in total
+by default. Raise that for heavy fan-out, such as an agent running many
+commands at once:
+
+```bash
+yas server --process-max-per-session 1024 --process-max 4096 --process-max-pending-spawns 64
+```
+
+`yas server --help` lists the other `--process-max*` flags (stream buffer,
+environment entries, pending WAITs and ATTACH/CONTROL operations). Each flag
+has a `YAS_PROCESS_*` environment variable.
+
 ## Running commands
 
 ```bash
@@ -404,6 +416,20 @@ takes a URL wherever it takes a command, so `localhost:3000` or
 what marks it as a location; a bare word stays a command). Locations are
 remembered per server in its KV store, and the focused pane takes over the
 status bar with back/forward/reload and its title.
+
+## A session over pipes
+
+`yas connect --stdio` relays one native YAS session over its stdin and stdout
+to the server `--on` names (the local one by default, started unless
+`--no-start`). Use it where only a command with pipes gets through:
+
+```bash
+ssh host yas connect --stdio                  # SSH exec, no socket forwarding
+docker exec -i sandbox yas connect --stdio    # into a container's server
+```
+
+Stdout carries only the session; errors go to stderr and exit 1. It ends when
+the server closes, which it does after stdin ends. It refuses a terminal.
 
 ## Port forwarding
 

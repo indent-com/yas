@@ -86,6 +86,7 @@ restartable; PTYs survive their restart.
 | `yas-edge`             | `crates/edge/`             | lib           | Authenticated fixed-home YAS WebSocket/WebTransport edge and web application host                                |
 | `yas-ssh`              | `crates/ssh/`              | lib           | Embedded SSH client (russh): ssh-agent auth, `~/.ssh/config`, `direct-streamlocal` channels                      |
 | `yas-proxy`            | `crates/proxy/`            | lib           | Native connection pool for socket, TCP, SSH, WebSocket, WebTransport, and WebRTC upstreams                       |
+| `yas-client`           | `crates/client/`           | lib           | Rust client: every CLI transport, typed errors, concurrent sessions, Process/FS/KV/Env, private hosted servers   |
 | `yas-uplink`           | `crates/uplink/`           | lib           | End-to-end Noise IK with pinned X25519 identities, AES-GCM, and authenticated datagrams                          |
 | `yas` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH/proxy/share transports, `remote` management, `server`/`share` subcommands |
 | `yas-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib           | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                    |
@@ -95,7 +96,7 @@ restartable; PTYs survive their restart.
 | `yas-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (wayland-server): surface multiplexing, input injection                 |
 | `yas-sd-notify`        | `crates/sd-notify/`        | lib           | Tiny pure-`libc` `sd_notify(3)` for daemon readiness; no `libsystemd` dependency                                 |
 
-Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`yas-server`, `yas-compositor`, `yas-cli`, `yas-webrtc-forwarder`) use a small number of sibling files in the same directory.
+Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`yas-server`, `yas-compositor`, `yas-cli`, `yas-client`, `yas-webrtc-forwarder`) use a small number of sibling files in the same directory.
 
 The uplink producer in `yas-cli` and consumer in `yas-proxy` share `yas-uplink`.
 The relay carries opaque Noise IK records. The producer requires a locally
@@ -124,6 +125,11 @@ graph TD
     ssh --> proxy[yas-proxy]
     forwarder --> proxy
     proxy --> server
+    wire --> client[yas-client]
+    ssh --> client
+    proxy --> client
+    forwarder --> client
+    client --> cli
 
     browser --> core[@yas-run/core]
     core --> react[@yas-run/react]
@@ -137,6 +143,7 @@ graph TD
 ```
 
 `yas-proxy` depends on `yas-ssh` and `yas-webrtc-forwarder` for upstream SSH and WebRTC transport support.
+`yas-client` holds the connectors and the native session the CLI uses (one implementation), plus the concurrent `Client` embedders use; see [EMBEDDING.md](EMBEDDING.md#rust-yas-client).
 
 ---
 

@@ -1,7 +1,7 @@
 //! Independent AES-GCM datagrams. Root keys are exchanged inside Noise.
 //! Route token + explicit counter are authenticated; loss cannot desynchronize
 //! key rotation because each epoch is a function of the packet counter.
-use ring::{
+use crate::crypto::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     hkdf,
 };

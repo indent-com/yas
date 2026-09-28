@@ -88,7 +88,7 @@ pub(crate) async fn dispatch(
     hub: &str,
     command: EventsCommand,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     match command {
         EventsCommand::Config => print_config(&get_config(&mut client).await?),
         EventsCommand::Set {
@@ -152,6 +152,7 @@ async fn get_config(client: &mut NativeClient) -> Result<events::Config, String>
             true,
         )
         .await
+        .map_err(String::from)
 }
 
 fn print_config(config: &events::Config) {

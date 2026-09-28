@@ -1,5 +1,6 @@
 mod cli;
 mod completion;
+mod connect;
 mod events_human;
 mod forward;
 mod generate;
@@ -749,6 +750,8 @@ async fn async_main() {
             scrollback,
             #[cfg(unix)]
             fd_channel,
+            #[cfg(unix)]
+            read_only_sock,
             export_sock,
             inject_path,
             max_ptys,
@@ -763,7 +766,15 @@ async fn async_main() {
             deployment,
             verbose,
             no_processes,
+            process_maxima,
         } => {
+            let process_maxima = match process_maxima.resolve() {
+                Ok(maxima) => maxima,
+                Err(error) => {
+                    eprintln!("yas server: {error}");
+                    std::process::exit(2);
+                }
+            };
             let deployment = match deployment.into_overrides() {
                 Ok(deployment) => deployment,
                 Err(error) => {
@@ -860,6 +871,8 @@ async fn async_main() {
                         .ok()
                         .and_then(|s| s.parse().ok())
                 }),
+                #[cfg(unix)]
+                read_only_ipc_path: read_only_sock,
                 verbose: verbose
                     || std::env::var("YAS_VERBOSE")
                         .ok()
@@ -867,6 +880,7 @@ async fn async_main() {
                         .unwrap_or(false),
                 processes: !no_processes
                     && !std::env::var("YAS_PROCESS").is_ok_and(|value| value == "0"),
+                process_maxima,
                 // Both default to 0 (unlimited), which is the right default:
                 // a client that can open a PTY can already spend the machine's
                 // resources from inside it, so these are an operator sanity
@@ -1070,6 +1084,16 @@ async fn async_main() {
                 Err(e) => Err(e),
             };
             match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("yas: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Connect { stdio: _, no_start } => {
+            let conn = &cli.connect;
+            match connect::cmd_connect_stdio(conn.on.as_deref(), &conn.hub, !no_start).await {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("yas: {e}");

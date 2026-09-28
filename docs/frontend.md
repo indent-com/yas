@@ -16,6 +16,16 @@ home-server Relay remotes. Embedders select it with `mountYasWorkspace`'s
 `connections` embeds use local layout storage without workspace-session
 management. Development source changes require a manual page reload.
 
+A host that frames the workspace with web panes on (`capabilities.previews`)
+serves the preview service worker at `/sw.js` and the workspace's document at
+`EMBED_DOCUMENT_PATH` (`/.yas-embed`) of an origin of its own. The worker takes
+every other frame navigation on its origin for a pane, because the app is
+otherwise always the top-level page; a navigation to that path is the app
+itself, never relayed, and its window brokers native Net for the panes as a
+top-level app does. Panes run the previewed server's pages on that origin, so
+it holds nothing but the workspace: one origin per YAS server (Ultimator gives
+each computer its own).
+
 Pane content is owned by surviving leaf identity outside the recursive layout.
 Structural slots adopt the existing pane DOM when adding a first sibling,
 nesting or collapsing splits, changing container kinds, or moving between tiled
