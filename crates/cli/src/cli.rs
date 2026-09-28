@@ -1563,10 +1563,6 @@ pub enum SurfaceCommand {
         #[arg(short, long)]
         format: Option<String>,
 
-        /// Quality: 0 = lossless, 1-100 = lossy (applies to AVIF only)
-        #[arg(short, long, default_value_t = 0)]
-        quality: u8,
-
         /// Resize the surface to this width (pixels) before capturing
         #[arg(long)]
         width: Option<u16>,
@@ -1576,8 +1572,9 @@ pub enum SurfaceCommand {
         height: Option<u16>,
 
         /// Render scale in 120ths (wp_fractional_scale_v1 units).
-        /// 120 = 1x, 240 = 2x, 180 = 1.5x, etc.
-        /// Default (0) uses the compositor's current output scale.
+        /// 120 = 1x, 240 = 2x, 180 = 1.5x, etc. Resizes the surface to its
+        /// current (or --width/--height) logical size at this scale before
+        /// capturing. Default (0) leaves the surface's scale alone.
         #[arg(long, default_value_t = 0)]
         scale: u16,
     },
@@ -1616,7 +1613,8 @@ pub enum SurfaceCommand {
         /// Surface ID
         id: u64,
 
-        /// Wheel detents; positive = down/right
+        /// Wheel detents; positive = down/right, negative = up/left
+        #[arg(allow_negative_numbers = true)]
         amount: f64,
 
         /// Scroll horizontally instead of vertically
@@ -1671,7 +1669,8 @@ pub enum SurfaceCommand {
         /// Surface ID
         id: u64,
 
-        /// Output file path (default: surface-<id>.<codec>)
+        /// Output file path (default: surface-<id>.h264, or surface-<id>.obu
+        /// for AV1)
         #[arg(short, long)]
         output: Option<String>,
 
@@ -1684,10 +1683,11 @@ pub enum SurfaceCommand {
         duration: f64,
 
         /// Codec(s) to announce as supported (comma-separated or repeated).
-        /// Accepted values: h264, av1, h264-444, av1-444 — the `-444`
-        /// variants also announce 4:4:4 chroma, which is what makes the
-        /// server pick a 4:4:4 encoder.
-        /// Default: all codecs.
+        /// Accepted values: h264, av1, h264-444, av1-444. The `-444`
+        /// variants also announce 4:4:4 chroma for that codec; the server
+        /// encodes 4:4:4 only when its own chroma setting and encoder allow
+        /// it, and falls back to 4:2:0 otherwise.
+        /// Default: h264 and av1 at 4:2:0.
         #[arg(short, long, value_delimiter = ',')]
         codec: Vec<String>,
 
@@ -2712,6 +2712,25 @@ mod tests {
         };
         assert_eq!(args.from, "http://localhost:10003/ext");
         assert!(Cli::try_parse_from(["yas", "ext", "install"]).is_err());
+    }
+
+    #[test]
+    fn surface_scroll_accepts_a_negative_amount() {
+        let cli =
+            Cli::try_parse_from(["yas", "surface", "scroll", "1", "-2.5", "--horizontal"]).unwrap();
+        let Command::Surface {
+            command:
+                Some(SurfaceCommand::Scroll {
+                    id,
+                    amount,
+                    horizontal,
+                    ..
+                }),
+        } = cli.command
+        else {
+            panic!("scroll must parse as a surface scroll");
+        };
+        assert_eq!((id, amount, horizontal), (1, -2.5, true));
     }
 
     #[test]

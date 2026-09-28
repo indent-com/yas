@@ -57,25 +57,24 @@ pub(crate) async fn cmd_capture(
     id: u64,
     output: Option<String>,
     format_arg: Option<String>,
-    quality: u8,
     width: Option<u16>,
     height: Option<u16>,
     scale: u16,
 ) -> Result<(), String> {
     let id = surface_handle(id)?;
-    if quality != 0 {
-        return Err("YAS Surface v1 CAPTURE does not expose encoder quality".to_string());
-    }
-    if scale != 0 {
-        return Err("YAS Surface v1 CAPTURE does not expose an output scale".to_string());
-    }
     let (format, extension) = capture_format(format_arg.as_deref(), output.as_deref())?;
     let mut client = NativeClient::connect(on, hub).await?;
     let mut record = find_surface(&mut client, id).await?;
 
-    if width.is_some() || height.is_some() {
-        let width = width.unwrap_or(640);
-        let height = height.unwrap_or(480);
+    if width.is_some() || height.is_some() || scale != 0 {
+        let (logical_width_32_32, logical_height_32_32) = if width.is_some() || height.is_some() {
+            (
+                i64::from(width.unwrap_or(640)) << 32,
+                i64::from(height.unwrap_or(480)) << 32,
+            )
+        } else {
+            (record.logical_width_32_32, record.logical_height_32_32)
+        };
         let _: surface::RevisionResult = client
             .request_typed(
                 family::SURFACE,
@@ -83,9 +82,9 @@ pub(crate) async fn cmd_capture(
                 &surface::Resize {
                     surface_handle: id,
                     operation_id: operation_id(),
-                    logical_width_32_32: i64::from(width) << 32,
-                    logical_height_32_32: i64::from(height) << 32,
-                    extensions: Extensions::default(),
+                    logical_width_32_32,
+                    logical_height_32_32,
+                    extensions: resize_scale_extensions(scale),
                 },
                 false,
             )
@@ -284,7 +283,7 @@ pub(crate) async fn cmd_record(
     let id = surface_handle(id)?;
     let requested_size = parse_record_size(size.as_deref())?;
     let encoded_size = parse_record_encode_size(encode_size.as_deref())?;
-    let codec_versions = parse_record_codecs(&codecs)?;
+    let (codec_versions, color_capabilities) = parse_record_codecs(&codecs)?;
 
     let mut client = NativeClient::connect(on, hub).await?;
     let mut record = find_surface(&mut client, id).await?;
@@ -321,7 +320,7 @@ pub(crate) async fn cmd_record(
                 max_fps: fps,
                 decoder_capacity: 4,
                 codec_versions,
-                extensions: Extensions::default(),
+                extensions: view_color_extensions(color_capabilities),
             },
             false,
         )
@@ -943,31 +942,60 @@ fn parse_record_encode_size(value: Option<&str>) -> Result<Option<(u16, u16)>, S
     Ok(parse_record_size(Some(value))?.map(|(width, height, _)| (width, height)))
 }
 
-fn parse_record_codecs(values: &[String]) -> Result<Vec<u16>, String> {
+fn parse_record_codecs(values: &[String]) -> Result<(Vec<u16>, u8), String> {
+    use yas_wire::schema::surface as schema;
     let mut codecs = BTreeSet::new();
+    let mut color_capabilities = 0u8;
     if values.is_empty() {
-        codecs.insert(yas_wire::schema::surface::CODEC_H264_V1 as u16);
-        codecs.insert(yas_wire::schema::surface::CODEC_AV1_V1 as u16);
+        codecs.insert(schema::CODEC_H264_V1 as u16);
+        codecs.insert(schema::CODEC_AV1_V1 as u16);
     }
     for value in values {
         match value.to_ascii_lowercase().as_str() {
             "h264" => {
-                codecs.insert(yas_wire::schema::surface::CODEC_H264_V1 as u16);
+                codecs.insert(schema::CODEC_H264_V1 as u16);
             }
             "av1" => {
-                codecs.insert(yas_wire::schema::surface::CODEC_AV1_V1 as u16);
+                codecs.insert(schema::CODEC_AV1_V1 as u16);
             }
-            "h264-444" | "av1-444" => {
-                return Err(format!(
-                    "codec {value:?} has no YAS Surface v1 chroma-profile negotiation"
-                ));
+            "h264-444" => {
+                codecs.insert(schema::CODEC_H264_V1 as u16);
+                color_capabilities |= schema::COLOR_CAP_H264_444 as u8;
+            }
+            "av1-444" => {
+                codecs.insert(schema::CODEC_AV1_V1 as u16);
+                color_capabilities |= schema::COLOR_CAP_AV1_444 as u8;
             }
             other => {
-                return Err(format!("unknown codec: {other} (expected h264 or av1)"));
+                return Err(format!(
+                    "unknown codec: {other} (expected h264, av1, h264-444, or av1-444)"
+                ));
             }
         }
     }
-    Ok(codecs.into_iter().collect())
+    Ok((codecs.into_iter().collect(), color_capabilities))
+}
+
+fn view_color_extensions(color_capabilities: u8) -> Extensions {
+    if color_capabilities == 0 {
+        return Extensions::default();
+    }
+    Extensions(vec![yas_wire::Extension {
+        tag: yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16,
+        required: false,
+        value: vec![color_capabilities],
+    }])
+}
+
+fn resize_scale_extensions(scale_120: u16) -> Extensions {
+    if scale_120 == 0 {
+        return Extensions::default();
+    }
+    Extensions(vec![yas_wire::Extension {
+        tag: yas_wire::schema::surface::RESIZE_SCALE_120_EXTENSION as u16,
+        required: true,
+        value: scale_120.to_le_bytes().to_vec(),
+    }])
 }
 
 fn scaled_logical_dimension(physical: u16, scale_120: u16) -> Result<i64, String> {
@@ -1249,6 +1277,48 @@ mod tests {
     fn native_surface_fragments_reject_out_of_order_delivery() {
         let mut assembler = SurfaceFrameAssembler::new(&view_result(), 1024).unwrap();
         assert!(assembler.push(fragment(1, b"defg")).is_err());
+    }
+
+    #[test]
+    fn record_codecs_announce_444_through_color_capabilities() {
+        use yas_wire::schema::surface as schema;
+        let (codecs, caps) = parse_record_codecs(&[]).unwrap();
+        assert_eq!(
+            codecs,
+            vec![schema::CODEC_H264_V1 as u16, schema::CODEC_AV1_V1 as u16]
+        );
+        assert_eq!(caps, 0);
+        assert!(view_color_extensions(caps).0.is_empty());
+
+        let (codecs, caps) =
+            parse_record_codecs(&["H264-444".to_string(), "av1".to_string()]).unwrap();
+        assert_eq!(
+            codecs,
+            vec![schema::CODEC_H264_V1 as u16, schema::CODEC_AV1_V1 as u16]
+        );
+        assert_eq!(caps, schema::COLOR_CAP_H264_444 as u8);
+        let extensions = view_color_extensions(caps);
+        assert_eq!(
+            surface::color_capabilities(&extensions).unwrap(),
+            schema::COLOR_CAP_H264_444 as u8
+        );
+
+        let (_, caps) = parse_record_codecs(&["av1-444".to_string()]).unwrap();
+        assert_eq!(caps, schema::COLOR_CAP_AV1_444 as u8);
+        assert!(parse_record_codecs(&["vp9".to_string()]).is_err());
+    }
+
+    #[test]
+    fn capture_scale_rides_the_resize_scale_extension() {
+        assert!(resize_scale_extensions(0).0.is_empty());
+        let resize = surface::Resize {
+            surface_handle: 1,
+            operation_id: [1; 16],
+            logical_width_32_32: 800_i64 << 32,
+            logical_height_32_32: 600_i64 << 32,
+            extensions: resize_scale_extensions(240),
+        };
+        assert_eq!(resize.scale_120().unwrap(), Some(240));
     }
 
     #[test]
