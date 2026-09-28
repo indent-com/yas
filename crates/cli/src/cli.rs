@@ -1815,7 +1815,7 @@ pub enum FsCommand {
     /// --json, emits one NDJSON event per record (`upsert`, `delete`,
     /// `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
     Sync {
-        /// Path on the server (absolute, or relative to the server's cwd)
+        /// Path on the server (absolute, or relative to the client's cwd)
         path: String,
 
         /// Sync file contents too (hashes always sync)
@@ -2023,12 +2023,13 @@ pub enum FsCommand {
         #[arg(short = 'w', long)]
         word: bool,
 
-        /// Search gitignored files too; they rank after tracked ones.
-        /// Much slower on a tree with build output.
+        /// Search gitignored files and `.git` too. Results stay in path
+        /// order; ignored files are marked in --json. Much slower on a tree
+        /// with build output.
         #[arg(long)]
         no_ignore: bool,
 
-        /// Stop after this many matching files (0 = server default)
+        /// Stop after this many matching files (0 = no limit)
         #[arg(short = 'm', long, default_value_t = 0)]
         max_matches: u16,
 

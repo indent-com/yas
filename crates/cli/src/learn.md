@@ -253,13 +253,15 @@ yas fs grep needle                      # search contents, PATH:LINE:TEXT
 yas fs grep -e 'fn \w+' --root crates   # regex
 yas fs grep -sw Config                  # case-sensitive, whole word
 yas fs grep -l needle                   # matching paths only
+yas fs grep -m 3 needle                 # stop after three matching files
 yas fs grep --no-ignore TODO            # include gitignored files
 yas fs sync . --json                    # mirror a tree, stream changes
 ```
 
-`fs grep` is case-insensitive literal by default and honours `.gitignore`,
-which is what keeps it fast on a tree with build output — `--no-ignore`
-searches ignored files too and ranks them last. It exits 1 when nothing
+`fs grep` is case-insensitive literal by default, honours `.gitignore`, and
+skips `.git`, which is what keeps it fast on a tree with build output. Dotfiles
+are searched. `--no-ignore` searches ignored files and `.git` too; results
+stay in path order, with ignored files marked `"ignored": true` in `--json`. It exits 1 when nothing
 matched, like grep(1), so `if yas fs grep -l TODO; then …` works.
 
 Writes are compare-and-swap by default, so a concurrent change is a
@@ -269,9 +271,9 @@ conflict rather than a silent clobber (exit 1):
 echo hi | yas fs write notes.txt              # unconditional overwrite
 echo hi | yas fs write notes.txt --create     # fail if it exists
 echo hi | yas fs write notes.txt --if-hash H  # only if unchanged
-yas fs mkdir -p a/b        # create a directory
+yas fs mkdir --parents a/b # create a directory and its parents
 yas fs mv old new          # rename or move
-yas fs rm -r dir           # remove a subtree
+yas fs rm dir              # remove a file or a whole subtree
 yas fs ln -s target link   # symlink (omit -s for a hard link)
 ```
 
