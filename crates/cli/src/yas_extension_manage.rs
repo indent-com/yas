@@ -570,7 +570,7 @@ pub(super) async fn run(on: Option<&str>, hub: &str, args: ManageArgs) -> Result
         return Err("yas ext manage needs an interactive terminal; use ext run --persist, ext update, or ext disable followed by ext remove in scripts".into());
     }
     let registry = Registry::fetch(&args.from).await?;
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     require_lifecycle(&client)?;
     let installed = snapshot(&mut client).await?;
     let Some(rows) = choose(&registry, &installed).await? else {

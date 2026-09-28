@@ -597,6 +597,7 @@ async fn send_frame_ack(
             false,
         )
         .await
+        .map_err(String::from)
 }
 
 #[cfg(unix)]
@@ -621,7 +622,7 @@ pub(crate) async fn start_view_task(
     ),
     String,
 > {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let view = open_view(&mut client, &record, rows, cols, 60).await?;
     // One complete rendered grid is enough to hand off at a time. If stdout
@@ -820,7 +821,7 @@ pub(crate) async fn start_interactive_view_task(
     rows: u16,
     cols: u16,
 ) -> Result<InteractiveView, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let mut view = open_view(&mut client, &record, rows, cols, 30).await?;
     let (updates_tx, updates) = tokio::sync::mpsc::channel(1);
@@ -1036,7 +1037,7 @@ async fn start_lifecycle_task(
     ),
     String,
 > {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let result = watch_terminal_exit(&mut client, id)
@@ -1175,7 +1176,7 @@ pub(super) async fn attach(on: Option<&str>, hub: &str, id: u64) -> Result<i32, 
     let (mut cols, mut rows) = tty::window_size();
     let (mut updates, mut view_task) = start_view_task(on, hub, id, rows, cols).await?;
     let (mut lifecycle, lifecycle_task) = start_lifecycle_task(on, hub, id).await?;
-    let mut input_client = NativeClient::connect(on, hub).await?;
+    let mut input_client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut input_client, id).await?;
     let input_view = open_view(&mut input_client, &record, rows, cols, 1).await?;
     let (mut input, stop) = tty::input_channel();
@@ -1303,7 +1304,7 @@ pub(super) async fn record(
     if !max_duration.is_finite() || max_duration < 0.0 {
         return Err("recording duration must be a finite non-negative number".into());
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let terminal_record = find_terminal(&mut client, id).await?;
     let view = open_view(
         &mut client,

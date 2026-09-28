@@ -200,7 +200,7 @@ pub(crate) async fn dispatch(
     if let ExtensionCommand::Manage(args) = command {
         return manage::run(on, hub, args).await;
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     require_lifecycle(&client)?;
     match command {
         ExtensionCommand::Manage(_) => unreachable!(),
@@ -254,7 +254,7 @@ pub(crate) async fn dispatch_advertised_command(
     args: Vec<String>,
     json: bool,
 ) -> Result<i32, String> {
-    let client = NativeClient::connect(on, hub).await?;
+    let client = crate::yas_native::connect(on, hub).await?;
     command_cli::invoke(client, &name, args, json).await
 }
 
@@ -264,7 +264,7 @@ pub(crate) async fn complete_advertised_commands(
     words: &[String],
     current: &str,
 ) -> Result<Vec<String>, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     command_cli::complete(&mut client, words, current).await
 }
 
@@ -425,6 +425,7 @@ async fn deploy(client: &mut NativeClient, request: Deploy) -> Result<Definition
             true,
         )
         .await
+        .map_err(String::from)
 }
 
 async fn control_once(
@@ -464,6 +465,7 @@ async fn control(
             true,
         )
         .await
+        .map_err(String::from)
 }
 
 async fn wait_until_started(

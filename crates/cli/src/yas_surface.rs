@@ -16,7 +16,7 @@ const MAX_SURFACE_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 const WHEEL_DETENT_PIXELS: f64 = 120.0;
 
 pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut records = surface_records(&mut client).await?;
     records.sort_by_key(|record| record.surface_handle);
 
@@ -36,7 +36,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
 }
 
 pub(crate) async fn cmd_close(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     request_empty(
         &mut client,
         surface::request_kind::CLOSE,
@@ -70,7 +70,7 @@ pub(crate) async fn cmd_capture(
         return Err("YAS Surface v1 CAPTURE does not expose an output scale".to_string());
     }
     let (format, extension) = capture_format(format_arg.as_deref(), output.as_deref())?;
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut record = find_surface(&mut client, id).await?;
 
     if width.is_some() || height.is_some() {
@@ -196,13 +196,14 @@ pub(crate) async fn cmd_scroll(
                     true,
                 )
                 .await
+                .map_err(String::from)
         })
     })
     .await
 }
 
 pub(crate) async fn cmd_focus(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let _: surface::RevisionResult = client
         .request_typed(
             family::SURFACE,
@@ -241,6 +242,7 @@ pub(crate) async fn cmd_text(
                     true,
                 )
                 .await
+                .map_err(String::from)
         })
     })
     .await
@@ -286,7 +288,7 @@ pub(crate) async fn cmd_record(
     let encoded_size = parse_record_encode_size(encode_size.as_deref())?;
     let codec_versions = parse_record_codecs(&codecs)?;
 
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut record = find_surface(&mut client, id).await?;
     if let Some((width, height, scale_120)) = requested_size {
         let _: surface::RevisionResult = client
@@ -499,7 +501,7 @@ where
     F: for<'a> FnOnce(&'a mut NativeClient, &'a InputView) -> InputFuture<'a>,
 {
     let id = surface_handle(id)?;
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_surface(&mut client, id).await?;
     let view = open_input_view(&mut client, &record).await?;
     let result = action(&mut client, &view).await;

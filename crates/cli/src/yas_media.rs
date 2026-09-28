@@ -16,7 +16,7 @@ pub(crate) async fn dispatch(
 
     let (action, requested_player) =
         action_and_player(&command).ok_or_else(|| "missing media player action".to_string())?;
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let players = player_records(&mut client).await?;
     let player = select_player(&players, requested_player)?;
     let request = media::PlayerAction {
@@ -46,7 +46,7 @@ pub(crate) async fn dispatch(
 }
 
 async fn list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut players = player_records(&mut client).await?;
     players.sort_by_key(|player| player.player_handle);
 

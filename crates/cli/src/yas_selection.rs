@@ -10,7 +10,7 @@ const INITIAL_RECEIVE_CREDIT: u64 = 1024 * 1024;
 const MAX_SELECTION_BYTES: u64 = MAX_COLLECTED_TRANSFER_BYTES;
 
 pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = clipboard_record(&mut client).await?;
     for mime in record.mime_types {
         println!("{mime}");
@@ -19,7 +19,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
 }
 
 pub(crate) async fn cmd_get(on: Option<&str>, hub: &str, mime: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let bytes = get_with_client(&mut client, mime).await?;
     let mut stdout = std::io::stdout().lock();
     stdout
@@ -49,6 +49,7 @@ async fn get_with_client(client: &mut NativeClient, mime: &str) -> Result<Vec<u8
     client
         .receive_inline_or_transfer(result.0, MAX_SELECTION_BYTES)
         .await
+        .map_err(String::from)
 }
 
 pub(crate) async fn cmd_set(
@@ -72,7 +73,7 @@ pub(crate) async fn cmd_set(
         yas_wire::schema::selection::SLOT_CLIPBOARD as u8
     };
     let operation_id = operation_id();
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     set_with_client(&mut client, slot, mime, bytes, operation_id).await
 }
 
@@ -387,7 +388,7 @@ mod tests {
 
         let mut client = NativeClient::connect_transport(
             crate::transport::Transport::Duplex(client_stream),
-            "yas-selection-test",
+            &yas_client::HelloOptions::named("yas-selection-test"),
         )
         .await
         .unwrap();

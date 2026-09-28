@@ -3,7 +3,6 @@
 use yas_wire::{Encode, client, family};
 
 use crate::cli::{ClientCommand, SessionId};
-use crate::yas_native::NativeClient;
 
 pub(crate) async fn dispatch(
     on: Option<&str>,
@@ -19,7 +18,7 @@ pub(crate) async fn dispatch(
 }
 
 async fn list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let self_id = client.hello().session_id;
     let server_now = client.hello().server_monotonic_ns;
     let records = client
@@ -128,7 +127,7 @@ async fn disconnect(
     id: SessionId,
     reason: String,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let request = client::Disconnect {
         session_id: id.into_bytes(),
         operation_id: operation_id(),

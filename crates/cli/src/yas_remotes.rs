@@ -40,7 +40,7 @@ struct Catalogue {
 
 impl Catalogue {
     async fn open(on: Option<&str>, hub: &str) -> Result<Self, String> {
-        let mut client = NativeClient::connect(on, hub).await?;
+        let mut client = crate::yas_native::connect(on, hub).await?;
         if !client.supports(family::KV, Class::Request, kv::request_kind::OPEN) {
             return Err(
                 "this server does not offer the KV family, which is where remotes live".to_owned(),

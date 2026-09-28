@@ -34,7 +34,7 @@ struct Workspace {
 impl Workspace {
     async fn open(on: Option<&str>, hub: &str, root: &str) -> Result<Self, String> {
         let canonical = client_abs(root);
-        let mut client = NativeClient::connect(on, hub).await?;
+        let mut client = crate::yas_native::connect(on, hub).await?;
         let result: OpenResult = client
             .request_typed(
                 family::LSP,
@@ -80,6 +80,7 @@ impl Workspace {
             )
             .await
             .map(|_| ())
+            .map_err(String::from)
     }
 
     fn target(&self, path: &str) -> Result<DocumentTarget, String> {
@@ -300,7 +301,7 @@ async fn cmd_symbols(
 }
 
 async fn cmd_list(on: Option<&str>, hub: &str, json: bool) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let servers: ServerList = client
         .request_typed(
             family::LSP,
@@ -317,7 +318,7 @@ async fn cmd_list(on: Option<&str>, hub: &str, json: bool) -> Result<i32, String
 }
 
 async fn cmd_stop(on: Option<&str>, hub: &str, server_handle: u64) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let servers: ServerList = client
         .request_typed(
             family::LSP,

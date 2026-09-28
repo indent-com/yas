@@ -21,6 +21,7 @@ x264 = ["yas-server/x264"]
 openh264 = ["yas-server/openh264"]
 
 [dependencies]
+yas-client = { workspace = true }
 yas-wire = { workspace = true }
 yas-webserver = { workspace = true }
 tokio = { version = "1", features = ["full"] }

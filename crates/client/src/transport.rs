@@ -1,5 +1,23 @@
+//! Endpoint selection: turn a target URI into a connected byte stream.
+//!
+//! Every connector here returns a [`Transport`] that carries native YAS
+//! bytes; none of them speaks the YAS protocol itself (see
+//! [`crate::native`] for that). Errors are human-readable strings, wrapped
+//! as [`crate::Error::Connect`] by the session layer.
+//!
+//! Targets: `local` / `local:NAME` (the per-user server socket, peer UID
+//! checked), `socket:PATH` (any Unix socket or named pipe), `tcp:HOST:PORT`,
+//! `ssh:[USER@]HOST[:SOCKET]` (YAS on the remote host, installed if needed),
+//! `ws://`/`wss://` edges (`#passphrase` fragment or `?passphrase=`),
+//! `wt://` WebTransport edges, `uplink:` routes, `share:` WebRTC shares,
+//! `proxy:URI` (force the shared yas-proxy daemon), or a name from
+//! `yas.remotes`.
+
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::ConnectOptions;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -23,7 +41,7 @@ pub enum Transport {
     },
 }
 
-pub(crate) struct DatagramTransport {
+pub struct DatagramTransport {
     sender: DatagramSender,
     receiver: DatagramReceiver,
     session: DatagramSession,
@@ -44,24 +62,24 @@ enum DatagramReceiverInner {
 }
 
 #[derive(Clone)]
-pub(crate) struct DatagramSender {
+pub struct DatagramSender {
     inner: DatagramSenderInner,
     available: Arc<AtomicBool>,
 }
 
-pub(crate) struct DatagramReceiver {
+pub struct DatagramReceiver {
     inner: DatagramReceiverInner,
     available: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DatagramSend {
+pub enum DatagramSend {
     Sent,
     Dropped,
     Closed,
 }
 
-pub(crate) enum DatagramSession {
+pub enum DatagramSession {
     WebRtc {
         _session: yas_webrtc_forwarder::client::Session,
     },
@@ -166,17 +184,17 @@ impl DatagramTransport {
         }
     }
 
-    pub(crate) fn maximum(&self) -> u32 {
+    pub fn maximum(&self) -> u32 {
         self.maximum
     }
 
-    pub(crate) fn into_parts(self) -> (DatagramSender, DatagramReceiver, DatagramSession) {
+    pub fn into_parts(self) -> (DatagramSender, DatagramReceiver, DatagramSession) {
         (self.sender, self.receiver, self.session)
     }
 }
 
 impl DatagramSender {
-    pub(crate) fn try_send(&self, frame: Vec<u8>) -> DatagramSend {
+    pub fn try_send(&self, frame: Vec<u8>) -> DatagramSend {
         if !self.available.load(Ordering::Acquire) {
             return DatagramSend::Closed;
         }
@@ -210,7 +228,7 @@ impl DatagramSender {
 }
 
 impl DatagramReceiver {
-    pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
         let frame = match &mut self.inner {
             DatagramReceiverInner::WebRtc(receiver) => receiver.recv().await,
             DatagramReceiverInner::WebTransport(session) => session
@@ -233,6 +251,38 @@ pub type HomeServerUid = u32;
 pub type HomeServerUid = ();
 
 impl Transport {
+    /// Wrap any connected byte stream that carries native YAS: a socketpair
+    /// end, an SSH channel, a child's stdio, an in-memory duplex.
+    pub fn from_stream<S>(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (reader, writer) = tokio::io::split(stream);
+        Self::from_split(reader, writer)
+    }
+
+    /// Wrap separate read and write halves (for example a child's stdout
+    /// and stdin) that together carry native YAS.
+    pub fn from_split<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        Transport::Web {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            datagram: None,
+        }
+    }
+
+    /// Adopt a connected Unix stream socket, for example one end of a
+    /// `socketpair` or a descriptor received over SCM_RIGHTS.
+    #[cfg(unix)]
+    pub fn from_std_unix(stream: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Transport::Unix(tokio::net::UnixStream::from_std(stream)?))
+    }
+
     pub fn split(
         self,
     ) -> (
@@ -243,7 +293,7 @@ impl Transport {
         (reader, writer)
     }
 
-    pub(crate) fn split_with_datagram(
+    pub fn split_with_datagram(
         self,
     ) -> (
         Box<dyn AsyncRead + Unpin + Send>,
@@ -365,12 +415,10 @@ pub fn proxy_socket_path() -> String {
 
 /// Ensure a yas-proxy daemon is running.  Returns the socket/pipe path.
 ///
-/// If no live proxy is found, re-execs the current binary as
-/// `yas proxy-daemon` in a detached background process so it outlives
-/// the calling CLI invocation.
-pub async fn ensure_proxy() -> Result<String, String> {
-    let exe = yas_proxy::yas_exe();
-    yas_proxy::ensure_proxy(&exe, true).await
+/// If no live proxy is found, runs `executable proxy-daemon` (the `yas`
+/// CLI) in a detached background process so it outlives the caller.
+pub async fn ensure_proxy(executable: &Path) -> Result<String, String> {
+    yas_proxy::ensure_proxy(executable, true).await
 }
 
 /// Send a `shutdown\n` command to a running yas-proxy, causing it to exit.
@@ -471,10 +519,13 @@ async fn connect_via_native_proxy_at(
 /// Connect through the shared proxy while requiring its YAS-aware upstream
 /// selector. In particular, this resolves SSH to the canonical socket and
 /// negotiates `yas.v1` for WebSocket.
-pub async fn connect_via_native_proxy(upstream_uri: &str) -> Result<Transport, String> {
+pub async fn connect_via_native_proxy(
+    upstream_uri: &str,
+    executable: &Path,
+) -> Result<Transport, String> {
     let prepared = yas_proxy::prepare_uplink_uri(upstream_uri)?;
     let upstream_uri = prepared.as_str();
-    let socket = ensure_proxy().await?;
+    let socket = ensure_proxy(executable).await?;
 
     #[cfg(unix)]
     {
@@ -636,10 +687,13 @@ async fn connect_via_composite_proxy_at(
 /// Obtain a fresh reliable+datagram YAS channel pair from a persistent proxy
 /// WebRTC session. Two authenticated local sockets keep the reliable byte
 /// stream and lossy, message-preserving datagram lane independent.
-pub async fn connect_via_composite_proxy(upstream_uri: &str) -> Result<Transport, String> {
+pub async fn connect_via_composite_proxy(
+    upstream_uri: &str,
+    executable: &Path,
+) -> Result<Transport, String> {
     #[cfg(any(unix, windows))]
     {
-        let socket = ensure_proxy().await?;
+        let socket = ensure_proxy(executable).await?;
         let first = connect_via_composite_proxy_at(&socket, upstream_uri).await;
         let incompatible = matches!(
             first.as_ref(),
@@ -665,7 +719,7 @@ pub async fn connect_via_composite_proxy(upstream_uri: &str) -> Result<Transport
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let socket = ensure_proxy().await?;
+        let socket = ensure_proxy(executable).await?;
         return connect_via_composite_proxy_at(&socket, upstream_uri).await;
     }
 
@@ -677,39 +731,57 @@ pub async fn connect_via_composite_proxy(upstream_uri: &str) -> Result<Transport
 ///
 /// SSH resolves the canonical YAS socket and WebSocket negotiates `yas.v1`.
 /// Keeping that choice out of the byte stream prevents protocol sniffing.
-pub async fn connect_native_uri(uri: &str, hub: &str) -> Result<Transport, String> {
-    Box::pin(connect_native_uri_inner(
+pub async fn connect_uri(uri: &str, options: &ConnectOptions) -> Result<Transport, String> {
+    Box::pin(connect_uri_inner(
         uri,
-        hub,
+        options,
         std::collections::HashSet::new(),
     ))
     .await
 }
 
-async fn connect_native_uri_inner(
+fn proxy_executable(options: &ConnectOptions) -> Option<&Path> {
+    options.executable.as_deref().filter(|_| options.proxy)
+}
+
+async fn connect_uri_inner(
     uri: &str,
-    hub: &str,
+    options: &ConnectOptions,
     mut visited: std::collections::HashSet<String>,
 ) -> Result<Transport, String> {
     if let Some(upstream) = uri.strip_prefix("proxy:") {
-        return connect_via_native_proxy(upstream).await;
+        let executable = options.executable.as_deref().ok_or_else(|| {
+            format!(
+                "{uri}: the shared yas-proxy needs a yas executable (ConnectOptions::executable)"
+            )
+        })?;
+        return connect_via_native_proxy(upstream, executable).await;
     }
 
     if let Some(rest) = uri.strip_prefix("ssh:") {
-        if proxy_enabled() {
-            return connect_via_native_proxy(uri).await;
+        if options.ssh.is_none()
+            && let Some(executable) = proxy_executable(options)
+        {
+            return connect_via_native_proxy(uri, executable).await;
         }
         let (user, host, socket) = yas_ssh::parse_ssh_uri(rest);
-        let pool = yas_ssh::SshPool::new();
-        let stream = pool
-            .connect_yas(&host, user.as_deref(), socket.as_deref())
-            .await
-            .map_err(|error| format!("ssh:{rest}: {error}"))?;
+        let stream = match &options.ssh {
+            Some(ssh) => {
+                ssh.connect_yas(&host, user.as_deref(), socket.as_deref())
+                    .await
+            }
+            None => {
+                yas_ssh::SshPool::new()
+                    .connect_yas(&host, user.as_deref(), socket.as_deref())
+                    .await
+            }
+        }
+        .map_err(|error| format!("ssh:{rest}: {error}"))?;
         return Ok(Transport::Duplex(stream));
     }
     if let Some(rest) = uri.strip_prefix("tcp:") {
-        if proxy_enabled() {
-            return connect_via_native_proxy(uri).await;
+        if let Some(executable) = proxy_executable(options) {
+            return connect_via_native_proxy(uri, executable).await;
         }
         let stream = tokio::net::TcpStream::connect(rest)
             .await
@@ -723,15 +795,9 @@ async fn connect_native_uri_inner(
         // explicit WT targets in-process even when proxying is enabled.
         return connect_native_webtransport(uri).await;
     }
-    if uri.starts_with("ws://") || uri.starts_with("wss://") {
-        if proxy_enabled() {
-            return connect_via_native_proxy(uri).await;
-        }
-        return connect_native_upstream(uri).await;
-    }
-    if uri.starts_with("uplink:") {
-        if proxy_enabled() {
-            return connect_via_native_proxy(uri).await;
+    if uri.starts_with("ws://") || uri.starts_with("wss://") || uri.starts_with("uplink:") {
+        if let Some(executable) = proxy_executable(options) {
+            return connect_via_native_proxy(uri, executable).await;
         }
         return connect_native_upstream(uri).await;
     }
@@ -742,18 +808,18 @@ async fn connect_native_uri_inner(
         let has_explicit_hub = target
             .split_once('?')
             .is_some_and(|(_, query)| query.split('&').any(|item| item.starts_with("hub=")));
-        if proxy_enabled() {
+        if let Some(executable) = proxy_executable(options) {
             // The proxy retains one ICE/DTLS/SCTP session and gives each CLI
             // invocation fresh paired reliable and unreliable DataChannels.
             // The local proxy connection also keeps those lanes separate.
-            let proxy_uri = share_proxy_uri(target, hub);
-            return connect_via_composite_proxy(&proxy_uri).await;
+            let proxy_uri = share_proxy_uri(target, &options.hub);
+            return connect_via_composite_proxy(&proxy_uri, executable).await;
         }
         let (passphrase, uri_hub) = yas_proxy::parse_share_uri(target);
         let hub = if has_explicit_hub {
             uri_hub
         } else {
-            yas_webrtc_forwarder::normalize_hub(hub)
+            yas_webrtc_forwarder::normalize_hub(&options.hub)
         };
         let (session, _stream_handle, stream, channel) =
             yas_webrtc_forwarder::client::Session::establish_composite(&passphrase, &hub)
@@ -765,31 +831,52 @@ async fn connect_native_uri_inner(
         });
     }
     if uri == "local" {
-        let path = yas_webserver::config::default_yas_socket();
-        ensure_local_server(&path).await?;
-        return connect_native_home(&path).await;
+        return connect_local(None, options).await;
     }
     if let Some(raw_name) = uri.strip_prefix("local:") {
-        let name: yas_server::ServerName = raw_name
-            .parse()
-            .map_err(|error| format!("invalid local server name: {error}"))?;
-        let path = yas_webserver::config::yas_socket_for_name(name.as_str());
-        ensure_local_server_with_name(&path, Some(&name)).await?;
-        return connect_native_home(&path).await;
+        return connect_local(Some(raw_name), options).await;
     }
 
-    let entries = yas_webserver::config::read_remotes();
-    if let Some((_, target_uri)) = entries.into_iter().find(|(name, _)| name == uri) {
-        if !visited.insert(uri.to_string()) {
-            return Err(format!("yas.remotes: cycle detected resolving '{uri}'"));
+    if options.remotes {
+        let entries = yas_webserver::config::read_remotes();
+        if let Some((_, target_uri)) = entries.into_iter().find(|(name, _)| name == uri) {
+            if !visited.insert(uri.to_string()) {
+                return Err(format!("yas.remotes: cycle detected resolving '{uri}'"));
+            }
+            return Box::pin(connect_uri_inner(&target_uri, options, visited)).await;
         }
-        return Box::pin(connect_native_uri_inner(&target_uri, hub, visited)).await;
     }
     Err(format!(
         "unknown target '{uri}' \
          (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], \
           or a name from yas.remotes)"
     ))
+}
+
+/// Connect the per-user local server (`local` or `local:NAME`), starting it
+/// first when [`ConnectOptions::start_local`] is set and an executable is
+/// known. The socket's kernel peer UID is verified before any byte is sent.
+pub async fn connect_local(
+    name: Option<&str>,
+    options: &ConnectOptions,
+) -> Result<Transport, String> {
+    if let Some(name) = name
+        && !yas_webserver::config::valid_server_name(name)
+    {
+        return Err(format!(
+            "invalid local server name: {name:?} (ASCII letters, digits, '-', '_' and '.', at most 64)"
+        ));
+    }
+    let path = match name {
+        Some(name) => yas_webserver::config::yas_socket_for_name(name),
+        None => yas_webserver::config::default_yas_socket(),
+    };
+    if options.start_local
+        && let Some(executable) = options.executable.as_deref()
+    {
+        ensure_local_server(&path, name, executable).await?;
+    }
+    connect_native_home(&path).await
 }
 
 async fn connect_native_upstream(uri: &str) -> Result<Transport, String> {
@@ -872,33 +959,30 @@ pub fn default_target() -> Option<String> {
     config.get("yas.target").cloned()
 }
 
-/// Resolve the configured target and connect to its canonical YAS endpoint.
-pub async fn connect_native(on: &Option<String>, hub: &str) -> Result<Transport, String> {
-    let effective_target = on.clone().or_else(default_target);
+/// Resolve `target` (or, when `None`, the configured default target, else
+/// `local`) and connect to its canonical YAS endpoint.
+pub async fn connect_target(
+    target: Option<&str>,
+    options: &ConnectOptions,
+) -> Result<Transport, String> {
+    let effective_target = target.map(str::to_owned).or_else(default_target);
     if let Some(uri) = effective_target {
-        return connect_native_uri(&uri, hub).await;
+        return connect_uri(&uri, options).await;
     }
-
-    let path = yas_webserver::config::default_yas_socket();
-    ensure_local_server(&path).await?;
-    connect_native_home(&path).await
+    connect_local(None, options).await
 }
 
-/// Connect to the local server, spawning it as a **detached process**
-/// if absent. In-process hosting (the old behavior) breaks every
-/// daemon-resident feature for one-shot commands: warm LSP backends
-/// (docs/design/lsp.md "Sessions and discovery"), surviving PTYs — all
-/// died with each short-lived CLI invocation. The spawned `yas server`
+/// Connect to the local server, spawning `executable server` as a
+/// **detached process** if absent. In-process hosting (the old behavior)
+/// breaks every daemon-resident feature for one-shot commands: warm LSP
+/// backends (docs/design/lsp.md "Sessions and discovery"), surviving PTYs —
+/// all died with each short-lived CLI invocation. The spawned `yas server`
 /// outlives us and is shared by later invocations; `yas quit` shuts it
 /// down.
-#[cfg(any(unix, windows))]
-pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
-    ensure_local_server_with_name(socket_path, None).await
-}
-
-pub(crate) async fn ensure_local_server_with_name(
+pub async fn ensure_local_server(
     socket_path: &str,
-    name: Option<&yas_server::ServerName>,
+    name: Option<&str>,
+    executable: &Path,
 ) -> Result<(), String> {
     if local_server_alive(socket_path).await {
         return Ok(());
@@ -909,7 +993,7 @@ pub(crate) async fn ensure_local_server_with_name(
     if std::path::Path::new(socket_path).exists() {
         let _ = std::fs::remove_file(socket_path);
     }
-    let mut spawned = spawn_detached_server(socket_path, name)?;
+    let mut spawned = spawn_detached_server(executable, socket_path, name)?;
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Another concurrent auto-start may have won the bind while our
@@ -991,14 +1075,14 @@ impl Drop for SpawnedServer {
 /// `YAS_*`/`SHELL` env vars, which the server command reads itself —
 /// `YAS_PASSPHRASE` excepted, which is not the server's to hold.
 fn spawn_detached_server(
+    executable: &Path,
     socket_path: &str,
-    name: Option<&yas_server::ServerName>,
+    name: Option<&str>,
 ) -> Result<SpawnedServer, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate yas executable: {e}"))?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(executable);
     cmd.arg("server");
     if let Some(name) = name {
-        cmd.arg("--name").arg(name.as_str());
+        cmd.arg("--name").arg(name);
     }
     cmd.arg("--socket")
         .arg(socket_path)

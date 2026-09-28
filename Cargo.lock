@@ -8305,12 +8305,33 @@ dependencies = [
  "uuid",
  "web-transport-quinn",
  "windows-sys 0.61.2",
+ "yas-client",
  "yas-composite-transport",
  "yas-edge",
  "yas-proxy",
  "yas-server",
  "yas-ssh",
  "yas-uplink",
+ "yas-webrtc-forwarder",
+ "yas-webserver",
+ "yas-wire",
+]
+
+[[package]]
+name = "yas-client"
+version = "0.3.1"
+dependencies = [
+ "blake3",
+ "bytes",
+ "libc",
+ "rand 0.10.2",
+ "tempfile",
+ "tokio",
+ "url",
+ "web-transport-quinn",
+ "yas-composite-transport",
+ "yas-proxy",
+ "yas-ssh",
  "yas-webrtc-forwarder",
  "yas-webserver",
  "yas-wire",

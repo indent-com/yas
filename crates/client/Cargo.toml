@@ -1,0 +1,27 @@
+[package]
+name = "yas-client"
+version = "0.3.1"
+edition.workspace = true
+description = "Rust client for YAS servers: processes, files, terminals, surfaces, KV"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+yas-wire = { workspace = true }
+yas-proxy = { workspace = true }
+yas-ssh = { workspace = true }
+yas-webserver = { workspace = true }
+yas-webrtc-forwarder = { workspace = true }
+yas-composite-transport = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+rand = "0.10"
+blake3 = { version = "1", default-features = false, features = ["std"] }
+bytes = "1"
+url = "2"
+web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
+
+[target.'cfg(unix)'.dependencies]
+tempfile = "3"
+libc = "0.2"
+

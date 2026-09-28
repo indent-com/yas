@@ -286,6 +286,62 @@ interface YasTransport {
 }
 ```
 
+## Rust: `yas-client`
+
+`crates/client` (package `yas-client`) is the Rust client the `yas` CLI is
+built on. It is not on crates.io yet; depend on it by path or git:
+
+```toml
+yas-client = { path = "../yas/crates/client" }
+tokio = { version = "1", features = ["full"] }
+```
+
+`Client::connect(target, &ConnectOptions)` accepts every target the CLI does
+(`local[:NAME]`, `socket:PATH`, `ssh:[USER@]HOST`, `tcp:`, `ws(s)://`,
+`wt://`, `uplink:`, `share:`, remote names); `Client::from_stream` speaks YAS
+over any byte stream you already have. A `Client` is one session, `Clone` and
+safe to use from many tasks at once: each process stream, file transfer and
+subscription is flow-controlled on its own.
+
+```rust
+use yas_client::{Client, ConnectOptions, process::Command};
+
+let client = Client::connect(Some("ssh:build@ci"), &ConnectOptions::named("my-app")).await?;
+let output = client.spawn(Command::new("cargo").args(["test", "--workspace"]).current_dir("/src/app"))
+    .await?
+    .output()
+    .await?;
+println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
+```
+
+- **Processes** (`process`): argv/env/cwd, piped or null stdin, merged stderr,
+  detachable, operation IDs for retries, wait/signal/kill, list/watch. Each
+  command gets its own process group; when the command exits the server
+  terminates the group (`SIGTERM`, then `SIGKILL` after
+  `YAS_PROCESS_KILL_GRACE`, 2 s), so background children die with it unless
+  they `setsid`. Ordinary processes die with their session; detachable ones
+  survive it. The module docs spell this out.
+- **Files** (`fs`): open a root, read (whole, limited, ranged) with BLAKE3
+  hashes, stat (`lstat` semantics), list, write with preconditions (`Any`,
+  `Absent`, `Hash`) through a staged commit, mkdir -p, rename, remove, symlink.
+- **KV and environment** (`kv`): get/put/delete with preconditions, list,
+  watch; the server environment (`ENV_GET`).
+- **Errors** (`Error`): connection failures, lost sessions, server statuses
+  (`is_not_found`, `is_conflict`), timeouts, unsupported operations,
+  protocol violations.
+- **SSH** (`ssh`, re-exported `yas-ssh`): `SshOptions::in_memory(HostKeyPolicy::Pinned(keys))`
+  with `with_private_key(text, passphrase)` authenticates with keys held in
+  memory and trusts only pinned host keys, touching no `~/.ssh` file; pass
+  `SshPool::with_options(options)` as `ConnectOptions::ssh`.
+- **Hosting** (`host`, Unix): `HostedServer::start(HostOptions::new("yas"))` runs
+  a private `yas server --fd-channel` child in a 0700 directory (own state,
+  cache and runtime directories by default); `connect()` hands it a fresh
+  socketpair per session, `socket_path()` exposes its private socket for
+  `YAS_SOCK`, and dropping it (or the host process dying) stops the server.
+
+`cargo run -p yas-client --example run -- local -- uname -a` is a complete
+example; `crates/cli/tests/client_host.rs` exercises the API end to end.
+
 ## Server-side: a Node/Bun client over a unix socket
 
 You can also run a `@yas-run/core` client **server-side** (Node/Bun/Deno) to drive a
@@ -359,6 +415,7 @@ workspace.subscribe(() => {
 
 - [Python](examples/fd-channel-python.py)
 - [Bun](examples/fd-channel-bun.ts)
+- Rust: [`yas_client::host`](crates/client/src/host.rs) (see [above](#rust-yas-client))
 
 ## Uplink connections
 

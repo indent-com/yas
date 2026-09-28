@@ -1,8 +1,15 @@
-//! Native YAS session client used by the Rust CLI.
+//! The sequential native YAS session: preface, HELLO, and framed family
+//! requests over one byte stream.
 //!
-//! Endpoint selection is performed by [`crate::transport::connect_native`].
-//! This module only speaks the YAS preface, HELLO, and framed family protocol;
-//! it never probes the byte stream for an alternate protocol.
+//! [`NativeClient`] owns its stream and is driven by `&mut self`: one
+//! request at a time, with unrelated frames parked in a bounded queue until a
+//! caller asks for them. It is what the `yas` CLI uses for one-shot
+//! commands. [`NativeClient::into_framed`] splits a connected session into a
+//! [`NativeFrameReader`] and a cloneable [`NativeFrameSender`] for
+//! long-lived multiplexed use; [`crate::Client`] is built on that split.
+//!
+//! Endpoint selection is performed by [`crate::transport`]. This module
+//! never probes the byte stream for an alternate protocol.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -12,8 +19,8 @@ use yas_wire::frame::DatagramContext;
 use yas_wire::{
     Class, Decode, Encode, Extensions, Frame, FrameCodec, FrameHeader, FrameLimits,
     core::{
-        CatalogStep, ClientHello, FamilyOffer, FamilyUpdate, GoAway, Ping, PingResult,
-        ReceiveLimits, ResultPrefix, ServerHello, SessionUpdate, Status,
+        CatalogStep, ClientHello, FamilyUpdate, GoAway, Ping, PingResult, ReceiveLimits,
+        ResultPrefix, ServerHello, SessionUpdate, Status,
     },
     family,
     state::{Phase, StateAck, StateEvent, Unwatch, Watch, WatchResult},
@@ -23,19 +30,21 @@ use yas_wire::{
     },
 };
 
+use crate::error::{Error, Result, format_result_detail, wire_error};
 use crate::transport;
+use crate::{ConnectOptions, HelloOptions};
 
 const HELLO_REQUEST_ID: u32 = 1;
 const WATCH_CREDIT: u64 = yas_wire::schema::transport::RECOMMENDED_BUFFERED;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_PENDING_FRAMES: usize = 1_024;
 const MAX_PENDING_BYTES: usize = yas_wire::schema::transport::RECOMMENDED_BUFFERED as usize;
-pub(crate) const MAX_COLLECTED_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_COLLECTED_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
 
 type Reader = Box<dyn AsyncRead + Unpin + Send>;
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 
-pub(crate) struct NativeClient {
+pub struct NativeClient {
     reader: Reader,
     writer: Writer,
     datagram: Option<transport::DatagramTransport>,
@@ -58,7 +67,7 @@ pub(crate) struct NativeClient {
 /// and one reader while preserving the negotiated codec and Core control
 /// handling.
 #[derive(Clone)]
-pub(crate) struct NativeFrameSender {
+pub struct NativeFrameSender {
     inner: Arc<NativeFrameSenderInner>,
 }
 
@@ -68,7 +77,7 @@ struct NativeFrameSenderInner {
     datagram: Option<transport::DatagramSender>,
 }
 
-pub(crate) struct NativeFrameReader {
+pub struct NativeFrameReader {
     reader: Reader,
     inbound: FrameCodec,
     sender: NativeFrameSender,
@@ -81,27 +90,23 @@ pub(crate) struct NativeFrameReader {
 }
 
 impl NativeClient {
-    pub(crate) async fn connect(on: Option<&str>, hub: &str) -> Result<Self, String> {
-        let target = on.map(str::to_owned);
-        let transport = transport::connect_native(&target, hub).await?;
-        Self::connect_transport(transport, "yas-cli").await
+    /// Connect to `target` (a URI such as `local:NAME`, `socket:/path`,
+    /// `ssh:host`; `None` for the configured default) and complete HELLO.
+    pub async fn connect(target: Option<&str>, options: &ConnectOptions) -> Result<Self> {
+        let transport = transport::connect_target(target, options)
+            .await
+            .map_err(Error::Connect)?;
+        Self::connect_transport(transport, &options.hello).await
     }
 
-    pub(crate) async fn connect_transport(
+    /// Complete the preface and HELLO over an already connected transport.
+    pub async fn connect_transport(
         transport: transport::Transport,
-        client_name: &str,
-    ) -> Result<Self, String> {
+        options: &HelloOptions,
+    ) -> Result<Self> {
         let (mut reader, mut writer, datagram) = transport.split_with_datagram();
 
-        let families = yas_wire::schema::FAMILIES
-            .iter()
-            .filter(|metadata| metadata.id != family::CORE)
-            .map(|metadata| FamilyOffer {
-                family_id: metadata.id,
-                versions: vec![metadata.version],
-                required: false,
-            })
-            .collect();
+        let families = options.family_offers();
         let max_datagram = datagram
             .as_ref()
             .map_or(0, transport::DatagramTransport::maximum);
@@ -110,21 +115,15 @@ impl NativeClient {
             max_minor: 1,
             receive: ReceiveLimits::recommended(max_datagram),
             client_instance: rand::random(),
-            client_name: client_name.to_string(),
-            client_release: env!("CARGO_PKG_VERSION").to_string(),
+            client_name: options.client_name.clone(),
+            client_release: options.client_release.clone(),
             families,
             codecs: Vec::new(),
-            // Say what this build is, so a client list can name it: the
-            // extension is optional and a peer that ignores it loses nothing.
-            extensions: Extensions(vec![
-                yas_wire::core::Platform::current()
-                    .extension(yas_wire::schema::core::CLIENT_HELLO_PLATFORM_EXTENSION as u16)
-                    .map_err(|error| format!("invalid platform extension: {error}"))?,
-            ]),
+            extensions: options.extensions()?,
         };
         hello_request
             .validate()
-            .map_err(|error| format!("invalid local HELLO: {error}"))?;
+            .map_err(|error| Error::protocol(format!("invalid local HELLO: {error}")))?;
         let hello_frame = Frame {
             header: FrameHeader::request(
                 family::CORE,
@@ -133,20 +132,20 @@ impl NativeClient {
             ),
             payload: hello_request
                 .encode()
-                .map_err(|error| format!("cannot encode HELLO: {error}"))?,
+                .map_err(|error| Error::protocol(format!("cannot encode HELLO: {error}")))?,
         };
         let pre_hello = FrameCodec::pre_hello();
         let encoded = pre_hello
             .encode_stream(&hello_frame)
-            .map_err(|error| format!("cannot frame HELLO: {error}"))?;
+            .map_err(|error| Error::protocol(format!("cannot frame HELLO: {error}")))?;
         writer
             .write_all(&yas_wire::PREFACE)
             .await
-            .map_err(|error| format!("cannot send YAS preface: {error}"))?;
+            .map_err(|error| Error::disconnected(format!("cannot send YAS preface: {error}")))?;
         writer
             .write_all(&encoded)
             .await
-            .map_err(|error| format!("cannot send YAS HELLO: {error}"))?;
+            .map_err(|error| Error::disconnected(format!("cannot send YAS HELLO: {error}")))?;
 
         let result = read_frame(&mut reader, &pre_hello).await?;
         if result.header
@@ -156,25 +155,27 @@ impl NativeClient {
                 HELLO_REQUEST_ID,
             )
         {
-            return Err("native YAS listener returned an unexpected HELLO frame".into());
+            return Err(Error::protocol(
+                "native YAS listener returned an unexpected HELLO frame",
+            ));
         }
         let prefix = ResultPrefix::decode(&result.payload)
-            .map_err(|error| format!("cannot decode HELLO Result: {error}"))?;
+            .map_err(|error| Error::protocol(format!("cannot decode HELLO Result: {error}")))?;
         if !prefix.status.is_ok() {
-            return Err(format!(
-                "YAS HELLO failed with {:?}: {}",
+            return Err(Error::status_from(
+                "YAS HELLO",
                 prefix.status,
-                format_result_detail(&prefix.detail)
+                prefix.detail,
             ));
         }
         let hello = ServerHello::decode(&prefix.body)
-            .map_err(|error| format!("cannot decode ServerHello: {error}"))?;
-        hello
-            .validate_for_client(&hello_request)
-            .map_err(|error| format!("server selected an invalid YAS catalogue: {error}"))?;
+            .map_err(|error| Error::protocol(format!("cannot decode ServerHello: {error}")))?;
+        hello.validate_for_client(&hello_request).map_err(|error| {
+            Error::protocol(format!("server selected an invalid YAS catalogue: {error}"))
+        })?;
         let codecs = hello
             .negotiated_codecs()
-            .map_err(|error| format!("invalid negotiated codecs: {error}"))?
+            .map_err(|error| Error::protocol(format!("invalid negotiated codecs: {error}")))?
             .0;
         let inbound = FrameCodec::new(
             FrameLimits {
@@ -183,7 +184,7 @@ impl NativeClient {
             },
             codecs.iter().copied(),
         )
-        .map_err(|error| format!("invalid inbound YAS codec: {error}"))?;
+        .map_err(|error| Error::protocol(format!("invalid inbound YAS codec: {error}")))?;
         let outbound = FrameCodec::new(
             FrameLimits {
                 max_wire_frame: hello.receive.max_frame,
@@ -191,7 +192,7 @@ impl NativeClient {
             },
             codecs.iter().copied(),
         )
-        .map_err(|error| format!("invalid outbound YAS codec: {error}"))?;
+        .map_err(|error| Error::protocol(format!("invalid outbound YAS codec: {error}")))?;
 
         Ok(Self {
             reader,
@@ -209,11 +210,11 @@ impl NativeClient {
         })
     }
 
-    pub(crate) fn hello(&self) -> &ServerHello {
+    pub fn hello(&self) -> &ServerHello {
         &self.hello
     }
 
-    pub(crate) fn supports_datagrams(&self) -> bool {
+    pub fn supports_datagrams(&self) -> bool {
         self.datagram.is_some()
             && self.local_receive.max_datagram > 0
             && self.hello.receive.max_datagram > 0
@@ -223,7 +224,7 @@ impl NativeClient {
     /// Request correlation and family-specific demultiplexing become the
     /// caller's responsibility; Core PING/GOAWAY/catalogue traffic remains
     /// handled by [`NativeFrameReader`].
-    pub(crate) fn into_framed(self) -> (NativeFrameReader, NativeFrameSender) {
+    pub fn into_framed(self) -> (NativeFrameReader, NativeFrameSender) {
         let max_datagram = self.local_receive.max_datagram;
         let (datagram_sender, datagram_receiver, datagram_session) = match self.datagram {
             Some(datagram) => {
@@ -253,7 +254,7 @@ impl NativeClient {
         (reader, sender)
     }
 
-    pub(crate) fn supports(&self, family_id: u16, class: Class, kind: u16) -> bool {
+    pub fn supports(&self, family_id: u16, class: Class, kind: u16) -> bool {
         self.hello
             .families
             .iter()
@@ -266,10 +267,10 @@ impl NativeClient {
             })
     }
 
-    pub(crate) async fn snapshot(
+    pub async fn snapshot(
         &mut self,
         family_id: u16,
-    ) -> Result<Option<Vec<yas_wire::state::Record>>, String> {
+    ) -> Result<Option<Vec<yas_wire::state::Record>>> {
         let Some(descriptor) = self
             .hello
             .families
@@ -307,7 +308,9 @@ impl NativeClient {
                 tokio::time::timeout(REQUEST_TIMEOUT, self.next_matching_event(family_id, 0))
                     .await
                     .map_err(|_| {
-                        format!("timed out waiting for family {family_id:#06x} snapshot")
+                        Error::Timeout(format!(
+                            "timed out waiting for family {family_id:#06x} snapshot"
+                        ))
                     })??;
             let event = StateEvent::decode(&frame.payload).map_err(wire_error)?;
             if event.subscription_id != watch_result.subscription_id {
@@ -339,7 +342,9 @@ impl NativeClient {
                 break;
             }
             if event.phase == Phase::Reset {
-                return Err(format!("family {family_id:#06x} reset its snapshot"));
+                return Err(Error::protocol(format!(
+                    "family {family_id:#06x} reset its snapshot"
+                )));
             }
         }
 
@@ -352,35 +357,35 @@ impl NativeClient {
         Ok(Some(records))
     }
 
-    pub(crate) async fn request(
+    pub async fn request(
         &mut self,
         family_id: u16,
         kind: u16,
         payload: Vec<u8>,
         sensitive: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>> {
         self.request_with_timeout(family_id, kind, payload, sensitive, REQUEST_TIMEOUT)
             .await
     }
 
-    pub(crate) async fn request_with_timeout(
+    pub async fn request_with_timeout(
         &mut self,
         family_id: u16,
         kind: u16,
         payload: Vec<u8>,
         sensitive: bool,
         timeout: std::time::Duration,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>> {
         let prefix = self
             .request_result_with_timeout(family_id, kind, payload, sensitive, timeout)
             .await?;
         if prefix.status == Status::Ok {
             return Ok(prefix.body);
         }
-        Err(format!(
-            "YAS request {family_id:#06x}/{kind:#06x} failed with {:?}: {}",
+        Err(Error::status_from(
+            format!("YAS request {family_id:#06x}/{kind:#06x}"),
             prefix.status,
-            format_result_detail(&prefix.detail)
+            prefix.detail,
         ))
     }
 
@@ -388,25 +393,25 @@ impl NativeClient {
     /// the caller. Commands with useful negative answers (for example KV
     /// `NOT_FOUND` and compare-and-swap `CONFLICT`) must not recover those
     /// statuses by parsing an error string.
-    pub(crate) async fn request_result(
+    pub async fn request_result(
         &mut self,
         family_id: u16,
         kind: u16,
         payload: Vec<u8>,
         sensitive: bool,
-    ) -> Result<ResultPrefix, String> {
+    ) -> Result<ResultPrefix> {
         self.request_result_with_timeout(family_id, kind, payload, sensitive, REQUEST_TIMEOUT)
             .await
     }
 
-    pub(crate) async fn request_result_with_timeout(
+    pub async fn request_result_with_timeout(
         &mut self,
         family_id: u16,
         kind: u16,
         payload: Vec<u8>,
         sensitive: bool,
         timeout: std::time::Duration,
-    ) -> Result<ResultPrefix, String> {
+    ) -> Result<ResultPrefix> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(2).max(3) | 1;
         let mut header = FrameHeader::request(family_id, kind, request_id);
@@ -417,7 +422,9 @@ impl NativeClient {
             let frame = tokio::time::timeout_at(deadline, self.read_next())
                 .await
                 .map_err(|_| {
-                    format!("timed out waiting for {family_id:#06x}/{kind:#06x} Result")
+                    Error::Timeout(format!(
+                        "timed out waiting for {family_id:#06x}/{kind:#06x} Result"
+                    ))
                 })??;
             if frame.header.class == Class::Result
                 && frame.header.family == family_id
@@ -428,22 +435,22 @@ impl NativeClient {
                 return Ok(prefix);
             }
             if frame.header.class == Class::Result {
-                return Err(format!(
+                return Err(Error::protocol(format!(
                     "YAS returned an uncorrelated Result for {:#06x}/{:#06x}/{:?}",
                     frame.header.family, frame.header.kind, frame.header.request_id
-                ));
+                )));
             }
             self.defer(frame)?;
         }
     }
 
-    pub(crate) async fn request_typed<Request, Response>(
+    pub async fn request_typed<Request, Response>(
         &mut self,
         family_id: u16,
         kind: u16,
         request: &Request,
         sensitive: bool,
-    ) -> Result<Response, String>
+    ) -> Result<Response>
     where
         Request: Encode,
         Response: Decode,
@@ -453,14 +460,14 @@ impl NativeClient {
         Response::decode(&body).map_err(wire_error)
     }
 
-    pub(crate) async fn request_typed_with_timeout<Request, Response>(
+    pub async fn request_typed_with_timeout<Request, Response>(
         &mut self,
         family_id: u16,
         kind: u16,
         request: &Request,
         sensitive: bool,
         timeout: std::time::Duration,
-    ) -> Result<Response, String>
+    ) -> Result<Response>
     where
         Request: Encode,
         Response: Decode,
@@ -472,25 +479,25 @@ impl NativeClient {
         Response::decode(&body).map_err(wire_error)
     }
 
-    pub(crate) async fn send_event(
+    pub async fn send_event(
         &mut self,
         family_id: u16,
         kind: u16,
         payload: Vec<u8>,
         sensitive: bool,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         let mut header = FrameHeader::event(family_id, kind);
         header.sensitive = sensitive;
         self.send(Frame { header, payload }).await
     }
 
-    pub(crate) async fn send_typed_event<Event: Encode>(
+    pub async fn send_typed_event<Event: Encode>(
         &mut self,
         family_id: u16,
         kind: u16,
         event: &Event,
         sensitive: bool,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.send_event(
             family_id,
             kind,
@@ -500,19 +507,15 @@ impl NativeClient {
         .await
     }
 
-    async fn send(&mut self, frame: Frame) -> Result<(), String> {
+    async fn send(&mut self, frame: Frame) -> Result<()> {
         let bytes = self.outbound.encode_stream(&frame).map_err(wire_error)?;
         self.writer
             .write_all(&bytes)
             .await
-            .map_err(|error| format!("cannot write YAS frame: {error}"))
+            .map_err(|error| Error::disconnected(format!("cannot write YAS frame: {error}")))
     }
 
-    pub(crate) async fn next_matching_event(
-        &mut self,
-        family_id: u16,
-        kind: u16,
-    ) -> Result<Frame, String> {
+    pub async fn next_matching_event(&mut self, family_id: u16, kind: u16) -> Result<Frame> {
         if let Some(index) = self.pending.iter().position(|frame| {
             frame.header.class == Class::Event
                 && frame.header.family == family_id
@@ -521,7 +524,7 @@ impl NativeClient {
             let frame = self
                 .pending
                 .remove(index)
-                .ok_or_else(|| "pending YAS event disappeared".to_string())?;
+                .ok_or_else(|| Error::protocol("pending YAS event disappeared"))?;
             self.pending_bytes = self.pending_bytes.saturating_sub(frame.payload.len());
             return Ok(frame);
         }
@@ -537,16 +540,16 @@ impl NativeClient {
         }
     }
 
-    pub(crate) async fn next_typed_event<Event: Decode>(
+    pub async fn next_typed_event<Event: Decode>(
         &mut self,
         family_id: u16,
         kind: u16,
-    ) -> Result<Event, String> {
+    ) -> Result<Event> {
         let frame = self.next_matching_event(family_id, kind).await?;
         Event::decode(&frame.payload).map_err(wire_error)
     }
 
-    pub(crate) async fn next_event(&mut self) -> Result<Frame, String> {
+    pub async fn next_event(&mut self) -> Result<Frame> {
         if let Some(index) = self
             .pending
             .iter()
@@ -555,7 +558,7 @@ impl NativeClient {
             let frame = self
                 .pending
                 .remove(index)
-                .ok_or_else(|| "pending YAS event disappeared".to_string())?;
+                .ok_or_else(|| Error::protocol("pending YAS event disappeared"))?;
             self.pending_bytes = self.pending_bytes.saturating_sub(frame.payload.len());
             return Ok(frame);
         }
@@ -565,24 +568,24 @@ impl NativeClient {
                 return Ok(frame);
             }
             if frame.header.class == Class::Result {
-                return Err(format!(
+                return Err(Error::protocol(format!(
                     "YAS returned an unsolicited Result for {:#06x}/{:#06x}/{:?}",
                     frame.header.family, frame.header.kind, frame.header.request_id
-                ));
+                )));
             }
         }
     }
 
-    pub(crate) async fn receive_inline_or_transfer(
+    pub async fn receive_inline_or_transfer(
         &mut self,
         value: InlineOrTransfer,
         maximum: u64,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>> {
         if value.byte_len > maximum {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS delivery is {} bytes; collection limit is {maximum}",
                 value.byte_len
-            ));
+            )));
         }
         let bytes = match value.delivery {
             Delivery::Inline(bytes) => bytes,
@@ -592,36 +595,38 @@ impl NativeClient {
             }
         };
         if bytes.len() as u64 != value.byte_len {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS delivery length mismatch: declared {}, received {}",
                 value.byte_len,
                 bytes.len()
-            ));
+            )));
         }
         if blake3::hash(&bytes).as_bytes() != &value.content_hash {
-            return Err("YAS delivery content hash mismatch".to_string());
+            return Err(Error::protocol("YAS delivery content hash mismatch"));
         }
         Ok(bytes)
     }
 
-    pub(crate) async fn receive_byte_transfer(
+    pub async fn receive_byte_transfer(
         &mut self,
         descriptor: &Descriptor,
         expected_length: Option<u64>,
         maximum: u64,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>> {
         descriptor.validate().map_err(wire_error)?;
         if descriptor.mode != Mode::Byte || descriptor.direction != Direction::SENDER_TO_RECEIVER {
-            return Err("YAS delivery did not provide a server-to-client BYTE Transfer".into());
+            return Err(Error::protocol(
+                "YAS delivery did not provide a server-to-client BYTE Transfer",
+            ));
         }
         if maximum == 0 || expected_length.is_some_and(|length| length > maximum) {
-            return Err("invalid YAS Transfer collection limit".into());
+            return Err(Error::protocol("invalid YAS Transfer collection limit"));
         }
         if descriptor.sender_send_credit > maximum {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS Transfer initial credit {} exceeds collection limit {maximum}",
                 descriptor.sender_send_credit
-            ));
+            )));
         }
         if descriptor.sender_send_credit < maximum {
             self.send_typed_event(
@@ -646,10 +651,10 @@ impl NativeClient {
                 .requires_sensitive_frame(frame.header.kind)
                 .map_err(wire_error)?;
             if frame.header.sensitive != sensitive {
-                return Err(format!(
+                return Err(Error::protocol(format!(
                     "YAS Transfer {:#010x} sensitivity flag mismatch",
                     descriptor.transfer_id
-                ));
+                )));
             }
             match frame.header.kind {
                 yas_wire::transfer::kind::BYTE_DATA => {
@@ -657,73 +662,75 @@ impl NativeClient {
                     if data.offset != bytes.len() as u64
                         || data.data.len() > descriptor.max_chunk_bytes as usize
                     {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} sent a non-contiguous or oversized chunk",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                     let next = (bytes.len() as u64)
                         .checked_add(data.data.len() as u64)
-                        .ok_or_else(|| "YAS Transfer length overflow".to_string())?;
+                        .ok_or_else(|| Error::protocol("YAS Transfer length overflow"))?;
                     if next > maximum || expected_length.is_some_and(|length| next > length) {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} exceeded its declared collection limit",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                     bytes.extend_from_slice(&data.data);
                 }
                 yas_wire::transfer::kind::CLOSE => {
                     let close = TransferClose::decode(&frame.payload).map_err(wire_error)?;
                     if close.final_data_bytes != bytes.len() as u64 {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} CLOSE length mismatch",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                     if close.status != Status::Ok.code() {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} closed with status {}: {}",
                             descriptor.transfer_id,
                             close.status,
                             String::from_utf8_lossy(&close.detail)
-                        ));
+                        )));
                     }
                     if expected_length.is_some_and(|length| length != bytes.len() as u64) {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} ended before its declared length",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                     return Ok(bytes);
                 }
                 yas_wire::transfer::kind::RESET => {
                     let reset = TransferReset::decode(&frame.payload).map_err(wire_error)?;
-                    return Err(format!(
+                    return Err(Error::protocol(format!(
                         "YAS Transfer {:#010x} reset with status {}: {}",
                         descriptor.transfer_id,
                         reset.status,
                         String::from_utf8_lossy(&reset.detail)
-                    ));
+                    )));
                 }
                 other => {
-                    return Err(format!(
+                    return Err(Error::protocol(format!(
                         "YAS Transfer {:#010x} received unexpected event {other:#06x}",
                         descriptor.transfer_id
-                    ));
+                    )));
                 }
             }
         }
     }
 
-    pub(crate) async fn send_byte_transfer(
+    pub async fn send_byte_transfer(
         &mut self,
         descriptor: &Descriptor,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         descriptor.validate().map_err(wire_error)?;
         if descriptor.mode != Mode::Byte || descriptor.direction != Direction::RECEIVER_TO_SENDER {
-            return Err("YAS upload did not provide a client-to-server BYTE Transfer".into());
+            return Err(Error::protocol(
+                "YAS upload did not provide a client-to-server BYTE Transfer",
+            ));
         }
         let mut offset = 0u64;
         let mut credit = descriptor.receiver_send_credit;
@@ -733,41 +740,43 @@ impl NativeClient {
                 match frame.header.kind {
                     yas_wire::transfer::kind::CREDIT => {
                         if frame.header.sensitive {
-                            return Err("YAS Transfer CREDIT was marked sensitive".into());
+                            return Err(Error::protocol(
+                                "YAS Transfer CREDIT was marked sensitive",
+                            ));
                         }
                         let update = Credit::decode(&frame.payload).map_err(wire_error)?;
                         if update.cumulative_limit <= credit {
-                            return Err("YAS Transfer credit did not increase".into());
+                            return Err(Error::protocol("YAS Transfer credit did not increase"));
                         }
                         credit = update.cumulative_limit;
                     }
                     yas_wire::transfer::kind::RESET => {
                         let reset = TransferReset::decode(&frame.payload).map_err(wire_error)?;
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} reset with status {}: {}",
                             descriptor.transfer_id,
                             reset.status,
                             String::from_utf8_lossy(&reset.detail)
-                        ));
+                        )));
                     }
                     other => {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} received unexpected upload event {other:#06x}",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                 }
             }
             let available = usize::try_from(credit - offset).unwrap_or(usize::MAX);
             let remaining = &bytes[usize::try_from(offset).map_err(|_| {
-                "YAS Transfer upload offset exceeds this platform's address space".to_string()
+                Error::protocol("YAS Transfer upload offset exceeds this platform's address space")
             })?..];
             let length = remaining
                 .len()
                 .min(descriptor.max_chunk_bytes as usize)
                 .min(available);
             if length == 0 {
-                return Err("YAS Transfer made no upload progress".into());
+                return Err(Error::protocol("YAS Transfer made no upload progress"));
             }
             let data = ByteData {
                 transfer_id: descriptor.transfer_id,
@@ -805,25 +814,29 @@ impl NativeClient {
     /// Collect a bounded server-to-client MESSAGE Transfer. Returned items
     /// are ordered by sequence number even when the peer interleaves their
     /// fragments within its negotiated open-message window.
-    pub(crate) async fn receive_message_transfer(
+    pub async fn receive_message_transfer(
         &mut self,
         descriptor: &Descriptor,
         maximum_bytes: u64,
         maximum_messages: usize,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<Vec<u8>>> {
         descriptor.validate().map_err(wire_error)?;
         if descriptor.mode != Mode::Message || descriptor.direction != Direction::SENDER_TO_RECEIVER
         {
-            return Err("YAS delivery did not provide a server-to-client MESSAGE Transfer".into());
+            return Err(Error::protocol(
+                "YAS delivery did not provide a server-to-client MESSAGE Transfer",
+            ));
         }
         if maximum_bytes == 0 || maximum_messages == 0 {
-            return Err("invalid YAS MESSAGE Transfer collection limit".into());
+            return Err(Error::protocol(
+                "invalid YAS MESSAGE Transfer collection limit",
+            ));
         }
         if descriptor.sender_send_credit > maximum_bytes {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS Transfer initial credit {} exceeds collection limit {maximum_bytes}",
                 descriptor.sender_send_credit
-            ));
+            )));
         }
         if descriptor.sender_send_credit < maximum_bytes {
             self.send_typed_event(
@@ -848,10 +861,10 @@ impl NativeClient {
                 .requires_sensitive_frame(frame.header.kind)
                 .map_err(wire_error)?;
             if frame.header.sensitive != sensitive {
-                return Err(format!(
+                return Err(Error::protocol(format!(
                     "YAS Transfer {:#010x} sensitivity flag mismatch",
                     descriptor.transfer_id
-                ));
+                )));
             }
             match frame.header.kind {
                 yas_wire::transfer::kind::MESSAGE_DATA => {
@@ -859,78 +872,78 @@ impl NativeClient {
                     let ended = validator.accept(&fragment).map_err(wire_error)?;
                     received = received
                         .checked_add(fragment.data.len() as u64)
-                        .ok_or_else(|| "YAS MESSAGE Transfer length overflow".to_string())?;
+                        .ok_or_else(|| Error::protocol("YAS MESSAGE Transfer length overflow"))?;
                     if received > maximum_bytes {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} exceeded its byte collection limit",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                     if fragment.start {
                         if open.len() + complete.len() >= maximum_messages
                             || complete.contains_key(&fragment.sequence)
                         {
-                            return Err(format!(
+                            return Err(Error::protocol(format!(
                                 "YAS Transfer {:#010x} exceeded its message collection limit",
                                 descriptor.transfer_id
-                            ));
+                            )));
                         }
                         open.insert(fragment.sequence, Vec::new());
                     }
                     let item = open.get_mut(&fragment.sequence).ok_or_else(|| {
-                        format!(
+                        Error::protocol(format!(
                             "YAS Transfer {:#010x} lost an open message",
                             descriptor.transfer_id
-                        )
+                        ))
                     })?;
                     item.extend_from_slice(&fragment.data);
                     if ended {
                         let item = open.remove(&fragment.sequence).ok_or_else(|| {
-                            "completed YAS Transfer message disappeared".to_string()
+                            Error::protocol("completed YAS Transfer message disappeared")
                         })?;
                         if complete.insert(fragment.sequence, item).is_some() {
-                            return Err("duplicate YAS Transfer message sequence".into());
+                            return Err(Error::protocol("duplicate YAS Transfer message sequence"));
                         }
                     }
                 }
                 yas_wire::transfer::kind::CLOSE => {
                     let close = TransferClose::decode(&frame.payload).map_err(wire_error)?;
                     if close.final_data_bytes != received || validator.open_messages() != 0 {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} CLOSE accounting mismatch",
                             descriptor.transfer_id
-                        ));
+                        )));
                     }
                     if close.status != Status::Ok.code() {
-                        return Err(format!(
+                        return Err(Error::protocol(format!(
                             "YAS Transfer {:#010x} closed with status {}: {}",
                             descriptor.transfer_id,
                             close.status,
                             String::from_utf8_lossy(&close.detail)
-                        ));
+                        )));
                     }
                     return Ok(complete.into_values().collect());
                 }
                 yas_wire::transfer::kind::RESET => {
                     let reset = TransferReset::decode(&frame.payload).map_err(wire_error)?;
-                    return Err(format!(
+                    return Err(Error::protocol(format!(
                         "YAS Transfer {:#010x} reset with status {}: {}",
                         descriptor.transfer_id,
                         reset.status,
                         String::from_utf8_lossy(&reset.detail)
-                    ));
+                    )));
                 }
                 other => {
-                    return Err(format!(
+                    return Err(Error::protocol(format!(
                         "YAS Transfer {:#010x} received unexpected message event {other:#06x}",
                         descriptor.transfer_id
-                    ));
+                    )));
                 }
             }
         }
     }
 
-    async fn next_transfer_event(&mut self, transfer_id: u32) -> Result<Frame, String> {
+    async fn next_transfer_event(&mut self, transfer_id: u32) -> Result<Frame> {
         if let Some(index) = self.pending.iter().position(|frame| {
             frame.header.class == Class::Event
                 && frame.header.family == family::TRANSFER
@@ -939,7 +952,7 @@ impl NativeClient {
             let frame = self
                 .pending
                 .remove(index)
-                .ok_or_else(|| "pending YAS Transfer event disappeared".to_string())?;
+                .ok_or_else(|| Error::protocol("pending YAS Transfer event disappeared"))?;
             self.pending_bytes = self.pending_bytes.saturating_sub(frame.payload.len());
             return Ok(frame);
         }
@@ -955,20 +968,22 @@ impl NativeClient {
         }
     }
 
-    fn defer(&mut self, frame: Frame) -> Result<(), String> {
+    fn defer(&mut self, frame: Frame) -> Result<()> {
         let next_bytes = self
             .pending_bytes
             .checked_add(frame.payload.len())
-            .ok_or_else(|| "pending YAS frame accounting overflow".to_string())?;
+            .ok_or_else(|| Error::protocol("pending YAS frame accounting overflow"))?;
         if self.pending.len() >= MAX_PENDING_FRAMES || next_bytes > MAX_PENDING_BYTES {
-            return Err("native YAS peer exceeded the bounded pending-frame queue".into());
+            return Err(Error::protocol(
+                "native YAS peer exceeded the bounded pending-frame queue",
+            ));
         }
         self.pending_bytes = next_bytes;
         self.pending.push_back(frame);
         Ok(())
     }
 
-    async fn read_next(&mut self) -> Result<Frame, String> {
+    async fn read_next(&mut self) -> Result<Frame> {
         loop {
             let frame = read_frame(&mut self.reader, &self.inbound).await?;
             if frame.header.class == Class::Request
@@ -979,21 +994,20 @@ impl NativeClient {
                 continue;
             }
             if frame.header.class == Class::Request {
-                return Err(format!(
+                return Err(Error::protocol(format!(
                     "YAS server sent an unsupported peer Request {:#06x}/{:#06x}",
                     frame.header.family, frame.header.kind
-                ));
+                )));
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
                 && frame.header.kind == yas_wire::core::event_kind::GOAWAY
             {
                 let goaway = GoAway::decode(&frame.payload).map_err(wire_error)?;
-                return Err(format!(
-                    "YAS server is closing with {:?}: {}",
-                    goaway.status,
-                    format_result_detail(&goaway.detail)
-                ));
+                return Err(Error::GoAway {
+                    status: goaway.status,
+                    detail: format_result_detail(&goaway.detail),
+                });
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
@@ -1013,11 +1027,11 @@ impl NativeClient {
         }
     }
 
-    async fn answer_ping(&mut self, frame: Frame) -> Result<(), String> {
+    async fn answer_ping(&mut self, frame: Frame) -> Result<()> {
         let request_id = frame
             .header
             .request_id
-            .ok_or_else(|| "YAS PING Request has no request ID".to_string())?;
+            .ok_or_else(|| Error::protocol("YAS PING Request has no request ID"))?;
         let _ping = Ping::decode(&frame.payload).map_err(wire_error)?;
         let receive_ns = self.monotonic_ns();
         let result = PingResult {
@@ -1040,20 +1054,20 @@ impl NativeClient {
         .await
     }
 
-    pub(crate) fn monotonic_ns(&self) -> u64 {
+    pub fn monotonic_ns(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    fn apply_session_update(&mut self, payload: &[u8]) -> Result<(), String> {
+    fn apply_session_update(&mut self, payload: &[u8]) -> Result<()> {
         let update = SessionUpdate::decode(payload).map_err(wire_error)?;
         let step = update
             .validate_after(self.hello.catalog_revision, &self.hello.receive)
             .map_err(wire_error)?;
         if step == CatalogStep::Gap {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS catalogue jumped from revision {} to {}; reconnect required",
                 self.hello.catalog_revision, update.catalog_revision
-            ));
+            )));
         }
         self.outbound = FrameCodec::new(
             FrameLimits {
@@ -1068,7 +1082,7 @@ impl NativeClient {
         Ok(())
     }
 
-    fn apply_family_update(&mut self, payload: &[u8]) -> Result<(), String> {
+    fn apply_family_update(&mut self, payload: &[u8]) -> Result<()> {
         let update = FamilyUpdate::decode(payload).map_err(wire_error)?;
         let descriptor = self
             .hello
@@ -1076,19 +1090,19 @@ impl NativeClient {
             .iter_mut()
             .find(|descriptor| descriptor.family_id == update.family.family_id)
             .ok_or_else(|| {
-                format!(
+                Error::protocol(format!(
                     "YAS FAMILY_UPDATE introduced unknown family {:#06x}; reconnect required",
                     update.family.family_id
-                )
+                ))
             })?;
         let step = update
             .validate_after(self.hello.catalog_revision, descriptor)
             .map_err(wire_error)?;
         if step == CatalogStep::Gap {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS catalogue jumped from revision {} to {}; reconnect required",
                 self.hello.catalog_revision, update.catalog_revision
-            ));
+            )));
         }
         *descriptor = update.family;
         self.hello.catalog_revision = update.catalog_revision;
@@ -1097,13 +1111,13 @@ impl NativeClient {
 }
 
 impl NativeFrameSender {
-    pub(crate) async fn send(&self, frame: Frame) -> Result<(), String> {
+    pub async fn send(&self, frame: Frame) -> Result<()> {
         let bytes = {
             let codec = self
                 .inner
                 .outbound
                 .read()
-                .map_err(|_| "native YAS outbound codec lock is poisoned".to_string())?;
+                .map_err(|_| Error::protocol("native YAS outbound codec lock is poisoned"))?;
             codec.encode_stream(&frame).map_err(wire_error)?
         };
         self.inner
@@ -1112,52 +1126,55 @@ impl NativeFrameSender {
             .await
             .write_all(&bytes)
             .await
-            .map_err(|error| format!("cannot write YAS frame: {error}"))
+            .map_err(|error| Error::disconnected(format!("cannot write YAS frame: {error}")))
     }
 
     /// Attempt one message-preserving transport datagram. Queue or SCTP
     /// congestion returns `Ok(false)` and is ordinary packet loss.
-    pub(crate) fn try_send_datagram(
+    pub fn try_send_datagram(
         &self,
         frame: &Frame,
         maximum: u32,
         context: DatagramContext,
-    ) -> Result<transport::DatagramSend, String> {
-        let sender = self
-            .inner
-            .datagram
-            .as_ref()
-            .ok_or_else(|| "native YAS datagram transport is unavailable".to_string())?;
+    ) -> Result<transport::DatagramSend> {
+        let sender = self.inner.datagram.as_ref().ok_or_else(|| {
+            Error::Unsupported("native YAS datagram transport is unavailable".into())
+        })?;
         let bytes = self
             .inner
             .outbound
             .read()
-            .map_err(|_| "native YAS outbound codec lock is poisoned".to_string())?
+            .map_err(|_| Error::protocol("native YAS outbound codec lock is poisoned"))?
             .encode_datagram(frame, maximum, context)
             .map_err(wire_error)?;
         Ok(sender.try_send(bytes))
     }
 
-    fn replace_codec(&self, codec: FrameCodec) -> Result<(), String> {
+    fn replace_codec(&self, codec: FrameCodec) -> Result<()> {
         *self
             .inner
             .outbound
             .write()
-            .map_err(|_| "native YAS outbound codec lock is poisoned".to_string())? = codec;
+            .map_err(|_| Error::protocol("native YAS outbound codec lock is poisoned"))? = codec;
         Ok(())
     }
 }
 
 impl NativeFrameReader {
+    /// The server HELLO as updated by the latest catalog revision.
+    pub fn hello(&self) -> &ServerHello {
+        &self.hello
+    }
+
     /// Read the next family frame after servicing Core control traffic.
-    pub(crate) async fn next(&mut self) -> Result<Frame, String> {
+    pub async fn next(&mut self) -> Result<Frame> {
         self.next_with_source().await.map(|(frame, _)| frame)
     }
 
     /// Read the next family frame and report whether it arrived on the lossy
     /// transport sideband. Malformed datagrams are dropped without affecting
     /// the reliable session.
-    pub(crate) async fn next_with_source(&mut self) -> Result<(Frame, bool), String> {
+    pub async fn next_with_source(&mut self) -> Result<(Frame, bool)> {
         loop {
             let (frame, datagram) = if let Some(receiver) = self.datagram.as_mut() {
                 tokio::select! {
@@ -1188,21 +1205,20 @@ impl NativeFrameReader {
                 continue;
             }
             if frame.header.class == Class::Request {
-                return Err(format!(
+                return Err(Error::protocol(format!(
                     "YAS server sent an unsupported peer Request {:#06x}/{:#06x}",
                     frame.header.family, frame.header.kind
-                ));
+                )));
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
                 && frame.header.kind == yas_wire::core::event_kind::GOAWAY
             {
                 let goaway = GoAway::decode(&frame.payload).map_err(wire_error)?;
-                return Err(format!(
-                    "YAS server is closing with {:?}: {}",
-                    goaway.status,
-                    format_result_detail(&goaway.detail)
-                ));
+                return Err(Error::GoAway {
+                    status: goaway.status,
+                    detail: format_result_detail(&goaway.detail),
+                });
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
@@ -1222,11 +1238,11 @@ impl NativeFrameReader {
         }
     }
 
-    async fn answer_ping(&mut self, frame: Frame) -> Result<(), String> {
+    async fn answer_ping(&mut self, frame: Frame) -> Result<()> {
         let request_id = frame
             .header
             .request_id
-            .ok_or_else(|| "YAS PING Request has no request ID".to_string())?;
+            .ok_or_else(|| Error::protocol("YAS PING Request has no request ID"))?;
         let _ping = Ping::decode(&frame.payload).map_err(wire_error)?;
         let receive_ns = self.monotonic_ns();
         let result = PingResult {
@@ -1254,16 +1270,16 @@ impl NativeFrameReader {
         u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    fn apply_session_update(&mut self, payload: &[u8]) -> Result<(), String> {
+    fn apply_session_update(&mut self, payload: &[u8]) -> Result<()> {
         let update = SessionUpdate::decode(payload).map_err(wire_error)?;
         let step = update
             .validate_after(self.hello.catalog_revision, &self.hello.receive)
             .map_err(wire_error)?;
         if step == CatalogStep::Gap {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS catalogue jumped from revision {} to {}; reconnect required",
                 self.hello.catalog_revision, update.catalog_revision
-            ));
+            )));
         }
         let codec = FrameCodec::new(
             FrameLimits {
@@ -1279,7 +1295,7 @@ impl NativeFrameReader {
         Ok(())
     }
 
-    fn apply_family_update(&mut self, payload: &[u8]) -> Result<(), String> {
+    fn apply_family_update(&mut self, payload: &[u8]) -> Result<()> {
         let update = FamilyUpdate::decode(payload).map_err(wire_error)?;
         let descriptor = self
             .hello
@@ -1287,19 +1303,19 @@ impl NativeFrameReader {
             .iter_mut()
             .find(|descriptor| descriptor.family_id == update.family.family_id)
             .ok_or_else(|| {
-                format!(
+                Error::protocol(format!(
                     "YAS FAMILY_UPDATE introduced unknown family {:#06x}; reconnect required",
                     update.family.family_id
-                )
+                ))
             })?;
         let step = update
             .validate_after(self.hello.catalog_revision, descriptor)
             .map_err(wire_error)?;
         if step == CatalogStep::Gap {
-            return Err(format!(
+            return Err(Error::protocol(format!(
                 "YAS catalogue jumped from revision {} to {}; reconnect required",
                 self.hello.catalog_revision, update.catalog_revision
-            ));
+            )));
         }
         *descriptor = update.family;
         self.hello.catalog_revision = update.catalog_revision;
@@ -1324,31 +1340,32 @@ fn decode_transport_datagram(codec: &FrameCodec, bytes: &[u8], maximum: u32) -> 
     codec.decode_datagram(bytes, maximum, context).ok()
 }
 
-async fn read_frame(
-    reader: &mut (impl AsyncRead + Unpin),
-    codec: &FrameCodec,
-) -> Result<Frame, String> {
+async fn read_frame(reader: &mut (impl AsyncRead + Unpin), codec: &FrameCodec) -> Result<Frame> {
     let mut length = [0; 4];
     reader
         .read_exact(&mut length)
         .await
-        .map_err(|error| format!("cannot read YAS frame length: {error}"))?;
+        .map_err(|error| Error::disconnected(format!("cannot read YAS frame length: {error}")))?;
     let length = u32::from_le_bytes(length) as usize;
     let total = length
         .checked_add(4)
-        .ok_or_else(|| "YAS frame length overflow".to_string())?;
+        .ok_or_else(|| Error::protocol("YAS frame length overflow"))?;
     if total > codec.limits().max_wire_frame as usize + 4 {
-        return Err(format!("YAS frame exceeds negotiated limit: {length}"));
+        return Err(Error::protocol(format!(
+            "YAS frame exceeds negotiated limit: {length}"
+        )));
     }
     let mut bytes = vec![0; total];
     bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
     reader
         .read_exact(&mut bytes[4..])
         .await
-        .map_err(|error| format!("cannot read YAS frame: {error}"))?;
+        .map_err(|error| Error::disconnected(format!("cannot read YAS frame: {error}")))?;
     let (frame, consumed) = codec.decode_stream(&bytes).map_err(wire_error)?;
     if consumed != bytes.len() {
-        return Err("YAS decoder did not consume one complete frame".into());
+        return Err(Error::protocol(
+            "YAS decoder did not consume one complete frame",
+        ));
     }
     Ok(frame)
 }
@@ -1372,40 +1389,6 @@ fn transfer_event_id(frame: &Frame) -> Option<u32> {
                     .expect("checked Transfer ID length"),
             )
         })
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[usize::from(byte >> 4)] as char);
-        output.push(DIGITS[usize::from(byte & 0x0f)] as char);
-    }
-    output
-}
-
-fn wire_error(error: yas_wire::Error) -> String {
-    format!("YAS wire error: {error}")
-}
-
-fn format_result_detail(detail: &Extensions) -> String {
-    if detail.0.is_empty() {
-        "no detail".to_string()
-    } else {
-        detail
-            .0
-            .iter()
-            .map(|extension| {
-                format!(
-                    "tag {}{}={}",
-                    extension.tag,
-                    if extension.required { "!" } else { "" },
-                    hex(&extension.value)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
 #[cfg(test)]
@@ -1537,7 +1520,7 @@ mod tests {
 
         let mut client = NativeClient::connect_transport(
             transport::Transport::Duplex(client_stream),
-            "yas-test",
+            &HelloOptions::named("yas-test"),
         )
         .await
         .unwrap();
@@ -1545,7 +1528,10 @@ mod tests {
             .next_matching_event(family::CORE, yas_wire::core::event_kind::SESSION_UPDATE)
             .await
             .unwrap_err();
-        assert!(error.contains("cannot read YAS frame length"), "{error}");
+        assert!(
+            error.to_string().contains("cannot read YAS frame length"),
+            "{error}"
+        );
         assert_eq!(client.hello().catalog_revision, 2);
         server.await.unwrap();
     }
