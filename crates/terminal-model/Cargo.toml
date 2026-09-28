@@ -1,6 +1,6 @@
 [package]
 name = "yas-terminal-model"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 description = "Protocol-neutral terminal frame model for YAS"
 license.workspace = true

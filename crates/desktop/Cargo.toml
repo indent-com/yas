@@ -1,6 +1,6 @@
 [package]
 name = "yas-desktop"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 description = "Private D-Bus tray and desktop notification services for yas"
 license.workspace = true
