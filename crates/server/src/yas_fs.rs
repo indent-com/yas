@@ -2914,6 +2914,7 @@ fn set_private_directory(_path: &OsPath) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use yas_wire::Decode as _;
 
     struct TestDir(PathBuf);
@@ -3376,6 +3377,7 @@ mod tests {
         (os.code, os.name.as_str(), os.operation.as_str())
     }
 
+    #[cfg(unix)]
     fn read_one(root: &Root, kind: u64, flags: u64, components: &[&[u8]]) -> wire::QueryReadRecord {
         let question = wire::ReadQuestion {
             kind: kind as u16,
