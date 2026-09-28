@@ -311,24 +311,44 @@ async fn run(client: &mut NativeClient, args: RunArgs) -> Result<i32, String> {
     if args.persist {
         flags |= schema::DEFINITION_PERSISTENT as u16;
     }
-    let identity = deploy(
-        client,
-        Deploy {
-            operation_id: operation_id(),
-            expected_extension_handle: 0,
-            expected_generation: 0,
-            expected_definition_revision: 0,
-            flags,
-            runtime: Runtime::Auto,
-            restart_policy: restart_policy(args.restart),
-            name: args.name,
-            content_hash: object.hash,
-            argv: argv.into_iter().map(String::into_bytes).collect(),
-            runtime_limits: default_runtime_limits(),
-            extensions: Extensions::default(),
-        },
-    )
-    .await?;
+    let name = args.name.clone();
+    let request = Deploy {
+        operation_id: operation_id(),
+        expected_extension_handle: 0,
+        expected_generation: 0,
+        expected_definition_revision: 0,
+        flags,
+        runtime: Runtime::Auto,
+        restart_policy: restart_policy(args.restart),
+        name: args.name,
+        content_hash: object.hash,
+        argv: argv.into_iter().map(String::into_bytes).collect(),
+        runtime_limits: default_runtime_limits(),
+        extensions: Extensions::default(),
+    };
+    let prefix = client
+        .request_result(
+            family::EXTENSION,
+            wire::request_kind::DEPLOY,
+            request.encode().map_err(wire_error)?,
+            true,
+        )
+        .await?;
+    if prefix.status == yas_wire::core::Status::Conflict
+        && let Some(message) = name_conflict_message(&snapshot(client).await?, &name)
+    {
+        return Err(message);
+    }
+    if prefix.status != yas_wire::core::Status::Ok {
+        return Err(format!(
+            "YAS request {:#06x}/{:#06x} failed with {:?}: {}",
+            family::EXTENSION,
+            wire::request_kind::DEPLOY,
+            prefix.status,
+            crate::yas_native::format_result_detail(&prefix.detail)
+        ));
+    }
+    let identity = DefinitionIdentity::decode(&prefix.body).map_err(wire_error)?;
     let record = wait_for_identity(client, &identity).await?;
     if args.json {
         render_record(&record, true, "status");
@@ -485,6 +505,9 @@ async fn wait_until_started(
         }
         if matches!(current.phase, Phase::Stopped | Phase::Blocked) {
             render_record(&current, json, "status");
+            if !json && let Some(message) = exit_message(&current) {
+                eprintln!("yas: {message}");
+            }
             return Ok(exit_code(&current).max(1));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -525,6 +548,15 @@ async fn follow_until_terminal(
                     return Ok(130);
                 }
             }
+        } else if matches!(current.phase, Phase::Stopped | Phase::Blocked) {
+            if json {
+                render_record(&current, true, "status");
+            } else if let Some(message) = exit_message(&current) {
+                eprintln!("yas: {message}");
+            }
+            return Ok(exit_code(&current));
+        } else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         current = find_identity(
             &snapshot(client).await?,
@@ -532,13 +564,6 @@ async fn follow_until_terminal(
             current.generation,
         )?
         .clone();
-        if matches!(current.phase, Phase::Stopped | Phase::Blocked) {
-            if json {
-                render_record(&current, true, "status");
-            }
-            return Ok(exit_code(&current));
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -924,6 +949,58 @@ fn exit_code(record: &ExtensionRecord) -> i32 {
     }
 }
 
+fn name_conflict_message(records: &[ExtensionRecord], name: &str) -> Option<String> {
+    let existing = records.iter().find(|record| record.name == name)?;
+    let id = format_id(existing.extension_handle);
+    let phase = phase_name(existing.phase);
+    Some(
+        if existing.flags & schema::DEFINITION_PERSISTENT as u16 != 0 {
+            format!(
+                "a persistent extension named {name} already exists (id:{id}, phase {phase}); \
+             use `yas ext update {name}` to replace it"
+            )
+        } else if matches!(existing.phase, Phase::Stopped | Phase::Blocked) {
+            format!(
+                "a stopped transient extension named {name} (id:{id}) is still retained for output \
+             replay; retry after it expires (YAS_EXT_TERMINAL_RETAIN, 30 s by default) or use \
+             another name"
+            )
+        } else {
+            format!(
+                "an extension named {name} is already {phase} (id:{id}); stop it with \
+             `yas ext stop id:{id}` or use another name"
+            )
+        },
+    )
+}
+
+fn exit_message(record: &ExtensionRecord) -> Option<String> {
+    let name = &record.name;
+    match record.last_exit.as_ref() {
+        Some(exit) if exit.kind == wire::ExitKind::Returned => None,
+        Some(exit) => {
+            let kind = match exit.kind {
+                wire::ExitKind::Returned => "returned",
+                wire::ExitKind::Trapped => "trapped",
+                wire::ExitKind::Cancelled => "was cancelled",
+                wire::ExitKind::Updated => "was replaced by an update",
+                wire::ExitKind::SlowConsumer => "was stopped as a slow consumer",
+                wire::ExitKind::ProtocolViolation => "violated the protocol",
+                wire::ExitKind::HostFailure => "failed in the host",
+                wire::ExitKind::ServerShutdown => "stopped for server shutdown",
+                wire::ExitKind::ResourceLimit => "exceeded a resource limit",
+            };
+            if exit.detail.is_empty() {
+                Some(format!("extension {name} {kind}"))
+            } else {
+                Some(format!("extension {name} {kind}: {}", exit.detail))
+            }
+        }
+        None if record.phase == Phase::Blocked => Some(format!("extension {name} is blocked")),
+        None => None,
+    }
+}
+
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::NeedObject => "need-object",
@@ -1243,6 +1320,67 @@ fn loopback_url(url: &reqwest::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stopped(name: &str, flags: u16, last_exit: Option<wire::ExitRecord>) -> ExtensionRecord {
+        ExtensionRecord {
+            extension_handle: 0x2a,
+            generation: 1,
+            definition_revision: 1,
+            phase: Phase::Stopped,
+            runtime: Runtime::QuickJs,
+            restart_policy: wire::RestartPolicy::Never,
+            flags,
+            attempt: 1,
+            last_running_attempt: 1,
+            task_id: 0,
+            next_start_unix_ms: 0,
+            directory_revision: 0,
+            content_hash: [0; 32],
+            name: name.into(),
+            last_exit,
+            runtime_limits: default_runtime_limits(),
+            extensions: Extensions::default(),
+        }
+    }
+
+    fn exit(kind: wire::ExitKind, detail: &str) -> Option<wire::ExitRecord> {
+        Some(wire::ExitRecord {
+            kind,
+            code: 0,
+            attempt: 1,
+            server_ns: 0,
+            detail: detail.into(),
+            extensions: Extensions::default(),
+        })
+    }
+
+    #[test]
+    fn a_trapped_attempt_names_its_error() {
+        let record = stopped(
+            "hello",
+            0,
+            exit(wire::ExitKind::Trapped, "Error: boom at main.js:1"),
+        );
+        assert_eq!(
+            exit_message(&record).as_deref(),
+            Some("extension hello trapped: Error: boom at main.js:1")
+        );
+        assert_eq!(exit_code(&record), 1);
+        let returned = stopped("hello", 0, exit(wire::ExitKind::Returned, ""));
+        assert_eq!(exit_message(&returned), None);
+    }
+
+    #[test]
+    fn a_name_conflict_explains_which_definition_holds_the_name() {
+        let transient = [stopped("hello", 0, exit(wire::ExitKind::Returned, ""))];
+        let message = name_conflict_message(&transient, "hello").unwrap();
+        assert!(message.contains("stopped transient"), "{message}");
+        assert!(message.contains("000000000000002a"), "{message}");
+        let persistent = [stopped("hello", schema::DEFINITION_PERSISTENT as u16, None)];
+        let message = name_conflict_message(&persistent, "hello").unwrap();
+        assert!(message.contains("yas ext update hello"), "{message}");
+        assert_eq!(name_conflict_message(&transient, "other"), None);
+    }
 
     #[test]
     fn selectors_never_infer_numeric_names() {
