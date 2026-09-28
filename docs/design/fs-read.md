@@ -89,10 +89,10 @@ only when the matching `CAPABILITY_*` bit is in the FS family limits.
 - `READ_REALPATH` (5) answers the absolute canonical platform path with every
   symlink resolved. A result outside the root is `IO`, as for any other
   confined path.
-- `READ_STAT_ONLY` (6) answers `kind:u8,reserved:u8,reserved:u16,mode:u32,
-  size:u64,modified_unix_ns:i64` from stat(2), or lstat(2) with
-  `READ_NO_FOLLOW`. The size of a large file costs no read, and an unreadable
-  file still answers.
+- `READ_STAT_ONLY` (6) answers
+  `kind:u8,reserved:u8,reserved:u16,mode:u32,size:u64,modified_unix_ns:i64`
+  from stat(2), or lstat(2) with `READ_NO_FOLLOW`. The size of a large file
+  costs no read, and an unreadable file still answers.
 
 `READ_NO_FOLLOW` is invalid with `READ_LIST` and `READ_REALPATH`. The empty path
 names the root. When one of these questions fails because of an OS error, its
