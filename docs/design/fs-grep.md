@@ -101,7 +101,9 @@ list before a between-files check looked at it, and the
 pattern comes from the client.
 
 65,535 matches per file is the Request field's `u16` ceiling. A zero request
-uses the page record limit; a nonzero value is applied per candidate file.
+applies no per-file cap: the page limits bound each page and the cursor resumes
+inside a file. A nonzero value caps the matches reported for each candidate
+file across all pages.
 
 The size check happens before a file read. A remaining file is read in full up
 to the 4 MiB ceiling and then accepted only if it is UTF-8, so an unpruned walk
