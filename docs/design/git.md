@@ -205,7 +205,10 @@ the tree via gix) with intraline span refinement on modified line pairs —
 word- or character-granular, over raw or whitespace-normalized text, per
 request flags; binary detection short-circuits to `BINARY`. The row
 records are engine-agnostic by design, so a syntax-aware engine can
-replace the alignment later, purely server-side.
+replace the alignment later, purely server-side. A `PATCH_TEXT` answer's
+content object is the right endpoint's object, else the left's; between two
+mutable endpoints (INDEX, WORKTREE, EMPTY) it is the null object ID, as
+`git diff` prints for the worktree side.
 
 Nothing runs under the session mutex; Results and Events interleave with
 Terminal, Surface, Media, and FS traffic through the per-session writer.

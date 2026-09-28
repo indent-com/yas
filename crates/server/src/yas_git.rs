@@ -1081,14 +1081,12 @@ fn run_query(
                 .map_err(native_error)?;
             let records = match response {
                 yas_git::native::PatchResult::Text(data) => {
-                    let object = endpoint_content_object(right)
+                    let object = match endpoint_content_object(right)
                         .or_else(|| endpoint_content_object(left))
-                        .ok_or_else(|| {
-                            Error::new(
-                                Status::Unsupported,
-                                "text patch between mutable endpoints has no content object",
-                            )
-                        })?;
+                    {
+                        Some(object) => object,
+                        None => null_object(object_algorithm)?,
+                    };
                     let byte_len = data.len() as u64;
                     return Ok(query_page(
                         vec![QueryItem::Content(OwnedContent {
@@ -1896,6 +1894,20 @@ fn native_endpoint(endpoint: &wire::QueryEndpoint) -> Result<yas_git::native::En
     })
 }
 
+/// Content object for a text patch between two mutable endpoints (INDEX,
+/// WORKTREE, EMPTY): the null ID, as `git diff` prints for the worktree side.
+fn null_object(object_algorithm: u8) -> Result<wire::ObjectId, Error> {
+    let len = match object_algorithm {
+        value if value == yas_wire::schema::git::OBJECT_SHA1 as u8 => 20,
+        value if value == yas_wire::schema::git::OBJECT_SHA256 as u8 => 32,
+        _ => return Err(Error::new(Status::Internal, "unknown Git object algorithm")),
+    };
+    Ok(wire::ObjectId {
+        algorithm: object_algorithm,
+        bytes: vec![0; len],
+    })
+}
+
 fn endpoint_content_object(endpoint: &wire::QueryEndpoint) -> Option<wire::ObjectId> {
     match endpoint {
         wire::QueryEndpoint::Commit(object)
@@ -2273,6 +2285,31 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record, QueryItem::Record(wire::QueryRecord::PatchRow(_))))
         );
+
+        let text = run_query(
+            Some(&repository),
+            algorithm,
+            &query(wire::QueryBody::Patch {
+                left: wire::QueryEndpoint::Index,
+                right: wire::QueryEndpoint::Worktree,
+                path: None,
+                context_lines: 3,
+                rename_threshold: 50,
+                max_bytes: 1024 * 1024,
+                flags: yas_wire::schema::git::PATCH_TEXT as u16,
+            }),
+            None,
+            &cancel,
+        )
+        .unwrap();
+        match text.records.as_slice() {
+            [QueryItem::Content(OwnedContent { object, bytes, .. })] => {
+                assert!(object.bytes.iter().all(|byte| *byte == 0));
+                let text = String::from_utf8_lossy(bytes);
+                assert!(text.contains("-hello\n+hello native YAS\n"), "{text}");
+            }
+            other => panic!("unexpected index/worktree patch page: {other:?}"),
+        }
 
         for body in [
             wire::QueryBody::Index {
