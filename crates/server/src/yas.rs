@@ -56066,10 +56066,20 @@ mod tests {
         let (mut client, codec, _, server_task) =
             start_session(services, &[family::TRANSFER, family::EVENTS]).await;
         let maximum = yas_wire::schema::events::MAX_PENDING_DUMPS as usize;
+        async fn next_non_transfer_frame(client: &mut DuplexStream, codec: &FrameCodec) -> Frame {
+            loop {
+                let frame = next_frame(client, codec).await;
+                if frame.header.family != family::TRANSFER {
+                    return frame;
+                }
+            }
+        }
         const FIRST_DUMP: u32 = 500;
         let request = yas_events_wire::Dump {
-            // Keep successful transfers effectively dormant so only their
-            // Results are relevant to admission ordering in this test.
+            // One byte of credit (the least there is) holds each successful
+            // DUMP's transfer to a single one-byte chunk, which the server
+            // sends as soon as the credit allows; next_non_transfer_frame
+            // skips those, so only Results decide admission ordering here.
             initial_receive_credit: 1,
             extensions: Extensions::default(),
         };
@@ -56175,7 +56185,7 @@ mod tests {
         gate.release(maximum);
         let mut completed = BTreeSet::new();
         while completed.len() < maximum - 1 {
-            let frame = timeout(TEST_TIMEOUT, next_frame(&mut client, &codec))
+            let frame = timeout(TEST_TIMEOUT, next_non_transfer_frame(&mut client, &codec))
                 .await
                 .expect("uncancelled Events DUMP completion");
             assert_eq!(frame.header.family, family::EVENTS);
@@ -56205,17 +56215,23 @@ mod tests {
             .await
             .expect("Events DUMP slot released after actual completion");
         gate.release(1);
-        assert_eq!(
-            next_sensitive_result(
-                &mut client,
-                &codec,
-                family::EVENTS,
-                yas_wire::schema::events::request::DUMP,
-                AFTER_COMPLETION_DUMP,
-            )
+        let frame = timeout(TEST_TIMEOUT, next_non_transfer_frame(&mut client, &codec))
             .await
-            .status,
-            Status::Ok,
+            .expect("Events DUMP after completion");
+        assert_eq!(
+            frame.header,
+            FrameHeader {
+                sensitive: true,
+                ..FrameHeader::result(
+                    family::EVENTS,
+                    yas_wire::schema::events::request::DUMP,
+                    AFTER_COMPLETION_DUMP,
+                )
+            }
+        );
+        assert_eq!(
+            ResultPrefix::decode(&frame.payload).unwrap().status,
+            Status::Ok
         );
 
         drop(client);
