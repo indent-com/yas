@@ -1,11 +1,15 @@
 import type { Terminal } from "@yas-run/browser";
-import type { YasWorkspace } from "./YasWorkspace";
-import type { YasWorkspaceConnection } from "./YasWorkspace";
-import type { TerminalPalette, ConnectionStatus, SessionId } from "./types";
-import { DEFAULT_FONT, DEFAULT_FONT_SIZE, DEFAULT_TEXT_GAMMA } from "./types";
-import { cancelFrame, scheduleFrame } from "./frameScheduler";
-import { measureCell, cssFontFamily, type CellMetrics } from "./measure";
-import type { GlRenderer } from "./gl-renderer";
+import type { YasWorkspace } from "./YasWorkspace.js";
+import type { YasWorkspaceConnection } from "./YasWorkspace.js";
+import type { TerminalPalette, ConnectionStatus, SessionId } from "./types.js";
+import {
+  DEFAULT_FONT,
+  DEFAULT_FONT_SIZE,
+  DEFAULT_TEXT_GAMMA,
+} from "./types.js";
+import { cancelFrame, scheduleFrame } from "./frameScheduler.js";
+import { measureCell, cssFontFamily, type CellMetrics } from "./measure.js";
+import type { GlRenderer } from "./gl-renderer.js";
 import {
   keyToBytes,
   encoder,
@@ -13,14 +17,14 @@ import {
   refreshKeyboardLayout,
   encodeTerminalText,
   REPORT_ALL,
-} from "./keyboard";
-import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./input";
-import { YAS_TERMINAL_WHEEL_SOURCE_FINGER } from "./yas/generated";
-import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
-import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
-import { gridCaretRect, placeChip, placeImeTarget } from "./imeTarget";
-import { captureDelta } from "./prediction";
-import { WheelDetents, notchedRows } from "./wheel";
+} from "./keyboard.js";
+import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./input.js";
+import { YAS_TERMINAL_WHEEL_SOURCE_FINGER } from "./yas/generated.js";
+import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity.js";
+import { devicePixelBox, drawHalved, halve, halvings } from "./downscale.js";
+import { gridCaretRect, placeChip, placeImeTarget } from "./imeTarget.js";
+import { captureDelta } from "./prediction.js";
+import { WheelDetents, notchedRows } from "./wheel.js";
 
 /** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
 interface LinkSegment {

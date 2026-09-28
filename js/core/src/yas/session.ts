@@ -2,7 +2,7 @@ import type {
   YasTransport as BaseYasTransport,
   YasTransportMessage,
   ConnectionStatus,
-} from "../types";
+} from "../types.js";
 import {
   YAS_CORE_CANCEL,
   YAS_CORE_FAMILY_UPDATE,
@@ -35,10 +35,10 @@ import {
   type YasFamilyDescriptor,
   type YasGoAway,
   type YasServerHello,
-} from "./core";
-import type { YasExtension } from "./wire";
-import { YAS_FAMILY_DEPENDENCIES } from "./generated";
-import { validateYasDatagramFrame } from "./datagram";
+} from "./core.js";
+import type { YasExtension } from "./wire.js";
+import { YAS_FAMILY_DEPENDENCIES } from "./generated.js";
+import { validateYasDatagramFrame } from "./datagram.js";
 import {
   YAS_CLASS_EVENT,
   YAS_CLASS_REQUEST,
@@ -64,7 +64,7 @@ import {
   encodeYasFrame,
   frameForByteStream,
   type YasFrame,
-} from "./wire";
+} from "./wire.js";
 
 export interface YasTransport extends BaseYasTransport {
   /** Browser transports use messages; Relay tunnels expose a raw byte stream. */

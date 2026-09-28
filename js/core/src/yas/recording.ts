@@ -2,9 +2,9 @@ import {
   YAS_HARD_MAX_WIRE_FRAME,
   YAS_TERMINAL_FRAME_KEYFRAME,
   YAS_TERMINAL_GRID_CODEC_V1,
-} from "./generated";
-import { decodeTerminalFrame, type YasTerminalFrameEvent } from "./terminal";
-import { YasCursor, YasProtocolError } from "./wire";
+} from "./generated.js";
+import { decodeTerminalFrame, type YasTerminalFrameEvent } from "./terminal.js";
+import { YasCursor, YasProtocolError } from "./wire.js";
 
 const YASREC1_MAGIC = new Uint8Array([
   0x59, 0x41, 0x53, 0x52, 0x45, 0x43, 0x31, 0x0a,

@@ -2,7 +2,7 @@ import type {
   YasTransport,
   YasTransportOptions,
   ConnectionStatus,
-} from "../types";
+} from "../types.js";
 
 export interface WebRtcDataChannelTransportOptions extends YasTransportOptions {
   /** Data channel label. Default: the canonical YAS v1 selector. */

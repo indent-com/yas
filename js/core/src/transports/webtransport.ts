@@ -4,7 +4,7 @@ import type {
   YasTransportEventMap,
   YasTransportMessage,
   YasTransportOptions,
-} from "../types";
+} from "../types.js";
 
 const YAS_TRANSPORT_DATAGRAM_HARD_MAX = 65_536;
 const AUTH_MAX_BYTES = 4_096;

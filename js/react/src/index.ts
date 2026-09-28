@@ -1,18 +1,21 @@
-export { YasTerminal } from "./YasTerminal";
-export type { YasTerminalHandle } from "./YasTerminal";
-export { YasSurfaceView } from "./YasSurfaceView";
+export { YasTerminal } from "./YasTerminal.js";
+export type { YasTerminalHandle } from "./YasTerminal.js";
+export { YasSurfaceView } from "./YasSurfaceView.js";
 export type {
   YasSurfaceViewProps,
   YasSurfaceViewHandle,
-} from "./YasSurfaceView";
+} from "./YasSurfaceView.js";
 
-export type { YasTerminalProps } from "./types";
+export type { YasTerminalProps } from "./types.js";
 
-export { useYasConnection } from "./hooks/useYasConnection";
-export { useYasSessions } from "./hooks/useYasSessions";
-export { useYasWorkspace, useYasWorkspaceState } from "./hooks/useYasWorkspace";
-export { useYasSession, useYasFocusedSession } from "./hooks/useYasSession";
-export { useYasWorkspaceConnection } from "./hooks/useYasWorkspaceConnection";
+export { useYasConnection } from "./hooks/useYasConnection.js";
+export { useYasSessions } from "./hooks/useYasSessions.js";
+export {
+  useYasWorkspace,
+  useYasWorkspaceState,
+} from "./hooks/useYasWorkspace.js";
+export { useYasSession, useYasFocusedSession } from "./hooks/useYasSession.js";
+export { useYasWorkspaceConnection } from "./hooks/useYasWorkspaceConnection.js";
 
-export { YasWorkspaceProvider } from "./YasContext";
-export type { YasContextValue, YasProviderProps } from "./YasContext";
+export { YasWorkspaceProvider } from "./YasContext.js";
+export type { YasContextValue, YasProviderProps } from "./YasContext.js";

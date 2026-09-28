@@ -1,4 +1,4 @@
-import { lz4Decompress } from "../lz4";
+import { lz4Decompress } from "../lz4.js";
 import {
   YAS_TERMINAL_FRAME_CODEC_COMPRESSED,
   YAS_TERMINAL_FRAME_COMPONENTS,
@@ -14,9 +14,9 @@ import {
   YAS_TERMINAL_GRID_CODEC_V1,
   YAS_TERMINAL_CELL_BYTES,
   YAS_TERMINAL_COMPONENT_KEYBOARD_FLAGS,
-} from "./generated";
-import type { YasTerminalFrameEvent } from "./terminal";
-import { YasCursor, YasProtocolError } from "./wire";
+} from "./generated.js";
+import type { YasTerminalFrameEvent } from "./terminal.js";
+import { YasCursor, YasProtocolError } from "./wire.js";
 
 const FRAME_KNOWN_FLAGS =
   YAS_TERMINAL_FRAME_KEYFRAME |

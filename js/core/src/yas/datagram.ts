@@ -15,11 +15,11 @@ import {
   YAS_SURFACE_FRAME_DISCARDABLE,
   YAS_SURFACE_FRAME_END_OF_STREAM,
   YAS_SURFACE_FRAME_KEYFRAME,
-} from "./generated";
-import { decodeMediaFrame, type YasMediaFrame } from "./media";
-import { decodeNetDatagram, type YasNetDatagram } from "./net";
-import { decodeSurfaceFrame, type YasSurfaceFrame } from "./surface";
-import { YasProtocolError, yasOperationPolicy, type YasFrame } from "./wire";
+} from "./generated.js";
+import { decodeMediaFrame, type YasMediaFrame } from "./media.js";
+import { decodeNetDatagram, type YasNetDatagram } from "./net.js";
+import { decodeSurfaceFrame, type YasSurfaceFrame } from "./surface.js";
+import { YasProtocolError, yasOperationPolicy, type YasFrame } from "./wire.js";
 
 export type YasValidatedDatagram =
   | {

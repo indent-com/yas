@@ -2,14 +2,14 @@ import type {
   ConnectionStatus,
   YasTransportEventMap,
   YasTransportMessage,
-} from "../types";
+} from "../types.js";
 import {
   YasRelayClient,
   type YasRelayLink,
   type YasRelayRoute,
   type YasRelayTunnelTransport,
-} from "./relay";
-import type { YasTransport } from "./session";
+} from "./relay.js";
+import type { YasTransport } from "./session.js";
 
 /** Reconnectable raw YAS tunnel for one Relay route.
  *

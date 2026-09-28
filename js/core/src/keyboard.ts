@@ -5,12 +5,12 @@ import {
   REPORT_ALL,
   REPORT_EVENTS,
   type TerminalKey,
-} from "./keyboardProtocol";
+} from "./keyboardProtocol.js";
 export {
   encodeTerminalText,
   REPORT_ALL,
   REPORT_EVENTS,
-} from "./keyboardProtocol";
+} from "./keyboardProtocol.js";
 export const encoder = new TextEncoder();
 
 export function ctrlCharToByte(char: string): Uint8Array | null {

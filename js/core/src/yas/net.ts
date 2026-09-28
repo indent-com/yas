@@ -1,7 +1,7 @@
 /** YAS Net family v1 codecs and browser client. */
 
-import * as g from "./generated";
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
+import * as g from "./generated.js";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_MODE_MESSAGE,
@@ -10,7 +10,7 @@ import {
   transfersFor,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasDisconnectedError,
@@ -20,7 +20,7 @@ import {
   decodeExtensions,
   encodeExtensions,
   type YasExtension,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FAMILY_NET,
@@ -29,7 +29,7 @@ export {
   YAS_NET_DATAGRAM_STATS,
   YAS_NET_OPEN,
   YAS_NET_VERSION,
-} from "./generated";
+} from "./generated.js";
 
 export type YasNetAddress =
   | { kind: "tcp"; host: string; port: number }

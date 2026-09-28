@@ -1,5 +1,5 @@
-export { useYasConnection } from "./useYasConnection";
-export { useYasSessions } from "./useYasSessions";
-export { useYasWorkspace, useYasWorkspaceState } from "./useYasWorkspace";
-export { useYasSession, useYasFocusedSession } from "./useYasSession";
-export { useYasWorkspaceConnection } from "./useYasWorkspaceConnection";
+export { useYasConnection } from "./useYasConnection.js";
+export { useYasSessions } from "./useYasSessions.js";
+export { useYasWorkspace, useYasWorkspaceState } from "./useYasWorkspace.js";
+export { useYasSession, useYasFocusedSession } from "./useYasSession.js";
+export { useYasWorkspaceConnection } from "./useYasWorkspaceConnection.js";

@@ -19,8 +19,8 @@ import {
   YAS_CLIENT_VERSION,
   YAS_CLIENT_WATCH,
   YAS_FAMILY_CLIENT,
-} from "./generated";
-import type { YasConnection } from "./session";
+} from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -38,7 +38,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -47,7 +47,7 @@ import {
   decodeTypedRecord,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
@@ -68,7 +68,7 @@ export {
   YAS_CLIENT_VERSION,
   YAS_CLIENT_WATCH,
   YAS_FAMILY_CLIENT,
-} from "./generated";
+} from "./generated.js";
 
 export type YasClientOrigin =
   | {

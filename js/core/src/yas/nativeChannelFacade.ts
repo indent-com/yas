@@ -13,17 +13,17 @@ import {
   YAS_STATUS_INVALID,
   YAS_STATUS_OK,
   YAS_STATUS_UNAVAILABLE,
-} from "./generated";
+} from "./generated.js";
 import {
   type YasChannelConnection,
   type YasChannelListenerRecord,
   type YasChannelSnapshot,
   YasChannelClient,
-} from "./channel";
-import type { YasConnection } from "./session";
-import type { YasWatchOptions } from "./state";
-import type { YasTransfer } from "./transfer";
-import { YasProtocolError, YasResultError } from "./wire";
+} from "./channel.js";
+import type { YasConnection } from "./session.js";
+import type { YasWatchOptions } from "./state.js";
+import type { YasTransfer } from "./transfer.js";
+import { YasProtocolError, YasResultError } from "./wire.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: false });

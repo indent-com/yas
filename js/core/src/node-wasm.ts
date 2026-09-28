@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import init from "@yas-run/browser";
 
-import type { YasWasmModule } from "./TerminalStore";
+import type { YasWasmModule } from "./TerminalStore.js";
 
 /**
  * Initialise the `@yas-run/browser` WASM module in a non-browser runtime

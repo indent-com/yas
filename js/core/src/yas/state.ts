@@ -1,5 +1,5 @@
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
-import type { ConnectionStatus } from "../types";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
+import type { ConnectionStatus } from "../types.js";
 import {
   YAS_STATE_MODE_REPLAY,
   YAS_STATE_MODE_SNAPSHOT,
@@ -13,7 +13,7 @@ import {
   YAS_STATE_RECORD_REMOVE,
   YAS_STATE_RECORD_REPLACE,
   YAS_STATE_WATCH_RESUME,
-} from "./generated";
+} from "./generated.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -23,7 +23,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export const YAS_STATE_ADD = YAS_STATE_RECORD_ADD;
 export const YAS_STATE_REPLACE = YAS_STATE_RECORD_REPLACE;

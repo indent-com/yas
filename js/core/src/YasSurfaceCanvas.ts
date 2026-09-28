@@ -3,28 +3,28 @@ import {
   releaseSurfaceCanvas,
   surface2DContext,
   SurfaceHdrPresenter,
-} from "./surfaceColor";
+} from "./surfaceColor.js";
 
-import { plannedDropExtension, plannedDropName } from "./surfaceDrop";
-import type { ConnectionId, SurfaceId, YasSurface } from "./types";
-import type { YasNativeFsSyncHandle } from "./yas/nativeWorkspaceFs";
+import { plannedDropExtension, plannedDropName } from "./surfaceDrop.js";
+import type { ConnectionId, SurfaceId, YasSurface } from "./types.js";
+import type { YasNativeFsSyncHandle } from "./yas/nativeWorkspaceFs.js";
 import {
   CODEC_SUPPORT_H264,
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_H264_444,
   CODEC_SUPPORT_AV1_444,
-} from "./surfaceModel";
-import type { YasWorkspace } from "./YasWorkspace";
-import type { YasWorkspaceConnection } from "./YasWorkspace";
+} from "./surfaceModel.js";
+import type { YasWorkspace } from "./YasWorkspace.js";
+import type { YasWorkspaceConnection } from "./YasWorkspace.js";
 import type {
   RemoteSurfaceInput,
   SurfaceCursorImage,
   SurfaceCursorRect,
   SurfaceFramePresentationSize,
   SurfaceTextInputEvent,
-} from "./SurfaceStore";
-import { placeImeTarget } from "./imeTarget";
-import { av1LevelString } from "./videoCodec";
+} from "./SurfaceStore.js";
+import { placeImeTarget } from "./imeTarget.js";
+import { av1LevelString } from "./videoCodec.js";
 import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_UP,
@@ -37,7 +37,7 @@ import {
   SURFACE_TOUCH_DOWN,
   SURFACE_TOUCH_MOTION,
   SURFACE_TOUCH_UP,
-} from "./input";
+} from "./input.js";
 import {
   SCROLL_STOP_MS,
   WHEEL_DETENT_PX,
@@ -45,16 +45,16 @@ import {
   WHEEL_LINES_PER_DETENT,
   WHEEL_MODE_LINE,
   WHEEL_MODE_PAGE,
-} from "./wheel";
+} from "./wheel.js";
 import {
   devicePixelBox,
   drawHalved,
   halve,
   halvings,
   octaveCeil,
-} from "./downscale";
+} from "./downscale.js";
 
-export { av1LevelString } from "./videoCodec";
+export { av1LevelString } from "./videoCodec.js";
 
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
@@ -1483,7 +1483,7 @@ export class YasSurfaceCanvas {
   private _hasPresentedFirstFrame = false;
   /** Cached store reference so we can keep the frame listener alive
    *  even when the connection is temporarily unavailable. */
-  private _store: import("./SurfaceStore").SurfaceStore | null = null;
+  private _store: import("./SurfaceStore.js").SurfaceStore | null = null;
   private _connection: YasWorkspaceConnection | null;
   private _releasingConnection = false;
   private _workspaceUnsub: (() => void) | null = null;
@@ -2598,8 +2598,9 @@ export class YasSurfaceCanvas {
   /** Register this visible mount with the connection exactly once. */
   private serverSubscribe(
     conn: YasWorkspaceConnection | null = this.getConn(),
-    store: import("./SurfaceStore").SurfaceStore | null = conn?.surfaceStore ??
-      this._store,
+    store:
+      | import("./SurfaceStore.js").SurfaceStore
+      | null = conn?.surfaceStore ?? this._store,
   ): void {
     if (
       !this._live ||
@@ -2780,7 +2781,9 @@ export class YasSurfaceCanvas {
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */
-  private presentFromStore(store: import("./SurfaceStore").SurfaceStore): void {
+  private presentFromStore(
+    store: import("./SurfaceStore.js").SurfaceStore,
+  ): void {
     const src = store.getCanvas(this._surfaceId);
     const canvas = this.canvas;
     if (!src || !canvas) return;

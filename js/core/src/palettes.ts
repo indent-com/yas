@@ -1,4 +1,4 @@
-import type { TerminalPalette } from "./types";
+import type { TerminalPalette } from "./types.js";
 
 export const PALETTES: TerminalPalette[] = [
   {
