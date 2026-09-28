@@ -410,9 +410,17 @@ impl Session {
             self.remove_route(process_id);
             return Err(Error::Closed("mismatched Process SPAWN reply".to_owned()));
         }
-        route
-            .process_handle
-            .store(started.process_handle, Ordering::Release);
+        {
+            // Serialized with the Exit handler through `exits`: a child that
+            // exits before its handle is stored still leaves a WAIT replay.
+            let mut exits = self.inner.exits.lock().unwrap();
+            route
+                .process_handle
+                .store(started.process_handle, Ordering::Release);
+            if let Some(exit) = route.exit.borrow().clone() {
+                exits.insert(started.process_handle, exit);
+            }
+        }
         Ok(Attachment {
             session: self.clone(),
             route,
@@ -494,6 +502,16 @@ impl Session {
         let (mut exit, temporary) =
             if let Some(route) = self.route_by_handle(request.process_handle) {
                 (route.exit.subscribe(), None)
+            } else if let Some(exit) = self
+                .inner
+                .exits
+                .lock()
+                .unwrap()
+                .get(request.process_handle)
+                .cloned()
+            {
+                // The route retires only after its replay is recorded.
+                return Ok(exit);
             } else {
                 match self
                     .watch_process(request.process_handle, false, true)
@@ -874,18 +892,19 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                 .routes
                 .lock()
                 .unwrap()
-                .remove(&process_id)
+                .get(&process_id)
+                .cloned()
                 .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
             let exit = native_exit_info(exit);
-            let process_handle = route.process_handle.load(Ordering::Acquire);
-            if process_handle != 0 {
-                inner
-                    .exits
-                    .lock()
-                    .unwrap()
-                    .insert(process_handle, exit.clone());
+            {
+                let mut exits = inner.exits.lock().unwrap();
+                route.exit.send_replace(Some(exit.clone()));
+                let process_handle = route.process_handle.load(Ordering::Acquire);
+                if process_handle != 0 {
+                    exits.insert(process_handle, exit.clone());
+                }
             }
-            route.exit.send_replace(Some(exit.clone()));
+            inner.routes.lock().unwrap().remove(&process_id);
             let _ = route.events.try_send(Event::Exit(exit));
             Ok(())
         }
@@ -1178,6 +1197,44 @@ mod tests {
         };
         assert_eq!(exit.kind, wire::ExitKind::Code);
         assert_eq!(exit.code, 0);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wait_after_a_fast_exit_returns_the_exit_record() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([4; 16], None).unwrap();
+        for _ in 0..50 {
+            let mut attachment = session
+                .spawn(
+                    &spawn_request(
+                        vec![executable("sh"), b"-c".to_vec(), b"exit 7".to_vec()],
+                        Vec::new(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            let handle = attachment.process_handle;
+            while !matches!(
+                tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Event::Exit(_)
+            ) {}
+            let exit = session
+                .wait(&wire::Wait {
+                    process_handle: handle,
+                    timeout_ns: 5_000_000_000,
+                    extensions: Extensions::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(exit.code, 7);
+        }
         session.shutdown().await;
         server.shutdown().await;
     }
