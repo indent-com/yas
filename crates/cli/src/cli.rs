@@ -2198,7 +2198,7 @@ pub enum FsCommand {
 pub enum GitCommand {
     /// Branch, ahead/behind, stash, and working-tree status
     Status {
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2228,7 +2228,7 @@ pub enum GitCommand {
         #[arg(last = true)]
         pathspec: Vec<String>,
 
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2284,7 +2284,7 @@ pub enum GitCommand {
         #[arg(last = true)]
         pathspec: Vec<String>,
 
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2318,12 +2318,15 @@ pub enum GitCommand {
     ///   yas git show HEAD:src/main.rs   # a file at a revision
     ///   yas git show v1.0:Cargo.toml
     ///   yas git show HEAD               # the commit object itself
+    ///   yas git show HEAD:src           # a directory, listed like ls-tree
     Show {
-        /// REV[:PATH]. Omit PATH for the commit object; omit REV
-        /// (`:path`) for HEAD.
+        /// REV[:PATH]. REV names a commit; reach trees and blobs by PATH.
+        /// Omit PATH for the commit object (in `git cat-file commit`
+        /// layout); a directory PATH is listed like ls-tree, and `REV:`
+        /// lists the root tree. Omit REV (`:path`) for HEAD.
         spec: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2340,7 +2343,7 @@ pub enum GitCommand {
         /// REV[:PATH]; omit PATH for the root tree
         spec: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2358,7 +2361,7 @@ pub enum GitCommand {
         #[arg(default_value = "")]
         path: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2375,7 +2378,7 @@ pub enum GitCommand {
         #[arg(required = true, num_args = 2..)]
         revs: Vec<String>,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2393,7 +2396,7 @@ pub enum GitCommand {
         /// File to blame
         path: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2428,7 +2431,7 @@ pub enum GitCommand {
         #[arg(default_value = "")]
         ref_name: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2450,7 +2453,7 @@ pub enum GitCommand {
     /// TSV: WORKDIR<TAB>GITDIR. Deduped by gitdir, so several paths
     /// resolving to one repository report once.
     Discover {
-        /// Directory to search (default: server cwd)
+        /// Directory to search (relative to the client's cwd)
         #[arg(default_value = ".")]
         path: String,
 
@@ -2484,7 +2487,7 @@ pub enum GitCommand {
         /// Refspecs to fetch (default: the remote's configured ones)
         refspecs: Vec<String>,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
