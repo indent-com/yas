@@ -288,13 +288,40 @@ impl WriteOptions {
     }
 }
 
+/// How a server spells a root's platform paths (its canonical path and the
+/// absolute paths it reports). The paths [`FsRoot`]'s methods take are
+/// relative and `/`-separated whatever the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PathModel {
+    /// POSIX: a path is bytes, `/` separates components.
+    PosixBytes,
+    /// Windows: a path is UTF-8 (the server converts it to UTF-16), with a
+    /// drive or UNC prefix, and `\` separates components.
+    WindowsUtf8,
+}
+
+/// Whether names under a root that differ only by case are the same entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaseBehavior {
+    /// They are different entries (what a POSIX server says).
+    Sensitive,
+    /// They are the same entry, and names are not kept as written.
+    Insensitive,
+    /// They are the same entry, and a name keeps the case it was created
+    /// with (what a Windows server says).
+    PreservingInsensitive,
+}
+
 /// An open FS root. Dropping it closes the root on the server.
 #[derive(Debug)]
 pub struct FsRoot {
     client: Client,
     handle: u64,
     canonical_path: Vec<u8>,
-    windows_paths: bool,
+    path_model: PathModel,
+    case_behavior: CaseBehavior,
     closed: bool,
 }
 
@@ -324,6 +351,13 @@ impl Client {
         .await
     }
 
+    /// Open this session's staging directory, where a drag and drop leaves
+    /// its files: the server makes it when first asked and removes it when
+    /// the session ends, not when the root closes.
+    pub async fn open_staging_root(&self, writable: bool) -> Result<FsRoot> {
+        self.open_root_source(RootSource::Staging, writable).await
+    }
+
     async fn open_root_source(&self, source: RootSource, writable: bool) -> Result<FsRoot> {
         let opened: OpenResult = self
             .request(
@@ -344,7 +378,16 @@ impl Client {
             client: self.clone(),
             handle: opened.root_handle,
             canonical_path: opened.canonical_path,
-            windows_paths: u64::from(opened.path_model) == schema::PATH_WINDOWS_UTF8,
+            path_model: if u64::from(opened.path_model) == schema::PATH_WINDOWS_UTF8 {
+                PathModel::WindowsUtf8
+            } else {
+                PathModel::PosixBytes
+            },
+            case_behavior: match u64::from(opened.case_behavior) {
+                schema::CASE_INSENSITIVE => CaseBehavior::Insensitive,
+                schema::CASE_PRESERVING_INSENSITIVE => CaseBehavior::PreservingInsensitive,
+                _ => CaseBehavior::Sensitive,
+            },
             closed: false,
         })
     }
@@ -359,6 +402,18 @@ impl FsRoot {
     /// The root handle.
     pub fn handle(&self) -> u64 {
         self.handle
+    }
+
+    /// How the server spells this root's platform paths, the
+    /// [`canonical_path`](Self::canonical_path) among them.
+    pub fn path_model(&self) -> PathModel {
+        self.path_model
+    }
+
+    /// Whether names under this root that differ only by case are the same
+    /// entry.
+    pub fn case_behavior(&self) -> CaseBehavior {
+        self.case_behavior
     }
 
     /// Read a whole file (at most [`MAX_FILE_BYTES`]), verifying its hash.
@@ -1021,7 +1076,11 @@ impl FsRoot {
     }
 
     fn platform_path(&self, path: &Path) -> Vec<u8> {
-        let separator = if self.windows_paths { b'\\' } else { b'/' };
+        let separator = if self.path_model == PathModel::WindowsUtf8 {
+            b'\\'
+        } else {
+            b'/'
+        };
         let mut out = self.canonical_path.clone();
         for component in &path.components {
             if out.last() != Some(&separator) {

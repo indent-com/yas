@@ -8,7 +8,7 @@ mod ssh_server;
 
 use std::time::{Duration, Instant};
 
-use yas_client::fs::{EntryKind, Precondition, WriteOptions};
+use yas_client::fs::{CaseBehavior, EntryKind, PathModel, Precondition, WriteOptions};
 use yas_client::host::{HostOptions, HostedServer};
 use yas_client::kv::{KvChange, KvPrecondition};
 use yas_client::process::{Command, Signal, Stdin};
@@ -484,6 +484,46 @@ async fn files_read_write_list_and_preconditions() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roots_say_how_paths_are_spelled_and_the_staging_root_lasts_the_session() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = client.open_root(directory.path(), false).await.unwrap();
+    assert_eq!(root.path_model(), PathModel::PosixBytes);
+    assert_eq!(root.case_behavior(), CaseBehavior::Sensitive);
+    root.close().await.unwrap();
+
+    let staging = client.open_staging_root(true).await.unwrap();
+    assert_eq!(staging.path_model(), PathModel::PosixBytes);
+    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(staging.canonical_path()));
+    assert!(path.is_dir(), "{path:?}");
+    staging
+        .write("dropped.txt", b"dropped", &WriteOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(path.join("dropped.txt")).unwrap(), b"dropped");
+    staging.close().await.unwrap();
+    assert!(
+        path.is_dir(),
+        "closing the root keeps the staging directory"
+    );
+    let again = client.open_staging_root(false).await.unwrap();
+    assert_eq!(again.read("dropped.txt").await.unwrap().bytes, b"dropped");
+    drop(again);
+    drop(client);
+    let deadline = Instant::now() + TIMEOUT;
+    while path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the session ended and {path:?} is still there"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
