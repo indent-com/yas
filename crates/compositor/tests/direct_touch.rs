@@ -18,13 +18,16 @@ use wayland_client::protocol::{
     wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
     wl_registry, wl_seat, wl_surface, wl_touch,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use yas_compositor::{
     CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
     spawn_compositor_without_renderer,
 };
+
+/// Generous because CI runners are loaded; a passing run returns long before it.
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A `wl_touch` event, reduced to what these tests pin.
 #[derive(Debug, PartialEq, Clone)]
@@ -49,6 +52,7 @@ struct App {
     /// `time` of each motion, which is what an app differentiates to get a fling
     /// velocity.
     motion_times: Vec<u32>,
+    touch_capable: bool,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
@@ -153,7 +157,23 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for App {
 
 delegate_noop!(App: ignore wl_compositor::WlCompositor);
 delegate_noop!(App: ignore wl_surface::WlSurface);
-delegate_noop!(App: ignore wl_seat::WlSeat);
+impl Dispatch<wl_seat::WlSeat, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+        {
+            state.touch_capable = capabilities.contains(wl_seat::Capability::Touch);
+        }
+    }
+}
 delegate_noop!(App: ignore xdg_toplevel::XdgToplevel);
 delegate_noop!(App: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(App: ignore wl_data_device::WlDataDevice);
@@ -220,8 +240,14 @@ impl Fixture {
             .send(CompositorCommand::SetTouchEnabled { enabled: true })
             .expect("enable touch");
         handle.wake();
-        std::thread::sleep(Duration::from_millis(50));
-        queue.roundtrip(&mut app).expect("capabilities roundtrip");
+        // A wl_touch requested before the seat advertises touch never receives
+        // events, so wait for the capability rather than a fixed delay.
+        let deadline = Instant::now() + DISPATCH_TIMEOUT;
+        while !app.touch_capable {
+            assert!(Instant::now() < deadline, "seat never advertised touch");
+            std::thread::sleep(Duration::from_millis(10));
+            queue.roundtrip(&mut app).expect("capabilities roundtrip");
+        }
         let touch = seat.get_touch(&qh, ());
         queue.roundtrip(&mut app).expect("get_touch roundtrip");
 
@@ -281,7 +307,7 @@ impl Fixture {
     }
 
     fn dispatch_until(&mut self, done: impl Fn(&App) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + DISPATCH_TIMEOUT;
         while !done(&self.app) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for touch events");
@@ -584,8 +610,7 @@ fn direct_touch_has_its_own_browser_clock() {
     }
     handle.wake();
 
-    std::thread::sleep(Duration::from_millis(80));
-    f.queue.roundtrip(&mut f.app).expect("roundtrip");
+    f.dispatch_until(|app| app.motion_times.len() >= 5);
     let deltas: Vec<u32> = f
         .app
         .motion_times
