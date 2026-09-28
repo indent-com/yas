@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Choosing a runtime directory that belongs to this user alone.
 //!
 //! Two things in yas need a directory to put a Unix socket in: the native IPC

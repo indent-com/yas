@@ -40390,6 +40390,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn start_registered_session(
         state: AppState,
         family_ids: &[u16],

@@ -19,10 +19,11 @@ FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl htop nodejs npm dbus systemd \
+    blender ca-certificates curl htop nodejs npm dbus systemd \
     fonts-dejavu-core fonts-noto-color-emoji libpipewire-0.3-0 pipewire \
     pipewire-pulse wireplumber mesa-vulkan-drivers libvulkan1 libegl1 libgles2 libopengl0 \
-    xwayland libxcb-composite0 libxcb-cursor0 libxcb-randr0 libxcb-res0 \
+    mesa-utils xwayland libxcb-composite0 libxcb-cursor0 libxcb-randr0 libxcb-res0 \
+    && test -x /usr/bin/es2gears_wayland && blender --version \
     && rm -rf /var/lib/apt/lists/*
 
 # Tensorlake injects matching NVIDIA driver libraries, but not their loader
