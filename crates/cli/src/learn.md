@@ -278,7 +278,8 @@ yas fs ln -s target link   # symlink (omit -s for a hard link)
 ## Git
 
 Read-only introspection of repositories on the server. `--repo` picks the
-worktree (default: cwd); `--json` emits NDJSON.
+worktree; a relative path, and the default `.`, resolve against the client's
+cwd, as `--root` does for `fs` and `lsp`. `--json` emits NDJSON.
 
 ```bash
 yas git status                     # branch, ahead/behind, stash, worktree
@@ -287,7 +288,7 @@ yas git log                        # history, newest first
 yas git log v1.0                   # from a tag
 yas git log main..feature          # a range
 yas git log --follow -- src/main.rs
-yas git diff                       # unstaged
+yas git diff                       # unstaged (-p for hunks)
 yas git diff --staged              # staged
 yas git diff main dev              # between two commits
 yas git diff main...dev            # since they diverged (from the merge base)
@@ -295,6 +296,7 @@ yas git diff --merge-base main     # worktree vs where main forked (a `base` lin
 yas git diff HEAD~2 -p -- src      # with hunks, limited to a path
 yas git show HEAD:src/main.rs      # a file's bytes at a revision
 yas git show HEAD                  # the commit object itself
+yas git show HEAD:src              # a directory, listed like ls-tree
 yas git ls-tree HEAD                # one tree level (MODE TYPE OID<TAB>NAME)
 yas git ls-tree HEAD:src            # descend by passing a path
 yas git merge-base main feature     # best common ancestors (exit 1 if unrelated)
