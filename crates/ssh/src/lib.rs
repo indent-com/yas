@@ -3,6 +3,14 @@
 //! Provides connection pooling, ssh-agent authentication, `~/.ssh/config`
 //! parsing, and `direct-streamlocal` channel forwarding for connecting to
 //! remote yas-servers without shelling out to the system `ssh` binary.
+//!
+//! By default a pool behaves like `ssh`: ssh-agent, then key files, with
+//! host keys pinned in `~/.ssh/known_hosts` (trust on first use). A service
+//! holding credentials in memory builds its pool with
+//! [`SshPool::with_options`] instead: private keys (or a password) passed as
+//! values, host keys pinned by the caller ([`HostKeyPolicy::Pinned`]) or
+//! checked by a callback ([`HostKeyPolicy::Verify`]), and no file, agent or
+//! `~/.ssh/config` access unless asked for.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +34,155 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("ssh: {0}")]
     Other(String),
+}
+
+// ── Caller-supplied credentials and host-key policy ────────────────────
+
+/// What a [`HostKeyPolicy::Verify`] callback is asked about.
+#[derive(Debug)]
+pub struct HostKeyCheck<'a> {
+    /// The host as connected to (after `~/.ssh/config` resolution, if used).
+    pub host: &'a str,
+    /// The TCP port.
+    pub port: u16,
+    /// The key the server presented.
+    pub key: &'a keys::PublicKey,
+}
+
+impl HostKeyCheck<'_> {
+    /// The presented key as an OpenSSH public-key line (`ssh-ed25519 AAAA…`).
+    pub fn openssh(&self) -> String {
+        public_key_openssh(self.key)
+    }
+
+    /// The presented key's `SHA256:…` fingerprint.
+    pub fn fingerprint(&self) -> String {
+        fingerprint(self.key)
+    }
+}
+
+/// How a pool decides whether to trust a server's host key.
+#[derive(Clone, Default)]
+pub enum HostKeyPolicy {
+    /// `~/.ssh/known_hosts` (or `YAS_SSH_KNOWN_HOSTS`): unknown hosts are
+    /// learned and recorded, changed keys are refused.
+    #[default]
+    KnownHosts,
+    /// Accept exactly these keys (any host). Nothing is read or written.
+    Pinned(Vec<keys::PublicKey>),
+    /// Ask the callback; `true` accepts. Use it to pin into your own store
+    /// (trust on first use) or to compare fingerprints.
+    Verify(Arc<dyn Fn(&HostKeyCheck<'_>) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for HostKeyPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KnownHosts => f.write_str("KnownHosts"),
+            Self::Pinned(keys) => f
+                .debug_tuple("Pinned")
+                .field(&keys.iter().map(fingerprint).collect::<Vec<_>>())
+                .finish(),
+            Self::Verify(_) => f.write_str("Verify(..)"),
+        }
+    }
+}
+
+/// Credentials and policy for an [`SshPool`].
+#[derive(Clone, Debug)]
+pub struct SshOptions {
+    /// Private keys tried in order before anything else.
+    pub keys: Vec<Arc<keys::PrivateKey>>,
+    /// A password tried after the keys.
+    pub password: Option<String>,
+    /// Try ssh-agent (`SSH_AUTH_SOCK`).
+    pub agent: bool,
+    /// Try `~/.ssh/id_*` and `IdentityFile`s from `~/.ssh/config`.
+    pub key_files: bool,
+    /// Read `~/.ssh/config` (Hostname, User, Port, IdentityFile).
+    pub config_file: bool,
+    /// Host-key trust.
+    pub host_keys: HostKeyPolicy,
+    /// Port when neither the URI nor `~/.ssh/config` names one (default 22).
+    pub port: Option<u16>,
+    /// Install YAS on the remote (`curl https://yas.run | sh` into
+    /// `~/.local`) and start its server when no socket answers.
+    pub install: bool,
+}
+
+impl Default for SshOptions {
+    /// Behave like `ssh`: agent, key files, `~/.ssh/config`, known_hosts.
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            password: None,
+            agent: true,
+            key_files: true,
+            config_file: true,
+            host_keys: HostKeyPolicy::KnownHosts,
+            port: None,
+            install: true,
+        }
+    }
+}
+
+impl SshOptions {
+    /// Only what the caller passes: no agent, no key files, no
+    /// `~/.ssh/config`, and host keys pinned to `host_keys`.
+    pub fn in_memory(host_keys: HostKeyPolicy) -> Self {
+        Self {
+            agent: false,
+            key_files: false,
+            config_file: false,
+            host_keys,
+            ..Self::default()
+        }
+    }
+
+    /// Add a private key in OpenSSH (or PEM) text form.
+    pub fn with_private_key(mut self, text: &str, passphrase: Option<&str>) -> Result<Self, Error> {
+        self.keys
+            .push(Arc::new(keys::decode_secret_key(text, passphrase)?));
+        Ok(self)
+    }
+
+    /// Set a password.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+}
+
+/// Parse an OpenSSH public key: `ssh-ed25519 AAAA… [comment]`, a
+/// `known_hosts`-style `host ssh-ed25519 AAAA…` line, or bare base64.
+pub fn parse_public_key(text: &str) -> Result<keys::PublicKey, Error> {
+    let text = text.trim();
+    if let Ok(key) = keys::PublicKey::from_openssh(text) {
+        return Ok(key);
+    }
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    // known_hosts line: hosts, algorithm, base64
+    if fields.len() >= 3
+        && let Ok(key) = keys::PublicKey::from_openssh(&fields[1..].join(" "))
+    {
+        return Ok(key);
+    }
+    let base64 = fields
+        .iter()
+        .find(|field| field.starts_with("AAAA"))
+        .copied()
+        .unwrap_or(text);
+    Ok(keys::parse_public_key_base64(base64)?)
+}
+
+/// A key's `SHA256:…` fingerprint, as `ssh-keygen -l` prints it.
+pub fn fingerprint(key: &keys::PublicKey) -> String {
+    key.fingerprint(keys::HashAlg::Sha256).to_string()
+}
+
+/// A key as an OpenSSH public-key line (without comment).
+pub fn public_key_openssh(key: &keys::PublicKey) -> String {
+    key.to_openssh().unwrap_or_default()
 }
 
 // ── Shell scripts run on the remote ────────────────────────────────────
@@ -238,6 +395,7 @@ fn expand_tilde(path: &str) -> String {
 struct SshHandler {
     host: String,
     port: u16,
+    policy: HostKeyPolicy,
 }
 
 impl client::Handler for SshHandler {
@@ -257,6 +415,41 @@ impl client::Handler for SshHandler {
                 "SSH host certificates are not supported".into(),
             ));
         };
+        match &self.policy {
+            HostKeyPolicy::KnownHosts => {}
+            HostKeyPolicy::Pinned(pinned) => {
+                // Comments are labels, not identity.
+                if pinned
+                    .iter()
+                    .any(|key| key.key_data() == server_public_key.key_data())
+                {
+                    return Ok(true);
+                }
+                return Err(Error::Other(format!(
+                    "host key {} for {}:{} is not one of the {} pinned key(s)",
+                    fingerprint(server_public_key),
+                    self.host,
+                    self.port,
+                    pinned.len()
+                )));
+            }
+            HostKeyPolicy::Verify(verify) => {
+                let check = HostKeyCheck {
+                    host: &self.host,
+                    port: self.port,
+                    key: server_public_key,
+                };
+                if verify(&check) {
+                    return Ok(true);
+                }
+                return Err(Error::Other(format!(
+                    "host key {} for {}:{} was rejected",
+                    fingerprint(server_public_key),
+                    self.host,
+                    self.port
+                )));
+            }
+        }
         let path = known_hosts_path().ok_or_else(|| {
             Error::Other(
                 "cannot verify host keys: no home directory for ~/.ssh/known_hosts. \
@@ -368,6 +561,16 @@ pub struct SshPool {
 struct PoolInner {
     /// Cached connections keyed by `"user@host:port"`.
     connections: Mutex<HashMap<String, CachedConnection>>,
+    options: SshOptions,
+}
+
+impl std::fmt::Debug for SshPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshPool")
+            .field("host_keys", &self.inner.options.host_keys)
+            .field("keys", &self.inner.options.keys.len())
+            .finish_non_exhaustive()
+    }
 }
 
 struct CachedConnection {
@@ -384,11 +587,23 @@ impl Default for SshPool {
 
 impl SshPool {
     pub fn new() -> Self {
+        Self::with_options(SshOptions::default())
+    }
+
+    /// A pool whose connections all use `options` (credentials, host-key
+    /// policy). Pools share nothing; use one per credential set.
+    pub fn with_options(options: SshOptions) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 connections: Mutex::new(HashMap::new()),
+                options,
             }),
         }
+    }
+
+    /// The options this pool connects with.
+    pub fn options(&self) -> &SshOptions {
+        &self.inner.options
     }
 
     /// Open a `direct-streamlocal` channel to a remote yas-server.
@@ -424,13 +639,20 @@ impl SshPool {
         remote_socket: Option<&str>,
     ) -> Result<tokio::io::DuplexStream, Error> {
         let socket_is_explicit = remote_socket.is_some();
-        let config = resolve_ssh_config(host);
+        let options = &self.inner.options;
+        let config = if options.config_file {
+            resolve_ssh_config(host)
+        } else {
+            ResolvedConfig::default()
+        };
+        // An explicit "host:port" is not an SSH URI form (":" introduces the
+        // socket path there), so ports come from options or ~/.ssh/config.
         let effective_host = config.hostname.as_deref().unwrap_or(host);
         let effective_user = user
             .map(String::from)
             .or(config.user.clone())
             .unwrap_or_else(current_username);
-        let effective_port = config.port.unwrap_or(22);
+        let effective_port = config.port.or(options.port).unwrap_or(22);
 
         let key = format!("{effective_user}@{effective_host}:{effective_port}");
 
@@ -447,9 +669,14 @@ impl SshPool {
             // Release the lock while establishing the TCP + SSH connection —
             // this can take seconds (DNS, handshake, auth).
             drop(conns);
-            let handle =
-                establish_connection(effective_host, effective_port, &effective_user, &config)
-                    .await?;
+            let handle = establish_connection(
+                effective_host,
+                effective_port,
+                &effective_user,
+                &config,
+                options,
+            )
+            .await?;
             conns = self.inner.connections.lock().await;
             // Another task may have raced us for the same key — prefer the
             // existing live connection to avoid duplicates.
@@ -494,6 +721,11 @@ impl SshPool {
             .await
         {
             Ok(ch) => ch,
+            Err(first_err) if !options.install => {
+                return Err(Error::Other(format!(
+                    "cannot reach the YAS socket {socket_path} on {effective_host}: {first_err}"
+                )));
+            }
             Err(_first_err) => {
                 // Install yas if missing and (re)start the server.
                 let _ = exec_command(
@@ -548,6 +780,7 @@ async fn establish_connection(
     port: u16,
     user: &str,
     config: &ResolvedConfig,
+    options: &SshOptions,
 ) -> Result<client::Handle<SshHandler>, Error> {
     let ssh_config = client::Config {
         // Detect dead connections behind NATs/firewalls instead of hanging
@@ -561,23 +794,56 @@ async fn establish_connection(
     let handler = SshHandler {
         host: host.to_string(),
         port,
+        policy: options.host_keys.clone(),
     };
 
     let mut handle = client::connect(Arc::new(ssh_config), (host, port), handler).await?;
+    let mut tried = Vec::new();
 
-    // Try ssh-agent first.
-    if try_agent_auth(&mut handle, user).await {
-        return Ok(handle);
+    // Caller-supplied keys first.
+    if !options.keys.is_empty() {
+        tried.push("supplied keys");
+        for key in &options.keys {
+            let hash_alg = handle.best_supported_rsa_hash().await.ok().flatten();
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::clone(key), hash_alg.flatten());
+            match handle.authenticate_publickey(user, key_with_hash).await {
+                Ok(russh::client::AuthResult::Success) => return Ok(handle),
+                Ok(_) => continue,
+                Err(e) => log::debug!("supplied key auth failed: {e}"),
+            }
+        }
     }
 
-    // Fall back to key files.
-    if try_key_file_auth(&mut handle, user, config).await? {
-        return Ok(handle);
+    if let Some(password) = &options.password {
+        tried.push("password");
+        if let Ok(russh::client::AuthResult::Success) =
+            handle.authenticate_password(user, password.clone()).await
+        {
+            return Ok(handle);
+        }
+    }
+
+    if options.agent {
+        tried.push("ssh-agent");
+        if try_agent_auth(&mut handle, user).await {
+            return Ok(handle);
+        }
+    }
+
+    if options.key_files {
+        tried.push("key files");
+        if try_key_file_auth(&mut handle, user, config).await? {
+            return Ok(handle);
+        }
     }
 
     Err(Error::Other(format!(
-        "authentication failed for {user}@{host}:{port} \
-         (tried ssh-agent and key files)"
+        "authentication failed for {user}@{host}:{port} (tried {})",
+        if tried.is_empty() {
+            "nothing: no credentials configured".to_string()
+        } else {
+            tried.join(", ")
+        }
     )))
 }
 
@@ -883,6 +1149,7 @@ mod tests {
         let mut h = SshHandler {
             host: "example.test".into(),
             port: 22,
+            policy: HostKeyPolicy::KnownHosts,
         };
         futures_lite_block_on(h.check_server_key(&key(presented).into()))
     }
@@ -986,6 +1253,80 @@ mod tests {
             assert!(lines[0].starts_with("other.test"));
             assert!(lines[1].starts_with("example.test"));
         });
+    }
+
+    fn check_with(policy: HostKeyPolicy, presented: &str) -> Result<bool, Error> {
+        let mut h = SshHandler {
+            host: "example.test".into(),
+            port: 2222,
+            policy,
+        };
+        futures_lite_block_on(h.check_server_key(&key(presented).into()))
+    }
+
+    #[test]
+    fn pinned_keys_accept_only_themselves_and_touch_no_file() {
+        with_known_hosts(None, |path| {
+            let pinned = HostKeyPolicy::Pinned(vec![parse_public_key(KEY_A).unwrap()]);
+            assert!(check_with(pinned.clone(), KEY_A).unwrap());
+            let err = check_with(pinned.clone(), KEY_B).expect_err("unpinned key");
+            assert!(
+                format!("{err}").contains("not one of the 1 pinned"),
+                "{err}"
+            );
+            assert!(check_with(pinned, KEY_RSA).is_err());
+            let commented =
+                HostKeyPolicy::Pinned(vec![parse_public_key(&format!("{KEY_A} me@host")).unwrap()]);
+            assert!(
+                check_with(commented, KEY_A).unwrap(),
+                "comments are not identity"
+            );
+            assert!(!path.exists(), "pinning must not write known_hosts");
+        });
+    }
+
+    #[test]
+    fn verify_callback_sees_host_port_and_fingerprint() {
+        let expected = fingerprint(&key(KEY_A));
+        let policy = HostKeyPolicy::Verify(Arc::new(move |check: &HostKeyCheck<'_>| {
+            check.host == "example.test" && check.port == 2222 && check.fingerprint() == expected
+        }));
+        assert!(check_with(policy.clone(), KEY_A).unwrap());
+        assert!(check_with(policy, KEY_B).is_err());
+    }
+
+    #[test]
+    fn public_keys_parse_from_every_common_form() {
+        let bare = KEY_A.split_whitespace().nth(1).unwrap();
+        let a = parse_public_key(KEY_A).unwrap();
+        let data = |text: &str| parse_public_key(text).unwrap().key_data().clone();
+        assert_eq!(data(&format!("{KEY_A} me@host")), *a.key_data());
+        assert_eq!(data(&format!("example.test {KEY_A}")), *a.key_data());
+        assert_eq!(data(bare), *a.key_data());
+        assert!(fingerprint(&a).starts_with("SHA256:"));
+        assert_eq!(public_key_openssh(&a), KEY_A);
+    }
+
+    /// A throwaway key generated for this test only.
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACCgwmK3xYT+8Vx7J/rtA3C9cN3wlVh5V30Yyif+grok4gAAAJD1M1av9TNW\nrwAAAAtzc2gtZWQyNTUxOQAAACCgwmK3xYT+8Vx7J/rtA3C9cN3wlVh5V30Yyif+grok4g\nAAAEC8hSGyHNl8/0lO+hkgzJEZEkENc4U0+GcCfUiDHc1e36DCYrfFhP7xXHsn+u0DcL1w\n3fCVWHlXfRjKJ/6CuiTiAAAADHlhcy1zc2ggdGVzdAE=\n-----END OPENSSH PRIVATE KEY-----\n";
+    const TEST_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKDCYrfFhP7xXHsn+u0DcL1w3fCVWHlXfRjKJ/6CuiTi yas-ssh test";
+
+    #[test]
+    fn in_memory_private_keys_load_from_text() {
+        let options = SshOptions::in_memory(HostKeyPolicy::Pinned(Vec::new()))
+            .with_private_key(TEST_PRIVATE_KEY, None)
+            .unwrap();
+        assert_eq!(options.keys.len(), 1);
+        assert!(!options.agent && !options.key_files && !options.config_file);
+        assert_eq!(
+            options.keys[0].public_key(),
+            &parse_public_key(TEST_PUBLIC_KEY).unwrap()
+        );
+        assert!(
+            SshOptions::default()
+                .with_private_key("not a key", None)
+                .is_err()
+        );
     }
 
     #[test]
