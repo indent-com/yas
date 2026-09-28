@@ -865,11 +865,12 @@ async fn cmd_grep(
         flags |= yas_wire::schema::fs::GREP_INCLUDE_IGNORED as u16;
     }
 
+    let file_limit = (max_matches != 0).then_some(usize::from(max_matches));
     let mut cursor = Vec::new();
     let mut matched_files = 0usize;
-    let mut hits = 0usize;
-    let mut truncated = false;
-    loop {
+    let mut last_path = None;
+    let mut truncated;
+    'pages: loop {
         let page: QueryPage = root
             .client
             .request_typed(
@@ -878,7 +879,7 @@ async fn cmd_grep(
                 &Grep {
                     root_handle: root.handle,
                     flags,
-                    max_results: max_matches,
+                    max_results: 0,
                     max_per_file: 0,
                     query: pattern.as_bytes().to_vec(),
                     cursor: cursor.clone(),
@@ -888,7 +889,7 @@ async fn cmd_grep(
                 true,
             )
             .await?;
-        truncated |= page.flags & yas_wire::schema::fs::PAGE_TRUNCATED as u16 != 0;
+        truncated = page.flags & yas_wire::schema::fs::PAGE_TRUNCATED as u16 != 0;
         let next = page.next_cursor.clone();
         let records = page_records(&mut root.client, page).await?;
         let files: BTreeMap<u32, QueryGrepFileRecord> = records
@@ -898,39 +899,49 @@ async fn cmd_grep(
                 _ => None,
             })
             .collect();
-        if files_with_matches {
-            for file in files.values().filter(|file| file.match_count != 0) {
-                matched_files += 1;
-                print_grep_file(file, json);
-            }
-        } else {
-            for record in records {
-                let QueryRecord::GrepMatch(found) = record else {
-                    continue;
-                };
-                let file = files
-                    .get(&found.file_index)
-                    .ok_or_else(|| "FS GREP match referenced a missing file".to_string())?;
-                hits += 1;
-                let path = display_path(&file.path);
-                let ignored =
-                    file.flags & yas_wire::schema::fs::QUERY_GREP_FILE_IGNORED as u16 != 0;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "path": path,
-                            "ignored": ignored,
-                            "line": found.line + 1,
-                            "col": found.column,
-                            "endLine": found.end_line + 1,
-                            "endCol": found.end_column,
-                            "text": found.text,
-                        })
-                    );
-                } else {
-                    println!("{path}:{}:{}", found.line + 1, found.text);
+        for record in records {
+            match record {
+                QueryRecord::GrepFile(file) if file.match_count != 0 => {
+                    // A file whose matches span a page boundary is sent again
+                    // at the top of the next page.
+                    if last_path.as_ref() == Some(&file.path) {
+                        continue;
+                    }
+                    if file_limit.is_some_and(|limit| matched_files >= limit) {
+                        truncated = false;
+                        break 'pages;
+                    }
+                    matched_files += 1;
+                    if files_with_matches {
+                        print_grep_file(&file, json);
+                    }
+                    last_path = Some(file.path);
                 }
+                QueryRecord::GrepMatch(found) if !files_with_matches => {
+                    let file = files
+                        .get(&found.file_index)
+                        .ok_or_else(|| "FS GREP match referenced a missing file".to_string())?;
+                    let path = display_path(&file.path);
+                    let ignored =
+                        file.flags & yas_wire::schema::fs::QUERY_GREP_FILE_IGNORED as u16 != 0;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "path": path,
+                                "ignored": ignored,
+                                "line": found.line + 1,
+                                "col": found.column,
+                                "endLine": found.end_line + 1,
+                                "endCol": found.end_column,
+                                "text": found.text,
+                            })
+                        );
+                    } else {
+                        println!("{path}:{}:{}", found.line + 1, found.text);
+                    }
+                }
+                _ => {}
             }
         }
         if next.is_empty() || next == cursor {
@@ -942,12 +953,7 @@ async fn cmd_grep(
         eprintln!("yas: results truncated — a budget was reached");
     }
     root.close().await?;
-    let count = if files_with_matches {
-        matched_files
-    } else {
-        hits
-    };
-    Ok(if count == 0 { 1 } else { 0 })
+    Ok(if matched_files == 0 { 1 } else { 0 })
 }
 
 async fn page_records(
