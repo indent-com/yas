@@ -7,6 +7,7 @@ import {
   type ResponseHead,
 } from "@yas-run/core/http1";
 import {
+  EMBED_DOCUMENT_PATH,
   parseBootstrapUrl,
   parsePreviewFrameUrl,
   previewKey,
@@ -27,6 +28,7 @@ import { forgetBinding, loadBindings, rememberBinding } from "./bindings";
 import { bootstrapDocument } from "./bootstrap";
 import { injectIntoHtml, PREVIEW_WS_RELAY_CLOSE_GRACE_MS } from "./inject";
 import {
+  appWindow,
   desktopNotificationIdentity,
   desktopNotificationImage,
   desktopNotificationSourceClientId,
@@ -114,6 +116,14 @@ type DesktopNotificationMessage = DesktopNotificationIdentity & {
 
 function topLevelAppClient(source: Client | null): source is WindowClient {
   return topLevelDesktopSender(
+    source as WindowClient | null,
+    senderPreview(source) !== null,
+  );
+}
+
+/** The app that brokers Net for panes: top-level, or framed by a host. */
+function netBrokerClient(source: Client | null): source is WindowClient {
+  return appWindow(
     source as WindowClient | null,
     senderPreview(source) !== null,
   );
@@ -261,6 +271,8 @@ self.addEventListener("notificationclick", (event: NotificationEvent) => {
 self.addEventListener("fetch", (event: FetchEvent) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+  // A host framing the workspace serves it here: the app, not a pane.
+  if (url.pathname === EMBED_DOCUMENT_PATH) return;
 
   const bootstrap =
     parsePreviewFrameUrl(url.pathname, url.search) ??
@@ -609,7 +621,7 @@ async function requestNetPort(
       includeUncontrolled: true,
     })
   )
-    .filter((client): client is WindowClient => topLevelAppClient(client))
+    .filter((client): client is WindowClient => netBrokerClient(client))
     .sort(
       (left, right) =>
         Number(right.focused) - Number(left.focused) ||
