@@ -32258,12 +32258,43 @@ async fn run_lsp_watch(
     let mut revision = 1u64;
     let mut backend = Vec::new();
     let mut diagnostics = Vec::new();
+    // The engine replays its retained diagnostics as the first Diagnostics
+    // update, so waiting for it lets the initial snapshot carry them rather
+    // than an empty set that a one-shot reader would take as clean.
+    let mut initial_acks = Vec::new();
+    if watch.wants_diagnostics() {
+        loop {
+            let event = tokio::select! {
+                event = watch.next() => event,
+                _ = cancellation.cancelled() => return,
+            };
+            let Some(Ok(super::yas_lsp_adapter::WatchEvent::Snapshot {
+                stream,
+                update_id,
+                entities,
+            })) = event
+            else {
+                return;
+            };
+            initial_acks.push((stream, update_id));
+            match stream {
+                super::yas_lsp_adapter::WatchStream::Backend => backend = entities,
+                super::yas_lsp_adapter::WatchStream::Diagnostics => {
+                    diagnostics = entities;
+                    break;
+                }
+            }
+        }
+    }
+    let mut initial = session
+        .buffer_snapshot(workspace_handle)
+        .unwrap_or_default();
+    initial.extend(backend.iter().cloned());
+    initial.extend(diagnostics.iter().cloned());
     if send_lsp_snapshot(
         subscription_id,
         revision,
-        session
-            .buffer_snapshot(workspace_handle)
-            .unwrap_or_default(),
+        initial,
         event_limit,
         &mut sent_bytes,
         &control,
@@ -32274,6 +32305,9 @@ async fn run_lsp_watch(
     .is_err()
     {
         return;
+    }
+    for (stream, update_id) in initial_acks {
+        watch.acknowledge(stream, update_id);
     }
     enum Input {
         Backend(Option<Result<super::yas_lsp_adapter::WatchEvent, super::yas_lsp_adapter::Error>>),

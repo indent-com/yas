@@ -98,7 +98,9 @@ loss with an exact reason.
 `WATCH` subscribes independently to backend lifecycle, diagnostics, and buffer
 overlays. Backend records carry phase, progress, epoch, capabilities, stable
 identity, resource data, and failure detail. Diagnostic records are complete
-per-path replacements, including an explicit empty set to clear a file. State
+per-path replacements, including an explicit empty set to clear a file. A
+diagnostics subscription's initial snapshot carries the diagnostics the
+backends have already published. State
 credit and staged snapshots make reconnect and slow-consumer recovery exact.
 
 Every document target combines a component-vector path, revision, and

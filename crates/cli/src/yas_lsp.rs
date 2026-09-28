@@ -24,6 +24,7 @@ use crate::{cli::LspCommand, yas_native::NativeClient};
 const STATE_CREDIT: u64 = yas_wire::schema::transport::RECOMMENDED_BUFFERED;
 const QUERY_CREDIT: u64 = lsp::MAX_QUERY_BYTES as u64;
 const MAX_COLLECTED_RECORDS: usize = 65_536;
+const DIAGNOSTICS_LULL: Duration = Duration::from_secs(5);
 
 struct Workspace {
     client: NativeClient,
@@ -430,7 +431,14 @@ async fn cmd_diagnostics(
             lsp::request_kind::WATCH,
             &Watch {
                 workspace_handle: workspace.handle,
-                datasets: yas_wire::schema::lsp::WATCH_DIAGNOSTICS as u16,
+                // Backend updates carry indexing and check progress, which
+                // keep --wait from mistaking a running check for a lull.
+                datasets: if wait {
+                    (yas_wire::schema::lsp::WATCH_DIAGNOSTICS
+                        | yas_wire::schema::lsp::WATCH_BACKEND) as u16
+                } else {
+                    yas_wire::schema::lsp::WATCH_DIAGNOSTICS as u16
+                },
                 state: yas_wire::state::Watch {
                     initial_credit: STATE_CREDIT,
                     resume: None,
@@ -443,11 +451,25 @@ async fn cmd_diagnostics(
     let mut diagnostics = BTreeMap::<String, DiagnosticRecord>::new();
     let mut snapshot_done = false;
     let mut cumulative_credit = STATE_CREDIT;
+    let mut awaiting_publish = wait && !watch_forever;
+    let mut baseline: Option<BTreeMap<String, DiagnosticRecord>> = None;
     loop {
-        let frame = workspace
+        let next = workspace
             .client
-            .next_matching_event(family::LSP, lsp::event_kind::STATE)
-            .await?;
+            .next_matching_event(family::LSP, lsp::event_kind::STATE);
+        let frame = if awaiting_publish && snapshot_done {
+            match tokio::time::timeout(DIAGNOSTICS_LULL, next).await {
+                Ok(frame) => frame?,
+                // A clean workspace publishes nothing distinguishable, so a
+                // lull with no updates at all ends the wait.
+                Err(_) => {
+                    let count = print_diagnostics(&diagnostics, filter.as_deref(), json);
+                    return Ok(if count == 0 { 0 } else { 1 });
+                }
+            }
+        } else {
+            next.await?
+        };
         let event = StateEvent::decode(&frame.payload).map_err(wire_error)?;
         if event.subscription_id != result.subscription_id {
             continue;
@@ -502,6 +524,18 @@ async fn cmd_diagnostics(
         }
         if event.phase == Phase::SnapshotEnd || (snapshot_done && event.phase == Phase::Delta) {
             snapshot_done = true;
+            if awaiting_publish {
+                // Retained diagnostics may predate the edit being checked;
+                // wait for a publish that changes them.
+                match &baseline {
+                    None => {
+                        baseline = Some(diagnostics.clone());
+                        continue;
+                    }
+                    Some(baseline) if *baseline == diagnostics => continue,
+                    Some(_) => awaiting_publish = false,
+                }
+            }
             let count = print_diagnostics(&diagnostics, filter.as_deref(), json);
             if !watch_forever {
                 workspace
