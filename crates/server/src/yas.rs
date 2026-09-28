@@ -32149,25 +32149,7 @@ async fn run_git_watch(
     journal: Option<super::watch_diagnostics::WatchJournal>,
 ) {
     let mut sent_bytes = 0u64;
-    if send_git_snapshot(
-        subscription_id,
-        revision,
-        Vec::new(),
-        event_limit,
-        &mut sent_bytes,
-        &control,
-        &out,
-        &cancellation,
-        journal.as_ref(),
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-    if let Some(journal) = &journal {
-        journal.state(revision, 0, sent_bytes);
-    }
+    let mut initial = true;
     loop {
         let event = tokio::select! {
             event = watch.next() => event,
@@ -32191,9 +32173,32 @@ async fn run_git_watch(
                 return;
             }
             Ok(super::yas_git_adapter::WatchEvent::Snapshot { state_id, records }) => {
-                let next = revision.saturating_add(1).max(1);
                 let before = sent_bytes;
                 let count = records.len();
+                if std::mem::take(&mut initial) {
+                    if send_git_snapshot(
+                        subscription_id,
+                        revision,
+                        records,
+                        event_limit,
+                        &mut sent_bytes,
+                        &control,
+                        &out,
+                        &cancellation,
+                        journal.as_ref(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(journal) = &journal {
+                        journal.state(revision, count, sent_bytes - before);
+                    }
+                    watch.acknowledge(state_id);
+                    continue;
+                }
+                let next = revision.saturating_add(1).max(1);
                 if send_git_state_event(
                     subscription_id,
                     Phase::Reset,
@@ -40246,6 +40251,113 @@ mod tests {
         let (codec, server_hello) =
             handshake_with_receive(&mut client, family_ids, max_buffered).await;
         (client, codec, server_hello, task)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_watch_initial_snapshot_carries_worktree_status() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join("hello.txt"), b"hello\n").unwrap();
+        git(&["add", "hello.txt"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(root.path().join("hello.txt"), b"changed\n").unwrap();
+
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::GIT]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::OPEN,
+            10,
+            &yas_git_wire::Open {
+                source: yas_git_wire::RepositorySource::PlatformPath(
+                    root.path().to_string_lossy().as_bytes().to_vec(),
+                ),
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::OPEN,
+            10,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let repository_handle = yas_git_wire::OpenResult::decode(&opened.body)
+            .unwrap()
+            .repository_handle;
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::WATCH,
+            11,
+            &yas_git_wire::Watch {
+                repository_handle,
+                datasets: (yas_wire::schema::git::WATCH_HEAD | yas_wire::schema::git::WATCH_STATUS)
+                    as u16,
+                state: Watch {
+                    initial_credit: 1024 * 1024,
+                    resume: None,
+                    extensions: Extensions::default(),
+                },
+            },
+        )
+        .await;
+        let watched = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::WATCH,
+            11,
+        )
+        .await;
+        assert_eq!(watched.status, Status::Ok);
+        let mut entities = Vec::new();
+        loop {
+            let frame = timeout(TEST_TIMEOUT, next_frame(&mut client, &codec))
+                .await
+                .unwrap();
+            assert_eq!(frame.header.kind, yas_git_wire::event_kind::STATE);
+            let event = StateEvent::decode(&frame.payload).unwrap();
+            assert_ne!(event.phase, Phase::Reset);
+            for record in &event.records {
+                entities.push(yas_git_wire::EntityRecord::decode(&record.body).unwrap());
+            }
+            if event.phase == Phase::SnapshotEnd {
+                break;
+            }
+        }
+        assert!(
+            entities
+                .iter()
+                .any(|entity| matches!(entity.body, yas_git_wire::EntityBody::Head(_)))
+        );
+        assert!(
+            entities
+                .iter()
+                .any(|entity| matches!(entity.body, yas_git_wire::EntityBody::Status(_)))
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
