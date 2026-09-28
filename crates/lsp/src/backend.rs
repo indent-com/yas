@@ -564,6 +564,8 @@ struct PendingQuery {
     sub: u64,
     nonce: u16,
     kind: u8,
+    line: u32,
+    col: u32,
     path: Option<PathBuf>,
     sink: native::QuerySink,
 }
@@ -2096,6 +2098,8 @@ impl Engine {
             sub,
             nonce,
             kind,
+            line,
+            col,
             path: path.clone(),
             sink,
         };
@@ -2546,7 +2550,7 @@ fn project_query(job: ProjectionJob) {
         }
         LSP_QUERY_HOVER => {
             let path = q.path.clone().unwrap_or_default();
-            translate::hover(&mut sink, &mut src, &path, &result, enc)
+            translate::hover(&mut sink, &mut src, &path, (q.line, q.col), &result, enc)
         }
         LSP_QUERY_DOC_SYMBOLS => {
             let path = q.path.clone().unwrap_or_default();
@@ -2695,6 +2699,8 @@ mod tests {
             sub: 1,
             nonce,
             kind: LSP_QUERY_DEFINITION,
+            line: 0,
+            col: 0,
             path: None,
             sink,
         }

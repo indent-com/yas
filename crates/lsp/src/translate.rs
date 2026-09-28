@@ -369,12 +369,14 @@ pub fn locations(
 }
 
 /// `textDocument/hover`: `contents` is `MarkupContent | MarkedString |
-/// MarkedString[]`; everything becomes one markup record (plus a
-/// `LOCATION` for the hovered range when the server reports one).
+/// MarkedString[]`; everything becomes one markup record, preceded by the
+/// `LOCATION` it describes: the hovered range when the server reports one,
+/// else the empty range at the queried position `(line, col)`.
 pub fn hover(
     sink: &mut RecordSink<'_>,
     src: &mut TextSource,
     query_path: &Path,
+    (line, col): (u32, u32),
     result: &Value,
     enc: PositionEncoding,
 ) {
@@ -412,24 +414,35 @@ pub fn hover(
     if body.is_empty() {
         return;
     }
-    sink.push(&ProjectedRecord::Markup {
-        format,
-        text: &body,
-    });
-    if result["range"].is_object()
-        && let Some(s) = src.lookup(query_path)
-    {
-        let range = range_to_native(&result["range"], s, enc);
-        sink.push(&ProjectedRecord::Location {
+    let here = NativeRange {
+        line,
+        col,
+        end_line: line,
+        end_col: col,
+    };
+    let reported = result["range"].is_object().then(|| &result["range"]);
+    let (range, hash) = match src.lookup(query_path) {
+        Some(s) => (
+            reported.map_or(here, |range| range_to_native(range, s, enc)),
+            s.hash(),
+        ),
+        None => (reported.map_or(here, raw_range), LSP_HASH_NONE),
+    };
+    sink.push_group(&[
+        ProjectedRecord::Location {
             flags: 0,
-            hash: s.hash(),
+            hash,
             line: range.line,
             col: range.col,
             end_line: range.end_line,
             end_col: range.end_col,
             path: query_path,
-        });
-    }
+        },
+        ProjectedRecord::Markup {
+            format,
+            text: &body,
+        },
+    ]);
 }
 
 fn symbol_flags(item: &Value) -> u8 {
