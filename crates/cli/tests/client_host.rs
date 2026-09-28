@@ -705,7 +705,7 @@ async fn a_command_can_leave_its_background_running_with_a_null_stdin() {
             Command::new("sh")
                 .args([
                     "-c",
-                    "sleep 60 & echo $!; readlink /proc/self/fd/0 || echo no-proc",
+                    "sleep 60 & echo $!; if [ -c /dev/stdin ]; then echo character-device; else echo other; fi",
                 ])
                 .merge_stderr(true)
                 .leave_residue(Some(Duration::from_millis(300))),
@@ -722,7 +722,8 @@ async fn a_command_can_leave_its_background_running_with_a_null_stdin() {
     let mut lines = text.lines();
     let pid: i32 = lines.next().unwrap().trim().parse().unwrap();
     let stdin = lines.next().unwrap();
-    assert!(stdin == "/dev/null" || stdin == "no-proc", "{stdin}");
+    // The null device (a character device, not a pipe), on Linux and macOS alike.
+    assert_eq!(stdin, "character-device");
     assert!(alive(pid), "the background survives its command");
     // SAFETY: the test's own background process.
     unsafe { libc::kill(pid, libc::SIGKILL) };
