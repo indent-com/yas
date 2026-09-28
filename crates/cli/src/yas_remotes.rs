@@ -40,7 +40,10 @@ struct Catalogue {
 
 impl Catalogue {
     async fn open(on: Option<&str>, hub: &str) -> Result<Self, String> {
-        let mut client = NativeClient::connect(on, hub).await?;
+        Self::open_client(NativeClient::connect(on, hub).await?).await
+    }
+
+    async fn open_client(mut client: NativeClient) -> Result<Self, String> {
         if !client.supports(family::KV, Class::Request, kv::request_kind::OPEN) {
             return Err(
                 "this server does not offer the KV family, which is where remotes live".to_owned(),
@@ -160,5 +163,18 @@ pub(crate) async fn modify(
 /// The catalogue as stored, for `yas remote list`.
 pub(crate) async fn read(on: Option<&str>, hub: &str) -> Result<Vec<RemoteEntry>, String> {
     let mut catalogue = Catalogue::open(on, hub).await?;
+    Ok(catalogue.read().await?.0)
+}
+
+/// The home server's catalogue, for resolving a bare target name.
+///
+/// The home server is the local default instance (`YAS_SOCK`, else the
+/// default socket), never the configured target: resolving `yas.target`
+/// through itself would recurse, and the home server is where
+/// `yas remote add` without `--on` writes.
+pub(crate) async fn read_home() -> Result<Vec<RemoteEntry>, String> {
+    let transport = crate::transport::connect_home().await?;
+    let client = NativeClient::connect_transport(transport, "yas-cli").await?;
+    let mut catalogue = Catalogue::open_client(client).await?;
     Ok(catalogue.read().await?.0)
 }

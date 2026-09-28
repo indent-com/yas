@@ -226,6 +226,14 @@ yas remote add prod ssh:alice@prod.co
 yas remote set-default prod
 ```
 
+A bare name (from `--on`, `YAS_TARGET`, or `yas.target` in `yas.conf`) is
+looked up in the home server's remotes catalogue, the one `yas remote add`
+edits: the server at `YAS_SOCK`, else the default local instance, started if
+needed. A name may point at another name. Disabled remotes
+(`yas remote toggle`) and unknown names fail with an error. `yas remote`
+verbs edit the home server too unless `--on` names another server; the
+default target does not redirect them.
+
 ## Files
 
 All paths are relative to `--root` (default: the client's cwd, resolved
