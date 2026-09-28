@@ -50,6 +50,26 @@ name = "SERVER_HELLO_PLATFORM_EXTENSION"
 value = 3
 
 [[constant]]
+name = "SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION"
+value = 4
+
+[[constant]]
+name = "EXTENSION_SUPPORT_PERSISTENT"
+value = 1
+
+[[constant]]
+name = "EXTENSION_SUPPORT_WASMI"
+value = 2
+
+[[constant]]
+name = "EXTENSION_SUPPORT_QUICKJS"
+value = 4
+
+[[constant]]
+name = "EXTENSION_SUPPORT_COMMAND_PROVIDER"
+value = 8
+
+[[constant]]
 name = "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION"
 value = 1
 

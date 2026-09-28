@@ -99,12 +99,34 @@ yas events record list
 yas events record stop "$ID"
 ```
 
-`dump` and `tail` write binary `YASEVT1` data to stdout unless `--output`
-names a local path. `record` paths are on the server and continue after the
+`dump` and `tail` render readable records by default; `--binary` writes the
+binary journal. `--output` names a local path. `record` paths are on the server and continue after the
 starting client disconnects. A recording id is returned only after its header
 and history are flushed; `record list` shows state, counters, and delayed write
 errors. Event operations from extensions use the same access and stream budgets
 as direct clients.
+
+Trace native traffic across all families, including individual state records:
+
+```bash
+yas events set --events 'default,+frame.native.*,+datagram.native.*,+state.record.*'
+yas events tail --from-now
+```
+
+`frame.native.*` includes session, trace, request and watch IDs, family/operation,
+result status, State phase/revisions, ACK credit, and wire/payload byte counts.
+`datagram.native.*` records reads, outbound queue acceptance, and queue drops.
+`state.record.*` captures each State record, including nested Git query records.
+`payload.native.*` additionally captures complete decoded request/event/result
+bodies, including content marked sensitive. Binary bodies are split into bounded
+chunks with trace IDs and offsets; human output previews long chunks.
+Events-family traffic is excluded to keep following the journal from tracing
+itself. Connection lifecycle and exit reasons are enabled by default.
+
+For filesystem investigation, enable `git.*` and `fs.*`. These include watch
+start/stop, queued update/record traces, and raw native notifications observed
+before read-event filtering and coalescing. Raw notifications can occur without
+a resulting State update. See `docs/events.md` for payload layouts and timing controls.
 
 ## Commands in a live shell
 

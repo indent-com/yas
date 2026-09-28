@@ -193,6 +193,72 @@ value = 46
 [[constant]]
 name = "EVENT_SERVER_ERROR"
 value = 47
+[[constant]]
+name = "EVENT_GIT_WATCH_START"
+value = 48
+[[constant]]
+name = "EVENT_GIT_WATCH_STOP"
+value = 49
+[[constant]]
+name = "EVENT_GIT_STATE"
+value = 50
+[[constant]]
+name = "EVENT_GIT_RECORD"
+value = 51
+[[constant]]
+name = "EVENT_GIT_FS_EVENT"
+value = 52
+[[constant]]
+name = "EVENT_FS_RECORD"
+value = 53
+[[constant]]
+name = "EVENT_FS_EVENT"
+value = 54
+[[constant]]
+name = "EVENT_FS_WATCH_START"
+value = 55
+[[constant]]
+name = "EVENT_FS_WATCH_STOP"
+value = 56
+[[constant]]
+name = "EVENT_FS_STATE"
+value = 57
+[[constant]]
+name = "EVENT_NATIVE_FRAME_READ"
+value = 58
+[[constant]]
+name = "EVENT_NATIVE_FRAME_WRITE"
+value = 59
+[[constant]]
+name = "EVENT_NATIVE_PAYLOAD_READ"
+value = 60
+[[constant]]
+name = "EVENT_NATIVE_PAYLOAD_WRITE"
+value = 61
+[[constant]]
+name = "EVENT_NATIVE_STATE_RECORD_READ"
+value = 62
+[[constant]]
+name = "EVENT_NATIVE_STATE_RECORD_WRITE"
+value = 63
+[[constant]]
+name = "EVENT_NATIVE_CONNECT"
+value = 64
+[[constant]]
+name = "EVENT_NATIVE_DISCONNECT"
+value = 65
+[[constant]]
+name = "EVENT_NATIVE_ERROR"
+value = 66
+[[constant]]
+name = "EVENT_NATIVE_DATAGRAM_READ"
+value = 67
+[[constant]]
+name = "EVENT_NATIVE_DATAGRAM_WRITE"
+value = 68
+[[constant]]
+name = "EVENT_NATIVE_DATAGRAM_DROP"
+value = 69
 
 [[constant]]
 name = "MIN_RING_BYTES"

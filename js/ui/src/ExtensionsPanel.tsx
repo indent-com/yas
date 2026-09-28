@@ -1,16 +1,7 @@
-/**
- * What this server is running, and what it could run.
- *
- * One list over one identity: an extension is its BLAKE3 digest, so a row that
- * is both installed and offered shows the digest the definition is pinned to
- * next to the one the registry offers, and "outdated" is that comparison. There
- * is no version to trust. Installed and offered used to be two tables, which
- * named the same extension twice and made an update look like a fresh install.
- */
-
-import { TapButton } from "./TapButton";
+/** Concurrent extension management and connection-time install/update offers. */
 import {
   createMemo,
+  createRenderEffect,
   createSignal,
   For,
   onCleanup,
@@ -22,6 +13,7 @@ import type {
   YasWorkspace,
   ConnectionId,
   TerminalPalette,
+  YasNativeProductFamilies,
 } from "@yas-run/core";
 import {
   YAS_EXTENSION_CONTROL_DISABLE,
@@ -29,23 +21,12 @@ import {
   YAS_EXTENSION_CONTROL_RESTART,
   YAS_EXTENSION_CONTROL_START,
   YAS_EXTENSION_CONTROL_STOP,
-  YAS_EXTENSION_DEFINITION_ENABLED,
   YAS_EXTENSION_DEFINITION_PERSISTENT,
-  YAS_EXTENSION_PHASE_BACKOFF,
-  YAS_EXTENSION_PHASE_BLOCKED,
-  YAS_EXTENSION_PHASE_NEED_OBJECT,
-  YAS_EXTENSION_PHASE_QUEUED,
-  YAS_EXTENSION_PHASE_RUNNING,
-  YAS_EXTENSION_PHASE_STOPPED,
-  YAS_EXTENSION_PHASE_STOPPING,
-  YAS_EXTENSION_PHASE_VALIDATING,
-  yasExtensionHashHex,
 } from "@yas-run/core";
 import {
   defaultRegistry,
   disableAndRemoveExtension,
   fetchRegistry,
-  formatNativeExtensionHandle,
   installFromRegistry,
   isOutdated,
   mergeExtensionInventory,
@@ -55,21 +36,29 @@ import {
   type ExtensionRow,
   type Registry,
 } from "./extensionRegistry";
-import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
+import {
+  canRecommend,
+  checkExtensionViability,
+  extensionOfferFingerprint,
+  type Viability,
+} from "./extensionViability";
+import { extensionOperations } from "./extensionOperations";
+import { ExtensionRowView } from "./ExtensionRowView";
+import { TapButton } from "./TapButton";
+import { themeFor, uiScale } from "./theme";
 import { t, tp } from "./i18n";
+import "./extensions.css";
 
 export function ExtensionsPanel(props: {
   workspace: YasWorkspace;
   connectionId: ConnectionId;
   palette: TerminalPalette;
   fontSize: number;
+  offer?: { label: string; target: string };
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
-
-  // `null` means that the server inventory is not authoritative yet. Treating
-  // it as an empty list made every registry entry look installable during a
-  // slow or failed list request.
+  // Unknown inventory must not make installed extensions look installable.
   const [installed, setInstalled] = createSignal<
     readonly YasExtensionRecord[] | null
   >(null);
@@ -77,17 +66,101 @@ export function ExtensionsPanel(props: {
   const [registryUrl, setRegistryUrl] = createSignal(defaultRegistry());
   const [inventoryError, setInventoryError] = createSignal<string | null>(null);
   const [registryError, setRegistryError] = createSignal<string | null>(null);
-  const [actionError, setActionError] = createSignal<string | null>(null);
-  const [note, setNote] = createSignal<string | null>(null);
   const [inventoryLoading, setInventoryLoading] = createSignal(false);
   const [registryLoading, setRegistryLoading] = createSignal(false);
-  const [actionBusy, setActionBusy] = createSignal<string | null>(null);
-
-  let inventoryRequest = 0;
-  let registryRequest = 0;
-
+  const [checking, setChecking] = createSignal(false);
+  const [viability, setViability] = createSignal(new Map<string, Viability>());
+  // Default every eligible install/update to selected. Explicit choices survive
+  // rechecks, and newly eligible rows don't inherit a stale selection snapshot.
+  const [choices, setChoices] = createSignal(new Map<string, boolean>());
+  const [offeredNames, setOfferedNames] = createSignal(new Set<string>());
+  const [offerExpanded, setOfferExpanded] = createSignal(false);
+  const [registryOpen, setRegistryOpen] = createSignal(false);
+  const [dismissed, setDismissed] = createSignal(false);
   const host = () =>
     nativeExtensionHost(props.workspace.getConnection(props.connectionId));
+  const [operations, setOperations] = extensionOperations(host());
+  let offerFingerprint = "";
+  let dismissalKey = "";
+  let checkRequest = 0;
+  let checkAbort: AbortController | undefined;
+  let inventoryRequest = 0;
+  let registryRequest = 0;
+  let disposed = false;
+  const native = (): YasNativeProductFamilies | null => {
+    const value = host()?.native as YasNativeProductFamilies | undefined;
+    return value?.connection?.onReady ? value : null;
+  };
+  const errorText = (failure: unknown) =>
+    failure instanceof Error ? failure.message : String(failure);
+
+  const checkRegistry = async () => {
+    const source = registry();
+    if (!source) return;
+    const request = ++checkRequest;
+    checkAbort?.abort();
+    const abort = new AbortController();
+    checkAbort = abort;
+    setChecking(true);
+    try {
+      const connection = native();
+      const inventory = installed() ?? (await host()?.listExtensions());
+      const results = connection
+        ? await checkExtensionViability(
+            connection,
+            source.extensions,
+            abort.signal,
+          )
+        : new Map(
+            source.extensions.map((entry) => [
+              entry.name,
+              {
+                status: "unknown" as const,
+                reasons: [t("extensions.checkUnavailable")],
+              },
+            ]),
+          );
+      if (request !== checkRequest || disposed) return;
+      setViability(results);
+      if (props.offer && connection?.connection.hello) {
+        const hello = connection.connection.hello;
+        offerFingerprint = extensionOfferFingerprint(
+          hello,
+          source.extensions,
+          source.url,
+        );
+        dismissalKey = `yas.extensionOffer.${JSON.stringify([props.offer.target, hello.serverName])}`;
+        try {
+          setDismissed(localStorage.getItem(dismissalKey) === offerFingerprint);
+        } catch {
+          /* Storage may be disabled. */
+        }
+        // Keep all candidates visible in Review, with reasons for anything not
+        // selected. A failed probe must not silently hide three of four rows.
+        setOfferedNames(
+          new Set(
+            mergeExtensions(installed() ?? inventory ?? [], source.extensions)
+              .filter(
+                (row) => row.offered && (!row.installed || isOutdated(row)),
+              )
+              .map((row) => row.label),
+          ),
+        );
+      }
+    } catch (failure) {
+      if (request !== checkRequest || disposed) return;
+      setViability(
+        new Map(
+          source.extensions.map((entry) => [
+            entry.name,
+            { status: "unknown" as const, reasons: [errorText(failure)] },
+          ]),
+        ),
+      );
+    } finally {
+      if (request === checkRequest) setChecking(false);
+    }
+  };
 
   const refresh = async () => {
     const connection = host();
@@ -107,14 +180,11 @@ export function ExtensionsPanel(props: {
     } catch (failure) {
       if (request !== inventoryRequest) return;
       setInstalled(null);
-      setInventoryError(
-        failure instanceof Error ? failure.message : String(failure),
-      );
+      setInventoryError(errorText(failure));
     } finally {
       if (request === inventoryRequest) setInventoryLoading(false);
     }
   };
-
   const loadRegistry = async () => {
     const request = ++registryRequest;
     setRegistryLoading(true);
@@ -123,444 +193,430 @@ export function ExtensionsPanel(props: {
       if (request !== registryRequest) return;
       setRegistry(loaded);
       setRegistryError(null);
+      void checkRegistry();
     } catch (failure) {
       if (request !== registryRequest) return;
       setRegistry(null);
-      setRegistryError(
-        failure instanceof Error ? failure.message : String(failure),
-      );
+      setRegistryError(errorText(failure));
     } finally {
       if (request === registryRequest) setRegistryLoading(false);
     }
   };
-
   onMount(() => {
+    const unsubscribe = host()?.subscribeExtensions((records) => {
+      if (records === null) {
+        setInstalled(null);
+        return;
+      }
+      // Live state supersedes list snapshots awaiting delivery.
+      inventoryRequest++;
+      setInventoryLoading(false);
+      setInstalled((previous) => mergeExtensionInventory(previous, records));
+      setInventoryError(null);
+    });
+    const connection = native()?.connection;
+    const removeReady = connection?.onReady(() => {
+      void checkRegistry();
+    });
+    const removeCatalog = connection?.onCatalogChange(() => {
+      void checkRegistry();
+    });
+    onCleanup(() => {
+      unsubscribe?.();
+      removeReady?.();
+      removeCatalog?.();
+    });
     void refresh();
     void loadRegistry();
   });
   onCleanup(() => {
+    disposed = true;
     inventoryRequest++;
     registryRequest++;
+    checkRequest++;
+    checkAbort?.abort();
   });
 
-  const rows = createMemo<ExtensionRow[]>(() => {
+  const rows = createMemo<ExtensionRow[]>((previous) => {
     const inventory = installed();
-    return inventory === null
-      ? []
-      : mergeExtensions(inventory, registry()?.extensions ?? []);
-  });
-  const errors = createMemo(() =>
-    [actionError(), inventoryError(), registryError()].filter(
-      (error, index, all): error is string =>
-        error !== null && all.indexOf(error) === index,
-    ),
-  );
-  const controlsBusy = () => actionBusy() !== null || inventoryLoading();
-  const installsBusy = () => controlsBusy() || registryLoading();
-
-  const act = async (label: string, action: () => Promise<unknown>) => {
-    setActionBusy(label);
-    setActionError(null);
-    setNote(null);
+    if (inventory === null) return [];
+    const prior = new Map(previous.map((row) => [row.key, row]));
+    return mergeExtensions(inventory, registry()?.extensions ?? [])
+      .filter(
+        (row) =>
+          !props.offer || (row.offered && offeredNames().has(row.offered.name)),
+      )
+      .sort(
+        (a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key),
+      )
+      .map((row) => {
+        const known = prior.get(row.key);
+        // Preserve unrelated buttons even during a pointer-down/click pair.
+        return known &&
+          known.installed === row.installed &&
+          known.offered === row.offered
+          ? known
+          : row;
+      });
+  }, []);
+  const operationKey = (row: ExtensionRow) =>
+    row.offered ||
+    (row.installed?.name &&
+      row.installed.flags & YAS_EXTENSION_DEFINITION_PERSISTENT)
+      ? `name:${row.label}`
+      : row.key;
+  const operation = (row: ExtensionRow) => operations().get(operationKey(row));
+  const pendingRows = () =>
+    rows().filter((row) => row.offered && (!row.installed || isOutdated(row)));
+  const eligibleRows = () =>
+    pendingRows().filter((row) => canRecommend(viability().get(row.label)));
+  const selectedRows = () =>
+    eligibleRows().filter((row) => choices().get(row.label) !== false);
+  const select = (name: string, checked: boolean) =>
+    setChoices((previous) => new Map(previous).set(name, checked));
+  const installsBusy = (row: ExtensionRow) =>
+    operation(row)?.busy === true ||
+    registryLoading() ||
+    checking() ||
+    viability().get(row.label)?.status === "unavailable";
+  const summary = () =>
+    [
+      eligibleRows().filter((row) => !row.installed).length
+        ? tp("extensions.availableCount", {
+            count: eligibleRows().filter((row) => !row.installed).length,
+          })
+        : "",
+      pendingRows().filter(isOutdated).length === 1
+        ? t("extensions.oneUpdate")
+        : pendingRows().filter(isOutdated).length
+          ? tp("extensions.updateCount", {
+              count: pendingRows().filter(isOutdated).length,
+            })
+          : "",
+      rows().filter((row) => row.installed && !isOutdated(row)).length
+        ? tp("extensions.installedCount", {
+            count: rows().filter((row) => row.installed && !isOutdated(row))
+              .length,
+          })
+        : "",
+      pendingRows().filter((row) => !canRecommend(viability().get(row.label)))
+        .length && !checking()
+        ? tp("extensions.attentionCount", {
+            count: pendingRows().filter(
+              (row) => !canRecommend(viability().get(row.label)),
+            ).length,
+          })
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  const batchLabel = () =>
+    selectedRows().every((row) => !row.installed)
+      ? t("extensions.installSelected")
+      : selectedRows().every(isOutdated)
+        ? t("extensions.updateSelected")
+        : t("extensions.applySelected");
+  const dismissOffer = () => {
+    setDismissed(true);
     try {
-      await action();
-    } catch (failure) {
-      setActionError(
-        failure instanceof Error ? failure.message : String(failure),
-      );
-    } finally {
-      await refresh();
-      setActionBusy(null);
+      localStorage.setItem(dismissalKey, offerFingerprint);
+    } catch {
+      /* Keep session dismissal. */
     }
   };
-
-  /**
-   * Install, or replace the definition of the same name in place.
-   *
-   * The install helper re-lists at click time, so a render-time snapshot can
-   * never turn an existing durable name into a duplicate create.
-   */
+  const mutateInventory = (
+    update: (
+      records: readonly YasExtensionRecord[] | null,
+    ) => readonly YasExtensionRecord[] | null,
+  ) => {
+    if (disposed) return;
+    inventoryRequest++;
+    setInventoryLoading(false);
+    setInstalled(update);
+  };
+  const act = async (
+    row: ExtensionRow,
+    stage: string,
+    noteKey: string,
+    action: (progress: (stage: string) => void) => Promise<unknown>,
+  ) => {
+    const key = operationKey(row);
+    if (disposed || operations().get(key)?.busy) return;
+    const update = (busy: boolean, message: string, error = false) =>
+      setOperations((previous) =>
+        new Map(previous).set(key, { busy, message, error }),
+      );
+    const progress = (stage: string) =>
+      update(true, t(`extensions.progress.${stage}`));
+    progress(stage);
+    try {
+      await action(progress);
+      update(false, tp(noteKey, { name: row.label }));
+    } catch (failure) {
+      update(false, errorText(failure), true);
+      if (!disposed) void refresh();
+    }
+  };
   const install = (row: ExtensionRow) => {
     const connection = host();
     const source = registry();
-    if (!connection || !source || !row.offered) return;
-    void act(row.label, async () => {
-      const updated = await installFromRegistry(
-        connection,
-        source,
-        row.offered!,
+    if (!connection || !source || !row.offered || installsBusy(row)) return;
+    void act(
+      row,
+      "checking",
+      isOutdated(row) ? "extensions.updated" : "extensions.installed",
+      async (progress) => {
+        const updated = await installFromRegistry(
+          connection,
+          source,
+          row.offered!,
+          fetch,
+          progress,
+        );
+        mutateInventory((records) => upsertExtensionRecord(records, updated));
+      },
+    );
+  };
+  const remove = (row: ExtensionRow) => {
+    const record = row.installed!;
+    const connection = host();
+    if (!connection) return;
+    void act(row, "disabling", "extensions.removed", async (progress) => {
+      await disableAndRemoveExtension(connection, record, undefined, progress);
+      mutateInventory(
+        (records) =>
+          records?.filter(
+            (item) => item.extensionHandle !== record.extensionHandle,
+          ) ?? null,
       );
-      setInstalled((records) => upsertExtensionRecord(records, updated));
-      setNote(tp("extensions.installed", { name: row.label }));
     });
   };
-
-  /** Removal is a two-step verb: a definition must be quiescent first. */
-  const remove = (record: YasExtensionRecord) => {
+  const control = (row: ExtensionRow, action: number, noteKey: string) => {
     const connection = host();
     if (!connection) return;
-    void act(record.name, async () => {
-      await disableAndRemoveExtension(connection, record);
-      setNote(tp("extensions.removed", { name: record.name }));
+    const stage = {
+      [YAS_EXTENSION_CONTROL_START]: "starting",
+      [YAS_EXTENSION_CONTROL_STOP]: "stopping",
+      [YAS_EXTENSION_CONTROL_RESTART]: "restarting",
+      [YAS_EXTENSION_CONTROL_ENABLE]: "enabling",
+      [YAS_EXTENSION_CONTROL_DISABLE]: "disabling",
+    }[action]!;
+    void act(row, stage, noteKey, async () => {
+      const updated = await connection.controlExtension(
+        row.installed!.extensionHandle,
+        action,
+      );
+      if (updated)
+        mutateInventory((records) => upsertExtensionRecord(records, updated));
     });
   };
-
-  const control = (
-    record: YasExtensionRecord,
-    action: number,
-    noteKey: string,
-  ) => {
-    const connection = host();
-    if (!connection) return;
-    void act(record.name, async () => {
-      await connection.controlExtension(record.extensionHandle, action);
-      setNote(tp(noteKey, { name: record.name }));
-    });
-  };
-
-  const short = (digest: string) => digest.slice(0, 12);
-  const isStopped = (record: YasExtensionRecord) =>
-    record.phase === YAS_EXTENSION_PHASE_STOPPED ||
-    record.phase === YAS_EXTENSION_PHASE_BLOCKED;
-  const isPersistent = (record: YasExtensionRecord) =>
-    (record.flags & YAS_EXTENSION_DEFINITION_PERSISTENT) !== 0;
-  const isEnabled = (record: YasExtensionRecord) =>
-    (record.flags & YAS_EXTENSION_DEFINITION_ENABLED) !== 0;
-  const phaseName = (phase: number): string =>
-    ({
-      [YAS_EXTENSION_PHASE_NEED_OBJECT]: "need-object",
-      [YAS_EXTENSION_PHASE_VALIDATING]: "validating",
-      [YAS_EXTENSION_PHASE_QUEUED]: "queued",
-      [YAS_EXTENSION_PHASE_RUNNING]: "running",
-      [YAS_EXTENSION_PHASE_BACKOFF]: "backoff",
-      [YAS_EXTENSION_PHASE_STOPPED]: "stopped",
-      [YAS_EXTENSION_PHASE_BLOCKED]: "blocked",
-      [YAS_EXTENSION_PHASE_STOPPING]: "stopping",
-    })[phase] ?? String(phase);
+  const offerVisible = () =>
+    !dismissed() &&
+    rows().length > 0 &&
+    rows().some(
+      (row) => canRecommend(viability().get(row.label)) || operation(row),
+    );
 
   return (
-    <>
-      <For each={errors()}>
-        {(error) => (
-          <div
-            style={{
-              color: theme().error,
-              "font-size": `${scale().sm}px`,
-              "margin-bottom": `${scale().xs}px`,
-            }}
-          >
-            {error}
-          </div>
-        )}
-      </For>
-      <Show when={note()}>
-        <div
-          style={{
-            color: theme().dimFg,
-            "font-size": `${scale().sm}px`,
-            "margin-bottom": `${scale().xs}px`,
-          }}
-        >
-          {note()}
-        </div>
-      </Show>
-
-      <div
+    <Show when={!props.offer || offerVisible()}>
+      <section
+        class="yas-extensions"
+        data-offer={props.offer ? "" : undefined}
+        aria-label={t("extensions.title")}
         style={{
-          display: "flex",
-          gap: `${scale().xs}px`,
-          "align-items": "center",
-          "margin-bottom": `${scale().xs}px`,
+          "--ext-bg": theme().solidPanelBg,
+          "--ext-fg": theme().fg,
+          "--ext-muted": `color-mix(in srgb, ${theme().fg} 68%, ${theme().solidPanelBg})`,
+          "--ext-border": `color-mix(in srgb, ${theme().border} 65%, ${theme().solidPanelBg})`,
+          "--ext-hover": theme().hoverBg,
+          "--ext-accent": `color-mix(in srgb, ${theme().accent} 75%, ${theme().fg})`,
+          "--ext-error": theme().error,
+          "--ext-success": theme().success,
+          "--ext-warning": theme().warning,
+          "--ext-font": `${scale().md}px`,
+          "--ext-input": theme().inputBg,
         }}
       >
-        <span style={{ color: theme().dimFg, "font-size": `${scale().sm}px` }}>
-          {t("extensions.registryTitle")}
-        </span>
-        <input
-          data-registry-url
-          value={registryUrl()}
-          onInput={(event) => setRegistryUrl(event.currentTarget.value)}
-          onChange={() => void loadRegistry()}
-          style={mergeStyle(ui.input, {
-            flex: "1 1 auto",
-            "font-size": `${scale().sm}px`,
-          })}
-        />
-        <TapButton
-          type="button"
-          disabled={
-            actionBusy() !== null || inventoryLoading() || registryLoading()
-          }
-          style={mergeStyle(ui.btn, { "font-size": `${scale().sm}px` })}
-          onClick={() => {
-            void refresh();
-            void loadRegistry();
-          }}
-        >
-          {t("extensions.reload")}
-        </TapButton>
-      </div>
-
-      <div
-        style={mergeStyle(scrollbarStyle(theme()), {
-          "overflow-y": "auto",
-          // Bounded by the pane rather than the viewport — see SystemdPanel's
-          // table for why a `vh` cap inside a pane scrolls twice.
-          flex: "1 1 0",
-          "min-height": "6em",
-          "font-size": `${scale().sm}px`,
-        })}
-      >
-        <For
-          each={rows()}
-          fallback={
-            <div style={{ color: theme().dimFg }}>
-              {inventoryLoading() || registryLoading()
-                ? t("extensions.loading")
-                : inventoryError() || registryError()
-                  ? ""
-                  : t("extensions.none")}
-            </div>
-          }
-        >
-          {(row) => (
-            <div
-              data-extension={row.label}
-              style={{
-                display: "flex",
-                "flex-direction": "column",
-                gap: `${scale().xs}px`,
-                padding: `${scale().xs}px 0`,
-                "border-bottom": `1px solid ${theme().border}`,
+        <header class="yas-extensions-heading">
+          <div class="yas-extensions-title">
+            <strong>
+              {props.offer
+                ? tp("extensions.offer", { name: props.offer.label })
+                : t("extensions.title")}
+            </strong>
+            <span>{summary() || t("extensions.loading")}</span>
+          </div>
+          <div class="yas-extensions-tools">
+            <Show
+              when={props.offer}
+              fallback={
+                <>
+                  <TapButton
+                    class="yas-ext-button quiet"
+                    aria-expanded={registryOpen()}
+                    onClick={() => setRegistryOpen((value) => !value)}
+                  >
+                    {t("extensions.registryTitle")}
+                  </TapButton>
+                  <TapButton
+                    class="yas-ext-button quiet"
+                    disabled={
+                      inventoryLoading() || registryLoading() || checking()
+                    }
+                    onClick={() => {
+                      void refresh();
+                      void loadRegistry();
+                    }}
+                  >
+                    {t("extensions.reload")}
+                  </TapButton>
+                </>
+              }
+            >
+              <TapButton
+                class="yas-ext-button"
+                aria-expanded={offerExpanded()}
+                onClick={() => setOfferExpanded((value) => !value)}
+              >
+                {offerExpanded()
+                  ? t("extensions.hide")
+                  : t("extensions.review")}
+              </TapButton>
+              <TapButton class="yas-ext-button quiet" onClick={dismissOffer}>
+                {t("extensions.dismiss")}
+              </TapButton>
+            </Show>
+          </div>
+        </header>
+        <Show when={!props.offer || offerExpanded()}>
+          <For
+            each={[inventoryError(), registryError()].filter(
+              (error): error is string => error !== null,
+            )}
+          >
+            {(error) => (
+              <div role="alert" class="yas-extensions-error">
+                {error}
+              </div>
+            )}
+          </For>
+          <Show when={registryOpen() && !props.offer}>
+            <form
+              class="yas-extensions-registry"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void loadRegistry();
               }}
             >
-              <div
-                style={{
-                  display: "grid",
-                  // The info line keeps fixed columns so phase/digest/flags line
-                  // up across rows. Actions live on their own line below.
-                  "grid-template-columns": "minmax(0, 1fr) 6em 13em 7em",
-                  gap: `${scale().sm}px`,
-                  "align-items": "center",
-                }}
+              <input
+                data-registry-url
+                aria-label={t("extensions.registryTitle")}
+                value={registryUrl()}
+                onInput={(event) => setRegistryUrl(event.currentTarget.value)}
+              />
+              <TapButton
+                type="submit"
+                class="yas-ext-button"
+                disabled={registryLoading()}
               >
-                <span style={{ "min-width": 0 }}>
-                  <span
-                    title={
-                      row.installed
-                        ? `id:${formatNativeExtensionHandle(row.installed.extensionHandle)}`
-                        : undefined
-                    }
-                  >
-                    {row.label}
-                  </span>
-                  <Show when={row.description}>
-                    <div
-                      style={{
-                        color: theme().dimFg,
-                        "font-size": `${scale().xs}px`,
-                      }}
-                    >
-                      {row.description}
-                    </div>
-                  </Show>
-                </span>
-
-                <span
-                  style={{
-                    color: !row.installed
-                      ? theme().dimFg
-                      : row.installed.phase === YAS_EXTENSION_PHASE_RUNNING
-                        ? theme().success
-                        : theme().dimFg,
-                  }}
-                >
-                  {row.installed
-                    ? phaseName(row.installed.phase)
-                    : t("extensions.available")}
-                </span>
-
-                {/* The digest is the identity, so an update is shown as one. */}
-                <span
-                  style={{
-                    color: isOutdated(row) ? theme().warning : theme().dimFg,
-                  }}
-                  title={
-                    row.installed && row.offered
-                      ? `${yasExtensionHashHex(row.installed.contentHash)}\n${row.offered.blake3}`
-                      : row.installed
-                        ? yasExtensionHashHex(row.installed.contentHash)
-                        : row.offered?.blake3
+                {t("extensions.useRegistry")}
+              </TapButton>
+            </form>
+          </Show>
+          <Show when={pendingRows().length > 0 || checking()}>
+            <div class="yas-extensions-selection">
+              <label>
+                <input
+                  type="checkbox"
+                  aria-label={t("extensions.selectAll")}
+                  checked={
+                    eligibleRows().length > 0 &&
+                    selectedRows().length === eligibleRows().length
                   }
+                  ref={(input) =>
+                    createRenderEffect(() => {
+                      input.indeterminate =
+                        selectedRows().length > 0 &&
+                        selectedRows().length < eligibleRows().length;
+                    })
+                  }
+                  disabled={checking() || eligibleRows().length === 0}
+                  onChange={(event) => {
+                    const checked = event.currentTarget.checked;
+                    setChoices((previous) => {
+                      const next = new Map(previous);
+                      for (const row of eligibleRows())
+                        next.set(row.label, checked);
+                      return next;
+                    });
+                  }}
+                />
+                <span>
+                  {checking()
+                    ? t("extensions.checking")
+                    : tp("extensions.selectedCount", {
+                        count: selectedRows().length,
+                        total: pendingRows().length,
+                      })}
+                </span>
+              </label>
+              <div class="yas-extensions-tools">
+                <TapButton
+                  class="yas-ext-button quiet"
+                  disabled={checking()}
+                  onClick={() => {
+                    void refresh();
+                    void loadRegistry();
+                  }}
                 >
-                  {short(
-                    row.installed
-                      ? yasExtensionHashHex(row.installed.contentHash)
-                      : (row.offered?.blake3 ?? ""),
-                  )}
-                  <Show when={isOutdated(row)}>
-                    {" → "}
-                    {short(row.offered!.blake3)}
-                  </Show>
-                </span>
-
-                <span style={{ color: theme().dimFg }}>
-                  <Show
-                    when={row.installed}
-                    fallback={
-                      row.offered?.brotliBytes
-                        ? `${Math.round(row.offered.brotliBytes / 1024)} KiB`
-                        : ""
-                    }
-                  >
-                    {row.installed!.flags & YAS_EXTENSION_DEFINITION_PERSISTENT
-                      ? t("extensions.persistent")
-                      : t("extensions.transient")}
-                    {row.installed!.flags & YAS_EXTENSION_DEFINITION_ENABLED
-                      ? ""
-                      : ` ${t("extensions.disabled")}`}
-                  </Show>
-                </span>
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  gap: `${scale().xs}px`,
-                  "align-items": "center",
-                  "justify-content": "flex-end",
-                  "flex-wrap": "wrap",
-                }}
-              >
-                <Show when={row.offered && !row.installed}>
-                  <TapButton
-                    type="button"
-                    disabled={installsBusy()}
-                    style={mergeStyle(ui.btn, {
-                      "font-size": `${scale().sm}px`,
-                    })}
-                    onClick={() => install(row)}
-                  >
-                    {t("extensions.install")}
-                  </TapButton>
-                </Show>
-                <Show when={isOutdated(row)}>
-                  <TapButton
-                    type="button"
-                    data-extension-update
-                    disabled={installsBusy()}
-                    style={mergeStyle(ui.btn, {
-                      "font-size": `${scale().sm}px`,
-                    })}
-                    onClick={() => install(row)}
-                  >
-                    {t("extensions.update")}
-                  </TapButton>
-                </Show>
-                <Show when={row.installed && row.offered && !isOutdated(row)}>
-                  <span style={{ color: theme().dimFg }}>
-                    {t("extensions.current")}
-                  </span>
-                </Show>
-                <Show when={row.installed}>
-                  <Show when={isEnabled(row.installed!)}>
-                    <TapButton
-                      type="button"
-                      disabled={controlsBusy()}
-                      style={mergeStyle(ui.btn, {
-                        "font-size": `${scale().sm}px`,
-                      })}
-                      onClick={() =>
-                        control(
-                          row.installed!,
-                          isStopped(row.installed!)
-                            ? YAS_EXTENSION_CONTROL_START
-                            : YAS_EXTENSION_CONTROL_RESTART,
-                          isStopped(row.installed!)
-                            ? "extensions.started"
-                            : "extensions.restarted",
-                        )
-                      }
-                    >
-                      {isStopped(row.installed!)
-                        ? t("extensions.start")
-                        : t("extensions.restart")}
-                    </TapButton>
-                  </Show>
-                  <Show when={!isStopped(row.installed!)}>
-                    <TapButton
-                      type="button"
-                      disabled={controlsBusy()}
-                      style={mergeStyle(ui.btn, {
-                        "font-size": `${scale().sm}px`,
-                      })}
-                      onClick={() =>
-                        control(
-                          row.installed!,
-                          YAS_EXTENSION_CONTROL_STOP,
-                          "extensions.stopped",
-                        )
-                      }
-                    >
-                      {t("extensions.stop")}
-                    </TapButton>
-                  </Show>
-                  <Show when={isPersistent(row.installed!)}>
-                    <Show
-                      when={isEnabled(row.installed!)}
-                      fallback={
-                        <TapButton
-                          type="button"
-                          disabled={controlsBusy()}
-                          style={mergeStyle(ui.btn, {
-                            "font-size": `${scale().sm}px`,
-                          })}
-                          onClick={() =>
-                            control(
-                              row.installed!,
-                              YAS_EXTENSION_CONTROL_ENABLE,
-                              "extensions.enabledNote",
-                            )
-                          }
-                        >
-                          {t("extensions.enable")}
-                        </TapButton>
-                      }
-                    >
-                      <TapButton
-                        type="button"
-                        disabled={controlsBusy()}
-                        style={mergeStyle(ui.btn, {
-                          "font-size": `${scale().sm}px`,
-                        })}
-                        onClick={() =>
-                          control(
-                            row.installed!,
-                            YAS_EXTENSION_CONTROL_DISABLE,
-                            "extensions.disabledNote",
-                          )
-                        }
-                      >
-                        {t("extensions.disable")}
-                      </TapButton>
-                    </Show>
-                    <TapButton
-                      type="button"
-                      disabled={controlsBusy()}
-                      style={mergeStyle(ui.btn, {
-                        "font-size": `${scale().sm}px`,
-                      })}
-                      onClick={() => remove(row.installed!)}
-                    >
-                      {t("extensions.remove")}
-                    </TapButton>
-                  </Show>
-                </Show>
+                  {t("extensions.recheck")}
+                </TapButton>
+                <TapButton
+                  class="yas-ext-button primary"
+                  disabled={!selectedRows().some((row) => !installsBusy(row))}
+                  onClick={() => {
+                    for (const row of selectedRows()) install(row);
+                  }}
+                >
+                  {batchLabel()}
+                </TapButton>
               </div>
             </div>
-          )}
-        </For>
-      </div>
-    </>
+          </Show>
+          <div class="yas-extensions-list">
+            <For
+              each={rows()}
+              fallback={
+                <div class="yas-extensions-empty">
+                  {inventoryLoading() || registryLoading()
+                    ? t("extensions.loading")
+                    : inventoryError() || registryError()
+                      ? ""
+                      : t("extensions.none")}
+                </div>
+              }
+            >
+              {(row) => (
+                <ExtensionRowView
+                  row={row}
+                  viability={viability().get(row.label)}
+                  checking={checking()}
+                  operation={operation(row)}
+                  selected={
+                    canRecommend(viability().get(row.label)) &&
+                    choices().get(row.label) !== false
+                  }
+                  installDisabled={installsBusy(row)}
+                  onSelect={(checked) => select(row.label, checked)}
+                  onInstall={() => install(row)}
+                  onRemove={() => remove(row)}
+                  onControl={(action, note) => control(row, action, note)}
+                />
+              )}
+            </For>
+          </div>
+        </Show>
+      </section>
+    </Show>
   );
 }

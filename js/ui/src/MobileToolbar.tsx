@@ -1,4 +1,4 @@
-import { createSignal, createEffect, onCleanup } from "solid-js";
+import { createSignal, createEffect, onCleanup, type JSX } from "solid-js";
 import type {
   YasSurfaceCanvas,
   YasTerminalSurface,
@@ -7,6 +7,7 @@ import type {
 import { surfaceCanvasForInput, terminalSurfaceForInput } from "@yas-run/core";
 import type { Theme, UIScale } from "./theme";
 import { t } from "./i18n";
+import { TapButton } from "./TapButton";
 
 // ---------------------------------------------------------------------------
 // Extra-key definitions
@@ -68,21 +69,56 @@ function ToolbarButton(props: {
   active?: boolean;
   wide?: boolean;
   disabled?: boolean;
-  // When set, fire onPress from a real `click` instead of `pointerdown`.
-  // iOS Safari only authorises clipboard reads inside a genuine click/touch
-  // gesture, and preventDefault() on pointerdown suppresses that click.
+  // Clipboard actions must run inside touchend/click, not touchstart.
   clickToActivate?: boolean;
   theme: Theme;
   scale: UIScale;
 }) {
+  const style = (): JSX.CSSProperties => ({
+    background: props.active ? props.theme.fg : props.theme.inputBg,
+    color: props.active ? props.theme.bg : props.theme.fg,
+    border: `1px solid ${props.theme.subtleBorder}`,
+    "border-radius": "4px",
+    padding: `2px ${props.wide ? 10 : 6}px`,
+    "min-width": "32px",
+    height: "30px",
+    "font-size": `${props.scale.sm}px`,
+    "font-family": "ui-monospace, monospace",
+    cursor: props.disabled ? "default" : "pointer",
+    opacity: props.disabled ? 0.4 : 1,
+    "flex-shrink": 0,
+    display: "flex",
+    "align-items": "center",
+    "justify-content": "center",
+    "user-select": "none",
+    "-webkit-user-select": "none",
+    "touch-action": "manipulation",
+    "white-space": "nowrap",
+    transition: "background 0.1s, color 0.1s, opacity 0.1s",
+  });
+  if (props.clickToActivate) {
+    // Waiting for iOS compatibility clicks lets the textarea blur and the
+    // keyboard/toolbar disappear first. TapButton preserves focus and invokes
+    // the action synchronously in touchend, which authorizes clipboard.read().
+    return (
+      <TapButton
+        type="button"
+        disabled={props.disabled}
+        title={props.title}
+        onActivate={props.onPress}
+        onMouseDown={(e) => e.preventDefault()}
+        style={style()}
+      >
+        {props.label}
+      </TapButton>
+    );
+  }
   return (
     <button
       type="button"
       disabled={props.disabled}
       onPointerDown={(e) => {
-        // Click-activated buttons must let the native click through, so
-        // don't preventDefault (which would cancel it on iOS Safari).
-        if (!props.clickToActivate) e.preventDefault();
+        e.preventDefault();
         e.stopPropagation();
         // A touch press is activated by the button-local touchstart below.
         // Solid delegates pointerdown to document, but touchstart must be
@@ -90,12 +126,7 @@ function ToolbarButton(props: {
         // that cancellation can suppress the delegated touch pointer event.
         // Splitting by pointer type also prevents a browser that emits both
         // events from activating the key twice.
-        if (
-          props.disabled ||
-          props.clickToActivate ||
-          e.pointerType === "touch"
-        )
-          return;
+        if (props.disabled || e.pointerType === "touch") return;
         props.onPress();
       }}
       on:touchstart={(e) => {
@@ -105,40 +136,12 @@ function ToolbarButton(props: {
         // on every toolbar tap.  Bound with on: so the listener sits on the
         // button: Solid's delegated onTouchStart is a document-level listener,
         // which Chromium makes passive, and a passive listener cannot
-        // preventDefault.  Click-activated buttons (Paste) are exempt:
-        // cancelling the touch would suppress the click their clipboard read
-        // is authorised by.
-        if (props.clickToActivate) return;
+        // preventDefault. Paste uses the touchend-activated TapButton above.
         e.preventDefault();
         if (!props.disabled) props.onPress();
       }}
-      onClick={() => {
-        if (!props.clickToActivate || props.disabled) return;
-        props.onPress();
-      }}
       title={props.title}
-      style={{
-        background: props.active ? props.theme.fg : props.theme.inputBg,
-        color: props.active ? props.theme.bg : props.theme.fg,
-        border: `1px solid ${props.theme.subtleBorder}`,
-        "border-radius": "4px",
-        padding: `2px ${props.wide ? 10 : 6}px`,
-        "min-width": "32px",
-        height: "30px",
-        "font-size": `${props.scale.sm}px`,
-        "font-family": "ui-monospace, monospace",
-        cursor: props.disabled ? "default" : "pointer",
-        opacity: props.disabled ? 0.4 : 1,
-        "flex-shrink": 0,
-        display: "flex",
-        "align-items": "center",
-        "justify-content": "center",
-        "user-select": "none",
-        "-webkit-user-select": "none",
-        "touch-action": "manipulation",
-        "white-space": "nowrap",
-        transition: "background 0.1s, color 0.1s, opacity 0.1s",
-      }}
+      style={style()}
     >
       {props.label}
     </button>
@@ -282,7 +285,12 @@ export function MobileToolbar(props: {
     if (!target) return;
     const terminal = terminalSurfaceForInput(target);
     if (terminal) {
-      void terminal.pasteFromClipboard();
+      // This button explicitly pastes the device clipboard. A screenshot can
+      // replace it without a DOM copy event, leaving remote ownership stale.
+      void terminal.pasteFromClipboard({
+        source: "browser",
+        preferImage: true,
+      });
       // Keep the keyboard up: some browsers move focus to the tapped button.
       terminal.focus();
       return;

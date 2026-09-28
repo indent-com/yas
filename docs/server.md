@@ -615,18 +615,10 @@ pinned to `Medium` no matter what the quality setting said — so the default
 software H.264 encode is now cheaper and slightly softer than before.
 `YAS_SURFACE_SPEED=medium` restores it.
 
-Encode time also participates in adaptive resolution. A transport can be
-completely idle while a CPU fallback spends hundreds of milliseconds encoding
-each native-resolution frame; link and decoder backlog alone cannot detect
-that case. The server tracks encode work per surface and downsizes a moving
-stream until the encoder can sustain an interactive cadence. The first encode
-after creation is excluded from that estimate because driver warmup can cost
-hundreds of milliseconds on an otherwise fast encoder. Every subsequent work
-sample counts, so sustained or alternating slow frames still trigger adaptation.
-A still surface
-continues to refine back to full resolution, and a moving stream only probes a
-larger extent when the measured encoder work has enough headroom for the
-roughly fourfold pixel cost.
+Encoded dimensions follow the requested view, source geometry, and encoder
+limits. Performance pressure never reduces resolution: slow encoders deliver
+fewer frames, while transport and decoder pressure use the existing bandwidth
+and pacing controls. Encode timings remain available in diagnostics.
 
 `YAS_H264_SOFTWARE`: pins the `h264-software` backend to `x264` or
 `openh264` when the binary carries both (dev builds with

@@ -25,6 +25,7 @@ import {
   type YasClientInfo,
 } from "@yas-run/core";
 import { t, tp } from "./i18n";
+import * as g from "@yas-run/core";
 
 export function formatTerminalViewSize(
   cols: number | null,
@@ -212,8 +213,7 @@ const FAMILY_RESOURCE: Readonly<Record<number, string>> = {
  * repeated twice.
  *
  * The resource handle belongs to the watching connection's session, so it
- * cannot be resolved to a path, prefix, or repository from here — naming what
- * the number counts is as far as this side can go.
+ * can only be resolved through the optional diagnostics supplied by its owner.
  */
 export function formatClientSubscription(
   kind: number,
@@ -221,7 +221,11 @@ export function formatClientSubscription(
   subscriptionId: number,
   detail?: Pick<
     YasClientAuxSubscription,
-    "resource" | "requestFlags" | "stateWatchFlags"
+    | "resource"
+    | "requestFlags"
+    | "stateWatchFlags"
+    | "settleMs"
+    | "refsSettleMs"
   >,
 ): string {
   const watch = tp("clients.watch", { id: subscriptionId });
@@ -243,7 +247,11 @@ function formatSubscriptionDiagnostics(
   detail:
     | Pick<
         YasClientAuxSubscription,
-        "resource" | "requestFlags" | "stateWatchFlags"
+        | "resource"
+        | "requestFlags"
+        | "stateWatchFlags"
+        | "settleMs"
+        | "refsSettleMs"
       >
     | undefined,
 ): string {
@@ -255,7 +263,9 @@ function formatSubscriptionDiagnostics(
       tp(
         kind === YAS_FAMILY_KV
           ? "clients.subscriptionPrefix"
-          : "clients.subscriptionResource",
+          : kind === YAS_FAMILY_GIT || kind === YAS_FAMILY_FS
+            ? "clients.subscriptionPath"
+            : "clients.subscriptionResource",
         { value: label },
       ),
     );
@@ -267,7 +277,10 @@ function formatSubscriptionDiagnostics(
     const flags: string[] = [];
     const requestFlags = detail.requestFlags ?? 0;
     const stateFlags = detail.stateWatchFlags ?? 0;
-    if (requestFlags !== 0)
+    if (kind === YAS_FAMILY_GIT) flags.push(...gitWatchFlags(requestFlags));
+    else if (kind === YAS_FAMILY_FS)
+      flags.push(...namedFlags(requestFlags, FS_WATCH_FLAGS));
+    else if (requestFlags !== 0)
       flags.push(
         tp("clients.subscriptionRequest", {
           value: requestFlags.toString(16),
@@ -288,7 +301,84 @@ function formatSubscriptionDiagnostics(
       }),
     );
   }
+  if (detail.settleMs !== undefined) {
+    parts.push(
+      tp("clients.subscriptionSettle", { value: String(detail.settleMs) }),
+    );
+  }
+  if (kind === YAS_FAMILY_GIT && detail.refsSettleMs !== undefined) {
+    parts.push(
+      tp("clients.subscriptionRefsSettle", {
+        value: String(detail.refsSettleMs),
+      }),
+    );
+  }
   return parts.length === 0 ? "" : ` · ${parts.join(" · ")}`;
+}
+
+const FS_WATCH_FLAGS: readonly (readonly [number, string])[] = [
+  [g.YAS_FS_WATCH_RECURSIVE, "recursive"],
+  [g.YAS_FS_WATCH_CONTENT, "content"],
+  [g.YAS_FS_WATCH_INCLUDE_HIDDEN, "hidden"],
+  [g.YAS_FS_WATCH_GITIGNORE, "gitignore"],
+  [g.YAS_FS_WATCH_DOT_IGNORE, "dot-ignore"],
+  [g.YAS_FS_WATCH_EXCLUDE_GIT, "exclude-git"],
+];
+
+const GIT_DATASETS: readonly (readonly [number, string])[] = [
+  [g.YAS_GIT_WATCH_HEAD, "head"],
+  [g.YAS_GIT_WATCH_REFS, "refs"],
+  [g.YAS_GIT_WATCH_REMOTES, "remotes"],
+  [g.YAS_GIT_WATCH_OPERATION, "operation"],
+  [g.YAS_GIT_WATCH_STATUS, "status"],
+  [g.YAS_GIT_WATCH_UPSTREAMS, "upstreams"],
+  [g.YAS_GIT_WATCH_STASHES, "stashes"],
+  [g.YAS_GIT_WATCH_WORKTREE_GENERATION, "worktrees"],
+];
+
+function namedFlags(
+  value: number,
+  names: readonly (readonly [number, string])[],
+): string[] {
+  const result: string[] = [];
+  for (const [flag, name] of names) {
+    if (value & flag) result.push(name);
+    value &= ~flag;
+  }
+  if (value) result.push(`0x${(value >>> 0).toString(16)}`);
+  return result;
+}
+
+function gitWatchFlags(value: number): string[] {
+  if (value & g.YAS_CLIENT_GIT_QUERY_WATCH) {
+    const kind = (value >>> g.YAS_CLIENT_GIT_QUERY_KIND_SHIFT) & 0x7fff;
+    const kinds: Record<number, string> = {
+      [g.YAS_GIT_QUERY_RESOLVE]: "resolve",
+      [g.YAS_GIT_QUERY_MERGE_BASE]: "merge-base",
+      [g.YAS_GIT_QUERY_LOG]: "log",
+      [g.YAS_GIT_QUERY_TREE]: "tree",
+      [g.YAS_GIT_QUERY_BLOB]: "blob",
+      [g.YAS_GIT_QUERY_DIFF]: "diff",
+      [g.YAS_GIT_QUERY_PATCH]: "patch",
+      [g.YAS_GIT_QUERY_INDEX]: "index",
+      [g.YAS_GIT_QUERY_DISCOVER]: "discover",
+      [g.YAS_GIT_QUERY_BLAME]: "blame",
+      [g.YAS_GIT_QUERY_REFLOG]: "reflog",
+      [g.YAS_GIT_QUERY_WORKTREES]: "worktrees",
+    };
+    const flags = [`query=${kinds[kind] ?? kind}`];
+    if (value & 0xffff)
+      flags.push(`query-flags=0x${(value & 0xffff).toString(16)}`);
+    return flags;
+  }
+  const selection =
+    g.YAS_CLIENT_GIT_WATCH_UNTRACKED | g.YAS_CLIENT_GIT_WATCH_IGNORED;
+  const flags = namedFlags(value & ~selection, GIT_DATASETS);
+  if (value & g.YAS_GIT_WATCH_STATUS) {
+    flags.push(`untracked=${!!(value & g.YAS_CLIENT_GIT_WATCH_UNTRACKED)}`);
+    flags.push(`ignored=${!!(value & g.YAS_CLIENT_GIT_WATCH_IGNORED)}`);
+  }
+  return flags;
 }
 
 const resourceDecoder = new TextDecoder("utf-8", { fatal: true });

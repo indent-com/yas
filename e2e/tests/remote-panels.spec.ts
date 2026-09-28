@@ -91,6 +91,7 @@ test("a remote's panels open as a pane from its Manage button, not from status-b
   const extensions = page.locator('[data-connection-tab="extensions"]');
   await expect(extensions).toHaveCount(1);
   await extensions.click();
+  await page.getByRole("button", { name: "Registry", exact: true }).click();
   const registry = page.locator("[data-registry-url]");
   await expect(registry).toBeVisible({ timeout: 5_000 });
   // Whichever registry this page can actually reach. Under `vite dev` the

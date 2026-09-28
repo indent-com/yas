@@ -1,6 +1,6 @@
 [package]
 name = "yas-compositor"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "yas headless Wayland compositor"
 license.workspace = true
@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-server = "0.31"
+yas-runtime-dir = { workspace = true }
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
 wayland-protocols-misc = { version = "0.3", features = ["server"] }
 calloop = { version = "0.14", features = ["signals"] }

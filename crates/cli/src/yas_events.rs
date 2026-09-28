@@ -59,6 +59,28 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "supervisor.event",
     "connection.accept",
     "server.error",
+    "git.watch.start",
+    "git.watch.stop",
+    "git.state",
+    "git.record",
+    "git.fs_event",
+    "fs.record",
+    "fs.event",
+    "fs.watch.start",
+    "fs.watch.stop",
+    "fs.state",
+    "frame.native.read",
+    "frame.native.write",
+    "payload.native.read",
+    "payload.native.write",
+    "state.record.read",
+    "state.record.write",
+    "client.native.connect",
+    "client.native.disconnect",
+    "client.native.error",
+    "datagram.native.read",
+    "datagram.native.write",
+    "datagram.native.drop",
 ];
 
 pub(crate) async fn dispatch(
@@ -450,8 +472,10 @@ fn parse_activation_spec(spec: &str) -> Result<events::ActivationSet, String> {
             "none" => {}
             "default" if enabled => set = events::ActivationSet::low_throughput(),
             "default" => {
-                for id in 0..16 {
-                    set.set(id, false);
+                for id in 0..EVENT_NAMES.len() as u16 {
+                    if events::ActivationSet::low_throughput().enabled(id) {
+                        set.set(id, false);
+                    }
                 }
             }
             _ => {

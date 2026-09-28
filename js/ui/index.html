@@ -8,10 +8,7 @@
     />
     <meta name="theme-color" content="#000" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta
-      name="apple-mobile-web-app-status-bar-style"
-      content="black-translucent"
-    />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <meta name="mobile-web-app-capable" content="yes" />
     <title>YAS</title>
     <link
@@ -40,7 +37,7 @@
       body,
       #root {
         width: 100%;
-        height: 100%;
+        height: var(--yas-shell-height, 100%);
         background: var(--yas-system-bar-background);
         overflow: hidden;
         /* Unlike hidden, clip also forbids focus/scrollIntoView from moving
@@ -59,14 +56,15 @@
       body {
         /* iPadOS can pan the document despite overflow being disabled,
            especially around keyboard/browser-chrome viewport changes. */
-        position: fixed;
+        position: var(--yas-shell-position, fixed);
         inset: 0;
       }
       #root {
         /* Keep the root out of the unsafe top/side areas, but let the bottom
            chrome own the bottom inset so it can paint behind the home area. */
-        padding: var(--yas-system-bar-inset-top) env(safe-area-inset-right) 0
-          env(safe-area-inset-left);
+        padding: var(--yas-system-bar-inset-top)
+          var(--yas-safe-area-right, env(safe-area-inset-right)) 0
+          var(--yas-safe-area-left, env(safe-area-inset-left));
       }
       #yas-system-bar-background {
         display: none;
@@ -94,11 +92,31 @@
         }
       }
       @supports (height: 100dvh) {
-        html,
-        body,
-        #root {
-          height: 100dvh;
+        :root {
+          --yas-shell-height: 100dvh;
         }
+      }
+      /* iOS standalone uses viewport-fit=contain (set before mounting the app).
+         Keep the body in normal flow without an extra anti-blur spacer. */
+      @supports (-webkit-touch-callout: none) {
+        @media (display-mode: standalone) {
+          :root {
+            --yas-shell-position: static;
+            --yas-system-bar-inset-top: env(safe-area-inset-top);
+          }
+        }
+        :root[data-yas-standalone] {
+          --yas-shell-position: static;
+          --yas-system-bar-inset-top: env(safe-area-inset-top);
+        }
+      }
+      /* The native contained viewport already excludes these areas. Some
+         WebKit versions still return their physical env() sizes afterwards. */
+      :root[data-yas-contained-viewport] {
+        --yas-system-bar-inset-top: 0px;
+        --yas-safe-area-right: 0px;
+        --yas-safe-area-left: 0px;
+        --yas-safe-area-bottom: 0px;
       }
     </style>
   </head>

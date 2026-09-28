@@ -18,6 +18,13 @@ import { YasDisconnectedError, YasProtocolError } from "./wire";
 
 const encoder = new TextEncoder();
 
+export type YasNativeExtensionInstallStage =
+  | "checking"
+  | "downloading"
+  | "uploading"
+  | "deploying"
+  | "waiting";
+
 export interface YasNativeExtensionInstallRequest {
   contentHash: Uint8Array;
   name: string;
@@ -30,6 +37,7 @@ export interface YasNativeExtensionInstallRequest {
   expectedExtensionHandle?: bigint;
   expectedGeneration?: bigint;
   expectedDefinitionRevision?: bigint;
+  onProgress?: (stage: YasNativeExtensionInstallStage) => void;
 }
 
 type YasNativeExtensionConnection = Pick<
@@ -73,6 +81,16 @@ export class YasNativeExtensionFacade {
     return (await this.client.list()).definitions;
   }
 
+  /** Observe the catalogue kept live by listExtensions; zero is invalidation. */
+  subscribeExtensions(
+    listener: (records: readonly YasExtensionRecord[] | null) => void,
+  ): () => void {
+    this.assertOpen();
+    return this.client.catalog.subscribe((snapshot) =>
+      listener(snapshot.revision === 0n ? null : snapshot.definitions),
+    );
+  }
+
   async controlExtension(
     extensionHandle: bigint,
     action: number,
@@ -87,7 +105,19 @@ export class YasNativeExtensionFacade {
       operationId: randomOperationId(),
       action,
     });
-    if (action === g.YAS_EXTENSION_CONTROL_REMOVE) return null;
+    if (action === g.YAS_EXTENSION_CONTROL_REMOVE) {
+      // The successful result can overtake the catalogue's REMOVE. Do not
+      // report completion while listExtensions can still return this handle.
+      await this.waitForCatalog((snapshot) =>
+        snapshot.revision !== 0n &&
+        !snapshot.definitions.some(
+          (record) => record.extensionHandle === identity.extensionHandle,
+        )
+          ? true
+          : undefined,
+      );
+      return null;
+    }
     return this.waitForIdentity(identity);
   }
 
@@ -95,6 +125,7 @@ export class YasNativeExtensionFacade {
     request: YasNativeExtensionInstallRequest,
   ): Promise<YasExtensionRecord> {
     this.assertOpen();
+    request.onProgress?.("checking");
     if (
       request.contentHash.length !== 32 ||
       request.contentHash.every((byte) => byte === 0)
@@ -124,7 +155,10 @@ export class YasNativeExtensionFacade {
 
     let module: Uint8Array | undefined;
     const objectBytes = async (): Promise<Uint8Array> => {
-      module ??= new Uint8Array(await request.module());
+      if (!module) {
+        request.onProgress?.("downloading");
+        module = new Uint8Array(await request.module());
+      }
       if (
         module.length === 0 ||
         BigInt(module.length) >
@@ -147,6 +181,7 @@ export class YasNativeExtensionFacade {
     // when the server already has them.
     if (currentHash && !sameBytes(currentHash, request.contentHash)) {
       const bytes = await objectBytes();
+      request.onProgress?.("uploading");
       await this.client.uploadObject(
         {
           operationId: randomOperationId(),
@@ -159,6 +194,7 @@ export class YasNativeExtensionFacade {
       this.assertOpen();
     }
     for (let attempt = 0; attempt < 3; attempt++) {
+      request.onProgress?.("deploying");
       const identity = await this.client.deploy({
         operationId: randomOperationId(),
         expectedExtensionHandle: expectedHandle,
@@ -178,6 +214,7 @@ export class YasNativeExtensionFacade {
         runtimeLimits: request.runtimeLimits ?? defaultRuntimeLimits(),
       });
       this.assertOpen();
+      request.onProgress?.("waiting");
       const record = await this.waitForIdentity(identity);
       if (record.phase !== g.YAS_EXTENSION_PHASE_NEED_OBJECT) {
         if (!sameBytes(record.contentHash, request.contentHash))
@@ -188,6 +225,7 @@ export class YasNativeExtensionFacade {
       }
 
       const bytes = await objectBytes();
+      request.onProgress?.("uploading");
       await this.client.uploadObject(
         {
           operationId: randomOperationId(),
@@ -249,13 +287,20 @@ export class YasNativeExtensionFacade {
         return undefined;
       return record;
     };
-    const immediate = match(this.client.catalog.snapshot.definitions);
-    if (immediate) return Promise.resolve(immediate);
+    return this.waitForCatalog((snapshot) => match(snapshot.definitions));
+  }
+
+  private waitForCatalog<T>(
+    match: (snapshot: YasExtensionSnapshot) => T | undefined,
+  ): Promise<T> {
+    this.assertOpen();
+    const immediate = match(this.client.catalog.snapshot);
+    if (immediate !== undefined) return Promise.resolve(immediate);
     return new Promise((resolve, reject) => {
       let removeCatalog: (() => void) | undefined;
       let removeInvalidation: (() => void) | undefined;
       let settled = false;
-      const finish = (record?: YasExtensionRecord, error?: unknown) => {
+      const finish = (record?: T, error?: unknown) => {
         if (settled) return;
         settled = true;
         removeCatalog?.();
@@ -268,12 +313,17 @@ export class YasNativeExtensionFacade {
       this.pendingIdentityCancels.add(cancel);
       removeCatalog = this.client.catalog.subscribe((snapshot) => {
         try {
-          const record = match(snapshot.definitions);
-          if (record) finish(record);
+          const record = match(snapshot);
+          if (record !== undefined) finish(record);
         } catch (error) {
           finish(undefined, error);
         }
       });
+      // Catalogue subscriptions may synchronously deliver the matching state.
+      if (settled) {
+        removeCatalog();
+        return;
+      }
       removeInvalidation = this.connection.onInvalidation(({ family }) => {
         if (family === undefined || family === g.YAS_FAMILY_EXTENSION)
           finish(

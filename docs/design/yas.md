@@ -636,6 +636,16 @@ list. The list is the symmetric intersection usable for generic compression in
 either direction. Absence means no generic compression codec was negotiated.
 An endpoint MUST NOT set COMPRESSED with a codec outside this list.
 
+HELLO Result optional extension tag 4 is `extension_support`, one little-endian
+`u32` bitmask. Bit 0 permits persistent extension definitions, bit 1 supports
+Wasmi, bit 2 supports QuickJS, and bit 3 supports command registration by an
+extension attempt. These are host policy/runtime facts, not a grant to call
+attempt-only operations from a browser session. The server emits this extension
+only when the Extension family is selected. Clients still check that family's
+runtime state, operations, and limits. Unrecognized bits are ignored; an absent
+or malformed value means support is unknown. This allows installation offers to
+check policy without deploying a trial extension.
+
 The HELLO Result completes the negotiation. The client may immediately send
 other selected-family Requests. There is no READY message and no implicit
 server catalog burst; initial state is sent only when HELLO explicitly asks for

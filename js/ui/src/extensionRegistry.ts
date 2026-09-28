@@ -20,8 +20,14 @@ import {
   parseModuleDigest,
   yasExtensionHashHex,
   type YasExtensionRecord,
+  type YasNativeExtensionInstallRequest,
+  type YasNativeExtensionInstallStage,
 } from "@yas-run/core";
 import { tp } from "./i18n";
+import {
+  parseRequirements,
+  type ExtensionRequirements,
+} from "./extensionViability";
 
 export const PUBLIC_REGISTRY = "https://yas.run/ext";
 
@@ -56,6 +62,7 @@ export interface RegistryEntry {
   readonly blake3: string;
   readonly bytes: number;
   readonly brotliBytes: number;
+  readonly requirements?: ExtensionRequirements;
 }
 
 export interface Registry {
@@ -68,16 +75,12 @@ export interface Registry {
 export interface ExtensionHost {
   readonly native: unknown;
   listExtensions(): Promise<readonly YasExtensionRecord[]>;
-  installExtension(request: {
-    contentHash: Uint8Array;
-    name: string;
-    module: () => Promise<Uint8Array>;
-    args?: readonly string[];
-    restartPolicy?: number;
-    expectedExtensionHandle?: bigint;
-    expectedGeneration?: bigint;
-    expectedDefinitionRevision?: bigint;
-  }): Promise<YasExtensionRecord>;
+  subscribeExtensions(
+    listener: (records: readonly YasExtensionRecord[] | null) => void,
+  ): () => void;
+  installExtension(
+    request: YasNativeExtensionInstallRequest,
+  ): Promise<YasExtensionRecord>;
   controlExtension(
     extensionHandle: bigint,
     action: number,
@@ -93,6 +96,7 @@ export function nativeExtensionHost(value: unknown): ExtensionHost | null {
     value === null ||
     !("native" in value) ||
     typeof (value as ExtensionHost).listExtensions !== "function" ||
+    typeof (value as ExtensionHost).subscribeExtensions !== "function" ||
     typeof (value as ExtensionHost).installExtension !== "function" ||
     typeof (value as ExtensionHost).controlExtension !== "function"
   )
@@ -217,6 +221,7 @@ function entryOf(value: unknown): RegistryEntry | null {
     bytes: typeof record.bytes === "number" ? record.bytes : 0,
     brotliBytes:
       typeof record.brotli_bytes === "number" ? record.brotli_bytes : 0,
+    requirements: parseRequirements(record.requirements),
   };
 }
 
@@ -270,7 +275,9 @@ export async function installFromRegistry(
   registry: Registry,
   entry: RegistryEntry,
   fetcher: typeof fetch = fetch,
+  onProgress?: (stage: YasNativeExtensionInstallStage) => void,
 ): Promise<YasExtensionRecord> {
+  onProgress?.("checking");
   const hash = parseModuleDigest(entry.blake3);
   if (!hash)
     throw new Error(tp("extensions.invalidDigest", { name: entry.name }));
@@ -280,6 +287,7 @@ export async function installFromRegistry(
       record.name === entry.name,
   );
   return host.installExtension({
+    onProgress,
     contentHash: hash,
     name: entry.name,
     restartPolicy: YAS_EXTENSION_RESTART_ALWAYS,
@@ -312,16 +320,19 @@ export async function disableAndRemoveExtension(
   host: ExtensionHost,
   record: YasExtensionRecord,
   wait: (milliseconds: number) => Promise<void> = pause,
+  onProgress?: (stage: "disabling" | "stopping" | "removing") => void,
 ): Promise<void> {
+  onProgress?.("disabling");
   await host.controlExtension(
     record.extensionHandle,
     YAS_EXTENSION_CONTROL_DISABLE,
   );
+  onProgress?.("stopping");
   for (let attempt = 0; ; attempt++) {
     const status = (await host.listExtensions()).find(
-      (candidate) =>
-        candidate.extensionHandle === record.extensionHandle &&
-        candidate.generation === record.generation,
+      // Stop/disable advance generation. The handle identifies the definition
+      // being removed; a newer generation is still that same definition.
+      (candidate) => candidate.extensionHandle === record.extensionHandle,
     );
     if (!status) return;
     if (
@@ -335,6 +346,7 @@ export async function disableAndRemoveExtension(
     }
     await wait(50);
   }
+  onProgress?.("removing");
   await host.controlExtension(
     record.extensionHandle,
     YAS_EXTENSION_CONTROL_REMOVE,

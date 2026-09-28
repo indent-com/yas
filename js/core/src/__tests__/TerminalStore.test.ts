@@ -7,6 +7,8 @@ import {
   type TerminalStoreDelegate,
 } from "../TerminalStore";
 import type { GlRenderer } from "../gl-renderer";
+import { YasTerminalSurface } from "../YasTerminalSurface";
+import * as measure from "../measure";
 
 class FakeTerminal {
   constructor(_rows: number, _cols: number, _cellPw: number, _cellPh: number) {}
@@ -538,4 +540,84 @@ describe("TerminalStore native semantic delegate", () => {
     expect(store.getTerminal(handle)).not.toBeNull();
     store.destroy();
   });
+});
+
+describe("TerminalStore teardown", () => {
+  class CheckedTerminal extends FakeTerminal {
+    freed = false;
+    free = vi.fn(() => {
+      if (this.freed) throw new Error("terminal freed twice");
+      this.freed = true;
+    });
+    keyboard_flags(): number {
+      if (this.freed) throw new Error("null pointer passed to rust");
+      return 11;
+    }
+  }
+  const checkedWasm = { Terminal: CheckedTerminal } as unknown as YasWasmModule;
+
+  it("keeps shared terminals alive until the last surface releases them", () => {
+    const store = new TerminalStore(semanticDelegate(), checkedWasm);
+    store.handleUpdate(1n, new Uint8Array());
+    store.handleUpdate(2n, new Uint8Array());
+    const shared = store.getTerminal(1n) as unknown as CheckedTerminal;
+    const unretained = store.getTerminal(2n) as unknown as CheckedTerminal;
+    store.retain(1n);
+    store.retain(1n);
+
+    store.destroy();
+    store.destroy();
+    expect(unretained.free).toHaveBeenCalledOnce();
+    expect(shared.keyboard_flags()).toBe(11);
+    store.release(1n);
+    expect(shared.keyboard_flags()).toBe(11);
+    store.release(1n);
+    expect(shared.free).toHaveBeenCalledOnce();
+    expect(store.getTerminal(1n)).toBeNull();
+
+    // An in-flight frame must not resurrect a terminal after teardown.
+    store.handleUpdate(1n, new Uint8Array());
+    expect(store.getTerminal(1n)).toBeNull();
+  });
+
+  it.each(["store", "surface"])(
+    "can clean up keyboard listeners with %s disposed first",
+    (first) => {
+      const cellMeasure = vi.spyOn(measure, "measureCell").mockReturnValue({
+        w: 8,
+        h: 16,
+        pw: 8,
+        ph: 16,
+      });
+      const store = new TerminalStore(semanticDelegate(), checkedWasm);
+      store.handleUpdate(1n, new Uint8Array());
+      const terminal = store.getTerminal(1n)!;
+      const surface = new YasTerminalSurface({ sessionId: "s1" });
+      surface["_yasConn"] = {
+        transport: { status: "disconnected" },
+        release: () => store.release(1n),
+      } as never;
+      store.retain(1n);
+      surface["terminal"] = terminal;
+      surface["inputEl"] = document.createElement("textarea");
+      surface["setupKeyboard"]();
+
+      try {
+        if (first === "store") {
+          store.destroy();
+          // Blur/visibility callbacks also run between connection and pane cleanup.
+          expect(() => surface["boundKeyboardBlur"]?.()).not.toThrow();
+        }
+        expect(() => surface.dispose()).not.toThrow();
+        store.destroy();
+        expect(terminal.free).toHaveBeenCalledOnce();
+      } finally {
+        // Also remove global keyboard listeners when the regression fails.
+        surface["terminal"] = null;
+        surface.dispose();
+        store.destroy();
+        cellMeasure.mockRestore();
+      }
+    },
+  );
 });

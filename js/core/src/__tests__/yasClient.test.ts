@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
+  YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_ORIGIN_EXTENSION,
   YAS_FAMILY_FS,
   YasProtocolError,
   YasWriter,
   decodeClientActiveSubscriptions,
   decodeClientAuxiliarySubscriptionDetails,
+  decodeClientAuxiliarySubscriptionTimings,
   type YasClientRecord,
 } from "../yas";
 
@@ -33,6 +35,45 @@ function activeSubscriptionsValue(): Uint8Array {
     .u64(30n)
     .finish();
 }
+
+describe("Client watch timings", () => {
+  it("decodes timing values and rejects malformed or duplicate entries", () => {
+    const entry = new YasWriter()
+      .u16(YAS_FAMILY_FS)
+      .u16(0)
+      .u32(9)
+      .u16(17)
+      .u16(0)
+      .finish();
+    const decode = (value: Uint8Array) =>
+      decodeClientAuxiliarySubscriptionTimings([
+        {
+          tag: YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
+          required: false,
+          value,
+        },
+      ]);
+    const bytes = new Uint8Array([1, 0, 0, 0, ...entry]);
+    expect(decode(bytes)).toEqual({
+      entries: [
+        {
+          family: YAS_FAMILY_FS,
+          refsSettleMs: 0,
+          subscriptionId: 9,
+          settleMs: 17,
+        },
+      ],
+    });
+    for (let length = 0; length < bytes.length; length++)
+      expect(() => decode(bytes.slice(0, length))).toThrow();
+    expect(() =>
+      decode(new Uint8Array([2, 0, 0, 0, ...entry, ...entry])),
+    ).toThrow();
+    bytes[bytes.length - 1] = 1;
+    expect(() => decode(bytes)).toThrow();
+    expect(decodeClientAuxiliarySubscriptionTimings([])).toBeNull();
+  });
+});
 
 function clientRecord(): YasClientRecord {
   return {
@@ -72,6 +113,7 @@ function clientRecord(): YasClientRecord {
       ],
     },
     auxiliarySubscriptionDetails: null,
+    auxiliarySubscriptionTimings: null,
     bandwidthRates: null,
   };
 }

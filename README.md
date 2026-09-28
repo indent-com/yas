@@ -142,6 +142,10 @@ yas client list
 yas client disconnect "$SESSION_ID" --reason "duplicate browser tab"
 ```
 
+Manage → Clients shows Git/FS watch paths, effective flags, and resolved settle
+delays. Use the [event journal](docs/events.md) to trace native requests, results,
+individual state records, raw filesystem notifications, and transport traffic.
+
 In the browser, open the Ctrl/Cmd-K menu and choose **Connected clients** to
 see a live list of every client's age, measured outbound bandwidth, audio,
 filesystem, Git, LSP, KV, network, terminal, and surface subscriptions. Terminal

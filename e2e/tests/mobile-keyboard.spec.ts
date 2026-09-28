@@ -468,10 +468,10 @@ test("key-line taps cancel the touch so the keyboard stays up", async ({
   await expect(input).toBeFocused();
   await expect(keyLine).toBeVisible();
 
-  // Paste is the one exception: its clipboard read is authorised by a genuine
-  // click, which a cancelled touch would suppress.
+  // Paste keeps focus too, then authorizes its clipboard read directly in
+  // touchend without relying on the later compatibility click.
   await page.getByRole("button", { name: "Paste" }).tap();
-  expect(await touchCancelled()).toBe(false);
+  expect(await touchCancelled()).toBe(true);
 });
 
 /**

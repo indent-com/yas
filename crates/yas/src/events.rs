@@ -166,7 +166,18 @@ pub struct ActivationSet(pub [u64; ACTIVATION_WORDS]);
 
 impl ActivationSet {
     pub const fn low_throughput() -> Self {
-        Self([u16::MAX as u64, 0, 0, 0])
+        Self([
+            u16::MAX as u64
+                | (1 << crate::schema::events::EVENT_GIT_WATCH_START)
+                | (1 << crate::schema::events::EVENT_GIT_WATCH_STOP)
+                | (1 << crate::schema::events::EVENT_FS_WATCH_START)
+                | (1 << crate::schema::events::EVENT_FS_WATCH_STOP),
+            (1 << (crate::schema::events::EVENT_NATIVE_CONNECT - 64))
+                | (1 << (crate::schema::events::EVENT_NATIVE_DISCONNECT - 64))
+                | (1 << (crate::schema::events::EVENT_NATIVE_ERROR - 64)),
+            0,
+            0,
+        ])
     }
 
     pub const fn all() -> Self {
@@ -1077,7 +1088,7 @@ impl Decode for StreamStopped {
 }
 
 fn known_event(event_id: u32) -> bool {
-    event_id <= crate::schema::events::EVENT_SERVER_ERROR as u32
+    event_id <= crate::schema::events::EVENT_NATIVE_DATAGRAM_DROP as u32
 }
 
 fn validate_path(path: &[u8]) -> Result<()> {

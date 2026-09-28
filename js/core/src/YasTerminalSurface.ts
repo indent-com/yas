@@ -59,6 +59,7 @@ export interface LinkHover {
 /** Screenshots land far below this; anything above it is not something a
  *  paste should risk the session on. */
 const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
+const CLIPBOARD_IMAGE_TYPES = ["image/png", "image/webp", "image/jpeg"];
 
 interface ClipboardTextReservation {
   finish(text: string): Promise<void>;
@@ -885,20 +886,23 @@ export class YasTerminalSurface {
    * Read text from the active clipboard and send it to the focused session,
    * wrapped in bracketed-paste markers when the terminal is in
    * bracketed-paste mode. A Wayland-owned selection is read directly through
-   * the connection; otherwise `navigator.clipboard.readText` must be invoked
+   * the connection; otherwise `navigator.clipboard.read` must be invoked
    * from a user gesture in browsers that gate it. Returns the pasted text, or
    * null when nothing is available. An image-only browser clipboard (e.g. a
    * fresh phone screenshot) is forwarded to the server clipboard instead,
    * followed by a ^V so the app reads it — the same convention as the Ctrl+V
-   * paste-event path.
+   * paste-event path. Explicit device-clipboard actions can bypass remembered
+   * Wayland ownership and prefer an image over an accompanying text format.
    */
-  async pasteFromClipboard(): Promise<string | null> {
+  async pasteFromClipboard(
+    options: { source?: "active" | "browser"; preferImage?: boolean } = {},
+  ): Promise<string | null> {
     if (this._readOnly) return null;
     if (this._sessionId === null || this.status !== "connected") return null;
     const clipboardOperation = ++this._clipboardOperation;
     const sid = this._sessionId;
     const conn = this._yasConn;
-    if (conn?.usesWaylandClipboard?.()) {
+    if (options.source !== "browser" && conn?.usesWaylandClipboard?.()) {
       const text = await conn.readWaylandClipboardText();
       if (
         this._clipboardOperation !== clipboardOperation ||
@@ -917,18 +921,55 @@ export class YasTerminalSurface {
       if (conn.usesWaylandClipboard()) return null;
     }
     let text = "";
-    try {
-      text = await navigator.clipboard.readText();
-    } catch {
-      // readText rejects for image-only clipboards on some browsers; the
-      // image attempt below is the fallback.
+    let items: ClipboardItem[] = [];
+    if (typeof navigator.clipboard?.read === "function") {
+      // One read, started in the Paste tap's user activation. Reading text
+      // first and awaiting it before read() loses iOS clipboard authorization
+      // for screenshots (and can ask the user to authorize the same paste twice).
+      try {
+        items = await navigator.clipboard.read();
+      } catch {
+        return null;
+      }
+      if (this._clipboardOperation !== clipboardOperation) return null;
+      if (
+        options.preferImage &&
+        items.some((item) =>
+          CLIPBOARD_IMAGE_TYPES.some((mime) => item.types.includes(mime)),
+        )
+      ) {
+        // Once an image is selected, a failed transfer must not silently paste
+        // a different text representation (or stale remote text) instead.
+        await this.pasteClipboardImage(items, clipboardOperation);
+        return null;
+      }
+      const item = items.find((item) => item.types.includes("text/plain"));
+      if (item) {
+        try {
+          text = await (await item.getType("text/plain")).text();
+        } catch {
+          // An unreadable text representation can still have a usable image.
+        }
+      }
+    } else {
+      // Text-only fallback for browsers without the structured clipboard API.
+      try {
+        text = await navigator.clipboard.readText();
+      } catch {
+        return null;
+      }
     }
-    if (this._clipboardOperation !== clipboardOperation) return null;
+    if (
+      this._clipboardOperation !== clipboardOperation ||
+      this._sessionId !== sid ||
+      this.status !== "connected"
+    )
+      return null;
     if (text) {
       this.pasteText(text);
       return text;
     }
-    await this.pasteImageFromClipboard(clipboardOperation);
+    await this.pasteClipboardImage(items, clipboardOperation);
     return null;
   }
 
@@ -936,23 +977,17 @@ export class YasTerminalSurface {
    *  pushing it to the server clipboard and triggering the app's read with
    *  ^V — the same convention as the Ctrl+V paste-event path.  Returns true
    *  when an image was forwarded. */
-  private async pasteImageFromClipboard(
+  private async pasteClipboardImage(
+    items: ClipboardItem[],
     clipboardOperation: number,
   ): Promise<boolean> {
-    if (typeof navigator.clipboard.read !== "function") return false;
     const conn = this._yasConn;
     const sid = this._sessionId;
     if (!conn || sid === null) return false;
-    let items: ClipboardItem[];
-    try {
-      items = await navigator.clipboard.read();
-    } catch {
-      return false; // empty clipboard, or read() rejected
-    }
     if (this._clipboardOperation !== clipboardOperation) return false;
     // Same preference order as YasSurfaceCanvas: PNG is what every toolkit
     // asks for.
-    for (const mime of ["image/png", "image/webp", "image/jpeg"]) {
+    for (const mime of CLIPBOARD_IMAGE_TYPES) {
       const item = items.find((i) => i.types.includes(mime));
       if (!item) continue;
       try {
@@ -2776,17 +2811,19 @@ export class YasTerminalSurface {
 
       // A Wayland copy need not reach the host clipboard (Brave can deny the
       // export). Cmd+V must read it here: an empty host clipboard may produce
-      // no native paste event at all. Browser-owned Cmd+V still uses that event
-      // below, without requiring navigator.clipboard.readText permission.
+      // no native paste event at all. Browser-owned Cmd+V uses that event
+      // without requiring navigator.clipboard.readText permission. Reserve the
+      // chord in enhanced keyboard modes too, rather than encoding Super+V.
       if (
         e.metaKey &&
         !e.ctrlKey &&
         !e.altKey &&
-        (e.key === "v" || e.key === "V") &&
-        this._yasConn?.usesWaylandClipboard?.()
+        (e.key === "v" || e.key === "V")
       ) {
-        e.preventDefault();
-        if (!e.repeat) void this.pasteFromClipboard();
+        if (this._yasConn?.usesWaylandClipboard?.()) {
+          e.preventDefault();
+          if (!e.repeat) void this.pasteFromClipboard();
+        }
         return;
       }
 

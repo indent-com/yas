@@ -7,6 +7,7 @@
 //! handlers callable from any thread. Everything is built on gitoxide and
 //! returns or streams owned semantic values.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,22 @@ mod state;
 pub use state::{StateHandle, StateOptions};
 #[doc(hidden)]
 pub use state::{debug_engine_refs, debug_status_recomputes, debug_worktree_watches};
+
+/// The slash-separated Git path of `abs` relative to `workdir`, if any.
+/// On Windows this converts backslashes so that ignore rules and index
+/// lookups, which both use Git's forward-slash convention, see the same
+/// path shape.
+pub(crate) fn worktree_relative_git_path<'a>(
+    abs: &'a Path,
+    workdir: &Path,
+) -> Option<Cow<'a, gix::bstr::BStr>> {
+    let rel = abs.strip_prefix(workdir).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    let rel = gix::path::os_str_into_bstr(rel.as_os_str()).ok()?;
+    Some(gix::path::to_unix_separators_on_windows(rel))
+}
 
 /// Cooperative cancellation for one in-flight request (`GIT_CANCEL`).
 #[derive(Clone, Default)]

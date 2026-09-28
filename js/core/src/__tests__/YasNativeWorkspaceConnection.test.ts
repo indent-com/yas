@@ -66,7 +66,11 @@ import {
 } from "../yas/wire";
 import { CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264 } from "../surfaceModel";
 import { SurfaceStore } from "../SurfaceStore";
-import { YasSurfaceClient, type YasSurfaceView } from "../yas/surface";
+import {
+  YasSurfaceClient,
+  surfaceDirectTouch,
+  type YasSurfaceView,
+} from "../yas/surface";
 import { currentBrowserClipboardEpoch } from "../clipboardAuthority";
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -162,6 +166,7 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
     surfaceStreamingEnabled: true,
     displayFps: 120,
     surfaceMaxFps: 0,
+    surfaceTouchUsers: 0,
     surfaceRecords: new Map([
       [
         1n,
@@ -199,6 +204,48 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
 }
 
 describe("YasNativeWorkspaceConnection", () => {
+  it.each([0, 5])(
+    "advertises direct touch only for active touch viewers (%i contacts)",
+    async (maxTouchPoints) => {
+      vi.stubGlobal("navigator", { maxTouchPoints });
+      try {
+        const view = surfaceTestView(YAS_SURFACE_CODEC_H264_V1);
+        const openView = vi.fn().mockResolvedValue(view);
+        const { connection, lifecycle } = surfaceTestConnection(openView);
+        await lifecycle.refreshNativeSurfaceView(1n);
+        expect(surfaceDirectTouch(openView.mock.calls[0][0].extensions)).toBe(
+          false,
+        );
+
+        connection.acquireSurfaceTouch();
+        connection.acquireSurfaceTouch();
+        await lifecycle.refreshNativeSurfaceView(1n);
+        if (maxTouchPoints === 0) {
+          expect(view.configure).not.toHaveBeenCalled();
+        } else {
+          expect(
+            surfaceDirectTouch(view.configure.mock.calls[0][0].extensions),
+          ).toBe(true);
+          view.configure.mockClear();
+        }
+        connection.releaseSurfaceTouch();
+        await lifecycle.refreshNativeSurfaceView(1n);
+        expect(view.configure).not.toHaveBeenCalled();
+        connection.releaseSurfaceTouch();
+        await lifecycle.refreshNativeSurfaceView(1n);
+        if (maxTouchPoints > 0) {
+          expect(
+            surfaceDirectTouch(view.configure.mock.calls[0][0].extensions),
+          ).toBe(false);
+        } else {
+          expect(view.configure).not.toHaveBeenCalled();
+        }
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it.each(["terminal", "surface"])(
     "retains %s presentation during catalogue invalidation and rewatch",
     async (family) => {
@@ -447,6 +494,44 @@ describe("YasNativeWorkspaceConnection", () => {
       [1],
       [2],
     ]);
+  });
+
+  it("commits a screenshot upload with the operation ID that began it", async () => {
+    vi.doMock("@yas-run/browser", () => ({
+      blake3_hash: () => new Uint8Array(32),
+    }));
+    const write = vi.fn().mockResolvedValue(undefined);
+    const closeWrite = vi.fn();
+    const beginSet = vi.fn().mockResolvedValue({
+      stagingHandle: 42n,
+      transfers: [{ write, closeWrite, closed: Promise.resolve() }],
+    });
+    const commitSet = vi.fn().mockResolvedValue(1n);
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection, {
+      selectionClient: { beginSet, commitSet },
+      selectionWrites: new Map(),
+      waylandClipboardExpected: false,
+    });
+    const screenshot = new Uint8Array(300_000).fill(123);
+    try {
+      await connection.sendClipboard("image/png", screenshot);
+      expect(beginSet).toHaveBeenCalledOnce();
+      expect(write).toHaveBeenCalledWith(screenshot);
+      expect(closeWrite).toHaveBeenCalledOnce();
+      // The server rejects SET_COMMIT with CONFLICT if this identity changes.
+      expect(commitSet).toHaveBeenCalledExactlyOnceWith(
+        42n,
+        beginSet.mock.calls[0][1],
+      );
+      expect(closeWrite.mock.invocationCallOrder[0]).toBeLessThan(
+        commitSet.mock.invocationCallOrder[0],
+      );
+    } finally {
+      vi.doUnmock("@yas-run/browser");
+    }
   });
 
   it("reserves a host clipboard write until the Wayland selection arrives", async () => {

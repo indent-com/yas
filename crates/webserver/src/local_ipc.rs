@@ -5,8 +5,13 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+// The owner-only directory policy is shared with the compositor, which needs
+// the same guarantee for its Wayland socket and cannot depend on this crate.
+pub use yas_runtime_dir::effective_uid;
+use yas_runtime_dir::{BasePolicy, runtime_dir_for_base};
 
 pub const EXPECTED_SERVER_UID_ENV: &str = "YAS_SERVER_UID";
 
@@ -19,11 +24,6 @@ const PORTABLE_SOCKET_PATH_BYTES: usize = 103;
 // path for longer names.
 const SOCKET_TEMPLATE_MARKER: &str = "marker";
 pub const SOCKET_NAME_PLACEHOLDER: &str = "{name}";
-
-pub fn effective_uid() -> u32 {
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
-}
 
 /// Expected kernel peer UID for the fixed native YAS home server.
 ///
@@ -425,77 +425,6 @@ fn automatic_socket_path_from(
         .into_owned()
 }
 
-#[derive(Clone, Copy)]
-enum BasePolicy {
-    PrivateOnly,
-    PrivateOrSticky,
-}
-
-fn runtime_dir_for_base(base: &Path, uid: u32, policy: BasePolicy) -> Option<PathBuf> {
-    if !normal_absolute_path(base) {
-        return None;
-    }
-    let metadata = std::fs::symlink_metadata(base).ok()?;
-    if !metadata.file_type().is_dir() {
-        return None;
-    }
-
-    let private = metadata.uid() == uid && metadata.mode() & 0o077 == 0;
-    let sticky_shared = matches!(policy, BasePolicy::PrivateOrSticky)
-        && metadata.uid() == 0
-        && u64::from(metadata.mode()) & u64::from(libc::S_ISVTX) != 0
-        && metadata.mode() & 0o002 != 0;
-    let runtime_dir = if private {
-        base.join("yas")
-    } else if sticky_shared {
-        base.join(format!("yas-{uid}"))
-    } else {
-        return None;
-    };
-    prepare_private_runtime_dir(&runtime_dir, uid).ok()?;
-    Some(runtime_dir)
-}
-
-fn prepare_private_runtime_dir(path: &Path, uid: u32) -> io::Result<()> {
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "IPC runtime path is not a directory",
-        ));
-    }
-    if metadata.uid() != uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "IPC runtime directory is not owned by the effective user",
-        ));
-    }
-    if metadata.mode() & 0o777 != 0o700 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let checked = std::fs::symlink_metadata(path)?;
-    if !checked.file_type().is_dir() || checked.uid() != uid || checked.mode() & 0o777 != 0o700 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "IPC runtime directory failed its owner-only check",
-        ));
-    }
-    Ok(())
-}
-
-fn normal_absolute_path(path: &Path) -> bool {
-    path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
-}
-
 fn portable_socket_path(path: &Path) -> bool {
     path.to_str().is_some() && path.as_os_str().as_bytes().len() <= PORTABLE_SOCKET_PATH_BYTES
 }
@@ -512,7 +441,6 @@ fn safe_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
 
     fn assert_template_parity(
         expected_parent: &Path,
@@ -640,24 +568,6 @@ mod tests {
             root.path().join("unused"),
         );
         assert!(Path::new(&path).starts_with(run_user.join("yas")));
-    }
-
-    #[test]
-    fn malicious_prebound_runtime_symlink_is_rejected() {
-        let base = tempfile::tempdir().unwrap();
-        let target = base.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        let runtime = base.path().join("yas");
-        symlink(&target, &runtime).unwrap();
-        assert!(prepare_private_runtime_dir(&runtime, effective_uid()).is_err());
-    }
-
-    #[test]
-    fn prebound_runtime_directory_with_wrong_expected_owner_is_rejected() {
-        let base = tempfile::tempdir().unwrap();
-        let runtime = base.path().join("runtime");
-        std::fs::create_dir(&runtime).unwrap();
-        assert!(prepare_private_runtime_dir(&runtime, effective_uid().wrapping_add(1)).is_err());
     }
 
     #[test]

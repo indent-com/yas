@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  YAS_EVENTS_EVENT_SERVER_ERROR,
+  YAS_EVENTS_EVENT_NATIVE_DATAGRAM_DROP,
   YAS_GOLDEN_VECTORS,
   YasEventsStream,
   YasProtocolError,
@@ -72,7 +72,7 @@ describe("YAS Events v1", () => {
           {
             sequence: 1n,
             monotonicNs: 1n,
-            eventId: YAS_EVENTS_EVENT_SERVER_ERROR + 1,
+            eventId: YAS_EVENTS_EVENT_NATIVE_DATAGRAM_DROP + 1,
             required: true,
             eventFlags: 0,
             payload: new Uint8Array(0),
@@ -87,7 +87,7 @@ describe("YAS Events v1", () => {
           {
             sequence: 1n,
             monotonicNs: 1n,
-            eventId: YAS_EVENTS_EVENT_SERVER_ERROR + 1,
+            eventId: YAS_EVENTS_EVENT_NATIVE_DATAGRAM_DROP + 1,
             required: false,
             eventFlags: 0xffff,
             payload: new Uint8Array([1]),

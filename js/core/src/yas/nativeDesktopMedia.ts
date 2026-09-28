@@ -2065,10 +2065,17 @@ function productClient(
       entry,
     ]),
   );
+  const timings = new Map(
+    (record.auxiliarySubscriptionTimings?.entries ?? []).map((entry) => [
+      `${entry.family}:${entry.subscriptionId}`,
+      entry,
+    ]),
+  );
   const subscriptions: YasClientAuxSubscription[] = (
     active?.auxiliary ?? []
   ).map((entry) => {
     const detail = details.get(`${entry.family}:${entry.subscriptionId}`);
+    const timing = timings.get(`${entry.family}:${entry.subscriptionId}`);
     return {
       kind: entry.family,
       id: entry.resourceHandle,
@@ -2076,6 +2083,8 @@ function productClient(
       resource: detail?.resource,
       requestFlags: detail?.requestFlags,
       stateWatchFlags: detail?.stateWatchFlags,
+      settleMs: timing?.settleMs,
+      refsSettleMs: timing?.refsSettleMs,
     };
   });
   return {

@@ -2,22 +2,13 @@ import { TapButton } from "./TapButton";
 import {
   createSignal,
   createEffect,
-  createMemo,
   ErrorBoundary,
   onCleanup,
   Show,
 } from "solid-js";
 import {
   YAS_WEBSOCKET_SUBPROTOCOL,
-  YAS_FAMILY_RELAY,
-  YasConnection,
   YasEdgeWebSocketTransport,
-  YasNativeRelayTransport,
-  YasNativeWorkspaceConnection,
-  YasRelayClient,
-  WorkspaceSessionDeviceStore,
-  WorkspaceSessionStore,
-  yasBrowserConnectionOptions,
 } from "@yas-run/core";
 import { YasWebTransportTransport } from "@yas-run/core/transports";
 import type {
@@ -25,22 +16,14 @@ import type {
   YasWasmModule,
   YasWorkspace,
   YasWorkspaceConnection,
-  YasRelayRoute,
 } from "@yas-run/core";
 import { YasMark } from "./Logo";
 import { themeFor } from "./theme";
 import { t } from "./i18n";
-import { Workspace } from "./Workspace";
+import { ConnectedWorkspace } from "./ConnectedWorkspace";
 import { PASSPHRASE_KEY } from "./passphrase-storage";
 import { preferredPalette } from "./storage";
-import {
-  boundedRelayRoutes,
-  RelayConnectionCache,
-} from "./relayTransportCache";
-import { installPreviewNetBroker } from "./previewNetProtocol";
 import { consumePassphraseFromHash } from "./workspaceSessionUrl";
-import { createWorkspaceSessionController } from "./workspaceSession";
-import { reconcileWorkspaceSessionRelayConnections } from "./workspaceSessionRemotes";
 import { getOrCreateWorkspaceSessionDeviceId } from "./workspaceSessionDevice";
 import {
   discoverEdgeWebTransport,
@@ -93,9 +76,6 @@ export interface ConnectionSpec {
 type WorkspaceConnection = NonNullable<
   ReturnType<YasWorkspace["getConnection"]>
 >;
-
-const RELAY_RECONNECT_MIN_MS = 500;
-const RELAY_RECONNECT_MAX_MS = 10_000;
 
 /** The protocol-transparent edge endpoint connected only to the home server. */
 function edgeWsUrl(): string {
@@ -287,216 +267,13 @@ function ConnectedApp(props: {
         { serverCertificateHash: fetchEdgeCertificateHash },
       )
     : new YasEdgeWebSocketTransport(edgeWsUrl(), props.passphrase);
-  const yasOptions = yasBrowserConnectionOptions();
-  const homeYas = new YasConnection(edgeTransport, yasOptions);
-  const homeConnection = new YasNativeWorkspaceConnection(
-    "local",
-    homeYas,
-    props.wasm,
-    false,
-  );
-  let disposeConnectedResources: (() => void) | undefined;
-  onCleanup(() => {
-    try {
-      disposeConnectedResources?.();
-    } finally {
-      try {
-        homeConnection.close();
-      } finally {
-        homeConnection.dispose();
-      }
-    }
-  });
-  homeConnection.connect();
-  const [relayCacheRevision, setRelayCacheRevision] = createSignal(0);
-  const relayCache = new RelayConnectionCache(() =>
-    setRelayCacheRevision((revision) => revision + 1),
-  );
-  const [relayRoutes, setRelayRoutes] = createSignal<readonly YasRelayRoute[]>(
-    [],
-  );
-  const [relayClient, setRelayClient] = createSignal<YasRelayClient | null>(
-    null,
-  );
-  const onHomeStatus = () => {
-    if (edgeTransport.authRejected) props.onAuthError();
-  };
-  edgeTransport.addEventListener("statuschange", onHomeStatus);
-  onCleanup(() =>
-    edgeTransport.removeEventListener("statuschange", onHomeStatus),
-  );
-
-  createEffect(() => {
-    let stopped = false;
-    let stopRouteWatch: (() => void) | undefined;
-    let routeWatchRetryTimer: ReturnType<typeof setTimeout> | undefined;
-    let routeWatchRetryDelay = RELAY_RECONNECT_MIN_MS;
-    let hasRouteSnapshot = false;
-
-    const clearRouteWatchRetry = () => {
-      if (routeWatchRetryTimer !== undefined) {
-        clearTimeout(routeWatchRetryTimer);
-        routeWatchRetryTimer = undefined;
-      }
-    };
-
-    const stopWatching = () => {
-      clearRouteWatchRetry();
-      const stop = stopRouteWatch;
-      stopRouteWatch = undefined;
-      stop?.();
-      hasRouteSnapshot = false;
-    };
-    const scheduleWatchRetry = () => {
-      if (routeWatchRetryTimer !== undefined) return;
-      const delay = routeWatchRetryDelay;
-      routeWatchRetryDelay = Math.min(
-        routeWatchRetryDelay * 2,
-        RELAY_RECONNECT_MAX_MS,
-      );
-      routeWatchRetryTimer = setTimeout(() => {
-        routeWatchRetryTimer = undefined;
-        refresh();
-      }, delay);
-    };
-    const refresh = async () => {
-      stopWatching();
-      try {
-        await homeYas.connect();
-        if (stopped) return;
-        const relay = relayClient() ?? new YasRelayClient(homeYas);
-        setRelayClient(relay);
-        stopRouteWatch = relay.routes.subscribe((state) => {
-          if (state.revision === 0n) {
-            // A reset is not an empty route catalogue. Removing these routes
-            // would dispose every remote workspace before reconnect completes.
-            if (hasRouteSnapshot) scheduleWatchRetry();
-            return;
-          }
-          hasRouteSnapshot = true;
-          clearRouteWatchRetry();
-          routeWatchRetryDelay = RELAY_RECONNECT_MIN_MS;
-          setRelayRoutes(boundedRelayRoutes(state.routes));
-        });
-        await relay.routes.watch();
-      } catch {
-        if (stopped) return;
-        stopWatching();
-        if (homeYas.ready && !homeYas.families.has(YAS_FAMILY_RELAY))
-          setRelayRoutes([]);
-        // Relay may be temporarily unavailable or administratively omitted.
-        // The local home connection stays usable while bounded retries watch
-        // for a later catalogue/family update; there is no second protocol.
-        scheduleWatchRetry();
-      }
-    };
-
-    void refresh();
-    onCleanup(() => {
-      stopped = true;
-      stopWatching();
-    });
-  });
-
-  const sessionStore = new WorkspaceSessionStore(homeYas);
-  const sessionDeviceStore = new WorkspaceSessionDeviceStore(
-    homeYas,
-    props.workspaceSessionDeviceId,
-  );
-  const sessionController = createWorkspaceSessionController({
-    store: sessionStore,
-    deviceStore: sessionDeviceStore,
-    initialHash: location.hash,
-  });
-
-  void sessionController.start();
-
-  // Wake events bypass retry backoff only after the transport has dropped.
-  // A live connection can keep playing audio in the background; reconnecting
-  // it on foreground interrupts playback and every nested Relay session.
-  // Leave in-progress connection attempts alone too.
-  // Deliberately in the UI layer: js/core stays free of window/document so it
-  // can be imported by the preview service worker (docs/design/net.md).
-  createEffect(() => {
-    const wake = () => {
-      if (document.visibilityState === "hidden") return;
-      if (
-        edgeTransport.status === "disconnected" ||
-        edgeTransport.status === "error"
-      ) {
-        homeConnection.reconnect();
-      }
-    };
-    window.addEventListener("online", wake);
-    document.addEventListener("visibilitychange", wake);
-    onCleanup(() => {
-      window.removeEventListener("online", wake);
-      document.removeEventListener("visibilitychange", wake);
-    });
-  });
-
-  const connections = createMemo<ConnectionSpec[]>(() => {
-    relayCacheRevision();
-    const next: ConnectionSpec[] = [
-      {
-        id: "local",
-        label: t("common.local"),
-        connection: homeConnection,
-      },
-    ];
-    const relay = relayClient();
-    next.push(
-      ...reconcileWorkspaceSessionRelayConnections(
-        relayRoutes(),
-        sessionController.current()?.activeRemotes ?? [],
-        relayCache,
-        relay
-          ? (route) => {
-              const transport = new YasNativeRelayTransport(relay, route);
-              return new YasNativeWorkspaceConnection(
-                route.name,
-                new YasConnection(transport, yasBrowserConnectionOptions()),
-                props.wasm,
-              );
-            }
-          : null,
-      ),
-    );
-    return next;
-  });
-
-  // The service worker is deliberately transport-blind: resolve its preview
-  // sockets through the App's already-authenticated home or nested Relay YAS
-  // session. No passphrase or YAS frame crosses this local MessagePort.
-  const stopPreviewNetBroker = installPreviewNetBroker((dest) => {
-    const spec = connections().find((candidate) => candidate.id === dest);
-    return spec?.connection?.native.net ?? null;
-  });
-
-  disposeConnectedResources = () => {
-    stopPreviewNetBroker();
-    sessionController.dispose();
-    sessionDeviceStore.dispose();
-    sessionStore.dispose();
-    relayCache.clear();
-    relayClient()?.dispose();
-  };
-
   return (
-    <>
-      {/* Keep the protocol workspace mounted across keyed session screens.
-          Its YasConnections have already consumed handshake/catalog frames;
-          rebuilding them on the same live transports cannot replay that state. */}
-      <Workspace
-        connections={connections}
-        wasm={props.wasm}
-        onAuthError={props.onAuthError}
-        relayRoutes={() => relayRoutes()}
-        workspaceSession={sessionController.binding}
-        workspaceSessions={sessionController}
-        transportOwnership="external"
-      />
-    </>
+    <ConnectedWorkspace
+      transport={edgeTransport}
+      wasm={props.wasm}
+      workspaceSessionDeviceId={props.workspaceSessionDeviceId}
+      onAuthError={props.onAuthError}
+    />
   );
 }
 

@@ -203,6 +203,11 @@ export const YAS_CORE_CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION = 4 as const;
 export const YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION = 1 as const;
 export const YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION = 2 as const;
 export const YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION = 3 as const;
+export const YAS_CORE_SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION = 4 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_PERSISTENT = 1 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_WASMI = 2 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_QUICKJS = 4 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_COMMAND_PROVIDER = 8 as const;
 export const YAS_CORE_SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION = 1 as const;
 export const YAS_FAMILY_TRANSFER = 1 as const;
 export const YAS_TRANSFER_VERSION = 1 as const;
@@ -465,6 +470,11 @@ export const YAS_CLIENT_ORIGIN_EXTENSION = 5 as const;
 export const YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION = 1 as const;
 export const YAS_CLIENT_BANDWIDTH_RATES_EXTENSION = 2 as const;
 export const YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION = 3 as const;
+export const YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION = 4 as const;
+export const YAS_CLIENT_GIT_WATCH_UNTRACKED = 65536 as const;
+export const YAS_CLIENT_GIT_WATCH_IGNORED = 131072 as const;
+export const YAS_CLIENT_GIT_QUERY_WATCH = 2147483648 as const;
+export const YAS_CLIENT_GIT_QUERY_KIND_SHIFT = 16 as const;
 export const YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS = 4096 as const;
 export const YAS_CLIENT_MAX_PUBLISHED_CLIENTS = 4096 as const;
 export const YAS_CLIENT_LIMIT_MAX_PUBLISHED_CLIENTS = 1 as const;
@@ -502,6 +512,7 @@ export const YAS_SURFACE_STATE_MAXIMIZE_REQUEST_EXTENSION = 5 as const;
 export const YAS_SURFACE_STATE_MINIMUM_SIZE_EXTENSION = 6 as const;
 export const YAS_SURFACE_STATE_TEXT_INPUT_REQUEST_REVISION_EXTENSION = 7 as const;
 export const YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION = 8 as const;
+export const YAS_SURFACE_VIEW_DIRECT_TOUCH_EXTENSION = 9 as const;
 export const YAS_SURFACE_COLOR_CAP_DISPLAY_P3 = 1 as const;
 export const YAS_SURFACE_COLOR_CAP_HDR10_AV1 = 2 as const;
 export const YAS_SURFACE_COLOR_CAP_HDR10_AV1_444 = 4 as const;
@@ -1122,6 +1133,10 @@ export const YAS_GIT_REPOSITORY_FLAGS = 63 as const;
 export const YAS_GIT_WATCH_REFS_SETTLE_MS_EXTENSION = 1 as const;
 export const YAS_GIT_WATCH_STATUS_SETTLE_MS_EXTENSION = 2 as const;
 export const YAS_GIT_WATCH_REF_PREFIXES_EXTENSION = 3 as const;
+export const YAS_GIT_WATCH_STATUS_SELECTION_EXTENSION = 4 as const;
+export const YAS_GIT_WATCH_STATUS_UNTRACKED = 1 as const;
+export const YAS_GIT_WATCH_STATUS_IGNORED = 2 as const;
+export const YAS_GIT_WATCH_STATUS_SELECTION_FLAGS = 3 as const;
 export const YAS_GIT_CURSOR_LOG_FRONTIER = 1 as const;
 export const YAS_GIT_CURSOR_PATH = 2 as const;
 export const YAS_GIT_CURSOR_PLATFORM_PATH = 3 as const;
@@ -1948,6 +1963,28 @@ export const YAS_EVENTS_EVENT_OUTBOX_QUEUE = 44 as const;
 export const YAS_EVENTS_EVENT_SUPERVISOR = 45 as const;
 export const YAS_EVENTS_EVENT_CONNECTION_ACCEPT = 46 as const;
 export const YAS_EVENTS_EVENT_SERVER_ERROR = 47 as const;
+export const YAS_EVENTS_EVENT_GIT_WATCH_START = 48 as const;
+export const YAS_EVENTS_EVENT_GIT_WATCH_STOP = 49 as const;
+export const YAS_EVENTS_EVENT_GIT_STATE = 50 as const;
+export const YAS_EVENTS_EVENT_GIT_RECORD = 51 as const;
+export const YAS_EVENTS_EVENT_GIT_FS_EVENT = 52 as const;
+export const YAS_EVENTS_EVENT_FS_RECORD = 53 as const;
+export const YAS_EVENTS_EVENT_FS_EVENT = 54 as const;
+export const YAS_EVENTS_EVENT_FS_WATCH_START = 55 as const;
+export const YAS_EVENTS_EVENT_FS_WATCH_STOP = 56 as const;
+export const YAS_EVENTS_EVENT_FS_STATE = 57 as const;
+export const YAS_EVENTS_EVENT_NATIVE_FRAME_READ = 58 as const;
+export const YAS_EVENTS_EVENT_NATIVE_FRAME_WRITE = 59 as const;
+export const YAS_EVENTS_EVENT_NATIVE_PAYLOAD_READ = 60 as const;
+export const YAS_EVENTS_EVENT_NATIVE_PAYLOAD_WRITE = 61 as const;
+export const YAS_EVENTS_EVENT_NATIVE_STATE_RECORD_READ = 62 as const;
+export const YAS_EVENTS_EVENT_NATIVE_STATE_RECORD_WRITE = 63 as const;
+export const YAS_EVENTS_EVENT_NATIVE_CONNECT = 64 as const;
+export const YAS_EVENTS_EVENT_NATIVE_DISCONNECT = 65 as const;
+export const YAS_EVENTS_EVENT_NATIVE_ERROR = 66 as const;
+export const YAS_EVENTS_EVENT_NATIVE_DATAGRAM_READ = 67 as const;
+export const YAS_EVENTS_EVENT_NATIVE_DATAGRAM_WRITE = 68 as const;
+export const YAS_EVENTS_EVENT_NATIVE_DATAGRAM_DROP = 69 as const;
 export const YAS_EVENTS_MIN_RING_BYTES = 4096 as const;
 export const YAS_EVENTS_MAX_RING_BYTES = 67104768 as const;
 export const YAS_EVENTS_DEFAULT_RING_BYTES = 1048576 as const;
@@ -3153,6 +3190,26 @@ export const YAS_SCHEMA = {
         {
           "name": "SERVER_HELLO_PLATFORM_EXTENSION",
           "value": 3
+        },
+        {
+          "name": "SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_PERSISTENT",
+          "value": 1
+        },
+        {
+          "name": "EXTENSION_SUPPORT_WASMI",
+          "value": 2
+        },
+        {
+          "name": "EXTENSION_SUPPORT_QUICKJS",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_COMMAND_PROVIDER",
+          "value": 8
         },
         {
           "name": "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION",
@@ -4720,7 +4777,11 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "auxiliary_subscription_details",
-          "layout": "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the family-specific resource identity (the namespace prefix for KV), request_flags are family-specific, and state_watch_flags use StateWatch flags"
+          "layout": "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the namespace prefix for KV or canonical worktree/gitdir path for Git; Git state-watch request_flags contain datasets in bits 0..15 plus GIT_WATCH_UNTRACKED/GIT_WATCH_IGNORED effective selection; Git query-watch request_flags contain GIT_QUERY_WATCH, query kind shifted by GIT_QUERY_KIND_SHIFT, and query flags in bits 0..15; state_watch_flags use StateWatch flags"
+        },
+        {
+          "name": "auxiliary_subscription_timings",
+          "layout": "ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS"
         },
         {
           "name": "family_limits",
@@ -4763,6 +4824,26 @@ export const YAS_SCHEMA = {
         {
           "name": "AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION",
           "value": 3
+        },
+        {
+          "name": "AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "GIT_WATCH_UNTRACKED",
+          "value": 65536
+        },
+        {
+          "name": "GIT_WATCH_IGNORED",
+          "value": 131072
+        },
+        {
+          "name": "GIT_QUERY_WATCH",
+          "value": 2147483648
+        },
+        {
+          "name": "GIT_QUERY_KIND_SHIFT",
+          "value": 16
         },
         {
           "name": "MAX_ACTIVE_SUBSCRIPTIONS",
@@ -5101,6 +5182,10 @@ export const YAS_SCHEMA = {
           "layout": "revision:u64; nonzero last committed text-input enable; retained across caret updates, changes request an input panel for existing viewers; initial snapshots do not request a panel"
         },
         {
+          "name": "view_direct_touch",
+          "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 9: enabled:u8 (0 or 1); absent means disabled; enable only for viewers with a touch device using direct-touch input; the seat advertises touch while any open view enables it; disabling cancels that view's active touch sequence"
+        },
+        {
           "name": "view_color_capabilities",
           "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 8: capabilities:u8; bit 0 accepts Display-P3 SDR, bit 1 accepts 10-bit AV1 BT.2020/PQ and HDR presentation, bit 2 additionally accepts 10-bit AV1 4:4:4 Profile 1, bit 3 accepts 8-bit AV1 4:4:4, bit 4 accepts H.264 4:4:4; unknown bits are invalid; absent means sRGB SDR; output is described by each frame COLOR_SPACE using H.273 primaries/transfer/matrix and range 0 limited, 1 full; HDR output requires AV1 codec 2 and uses 10 bits, SDR output uses 8 bits"
         },
@@ -5141,6 +5226,10 @@ export const YAS_SCHEMA = {
         {
           "name": "VIEW_COLOR_CAPABILITIES_EXTENSION",
           "value": 8
+        },
+        {
+          "name": "VIEW_DIRECT_TOUCH_EXTENSION",
+          "value": 9
         },
         {
           "name": "COLOR_CAP_DISPLAY_P3",
@@ -8721,6 +8810,14 @@ export const YAS_SCHEMA = {
           "layout": "StateWatch Extensions: optional tag WATCH_REFS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_STATUS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_REF_PREFIXES_EXTENSION value count:u16 followed by unique strictly raw-byte-ascending prefix:bytes_u16 entries; empty/absent prefix list means every ref"
         },
         {
+          "name": "query_watch_options",
+          "layout": "WATCH_QUERY StateWatch Extensions accept WATCH_REFS_SETTLE_MS_EXTENSION and WATCH_STATUS_SETTLE_MS_EXTENSION with WATCH zero/default semantics; ref/status selection is query-derived"
+        },
+        {
+          "name": "watch_status_selection",
+          "layout": "Additional optional Git WATCH StateWatch extension: tag WATCH_STATUS_SELECTION_EXTENSION, REQUIRED clear, value exactly one u8 of flags admitting WATCH_STATUS_UNTRACKED and WATCH_STATUS_IGNORED in addition to tracked status; unknown bits are invalid and IGNORED requires UNTRACKED, so valid values are 0, 1, and 3. Absence admits both classes for compatibility; selection only applies with the WATCH_STATUS dataset and is enforced before collection budgets. Older servers may ignore this optional extension"
+        },
+        {
           "name": "query_endpoint",
           "layout": "kind:u8,reserved:[u8;3]=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId; COMMIT,TREE,MERGE_BASE require object; EMPTY,INDEX,WORKTREE forbid object; MERGE_BASE is valid only as the left endpoint"
         },
@@ -8912,6 +9009,22 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "WATCH_REF_PREFIXES_EXTENSION",
+          "value": 3
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "WATCH_STATUS_UNTRACKED",
+          "value": 1
+        },
+        {
+          "name": "WATCH_STATUS_IGNORED",
+          "value": 2
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_FLAGS",
           "value": 3
         },
         {
@@ -13522,6 +13635,94 @@ export const YAS_SCHEMA = {
           "value": 47
         },
         {
+          "name": "EVENT_GIT_WATCH_START",
+          "value": 48
+        },
+        {
+          "name": "EVENT_GIT_WATCH_STOP",
+          "value": 49
+        },
+        {
+          "name": "EVENT_GIT_STATE",
+          "value": 50
+        },
+        {
+          "name": "EVENT_GIT_RECORD",
+          "value": 51
+        },
+        {
+          "name": "EVENT_GIT_FS_EVENT",
+          "value": 52
+        },
+        {
+          "name": "EVENT_FS_RECORD",
+          "value": 53
+        },
+        {
+          "name": "EVENT_FS_EVENT",
+          "value": 54
+        },
+        {
+          "name": "EVENT_FS_WATCH_START",
+          "value": 55
+        },
+        {
+          "name": "EVENT_FS_WATCH_STOP",
+          "value": 56
+        },
+        {
+          "name": "EVENT_FS_STATE",
+          "value": 57
+        },
+        {
+          "name": "EVENT_NATIVE_FRAME_READ",
+          "value": 58
+        },
+        {
+          "name": "EVENT_NATIVE_FRAME_WRITE",
+          "value": 59
+        },
+        {
+          "name": "EVENT_NATIVE_PAYLOAD_READ",
+          "value": 60
+        },
+        {
+          "name": "EVENT_NATIVE_PAYLOAD_WRITE",
+          "value": 61
+        },
+        {
+          "name": "EVENT_NATIVE_STATE_RECORD_READ",
+          "value": 62
+        },
+        {
+          "name": "EVENT_NATIVE_STATE_RECORD_WRITE",
+          "value": 63
+        },
+        {
+          "name": "EVENT_NATIVE_CONNECT",
+          "value": 64
+        },
+        {
+          "name": "EVENT_NATIVE_DISCONNECT",
+          "value": 65
+        },
+        {
+          "name": "EVENT_NATIVE_ERROR",
+          "value": 66
+        },
+        {
+          "name": "EVENT_NATIVE_DATAGRAM_READ",
+          "value": 67
+        },
+        {
+          "name": "EVENT_NATIVE_DATAGRAM_WRITE",
+          "value": 68
+        },
+        {
+          "name": "EVENT_NATIVE_DATAGRAM_DROP",
+          "value": 69
+        },
+        {
           "name": "MIN_RING_BYTES",
           "value": 4096
         },
@@ -15481,7 +15682,7 @@ export const YAS_GOLDEN_VECTORS = {
     },
     {
       "name": "git.watch_options.payload",
-      "hex": "0100000000000000130000004a0000000000000000100000000000003a000000010000000200000032000200000002000000f401030000001e00000002000b00726566732f68656164732f0d00726566732f72656d6f7465732f"
+      "hex": "0100000000000000130000005300000000000000001000000000000043000000010000000200000032000200000002000000f401030000001e00000002000b00726566732f68656164732f0d00726566732f72656d6f7465732f040000000100000001"
     },
     {
       "name": "git.unwatch.payload",

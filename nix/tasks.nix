@@ -772,7 +772,8 @@ in
 
       printf '%s\n' "''${entries[@]}" | jq -s \
         --arg version "$version" \
-        '{version: $version, extensions: .}' >"$dist/manifest.json"
+        --slurpfile requirements requirements.json \
+        '{version: $version, extensions: map(. + {requirements: $requirements[0][.name]})}' >"$dist/manifest.json"
 
       echo ""
       echo "wrote $PWD/$dist/manifest.json"

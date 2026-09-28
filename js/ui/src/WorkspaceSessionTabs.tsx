@@ -39,6 +39,9 @@ export function WorkspaceSessionTabs(props: WorkspaceSessionTabsProps) {
       aria-label={t("sessions.tabs")}
       style={{
         ...workspaceBarStyle(scale(), props.isMobileTouch),
+        position: "sticky",
+        top: 0,
+        "z-index": 1,
         display: "flex",
         "align-items": "stretch",
         "min-width": 0,

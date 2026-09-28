@@ -707,6 +707,43 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
     );
   });
 
+  it("reads a screenshot while the Paste tap still has user activation", async () => {
+    const { s, sendClipboard } = newConnectedSurface();
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    let userActivation = true;
+    vi.mocked(navigator.clipboard.read).mockImplementation(() =>
+      userActivation
+        ? Promise.resolve([imageClipboardItem(bytes)])
+        : Promise.reject(new DOMException("Tap required", "NotAllowedError")),
+    );
+
+    const paste = s.pasteFromClipboard();
+    userActivation = false;
+    await paste;
+
+    expect(navigator.clipboard.read).toHaveBeenCalledOnce();
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendClipboard).toHaveBeenCalledWith("image/png", bytes);
+  });
+
+  it("pastes text from the same read without a second clipboard request", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    s["terminal"] = { bracketed_paste: () => true } as never;
+    vi.mocked(navigator.clipboard.read).mockResolvedValue([
+      {
+        types: ["text/plain", "image/png"],
+        getType: vi.fn(async () => new Blob(["copied\ntext"])),
+      } as unknown as ClipboardItem,
+    ]);
+
+    expect(await s.pasteFromClipboard()).toBe("copied\ntext");
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendClipboard).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "\x1b[200~copied\rtext\x1b[201~",
+    );
+  });
+
   it("waits for the image Selection commit before sending ^V", async () => {
     const { s, sendInput, sendClipboard } = newConnectedSurface();
     let commit!: () => void;
@@ -743,14 +780,18 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it("pasteFromClipboard() tries the image read when readText rejects", async () => {
+  it("pastes an image when its text representation cannot be read", async () => {
     const { s, sendClipboard } = newConnectedSurface();
     const bytes = new Uint8Array([1, 2, 3]);
-    vi.mocked(navigator.clipboard.readText).mockRejectedValue(
-      new Error("No valid data on clipboard."),
-    );
+    const image = imageClipboardItem(bytes);
     vi.mocked(navigator.clipboard.read).mockResolvedValue([
-      imageClipboardItem(bytes),
+      {
+        types: ["text/plain", "image/png"],
+        getType: (mime: string) =>
+          mime === "text/plain"
+            ? Promise.reject(new Error("No valid text on clipboard."))
+            : image.getType(mime),
+      } as ClipboardItem,
     ]);
     const result = await s.pasteFromClipboard();
     expect(result).toBeNull();
@@ -780,6 +821,32 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
     });
     const result = await s.pasteFromClipboard();
     expect(result).toBeNull();
+    expect(sendClipboard).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("still pastes text on browsers without clipboard.read", async () => {
+    const { s, sendInput } = newConnectedSurface();
+    Object.defineProperty(navigator.clipboard, "read", { value: undefined });
+    vi.mocked(navigator.clipboard.readText).mockResolvedValue("plain text");
+    expect(await s.pasteFromClipboard()).toBe("plain text");
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "plain text",
+    );
+  });
+
+  it("drops a clipboard read when the terminal disconnects during authorization", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    let resolveRead!: (items: ClipboardItem[]) => void;
+    vi.mocked(navigator.clipboard.read).mockReturnValue(
+      new Promise((resolve) => {
+        resolveRead = resolve;
+      }),
+    );
+    const paste = s.pasteFromClipboard();
+    Object.assign(s["_yasConn"]!.transport, { status: "disconnected" });
+    resolveRead([imageClipboardItem(new Uint8Array([137, 80, 78, 71]))]);
+    await paste;
     expect(sendClipboard).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -1106,33 +1173,46 @@ describe("YasTerminalSurface Ctrl+V image paste", () => {
     s["teardownKeyboard"]();
   });
 
-  it("sends bracketed Cmd+V text without waiting for another input", () => {
-    const sendInput = vi.fn();
-    const { s, input } = attach(sendInput);
-    // Fish enables bracketed paste while editing the command line.
-    // @ts-expect-error — only the mode queried by pasteText is needed here.
-    s["terminal"] = {
-      app_cursor: () => false,
-      bracketed_paste: () => true,
-    };
+  it.each([0, 11, 31])(
+    "pastes bracketed Cmd+V text with keyboard flags %i",
+    (flags) => {
+      const sendInput = vi.fn();
+      const { s, input } = attach(sendInput);
+      // @ts-expect-error — only keyboard and paste modes are needed here.
+      s["terminal"] = {
+        keyboard_flags: () => flags,
+        app_cursor: () => false,
+        bracketed_paste: () => true,
+        echo: () => false,
+      };
 
-    input.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "v",
-        code: "KeyV",
-        metaKey: true,
-        bubbles: true,
-      }),
-    );
-    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
-    const ev = fireTextPaste(input, "pasted-text");
+      try {
+        const init = {
+          key: "v",
+          code: "KeyV",
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        };
+        const down = new KeyboardEvent("keydown", init);
+        input.dispatchEvent(down);
+        expect(down.defaultPrevented).toBe(false);
+        expect(sendInput).not.toHaveBeenCalled();
+        expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+        const ev = fireTextPaste(input, "pasted-text");
+        input.dispatchEvent(new KeyboardEvent("keyup", init));
+        s["boundKeyboardBlur"]?.();
 
-    expect(ev.defaultPrevented).toBe(true);
-    expect(sendInput).toHaveBeenCalledTimes(1);
-    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
-      "\x1b[200~pasted-text\x1b[201~",
-    );
-  });
+        expect(ev.defaultPrevented).toBe(true);
+        expect(sendInput).toHaveBeenCalledTimes(1);
+        expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+          "\x1b[200~pasted-text\x1b[201~",
+        );
+      } finally {
+        s["teardownKeyboard"]();
+      }
+    },
+  );
 
   it.each([0, 11])(
     "pastes Wayland text on Cmd+V without a browser paste event (keyboard flags %i)",

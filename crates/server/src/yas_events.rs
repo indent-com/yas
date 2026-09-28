@@ -493,14 +493,16 @@ fn parse_live_record(record: &[u8]) -> Result<EventRecord, Error> {
         return Err(Error::CorruptJournal("record length mismatch"));
     }
     let event_id = u16::from_le_bytes([record[4], record[5]]);
-    if event_id > yas_wire::schema::events::EVENT_SERVER_ERROR as u16 {
+    if event_id > yas_wire::schema::events::EVENT_NATIVE_DATAGRAM_DROP as u16 {
         return Err(Error::CorruptJournal("unknown retained event ID"));
     }
     Ok(EventRecord {
         sequence: read_u64(record, 8)?,
         monotonic_ns: read_u64(record, 16)?,
         event_id: u32::from(event_id),
-        required: true,
+        // Additive diagnostics must not break older Events clients following
+        // the default lifecycle set. They can retain/skip unknown optional IDs.
+        required: event_id <= yas_wire::schema::events::EVENT_SERVER_ERROR as u16,
         event_flags: u16::from_le_bytes([record[6], record[7]]),
         payload: record[EVENT_RECORD_HEADER_LEN..].to_vec(),
     })
@@ -629,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn history_and_live_handoff_preserves_flags_and_has_no_gap() {
         let (runtime, log) = runtime(events::MIN_RING_SIZE);
-        log.record(EventType::Error, 0x1234, b"old");
+        log.record(EventType::GitWatchStart, 0x1234, b"old");
         let mut stream = runtime
             .start_stream(&StartStream {
                 operation_id: [3; 16],
@@ -640,7 +642,7 @@ mod tests {
             })
             .await
             .unwrap();
-        log.record(EventType::ServerStop, 0x5678, b"live");
+        log.record(EventType::NativeDatagramDrop, 0x5678, b"live");
 
         assert_eq!(stream.first_sequence(), 0);
         let StreamItem::Records(history) = stream.next().await.unwrap().unwrap() else {
@@ -648,7 +650,17 @@ mod tests {
         };
         assert_eq!(history.records.len(), 2);
         assert_eq!(history.records[0].event_flags, 0x1234);
+        assert!(!history.records[0].required);
+        assert_eq!(
+            history.records[0].event_id,
+            u32::from(EventType::GitWatchStart.id())
+        );
+        assert_eq!(
+            history.records[1].event_id,
+            u32::from(EventType::NativeDatagramDrop.id())
+        );
         assert_eq!(history.records[1].event_flags, 0x5678);
+        assert!(!history.records[1].required);
         assert_eq!(history.records[1].payload, b"live");
     }
 

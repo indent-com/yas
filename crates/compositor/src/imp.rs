@@ -12462,18 +12462,46 @@ fn spawn_compositor_inner(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
 
+    // The Wayland socket needs a directory belonging to this user alone, for
+    // the same reason the native IPC socket does, so it is chosen the same
+    // way (yas_runtime_dir, shared with yas-webserver's local_ipc).
+    //
+    // This used to accept `XDG_RUNTIME_DIR` on a write probe and otherwise
+    // fall back to `std::env::temp_dir()`. Both halves were wrong. The probe
+    // asks whether the *directory* is writable, which `/tmp` is — while the
+    // failure it was there to catch is a `wayland-N.lock` owned by another
+    // user *inside* it, where `fs.protected_regular=1` makes an `O_CREAT`
+    // open `EACCES`. And `wayland-server` treats that as `PermissionDenied`
+    // and stops rather than advancing to `wayland-N+1`, so a bare `/tmp`
+    // meant the second user to start a compositor on a machine got a panic
+    // here with 32 display numbers free. `PrivateOrSticky` resolves `/tmp`
+    // to a `yas-{uid}` child instead, which two users cannot collide in.
+    //
+    // A private `XDG_RUNTIME_DIR` is taken exactly as given rather than
+    // namespaced into: `/run/user/$uid` is per-user already, `wayland-N`
+    // directly inside it is where every other compositor puts its socket, and
+    // identity is what keeps this idempotent. The thread below exports the
+    // choice back into the environment, so a second compositor in this
+    // process re-reads its own answer — and a resolver that appended a
+    // component would nest one level deeper on every respawn.
+    let uid = yas_runtime_dir::effective_uid();
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .filter(|p| {
-            let probe = p.join(".yas-probe");
-            if std::fs::write(&probe, b"").is_ok() {
-                let _ = std::fs::remove_file(&probe);
-                true
-            } else {
-                false
-            }
+        .filter(|base| yas_runtime_dir::is_usable_private_dir(base, uid))
+        .or_else(|| {
+            yas_runtime_dir::runtime_dir_for_base(
+                &std::env::temp_dir(),
+                uid,
+                yas_runtime_dir::BasePolicy::PrivateOrSticky,
+            )
         })
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| {
+            panic!(
+                "no runtime directory this user owns: set XDG_RUNTIME_DIR to a directory owned by \
+                 UID {uid} with no group or other access, or make {} a writable sticky directory",
+                std::env::temp_dir().display()
+            )
+        });
 
     let runtime_dir_clone = runtime_dir.clone();
     let thread = std::thread::Builder::new()

@@ -1,20 +1,16 @@
 /**
- * Embedding entry point: the full yas workspace as a mountable component,
+ * Embedding entry point: the full YAS workspace as a mountable component,
  * for hosts that are not the app shell — yas.run's share page is the first.
  *
- * `App` is the shell: it owns same-origin edge authentication, workspace
- * sessions, and home-server Relay state. None of that holds on a marketing
- * site opening one direct share link.
- * `Workspace` below it never had those assumptions — it takes a list of
- * (id, transport) pairs and renders the whole product — so embedding is a
- * matter of exposing that seam, not of building a second, lesser client.
- * The 900-line reimplementation this replaces on yas.run/s is the argument
- * for doing it this way: it had drifted from the app it imitated.
+ * A full-control home connection uses the same ConnectedWorkspace shell as
+ * App, including durable workspace sessions and Relay remotes. Read-only
+ * shares and custom connection lists mount Workspace directly.
  */
 
 import { render } from "solid-js/web";
-import type { YasWasmModule } from "@yas-run/core";
+import type { YasTransport, YasWasmModule } from "@yas-run/core";
 import { Workspace } from "./Workspace";
+import { ConnectedWorkspace } from "./ConnectedWorkspace";
 import { setDefaultFont } from "./storage";
 import { setFontCatalog } from "./fontCatalog";
 import { setShellCapabilities } from "./shellCapabilities";
@@ -24,15 +20,12 @@ import type { FontChoice } from "./fontCatalog";
 
 export type { ConnectionSpec, FontChoice };
 export { shareTransport } from "./nativeShareTransport";
+export { getOrCreateWorkspaceSessionDeviceId } from "./workspaceSessionDevice";
 
-export interface EmbedOptions {
+interface EmbedPresentationOptions {
   wasm: YasWasmModule;
-  /** Connections to drive, static or reactive; each owns its transport. */
-  connections: ConnectionSpec[] | (() => ConnectionSpec[]);
-  /** Shell affordances the host page can honour. Defaults to none of the
-   *  app shell's extras: no remotes management (the host fixes the
-   *  connection list) and no preview service worker (there is no sw.js at
-   *  the host's origin). */
+  /** Remotes default on for a home connection, off for fixed connection lists.
+   *  Previews default off: the host must provide the preview service worker. */
   capabilities?: Partial<ShellCapabilities>;
   /** Monospace stack to default to, for a host that ships its own webfont
    *  and wants the workspace on the same face as the page around it. The
@@ -49,13 +42,27 @@ export interface EmbedOptions {
   onAuthError?: () => void;
 }
 
+export type EmbedOptions = EmbedPresentationOptions &
+  (
+    | {
+        /** Full-control home server, with the regular app's workspace manager. */
+        home: { transport: YasTransport; workspaceSessionDeviceId: string };
+        connections?: never;
+      }
+    | {
+        /** Fixed connections, including read-only shares; each owns its transport. */
+        connections: ConnectionSpec[] | (() => ConnectionSpec[]);
+        home?: never;
+      }
+  );
+
 /**
  * Mount the workspace into `root` and return a disposer.
  *
  * The container must have a definite height — the workspace fills it. The
  * app shell's global CSS (border-box sizing, `line-height: 1`, no
  * overscroll) is applied to the container here rather than assumed of the
- * page: yas is a terminal first and every pane sits on that tight rhythm,
+ * page: YAS is a terminal first and every pane sits on that tight rhythm,
  * but an embedding page has typography of its own that a global reset
  * would trample.
  */
@@ -64,7 +71,7 @@ export function mountYasWorkspace(
   opts: EmbedOptions,
 ): () => void {
   setShellCapabilities({
-    remotes: false,
+    remotes: !!opts.home,
     previews: false,
     ...opts.capabilities,
   });
@@ -75,13 +82,21 @@ export function mountYasWorkspace(
   root.style.overflow = "hidden";
   root.style.overscrollBehavior = "none";
   const dispose = render(
-    () => (
-      <Workspace
-        connections={opts.connections}
-        wasm={opts.wasm}
-        onAuthError={opts.onAuthError ?? (() => {})}
-      />
-    ),
+    () =>
+      opts.home ? (
+        <ConnectedWorkspace
+          transport={opts.home.transport}
+          workspaceSessionDeviceId={opts.home.workspaceSessionDeviceId}
+          wasm={opts.wasm}
+          onAuthError={opts.onAuthError ?? (() => {})}
+        />
+      ) : (
+        <Workspace
+          connections={opts.connections}
+          wasm={opts.wasm}
+          onAuthError={opts.onAuthError ?? (() => {})}
+        />
+      ),
     root,
   );
   return dispose;

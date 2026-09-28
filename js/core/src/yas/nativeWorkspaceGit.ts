@@ -400,6 +400,7 @@ class NativeGitRepository implements YasNativeGitRepoHandle {
       refsSettleMs: this.options.refsLatencyMs,
       statusSettleMs: this.options.statusLatencyMs,
       refPrefixes: sortedRefPrefixes(this.options.refPrefixes),
+      statusSelection: watchStatusSelection(this.options),
     });
     if (this.closed) return;
     this.applySnapshot(snapshot);
@@ -592,7 +593,11 @@ class NativeGitRepository implements YasNativeGitRepoHandle {
     const subscription = new NativeGitLogSubscription(
       this,
       spec,
-      options,
+      {
+        refsLatencyMs: this.options.refsLatencyMs,
+        statusLatencyMs: this.options.statusLatencyMs,
+        ...options,
+      },
       onUpdate,
     );
     this.watchedLogs.add(subscription);
@@ -618,7 +623,7 @@ class NativeGitRepository implements YasNativeGitRepoHandle {
   private applySnapshot(snapshot: YasGitSnapshot): void {
     if (this.closed || snapshot.revision === this.lastCatalogRevision) return;
     this.lastCatalogRevision = snapshot.revision;
-    applyStateSnapshot(this.state, snapshot);
+    applyStateSnapshot(this.state, snapshot, this.options);
     invokeLifecycleCallback(() =>
       this.options.onState?.(this.state, snapshot.revision),
     );
@@ -709,6 +714,8 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
         {
           initialCredit: queryCredit(this.options.limit ?? 0),
           maxRecords: this.options.limit ?? 0,
+          refsSettleMs: this.options.refsLatencyMs,
+          statusSettleMs: this.options.statusLatencyMs,
         },
       )
       .then((native) => {
@@ -864,6 +871,7 @@ function commitRecord(record: YasGitQueryRecord): YasNativeGitLogRecord[] {
 function applyStateSnapshot(
   mirror: model.GitStateMirror,
   snapshot: YasGitSnapshot,
+  options: YasNativeGitOpenOptions,
 ): void {
   mirror.head = null;
   mirror.refs = new Map();
@@ -874,7 +882,7 @@ function applyStateSnapshot(
   mirror.remotes = new Map();
   mirror.worktreeGen = { count: 0, digest: 0n };
   mirror.flags = 0;
-  for (const entity of snapshot.entities) applyEntity(mirror, entity);
+  for (const entity of snapshot.entities) applyEntity(mirror, entity, options);
   mirror.status.sort((left, right) => left.path.localeCompare(right.path));
   mirror.stashes.sort((left, right) => left.index - right.index);
 }
@@ -882,6 +890,7 @@ function applyStateSnapshot(
 function applyEntity(
   mirror: model.GitStateMirror,
   entity: YasGitEntityRecord,
+  options: YasNativeGitOpenOptions,
 ): void {
   const body = entity.body;
   if (body.kind === "head") {
@@ -910,6 +919,7 @@ function applyEntity(
       detail: body.detail,
     };
   } else if (body.kind === "status") {
+    if (!statusMatchesOptions(body, options)) return;
     mirror.status.push({
       staged: statusLetter(body.indexStatus),
       unstaged: statusLetter(body.worktreeStatus),
@@ -939,6 +949,41 @@ function applyEntity(
   } else {
     mirror.worktreeGen = { count: body.count, digest: body.digest };
   }
+}
+
+function statusClass(
+  body: Extract<YasGitEntityRecord["body"], { kind: "status" }>,
+) {
+  if (body.worktreeStatus === g.YAS_GIT_WORKTREE_STATUS_IGNORED)
+    return "ignored";
+  if (body.worktreeStatus === g.YAS_GIT_WORKTREE_STATUS_UNTRACKED)
+    return "untracked";
+  return "tracked";
+}
+
+function statusMatchesOptions(
+  body: Extract<YasGitEntityRecord["body"], { kind: "status" }>,
+  options: YasNativeGitOpenOptions,
+): boolean {
+  switch (statusClass(body)) {
+    case "ignored":
+      return options.ignored ?? false;
+    case "untracked":
+      return options.untracked ?? false;
+    case "tracked":
+      return options.status ?? false;
+  }
+}
+
+function watchStatusSelection(
+  options: YasNativeGitOpenOptions,
+): number | undefined {
+  if (!(options.status || options.untracked || options.ignored))
+    return undefined;
+  return (
+    (options.untracked ? g.YAS_GIT_WATCH_STATUS_UNTRACKED : 0) |
+    (options.ignored ? g.YAS_GIT_WATCH_STATUS_IGNORED : 0)
+  );
 }
 
 function wantsState(options: YasNativeGitOpenOptions): boolean {

@@ -1593,7 +1593,7 @@ describe("SurfaceStore decoder recovery", () => {
             codec === "av1" ? frame : h264Frame,
             0,
             // Neither the viewer box nor the logical surface extent is the
-            // encoded size, particularly with adaptive downscaling or DPI.
+            // encoded size, particularly with view-size changes or DPI.
             1600,
             1200,
             { width: 800, height: 600 },

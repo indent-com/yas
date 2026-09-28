@@ -1,20 +1,4 @@
-import {
-  isSurfaceAssignment,
-  type LayoutLeaf,
-  type LayoutNode,
-  type LayoutSplit,
-} from "@yas-run/core/layout";
-
-/**
- * Whether a parked sidebar card can turn a dragged live pane into tabs.
- *
- * A parked surface is only a preview, not a tab host. Surfaces can still host
- * a drop once they are live in a pane; terminals and tiles remain valid parked
- * targets for the sidebar shortcut.
- */
-export function isParkedTabDropTarget(assignment: string): boolean {
-  return !isSurfaceAssignment(assignment);
-}
+import type { LayoutLeaf, LayoutNode, LayoutSplit } from "@yas-run/core/layout";
 
 export interface TabInsertion {
   root: LayoutNode;

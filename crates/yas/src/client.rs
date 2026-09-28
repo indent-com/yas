@@ -766,6 +766,128 @@ fn decode_active_subscriptions(extensions: &Extensions) -> Result<Option<ActiveS
         .transpose()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxiliarySubscriptionTiming {
+    pub family: u16,
+    pub refs_settle_ms: u16,
+    pub subscription_id: u32,
+    pub settle_ms: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuxiliarySubscriptionTimings {
+    pub entries: Vec<AuxiliarySubscriptionTiming>,
+}
+
+impl AuxiliarySubscriptionTimings {
+    pub fn extension(&self) -> Result<Extension> {
+        Ok(Extension {
+            tag: crate::schema::client::AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION as u16,
+            required: false,
+            value: self.encode()?,
+        })
+    }
+
+    pub fn from_extensions(extensions: &Extensions) -> Result<Option<Self>> {
+        extensions.validate()?;
+        extensions
+            .0
+            .iter()
+            .find(|extension| {
+                extension.tag
+                    == crate::schema::client::AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION as u16
+            })
+            .map(|extension| Self::decode(&extension.value))
+            .transpose()
+    }
+}
+
+impl Encode for AuxiliarySubscriptionTimings {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        if self.entries.len() > crate::schema::client::MAX_ACTIVE_SUBSCRIPTIONS as usize {
+            return Err(Error::Invalid("Client auxiliary subscription timing count"));
+        }
+        put_len_u16(out, self.entries.len())?;
+        put_u16(out, 0);
+        let mut previous = None;
+        for entry in &self.entries {
+            let key = (entry.family, entry.subscription_id);
+            if entry.subscription_id == 0 || previous.is_some_and(|previous| previous >= key) {
+                return Err(Error::Invalid("Client auxiliary subscription timing order"));
+            }
+            previous = Some(key);
+            put_u16(out, entry.family);
+            put_u16(out, entry.refs_settle_ms);
+            put_u32(out, entry.subscription_id);
+            put_u16(out, entry.settle_ms);
+            put_u16(out, 0);
+        }
+        Ok(())
+    }
+}
+
+impl Decode for AuxiliarySubscriptionTimings {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let count = usize::from(decoder.u16()?);
+        if decoder.u16()? != 0
+            || count > crate::schema::client::MAX_ACTIVE_SUBSCRIPTIONS as usize
+            || count > decoder.remaining() / 12
+        {
+            return Err(Error::Invalid("Client auxiliary subscription timing count"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(AuxiliarySubscriptionTiming {
+                family: decoder.u16()?,
+                refs_settle_ms: decoder.u16()?,
+                subscription_id: decoder.u32()?,
+                settle_ms: decoder.u16()?,
+            });
+            if decoder.u16()? != 0 {
+                return Err(Error::Invalid("Client watch timing reserved"));
+            }
+        }
+        decoder.finish()?;
+        let value = Self { entries };
+        value.encode_to(&mut Vec::new())?;
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn timing_extensions_reject_truncation_reserved_bits_and_duplicate_ids() {
+        let mut value = AuxiliarySubscriptionTimings {
+            entries: vec![AuxiliarySubscriptionTiming {
+                family: crate::family::GIT,
+                refs_settle_ms: 17,
+                subscription_id: 9,
+                settle_ms: 23,
+            }],
+        };
+        let bytes = value.encode().unwrap();
+        assert_eq!(
+            AuxiliarySubscriptionTimings::from_extensions(&Extensions(vec![
+                value.extension().unwrap()
+            ]))
+            .unwrap(),
+            Some(value.clone())
+        );
+        for len in 0..bytes.len() {
+            assert!(AuxiliarySubscriptionTimings::decode(&bytes[..len]).is_err());
+        }
+        let mut reserved = bytes.clone();
+        *reserved.last_mut().unwrap() = 1;
+        assert!(AuxiliarySubscriptionTimings::decode(&reserved).is_err());
+        value.entries.push(value.entries[0].clone());
+        assert!(value.encode().is_err());
+    }
+}
+
 fn decode_auxiliary_subscription_details(
     extensions: &Extensions,
 ) -> Result<Option<AuxiliarySubscriptionDetails>> {
@@ -804,6 +926,11 @@ fn validate_record_extensions(extensions: &Extensions) -> Result<()> {
                 == crate::schema::client::AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION as u16 =>
             {
                 AuxiliarySubscriptionDetails::decode(&extension.value)?;
+            }
+            tag if tag
+                == crate::schema::client::AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION as u16 =>
+            {
+                AuxiliarySubscriptionTimings::decode(&extension.value)?;
             }
             _ if extension.required => {
                 return Err(Error::Invalid("unknown required Client record extension"));

@@ -227,12 +227,10 @@ export function ConnectionPanels(props: {
               fontSize={props.fontSize}
             />
           </Show>
-          {/* The extensions panel was built as its own overlay, so it carries
-              its own padding; the wrapper only bounds it. Same for systemd. */}
+          {/* Extensions owns its toolbar, row padding, and scrolling. */}
           <Show when={tab() === "extensions"}>
             <div
               style={{
-                padding: `${scale().controlX}px`,
                 "min-width": "0",
                 display: "flex",
                 "flex-direction": "column",

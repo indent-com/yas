@@ -1,16 +1,9 @@
 import type { LayoutNode, WorkspaceLayout } from "@yas-run/core/layout";
 import { describe, expect, it } from "vitest";
-import { surfaceAssignment } from "@yas-run/core/layout";
 import { enumeratePanes } from "../layout/store";
-import { insertTabAtPane, isParkedTabDropTarget } from "../layout/tabGrouping";
+import { insertTabAtPane } from "../layout/tabGrouping";
 
-describe("sidebar tab grouping", () => {
-  it("does not use parked surface previews as tab targets", () => {
-    expect(isParkedTabDropTarget(surfaceAssignment("dev", 7n))).toBe(false);
-    expect(isParkedTabDropTarget("terminal-session-id")).toBe(true);
-    expect(isParkedTabDropTarget("editor:/src/yas/README.md")).toBe(true);
-  });
-
+describe("pane tab grouping", () => {
   it("turns one fullscreen leaf into two tabs without changing its pane id", () => {
     const root = (
       {

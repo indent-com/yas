@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use yas_git::native::{
     self, BlameRecord, DiffRecord, DiffRequest, Endpoint, LogRequest, PatchRecord, PatchRequest,
@@ -68,6 +69,16 @@ impl Repository {
         self.git(&["add", "."]);
         self.git(&["commit", "-q", "-m", message]);
     }
+
+    fn worktree_watches(&self) -> Vec<PathBuf> {
+        // gix discovery simplifies Windows verbatim paths, while the fixture
+        // uses canonical paths. Compare the same spelling on both sides.
+        yas_git::debug_worktree_watches(&self.0.join(".git"))
+            .unwrap()
+            .into_iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect()
+    }
 }
 
 impl Drop for Repository {
@@ -95,6 +106,60 @@ fn resolve(handle: &yas_git::RepoHandle, spec: &str) -> native::Oid {
         .native_resolve(spec, &Cancel::default())
         .unwrap()
         .tips[0]
+}
+
+struct StateStream {
+    handle: yas_git::StateHandle,
+    events: std::sync::mpsc::Receiver<StateEvent>,
+}
+
+impl StateStream {
+    fn new(repository: &yas_git::RepoHandle, options: StateOptions) -> Self {
+        let (sender, events) = std::sync::mpsc::channel();
+        let handle = repository
+            .start_native_state(options, Box::new(move |event| sender.send(event).is_ok()));
+        Self { handle, events }
+    }
+
+    fn status(&self) -> BTreeMap<String, (u8, u8)> {
+        let StateEvent::Snapshot { state_id, records } = self
+            .events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("state snapshot timed out")
+        else {
+            panic!("state engine closed unexpectedly")
+        };
+        self.handle.ack(state_id);
+        records
+            .into_iter()
+            .filter_map(|record| match record {
+                StateRecord::Status {
+                    path,
+                    index_status,
+                    worktree_status,
+                    ..
+                } => Some((
+                    path.iter()
+                        .map(|part| String::from_utf8_lossy(part))
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    (index_status, worktree_status),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn status_options(untracked: bool, ignored: bool) -> StateOptions {
+    StateOptions {
+        status: true,
+        untracked,
+        ignored,
+        refs_latency: Duration::from_millis(5),
+        status_latency: Duration::from_millis(5),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -359,4 +424,188 @@ fn semantic_fetch_reports_local_remote_ref_updates() {
             && reference.new_ref
             && reference.name.starts_with(b"refs/remotes/origin/")
     }));
+}
+
+#[test]
+fn status_keeps_tracked_files_and_ancestors_observable_despite_ignore_rules() {
+    for untracked in [false, true] {
+        let repository = Repository::new();
+        repository.write("tracked.log", b"initial\n");
+        repository.write("generated/nested/tracked", b"initial\n");
+        repository.commit("track files before adding ignore rules");
+        repository.write(".gitignore", b"*.log\ngenerated/\n");
+        repository.commit("ignore tracked paths");
+        repository.write("generated/cache/ignored", b"ignored\n");
+        let (handle, _) = open(&repository);
+        let state = StateStream::new(&handle, status_options(untracked, false));
+        assert!(state.status().is_empty());
+        let watches = repository.worktree_watches();
+        assert!(watches.contains(&repository.0.join("generated/nested")));
+        assert!(!watches.contains(&repository.0.join("generated/cache")));
+
+        repository.write("tracked.log", b"modified tracked file\n");
+        assert_eq!(state.status()["tracked.log"], (b' ', b'M'));
+        repository.write("generated/nested/tracked", b"modified tracked descendant\n");
+        assert_eq!(state.status()["generated/nested/tracked"], (b' ', b'M'));
+        std::fs::remove_file(repository.0.join("tracked.log")).unwrap();
+        assert_eq!(state.status()["tracked.log"], (b' ', b'D'));
+    }
+}
+
+#[test]
+fn index_changes_reconcile_tracked_exceptions_to_ignore_pruning() {
+    let repository = Repository::new();
+    repository.write(".gitignore", b"generated/\n");
+    repository.commit("base");
+    repository.write("generated/nested/tracked", b"initial\n");
+    let (handle, _) = open(&repository);
+    let state = StateStream::new(&handle, status_options(true, false));
+    assert!(state.status().is_empty());
+    let watches = || repository.worktree_watches();
+    assert!(!watches().contains(&repository.0.join("generated")));
+
+    repository.git(&["add", "-f", "generated/nested/tracked"]);
+    assert_eq!(state.status()["generated/nested/tracked"], (b'A', b' '));
+    assert!(watches().contains(&repository.0.join("generated/nested")));
+    repository.write("generated/nested/tracked", b"modified after force-add\n");
+    assert_eq!(state.status()["generated/nested/tracked"], (b'A', b'M'));
+
+    repository.git(&["rm", "--cached", "-f", "generated/nested/tracked"]);
+    assert!(state.status().is_empty());
+    assert!(!watches().contains(&repository.0.join("generated")));
+}
+
+#[test]
+fn status_budgets_are_independent_across_shared_selections() {
+    for ignored in [false, true] {
+        let repository = Repository::new();
+        repository.write("z-tracked", b"initial\n");
+        repository.write(".gitignore", if ignored { b"a-generated/\n" } else { b"" });
+        repository.commit("base");
+        repository.write("z-tracked", b"modified\n");
+        repository.write("z-untracked", b"untracked\n");
+        for index in 0..10 {
+            repository.write(&format!("a-generated/{index}"), b"generated\n");
+        }
+        let (mut handle, _) = open(&repository);
+        handle.budgets = std::sync::Arc::new(yas_git::Budgets {
+            entries_max: 8,
+            ..Default::default()
+        });
+        // Tracked-only beside untracked, then untracked beside ignored:
+        // each broader selection exhausts its own budget before z-tracked.
+        let selected_options = status_options(ignored, false);
+        let selected = StateStream::new(&handle, selected_options.clone());
+        let expected = selected.status();
+        assert_eq!(expected["z-tracked"], (b' ', b'M'));
+        assert_eq!(expected.contains_key("z-untracked"), ignored);
+        let broader = StateStream::new(&handle, status_options(true, ignored));
+        let broad_status = broader.status();
+        assert_eq!(broad_status.len(), 8);
+        assert!(
+            broad_status
+                .keys()
+                .all(|name| name.starts_with("a-generated/"))
+        );
+
+        // Attaching in the other order must also use the selected budget.
+        let another = StateStream::new(&handle, selected_options);
+        assert_eq!(another.status(), expected);
+        repository.write("z-tracked", b"modified again\n");
+        assert_eq!(selected.status(), expected);
+        assert_eq!(another.status(), expected);
+    }
+}
+
+#[test]
+fn nested_status_paths_share_index_and_ignore_rules() {
+    let repository = Repository::new();
+    repository.write("nested/tracked", b"initial\n");
+    repository.write("nested/.gitignore", b"*.log\ncache/\n");
+    repository.commit("base");
+    repository.write("nested/tracked", b"modified\n");
+    repository.write("nested/untracked", b"untracked\n");
+    repository.write("nested/ignored.log", b"ignored\n");
+    repository.write("nested/cache/ignored", b"ignored\n");
+    let (handle, _) = open(&repository);
+
+    // Keep the shared engine alive while widening its status demand.
+    let mut states = Vec::new();
+    for (untracked, ignored) in [(false, false), (true, false), (true, true)] {
+        let state = StateStream::new(&handle, status_options(untracked, ignored));
+        let mut expected = BTreeMap::from([("nested/tracked".to_owned(), (b' ', b'M'))]);
+        if untracked {
+            expected.insert("nested/untracked".to_owned(), (b'?', b'?'));
+        }
+        if ignored {
+            expected.insert("nested/ignored.log".to_owned(), (b'!', b'!'));
+            expected.insert("nested/cache/ignored".to_owned(), (b'!', b'!'));
+        }
+        assert_eq!(state.status(), expected);
+        assert_eq!(
+            repository
+                .worktree_watches()
+                .contains(&repository.0.join("nested/cache")),
+            ignored
+        );
+        states.push(state);
+    }
+}
+
+#[test]
+fn non_status_subscribers_do_not_widen_status_collection() {
+    let repository = Repository::new();
+    repository.write(".gitignore", b"ignored/\n");
+    repository.write("tracked", b"initial\n");
+    repository.commit("base");
+    repository.write("ignored/nested/file", b"ignored\n");
+    repository.write("tracked", b"modified\n");
+    let (handle, _) = open(&repository);
+    let refs = StateStream::new(
+        &handle,
+        StateOptions {
+            status: false,
+            ..status_options(true, true)
+        },
+    );
+    assert!(refs.status().is_empty());
+    let selected = StateStream::new(&handle, status_options(true, false));
+    assert_eq!(selected.status().len(), 1);
+    let watches = repository.worktree_watches();
+    assert!(!watches.contains(&repository.0.join("ignored")));
+    assert_eq!(
+        yas_git::debug_status_recomputes(&repository.0.join(".git")),
+        1
+    );
+}
+
+#[test]
+fn reattached_status_selection_observes_changes_made_while_pruned() {
+    let repository = Repository::new();
+    repository.write(".gitignore", b"ignored/\n");
+    repository.commit("base");
+    repository.write("ignored/first", b"ignored\n");
+    let (handle, _) = open(&repository);
+    let selected = StateStream::new(&handle, status_options(true, false));
+    assert!(selected.status().is_empty());
+    let broader = StateStream::new(&handle, status_options(true, true));
+    assert_eq!(broader.status().len(), 1);
+    drop(broader);
+
+    // Wait for the asynchronous detach to disarm this directory. Writes
+    // inside it then cannot invalidate a cached ignored-status segment.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while repository
+        .worktree_watches()
+        .contains(&repository.0.join("ignored"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "ignored directory was not pruned"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    repository.write("ignored/second", b"new ignored file\n");
+    let broader = StateStream::new(&handle, status_options(true, true));
+    assert_eq!(broader.status().len(), 2);
 }

@@ -1401,10 +1401,10 @@ export class YasSurfaceCanvas {
    * When non-null the surface is in resizable mode: the framework binding's
    * ResizeObserver calls setDisplaySize with the container's physical pixel
    * size and a server-side resize is requested.  The canvas backing buffer
-   * always mirrors the decoded frame. applyLayout() normally maps those pixels
-   * 1:1, but a deliberately lower-resolution adaptive stream is scaled to the
-   * view extent carried alongside it. Stale frames retain their scale during
-   * resize; only committed application minima can force a uniform zoom-out.
+   * always mirrors the decoded frame. applyLayout() maps the frame's reported
+   * geometry to the viewer's display scale and zoom. Stale frames retain their
+   * scale during resize; only committed application minima can force a uniform
+   * zoom-out.
    */
   private _displaySize: {
     width: number;
@@ -2118,7 +2118,7 @@ export class YasSurfaceCanvas {
 
   /**
    * Set the viewer's display box in physical pixels. The decoded frame keeps
-   * its own backing-buffer dimensions; an adaptively smaller frame is scaled
+   * its own backing-buffer dimensions and is mapped to its reported geometry
    * for presentation without manufacturing decoder pixels. The box also
    * drives the server's next surface-size request. Call with `null` to return
    * to passive preview layout.

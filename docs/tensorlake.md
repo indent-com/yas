@@ -27,12 +27,21 @@ binary, all locally built extensions and their manifest, the Dockerfile, and
 extension installer. Reimport after changing YAS or its extensions; existing sandboxes
 continue using their original image.
 
-The image uses Ubuntu 26.04, systemd, PipeWire, htop, Vulkan/EGL userspace libraries, and native
+The image uses Ubuntu 26.04, systemd, PipeWire, htop, Blender, Vulkan/EGL userspace libraries, and native
 Brave and Firefox DEBs from the [Brave](https://brave.com/linux/) and
 [Mozilla](https://support.mozilla.org/en-US/kb/install-firefox-linux) APT
 repositories. Mozilla's repository is preferred over Ubuntu's Firefox Snap
 launcher. Tensorlake provides the GPU device and driver integration at sandbox
 creation.
+
+Firefox 155.0.1 currently fails to start in the tested Tensorlake runtime.
+Its Wayland proxy sends `MSG_CMSG_CLOEXEC` with `sendmsg`, which returns `EINVAL`;
+`MOZ_DISABLE_WAYLAND_PROXY=1` bypasses that first failure. GTK's Glycin icon
+loader then fails because bubblewrap cannot configure its isolated loopback
+interface (`RTM_NEWADDR`). Even after bypassing those failures, Firefox aborts
+in `wasm_rt_syscall_set_segue_base`: gVisor does not support the required
+`arch_prctl(ARCH_SET_GS, ...)` operation. See [gVisor issue #11567](https://github.com/google/gvisor/issues/11567).
+The proxy workaround alone is therefore insufficient.
 
 The image supplies NVIDIA's Vulkan ICD and EGL vendor registration files, plus
 the GLVND EGL runtime (`libegl1`). Tensorlake injects the matching NVIDIA driver
@@ -48,6 +57,15 @@ the sandbox's headless NVIDIA device while YAS renders successfully. Applying
 the registration files and EGL packages to an existing sandbox requires a YAS
 server restart to replace an already initialized software renderer.
 
+GPU rendering in YAS does not imply GPU rendering in Wayland clients. In the
+Tensorlake sandbox, `/dev/dri` is absent and YAS does not advertise
+`zwp_linux_dmabuf_v1`. The stock `es2gears_wayland` therefore falls back to Mesa
+software rendering. Installing NVIDIA's Wayland/GBM EGL platform libraries does
+not fix that missing device/protocol path; forcing the NVIDIA EGL vendor makes
+EGL initialization fail instead. gVisor's [supported device files](https://gvisor.dev/docs/user_guide/gpu/#supported-device-files)
+exclude NVIDIA DRM devices. Native NVIDIA Wayland rendering requires a runtime
+that exposes the DRM render device and a compositor advertising DMA-BUF support.
+
 CPU percentages inside the gVisor sandbox need a control measurement.
 [gVisor approximates per-process CPU time by sampling task state](https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/task_sched.go),
 so frequent timer wakeups can produce misleading `htop`, `/proc`, and
@@ -57,7 +75,7 @@ also wake periodically, even with no surfaces. Compare host cgroup CPU usage
 or a host-side profile before treating the displayed percentage as actual
 YAS execution time; changing the image cannot change gVisor's accounting.
 
-The image also includes Xwayland and
+The image includes Mesa utilities such as `es2gears_wayland`, plus Xwayland and
 [xwayland-satellite 0.8.2](https://github.com/Supreeeme/xwayland-satellite/releases/tag/v0.8.2),
 built from a checksum-verified upstream source archive in a separate Docker
 stage. YAS detects `xwayland-satellite` on `PATH`, starts it with the compositor,

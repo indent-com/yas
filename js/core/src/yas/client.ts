@@ -1,6 +1,7 @@
 import {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
+  YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
@@ -51,6 +52,7 @@ import {
 export {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
+  YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
@@ -117,6 +119,7 @@ export interface YasClientRecord {
   extensions: readonly YasExtension[];
   activeSubscriptions: YasClientActiveSubscriptions | null;
   auxiliarySubscriptionDetails: YasClientAuxiliarySubscriptionDetails | null;
+  auxiliarySubscriptionTimings: YasClientAuxiliarySubscriptionTimings | null;
   bandwidthRates: YasClientBandwidthRates | null;
 }
 
@@ -164,6 +167,17 @@ export interface YasClientAuxiliarySubscriptionDetail {
 
 export interface YasClientAuxiliarySubscriptionDetails {
   entries: readonly YasClientAuxiliarySubscriptionDetail[];
+}
+
+export interface YasClientAuxiliarySubscriptionTiming {
+  family: number;
+  subscriptionId: number;
+  refsSettleMs: number;
+  settleMs: number;
+}
+
+export interface YasClientAuxiliarySubscriptionTimings {
+  entries: readonly YasClientAuxiliarySubscriptionTiming[];
 }
 
 export interface YasClientSnapshot {
@@ -259,6 +273,8 @@ export function decodeClientRecord(bytes: Uint8Array): YasClientRecord {
     activeSubscriptions: decodeClientActiveSubscriptions(extensions),
     auxiliarySubscriptionDetails:
       decodeClientAuxiliarySubscriptionDetails(extensions),
+    auxiliarySubscriptionTimings:
+      decodeClientAuxiliarySubscriptionTimings(extensions),
     bandwidthRates: decodeClientBandwidthRates(extensions),
   };
   cursor.end("Client record");
@@ -318,6 +334,45 @@ export function decodeClientAuxiliarySubscriptionDetails(
     entries.push(value);
   }
   cursor.end("Client auxiliary subscription details");
+  return { entries };
+}
+
+export function decodeClientAuxiliarySubscriptionTimings(
+  extensions: readonly YasExtension[],
+): YasClientAuxiliarySubscriptionTimings | null {
+  const extension = extensions.find(
+    (entry) =>
+      entry.tag === YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
+  );
+  if (!extension) return null;
+  const cursor = new YasCursor(extension.value);
+  const count = cursor.u16("Client watch timing count");
+  if (
+    cursor.u16("Client watch timing reserved") !== 0 ||
+    count > YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS ||
+    count > cursor.remaining / 12
+  )
+    throw new YasProtocolError("invalid Client watch timing count");
+  const entries: YasClientAuxiliarySubscriptionTiming[] = [];
+  let previous: readonly [number, number] | null = null;
+  for (let i = 0; i < count; i++) {
+    const value = {
+      family: cursor.u16("Client watch timing family"),
+      refsSettleMs: cursor.u16("Client ref settle delay"),
+      subscriptionId: cursor.u32("Client watch timing ID"),
+      settleMs: cursor.u16("Client settle delay"),
+    };
+    if (
+      cursor.u16("Client watch timing reserved") !== 0 ||
+      value.subscriptionId === 0 ||
+      (previous !== null &&
+        compareNumberPair(previous, [value.family, value.subscriptionId]) >= 0)
+    )
+      throw new YasProtocolError("invalid Client watch timing entry");
+    previous = [value.family, value.subscriptionId];
+    entries.push(value);
+  }
+  cursor.end("Client watch timings");
   return { entries };
 }
 
@@ -733,6 +788,8 @@ export class YasClientCatalog {
             decodeClientActiveSubscriptions(mergedExtensions),
           auxiliarySubscriptionDetails:
             decodeClientAuxiliarySubscriptionDetails(mergedExtensions),
+          auxiliarySubscriptionTimings:
+            decodeClientAuxiliarySubscriptionTimings(mergedExtensions),
           bandwidthRates: decodeClientBandwidthRates(mergedExtensions),
         });
         retention.upsert(key, estimateStateRetainedBytes(next));

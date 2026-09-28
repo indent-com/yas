@@ -10,6 +10,69 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub type EventCallback = dyn Fn(&notify::Result<notify::Event>) + Send + Sync;
+
+/// Keeps one diagnostic observer registered without keeping a native watch alive.
+pub struct EventObserver {
+    _callback: Arc<EventCallback>,
+}
+
+type ObserverList = Arc<Vec<std::sync::Weak<EventCallback>>>;
+
+/// Shared-root diagnostics. Emitting borrows the original event, allocates
+/// nothing, and calls observers outside the registration lock. Registrations
+/// prune dead weak entries, so an idle root cannot accumulate dead observers.
+#[derive(Clone, Default)]
+pub struct EventObservers(Arc<std::sync::RwLock<ObserverList>>);
+
+impl EventObservers {
+    pub fn observe(&self, callback: Box<EventCallback>) -> EventObserver {
+        let callback: Arc<EventCallback> = Arc::from(callback);
+        let mut current = self.0.write().unwrap();
+        let mut next = current
+            .iter()
+            .filter(|entry| entry.strong_count() > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        next.push(Arc::downgrade(&callback));
+        *current = Arc::new(next);
+        EventObserver {
+            _callback: callback,
+        }
+    }
+
+    pub fn emit(&self, event: &notify::Result<notify::Event>) {
+        let observers = self.0.read().unwrap().clone();
+        for observer in observers.iter().filter_map(std::sync::Weak::upgrade) {
+            observer(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn raw_observers_see_access_and_errors_and_unregister_on_drop() {
+        let hub = EventObservers::default();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observed = seen.clone();
+        let guard = hub.observe(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }));
+        hub.emit(&Ok(notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Any,
+        ))));
+        hub.emit(&Err(notify::Error::generic("overflow")));
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        drop(guard);
+        hub.emit(&Ok(notify::Event::new(notify::EventKind::Any)));
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+    }
+}
+
 /// Keeps the native watch alive; dropping it unwatches.
 pub struct WatchBackend {
     /// Owned by the shared-root handle. The reconciler only receives a
@@ -278,21 +341,34 @@ pub fn watch(
     per_dir: bool,
     hints: HintSender,
 ) -> notify::Result<WatchBackend> {
-    let mut backend = watcher(move |res: notify::Result<notify::Event>| match res {
-        Ok(event) => {
-            if event.need_rescan() {
+    watch_observed(root, recursive, per_dir, hints, EventObservers::default())
+}
+
+pub fn watch_observed(
+    root: &Path,
+    recursive: bool,
+    per_dir: bool,
+    hints: HintSender,
+    observers: EventObservers,
+) -> notify::Result<WatchBackend> {
+    let mut backend = watcher(move |res: notify::Result<notify::Event>| {
+        observers.emit(&res);
+        match res {
+            Ok(event) => {
+                if event.need_rescan() {
+                    hints.send(Hint::Rescan);
+                    return;
+                }
+                if is_read_only_event(&event.kind) {
+                    return;
+                }
+                for path in event.paths {
+                    hints.send(Hint::Dirty(path));
+                }
+            }
+            Err(_) => {
                 hints.send(Hint::Rescan);
-                return;
             }
-            if is_read_only_event(&event.kind) {
-                return;
-            }
-            for path in event.paths {
-                hints.send(Hint::Dirty(path));
-            }
-        }
-        Err(_) => {
-            hints.send(Hint::Rescan);
         }
     })?;
     let mode = if recursive && !per_dir {

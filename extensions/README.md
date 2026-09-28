@@ -115,6 +115,25 @@ runs shows _Update_ when the registry offers a different digest under the same
 name — which replaces the definition in place, keeping its identity — and
 _Current_ when the digests match.
 
+On connection, the browser offers missing extensions and updates whose requirements pass.
+`requirements.json` is published inside each manifest entry by `bin/extensions`.
+Its version-1 format declares the runtime (`wasmi` or `quickjs`), command-provider
+support, optional host OS names, required family versions and Request operations,
+optional server-sent Events, and named host probes. Optional `minMemoryBytes`
+declares a memory floor. Optional `activation` explains immediate effects such as
+starting existing Muster units; this note is shown in the row's Details.
+
+The browser understands only a fixed set of read-only probes: `muster-config`
+checks the instance configuration location without creating it; `systemd` queries
+both managers and checks optional signal/journal support; `xdg-applications`
+checks XDG application roots. Registry metadata cannot supply shell commands.
+Probes use the server's environment with a five-second deadline and
+4 KiB output cap. Missing metadata, unknown probes, timeouts, and inaccessible
+paths are reported as unknown rather than assumed compatible. Missing `gdbus`,
+one inaccessible systemd scope, or empty application roots can still yield an
+offer with limitations. Manage → Extensions shows the reasons and can recheck.
+Checks do not prepare a desktop session or start its compositor/bus.
+
 ## Installing one locally
 
 ```bash

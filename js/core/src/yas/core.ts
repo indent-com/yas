@@ -33,6 +33,7 @@ import {
   YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION,
   YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION,
   YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION,
+  YAS_CORE_SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION,
   YAS_CORRELATED_HEADER_BYTES,
   YAS_EVENTS_LIMIT_MAX_RING_BYTES,
   YAS_EVENTS_LIMIT_MIN_RING_BYTES,
@@ -341,6 +342,22 @@ export function serverPlatform(
     // A platform nobody can parse is a platform nobody was told.
     return null;
   }
+}
+
+/** Optional server runtime/policy facts. Absence means unknown, not allowed. */
+export function serverExtensionSupport(
+  extensions: readonly YasExtension[],
+): number | null {
+  const value = extensions.find(
+    (extension) =>
+      extension.tag === YAS_CORE_SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION,
+  )?.value;
+  if (!value || value.length !== 4) return null;
+  return new DataView(
+    value.buffer,
+    value.byteOffset,
+    value.byteLength,
+  ).getUint32(0, true);
 }
 
 export function encodeFamilyDescriptor(value: YasFamilyDescriptor): Uint8Array {

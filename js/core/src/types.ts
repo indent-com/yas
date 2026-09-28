@@ -205,6 +205,10 @@ export interface YasClientAuxSubscription {
   requestFlags?: number;
   /** Flags from the common State WATCH envelope. */
   stateWatchFlags?: number;
+  /** Configured FS/Git status settle delay after server-default resolution. */
+  settleMs?: number;
+  /** Configured Git ref settle delay; zero for other families. */
+  refsSettleMs?: number;
 }
 
 /** What opened a connection, as the server accounts for it. */

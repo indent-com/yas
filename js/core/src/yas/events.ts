@@ -1559,7 +1559,10 @@ function validateBatch(value: YasEventBatch): void {
     const record = value.records[index]!;
     if (record.sequence !== value.firstSequence + BigInt(index))
       throw new YasProtocolError("non-consecutive Events records");
-    if (record.required && record.eventId > g.YAS_EVENTS_EVENT_SERVER_ERROR)
+    if (
+      record.required &&
+      record.eventId > g.YAS_EVENTS_EVENT_NATIVE_DATAGRAM_DROP
+    )
       throw new YasProtocolError("unknown required Events event ID");
     if (
       !Number.isInteger(record.eventId) ||

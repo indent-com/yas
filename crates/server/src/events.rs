@@ -14,6 +14,7 @@ pub(crate) const DEFAULT_RING_SIZE: usize = 1024 * 1024;
 pub(crate) const MIN_RING_SIZE: usize = 4 * 1024;
 pub(crate) const MAX_RING_SIZE: usize = yas_wire::schema::events::MAX_RING_BYTES as usize;
 const LIVE_CHANNEL_RECORDS: usize = 4096;
+pub(crate) const TRACE_CHUNK_BYTES: usize = 2048;
 pub(crate) const EVENT_DUMP_MAGIC: &[u8; 8] = b"YASEVT01";
 pub(crate) const EVENT_DUMP_HEADER_LEN: usize = 84;
 pub(crate) const EVENT_RECORD_HEADER_LEN: usize = 32;
@@ -73,6 +74,28 @@ pub(crate) enum EventType {
     Supervisor = yas_wire::schema::events::EVENT_SUPERVISOR as u16,
     ConnectionAccept = yas_wire::schema::events::EVENT_CONNECTION_ACCEPT as u16,
     Error = yas_wire::schema::events::EVENT_SERVER_ERROR as u16,
+    GitWatchStart = yas_wire::schema::events::EVENT_GIT_WATCH_START as u16,
+    GitWatchStop = yas_wire::schema::events::EVENT_GIT_WATCH_STOP as u16,
+    GitState = yas_wire::schema::events::EVENT_GIT_STATE as u16,
+    GitRecord = yas_wire::schema::events::EVENT_GIT_RECORD as u16,
+    GitFsEvent = yas_wire::schema::events::EVENT_GIT_FS_EVENT as u16,
+    FsRecord = yas_wire::schema::events::EVENT_FS_RECORD as u16,
+    FsEvent = yas_wire::schema::events::EVENT_FS_EVENT as u16,
+    FsWatchStart = yas_wire::schema::events::EVENT_FS_WATCH_START as u16,
+    FsWatchStop = yas_wire::schema::events::EVENT_FS_WATCH_STOP as u16,
+    FsState = yas_wire::schema::events::EVENT_FS_STATE as u16,
+    NativeFrameRead = yas_wire::schema::events::EVENT_NATIVE_FRAME_READ as u16,
+    NativeFrameWrite = yas_wire::schema::events::EVENT_NATIVE_FRAME_WRITE as u16,
+    NativePayloadRead = yas_wire::schema::events::EVENT_NATIVE_PAYLOAD_READ as u16,
+    NativePayloadWrite = yas_wire::schema::events::EVENT_NATIVE_PAYLOAD_WRITE as u16,
+    NativeStateRecordRead = yas_wire::schema::events::EVENT_NATIVE_STATE_RECORD_READ as u16,
+    NativeStateRecordWrite = yas_wire::schema::events::EVENT_NATIVE_STATE_RECORD_WRITE as u16,
+    NativeConnect = yas_wire::schema::events::EVENT_NATIVE_CONNECT as u16,
+    NativeDisconnect = yas_wire::schema::events::EVENT_NATIVE_DISCONNECT as u16,
+    NativeError = yas_wire::schema::events::EVENT_NATIVE_ERROR as u16,
+    NativeDatagramRead = yas_wire::schema::events::EVENT_NATIVE_DATAGRAM_READ as u16,
+    NativeDatagramWrite = yas_wire::schema::events::EVENT_NATIVE_DATAGRAM_WRITE as u16,
+    NativeDatagramDrop = yas_wire::schema::events::EVENT_NATIVE_DATAGRAM_DROP as u16,
 }
 
 impl EventType {
@@ -136,6 +159,28 @@ const EVENT_TYPE_CATALOG: &[(EventType, &str)] = &[
     (EventType::Supervisor, "supervisor.event"),
     (EventType::ConnectionAccept, "connection.accept"),
     (EventType::Error, "server.error"),
+    (EventType::GitWatchStart, "git.watch.start"),
+    (EventType::GitWatchStop, "git.watch.stop"),
+    (EventType::GitState, "git.state"),
+    (EventType::GitRecord, "git.record"),
+    (EventType::GitFsEvent, "git.fs_event"),
+    (EventType::FsRecord, "fs.record"),
+    (EventType::FsEvent, "fs.event"),
+    (EventType::FsWatchStart, "fs.watch.start"),
+    (EventType::FsWatchStop, "fs.watch.stop"),
+    (EventType::FsState, "fs.state"),
+    (EventType::NativeFrameRead, "frame.native.read"),
+    (EventType::NativeFrameWrite, "frame.native.write"),
+    (EventType::NativePayloadRead, "payload.native.read"),
+    (EventType::NativePayloadWrite, "payload.native.write"),
+    (EventType::NativeStateRecordRead, "state.record.read"),
+    (EventType::NativeStateRecordWrite, "state.record.write"),
+    (EventType::NativeConnect, "client.native.connect"),
+    (EventType::NativeDisconnect, "client.native.disconnect"),
+    (EventType::NativeError, "client.native.error"),
+    (EventType::NativeDatagramRead, "datagram.native.read"),
+    (EventType::NativeDatagramWrite, "datagram.native.write"),
+    (EventType::NativeDatagramDrop, "datagram.native.drop"),
 ];
 
 fn activation_enabled(set: ActivationSet, kind: EventType) -> bool {
@@ -594,6 +639,10 @@ impl EventLog {
     }
 
     pub(crate) fn record(&self, kind: EventType, flags: u16, payload: &[u8]) {
+        // Sequence assignment, retention and broadcast share one ordering.
+        // Reserving a sequence before this lock lets concurrent producers
+        // publish N+1 before N and breaks the Events stream cursor contract.
+        let mut ring = self.ring.lock().expect("event ring poisoned");
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let monotonic_ns = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let unix_ns = self.started_unix_ns.saturating_add(monotonic_ns);
@@ -609,7 +658,6 @@ impl EventLog {
         header[8..16].copy_from_slice(&sequence.to_le_bytes());
         header[16..24].copy_from_slice(&monotonic_ns.to_le_bytes());
         header[24..32].copy_from_slice(&unix_ns.to_le_bytes());
-        let mut ring = self.ring.lock().expect("event ring poisoned");
         ring.append_parts(&header, payload);
         // Live streams still see a record that is larger than the configured
         // ring. The ring's dropped counter reports that it was not retained.
@@ -984,6 +1032,43 @@ mod tests {
         assert!(records.len() <= 160);
         assert_eq!(records.last().copied(), Some(7));
         assert!(log.stats().dropped > 0);
+    }
+
+    #[test]
+    fn concurrent_producers_publish_in_sequence_order_to_history_and_live_streams() {
+        let mut log = EventLog::new(DEFAULT_RING_SIZE, ActivationSet::all());
+        Arc::get_mut(&mut log).unwrap().live_tx = broadcast::channel(8192).0;
+        let (_, first, mut live) = log.native_snapshot_and_subscribe(false);
+        assert_eq!(first, 0);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for producer in 0..8u8 {
+                let log = &log;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..512 {
+                        log.record(EventType::FsEvent, 0, &[producer; 32]);
+                    }
+                });
+            }
+        });
+        let history = log.ring.lock().unwrap().record_vecs();
+        assert_eq!(history.len(), 4096);
+        assert_eq!(log.stats().next_sequence, 4096);
+        let mut previous_ns = 0;
+        for (sequence, retained) in history.iter().enumerate() {
+            let published = live.try_recv().unwrap();
+            assert_eq!(published.as_ref(), retained);
+            assert_eq!(
+                u64::from_le_bytes(retained[8..16].try_into().unwrap()),
+                sequence as u64
+            );
+            let monotonic_ns = u64::from_le_bytes(retained[16..24].try_into().unwrap());
+            assert!(monotonic_ns >= previous_ns);
+            previous_ns = monotonic_ns;
+        }
+        assert!(live.try_recv().is_err());
     }
 
     #[test]

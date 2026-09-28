@@ -9,9 +9,12 @@ private renderer snapshot and produces GPU-ready vertex data.
 Each connected App owns its home connection and workspace. Component cleanup
 closes and disposes the connection, including ping timers, renderer
 subscriptions, nested Relay sessions, and their terminal and surface views.
-Workspace layouts are restored from the attached backend session, or local
-storage for embedded workspaces. Development source changes require a manual
-page reload.
+The regular app and full-control shares on `yas.run/s` use the same
+`ConnectedWorkspace` shell: workspace manager, durable tabs and layouts, and
+home-server Relay remotes. Embedders select it with `mountYasWorkspace`'s
+`home` option and a durable browser device ID. Read-only shares and fixed
+`connections` embeds use local layout storage without workspace-session
+management. Development source changes require a manual page reload.
 
 Pane content is owned by surviving leaf identity outside the recursive layout.
 Structural slots adopt the existing pane DOM when adding a first sibling,
@@ -30,12 +33,58 @@ are not empty server snapshots. Relay routes and product connections also stay
 in place during retries, so a home-link interruption does not rebuild every
 remote workspace.
 
-On iOS/iPadOS, Safari and installed apps share a fixed opaque top strip to
+Workspace persistence starts from the restored server document, including when
+pane restoration completes synchronously. This keeps the first layout edit
+(such as tiling Manage) from being mistaken for an already-saved baseline.
+Pending debounced edits are flushed on page hide or when the document becomes
+hidden, as well as when switching away from the workspace.
+
+In iOS/iPadOS Safari tabs, a fixed opaque top strip helps
 suppress the system scroll-edge blur. It follows the palette, sits above
 workspace overlays, and is at least 11 CSS pixels tall: WebKit samples a 2px
 band 4px from the edge and ignores background colours on boxes at most 10px
 tall. Both the root and the keyboard-pinned workspace reserve the strip's
 safe-area inset so it never covers the tabs.
+
+Installed iOS apps request an opaque black native status bar and switch to
+`viewport-fit=contain` before the workspace mounts. WebKit owns the unsafe
+screen edges, and `100dvh` sizes the normal-flow shell to the usable viewport.
+The opaque sticky tab bar stays in flow without an extra anti-blur spacer.
+Contained mode disables YAS's manual safe-area padding as well: iOS already
+reserves it, even when `env(safe-area-inset-*)` continues to return nonzero sizes.
+Detection accepts both the display-mode media query and `navigator.standalone`,
+since iOS may expose only the latter.
+
+On the tested iPhone running iOS 27, edge-to-edge mode blurred the top controls
+with static, sticky, and unified opaque fixed headers. Enlarging the contained
+shell to the large viewport clipped the footer; `height=device-height` had no
+effect. Containment is the verified blur-free fallback, not a fix for WebKit's
+native scroll-edge effect or a way to reclaim its reserved top area.
+
+## Extension management
+
+Manage → Extensions runs actions independently per extension. Only the active
+extension's controls are disabled; other installs, updates, and controls remain
+available. Each row shows operation stages and its own result or error. Rows stay
+alphabetically ordered while installations complete, and the live server
+catalogue updates runtime phases without reloading the panel.
+
+After connecting, a compact, non-modal offer appears for viable missing or
+outdated extensions. Review it to install or update them together or individually.
+All eligible actions start selected; explicit deselections survive a recheck.
+Candidates with incomplete or failed checks remain visible with an explanation.
+The offer and Manage share compact, responsive rows, with digests and secondary
+controls behind Details, and share operation progress, including when the
+initiating panel closes. Dismissal is stored per browser connection target and
+server instance name; reconnects do not repeat it. New module digests, changed
+registry requirements, or advertised capabilities permit a new offer.
+
+Checks use registry requirements, negotiated families/operations, server runtime
+and persistence policy, and bounded read-only host probes. They distinguish
+available, available with limitations, unavailable, and unknown. Old registries
+or servers without the metadata produce unknown results and no automatic offer.
+Manage retains all entries and provides Recheck; unknown entries can still be
+installed manually. No extension is installed by a check.
 
 ## Render pipeline overview
 
@@ -186,7 +235,19 @@ When a Wayland app owns the clipboard, Cmd+V and Ctrl+Shift+V in a terminal pane
 on the same connection read that selection directly, including a pending copy.
 They do not require host clipboard export or browser clipboard-read permission;
 Cmd+V works even when an empty host clipboard produces no browser paste event.
-For browser-owned clipboard contents, Cmd+V keeps using the native paste event.
+For browser-owned clipboard contents, Cmd+V keeps using the native paste event,
+including in enhanced keyboard modes: the paste chord is never sent as Super+V.
+
+The mobile toolbar's terminal Paste action starts one structured clipboard read
+directly in the tap gesture, preserving iOS authorization for screenshots. It
+activates on native touch release while retaining textarea focus, rather than
+waiting for a compatibility click that can arrive after the toolbar disappears.
+This explicit device-clipboard action bypasses remembered Wayland ownership
+(taking an iOS screenshot need not emit a browser copy event) and prefers an
+image over accompanying text. It publishes the image to the server clipboard
+and waits for that transfer to commit before sending the terminal application's
+paste chord. A failed image paste never substitutes text. With no image, it
+pastes plain text; text-only browsers fall back to `readText`.
 
 The native viewer requests disambiguation and key events from supporting host
 terminals, enabling all-key reporting only when the focused child requests it.
@@ -223,6 +284,10 @@ including a stationary touch hold, and restores it on release or cancel.
 Dedicated grips also cancel touch defaults to preserve pane focus.
 Only one pointer can own the bridge at a time.
 
+The preview sidebar is one drop-to-park target. Dropping a pane over an existing
+terminal, editor, or window preview parks it in the sidebar; preview cards do
+not become individual receivers or create tab groups.
+
 Chrome buttons (`TapButton`), main-menu entries, and left-dock headers/list
 rows (`TapArea`)
 activate inside `touchend`, through `HTMLElement.click()`, without waiting
@@ -252,6 +317,10 @@ with fixed `top`/`height` positioning. It stays untransformed so terminal and
 surface IME targets retain viewport coordinates and remain aligned with their
 rendered cursors; adding the viewport offset twice puts the hidden input
 behind the keyboard and triggers another browser reveal pan.
+Keyboard detection compares the visible band with the shell's measured CSS
+height (`100dvh`), not `innerHeight`, which can include Safari's browser bars.
+Expanding or collapsing those bars alone must leave the workspace in its normal
+layout, with tabs below the system strip and the footer at the bottom.
 
 Branches and Commit Log expand automatically for Git roots and fold outside
 repositories. Manual Git-section toggles last only for the current root and
@@ -455,12 +524,12 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
   accepting more input. Intentionally dropped and failed chunks are consumed in
   sequence, and cumulative feedback never jumps over an earlier unfinished
   frame.
-- Decoder configurations include the current encoded dimensions and square-pixel display aspect for H.264 and AV1, including after rotation and adaptive resolution changes. These come from the stream, not the pane or logical window, so Android hardware decoding does not start from Chromium's default 1280×720 size guess.
+- Decoder configurations include the current encoded dimensions and square-pixel display aspect for H.264 and AV1, including after rotation and view-size changes. These come from the stream, not the pane or logical window, so Android hardware decoding does not start from Chromium's default 1280×720 size guess.
 - Decoded `VideoFrame`s are rendered to a canvas by `YasSurfaceView` (React/Solid component).
 - Surface canvases allocate decoded frame dimensions rather than the remote catalogue's native size. Failed 2D context allocations retry on the next frame; restored visible contexts repaint the cached frame, and restored backing contexts request a fresh keyframe. Teardown explicitly releases canvas pixel buffers instead of waiting for garbage collection.
 - Closing the last mounted stream releases its decoder, queued frames, HDR frame, and backing canvas while retaining the surface catalogue. Decoder draining has a one-second deadline so a hung `flush()` cannot retain hardware resources indefinitely. A visible stream with a chunk still awaiting output after two seconds is retired and requests a keyframe, even when frame-credit backpressure has stopped further input. Recovery requests share a bounded retry budget; idle streams with no pending chunks are left alone, and callbacks from retired decoders cannot reset replacement streams.
 - Shared surface sizing first expands each viewer's logical box by any zoom-out forced by the application's minimum size, then takes the tightest bound on each axis. A 360×780 pane facing a 500px minimum width can therefore offer 500×1083 logical pixels; another viewer can still limit the height. Committed minima travel separately from rendered geometry so repeated frames cannot inflate the window, and releasing a minimum restores the original bounds. Maximum hints remain enforced by the compositor. Stream pixels stay bounded by viewers' physical panes.
-- Live canvases present each frame's logical extent at their own display scale and zoom, anchored top-left. During an in-flight resize, old frames retain that scale and are clipped by the pane until resized pixels arrive. Only committed application minima force uniform zoom-out; an oversized frame alone never does. Smaller frames are not enlarged. Geometry stays paired with the decoded frame through adaptive downscaling and queued presentation; new catalogue geometry cannot reinterpret an older frame. Streams stay bounded by the requested physical view size, with aspect-preserving server downscaling, even when the application minimum is larger.
+- Live canvases present each frame's logical extent at their own display scale and zoom, anchored top-left. During an in-flight resize, old frames retain that scale and are clipped by the pane until resized pixels arrive. Only committed application minima force uniform zoom-out; an oversized frame alone never does. Smaller frames are not enlarged. Geometry stays paired with the decoded frame through view-size changes and queued presentation; new catalogue geometry cannot reinterpret an older frame. Streams stay bounded by the requested physical view size, with aspect-preserving server downscaling, even when the application minimum is larger. Performance pressure never changes encoded resolution.
 - Surface views track browser DPI changes independently of pane resizing, so page zoom and moves between displays request the new Wayland scale even when the pane keeps the same physical dimensions.
 - A live pane does not open its stream before its first nonzero measurement. YAS records that pane constraint first, sends the corresponding resize, and only then opens the view, so encoder selection starts at the real display extent instead of a native-size or tiny provisional extent. The canvas uses each frame's logical extent at the local display DPI. Servers without per-frame logical metadata fall back to the latest catalogue geometry.
 - The sidebar waits for saved pane assignments to resolve before treating surfaces or terminals as parked. An intermediate empty layout during reload must not open thumbnail streams that the restored main panes would inherit from the shared frame cache.
@@ -472,6 +541,7 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 - A zero-size pane or hidden browser page withdraws its surface size claim and cancels queued resizes. Showing it again reclaims its measured box, even if the dimensions are unchanged. Window resize events remeasure the box independently of changes in display DPI.
 - Native file drags announce planned screenshot filenames during hover. Selection creates private files for that drag, exposes their URI list to the destination, and fills them only after every DROP payload has validated. No prior FS upload is required. File offers expose URI and binary representations rather than making Chromium wait for unavailable image bytes during hover; this supports screenshot-thumbnail drops into Electron apps such as Legcord. Dropped files remain available until the session closes.
 - Surface views accept `touchMode="pointer" | "direct"`. Direct mode is the default and forwards each event's contact changes as Surface `TOUCH` for native Wayland multitouch. Pointer mode is the explicit fallback and maps touch to tap, finger scroll, long-press right-click, and hold-drag. The UI exposes this as **Media → Touch input**.
+- Surface `OPEN_VIEW`/`CONFIGURE_VIEW` explicitly opt into the seat's touch capability through `VIEW_DIRECT_TOUCH_EXTENSION`. Browser viewers enable it only when `navigator.maxTouchPoints > 0` and a mounted canvas uses direct mode. Mouse-only viewers and pointer-mode touch viewers do not advertise a touchscreen: a false touch capability makes sites such as Apple's video player select touch controls that fail to restore the cursor on mouse movement. Disabling a view's capability cancels its contacts; the seat retains touch while another opted-in view remains.
 - Hardware-keyboard Shift+Space is forwarded as a native key chord, preserving Shift for shortcuts such as scrolling up in a remote browser. Other printable keys use browser-resolved text to preserve the host keyboard layout.
 - Enter preserves held modifiers even when the browser omits its physical key code, so Wayland applications receive Ctrl+Enter distinctly from Enter.
 - Backspace and Delete fall back to their logical key when the browser omits or cannot identify the physical code (notably iPadOS forward Delete). Modified deletion chords and forward Delete retain hardware press/release handling. Unmodified iPad Backspace edits the capture field natively so held-key repeat continues; deletions reach the app through input events. Deletable filler remains behind the recent text, and its delayed refill preserves that text and waits beyond the initial long-press delay.

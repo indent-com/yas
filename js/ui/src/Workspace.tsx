@@ -1,4 +1,5 @@
 import { TapButton } from "./TapButton";
+import { ExtensionOffers } from "./ExtensionOffers";
 import { createPointerDrag } from "./pointerDrag";
 import {
   createSignal,
@@ -137,6 +138,7 @@ import {
 } from "./theme";
 import { t, tp } from "./i18n";
 import { applySystemChrome } from "./systemChrome";
+import { observeWorkspaceViewport } from "./workspaceViewport";
 import { TerminalDropTarget } from "./terminalDrop";
 import { StatusBar } from "./StatusBar";
 import { DesktopChrome } from "./DesktopChrome";
@@ -151,7 +153,6 @@ import {
   shouldPlaceObservedSurface,
   surfacePlacementIdentity,
 } from "./layout/surfacePlacement";
-import { isParkedTabDropTarget } from "./layout/tabGrouping";
 import {
   groupMusterPreviewResources,
   isMusterSession,
@@ -1243,47 +1244,15 @@ function WorkspaceScreen(props: {
   const [vpOffset, setVpOffset] = createSignal(0);
   const [vpBaseHeight, setVpBaseHeight] = createSignal(0);
   onMount(() => {
-    const vv = window.visualViewport;
-    if (!vv) return;
-    let baseWidth = 0;
-    const update = () => {
-      const height = vv.height;
-      const width = vv.width;
-      const fullHeight = Math.max(height, window.innerHeight);
-      batch(() => {
-        setVpHeight(height);
-        setVpOffset(vv.offsetTop);
-        setVpBaseHeight((prev) => {
-          // A large width change means rotation or device-mode resize; reset the
-          // baseline instead of carrying a portrait height into landscape.
-          if (baseWidth === 0 || Math.abs(width - baseWidth) > 48) {
-            baseWidth = width;
-            return fullHeight;
-          }
-
-          // Grow with browser chrome collapse.  Also allow small decreases so
-          // address-bar changes do not look like a keyboard; never learn a
-          // keyboard-shrunken viewport (>150px) as the new baseline.
-          if (fullHeight > prev || prev - height <= 150) {
-            baseWidth = width;
-            return fullHeight;
-          }
-          return prev;
+    onCleanup(
+      observeWorkspaceViewport(({ height, offsetTop, baselineHeight }) => {
+        batch(() => {
+          setVpHeight(height);
+          setVpOffset(offsetTop);
+          setVpBaseHeight(baselineHeight);
         });
-      });
-    };
-    update(); // initialise immediately
-    vv.addEventListener("resize", update);
-    vv.addEventListener("scroll", update);
-    window.addEventListener("resize", update);
-    const onOrientationChange = () => setTimeout(update, 150);
-    screen.orientation?.addEventListener("change", onOrientationChange);
-    onCleanup(() => {
-      vv.removeEventListener("resize", update);
-      vv.removeEventListener("scroll", update);
-      window.removeEventListener("resize", update);
-      screen.orientation?.removeEventListener("change", onOrientationChange);
-    });
+      }),
+    );
   });
 
   // How much of the layout viewport something is parked over: a software
@@ -3985,8 +3954,6 @@ function WorkspaceScreen(props: {
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
-  let tabIntoPaneFn: ((value: string, sourcePaneId: string) => boolean) | null =
-    null;
   let openTabInPaneFn:
     | ((value: string, sourcePaneId: string) => boolean)
     | null = null;
@@ -4035,7 +4002,6 @@ function WorkspaceScreen(props: {
     focusBySessionFn = null;
     moveSessionToPaneFn = null;
     moveToPaneFn = null;
-    tabIntoPaneFn = null;
     openTabInPaneFn = null;
     openInContainerFn = null;
     splitPaneFn = null;
@@ -4057,44 +4023,6 @@ function WorkspaceScreen(props: {
     if (!moveToPaneFn) return false;
     moveToPaneFn(assignment, paneId);
     return true;
-  }
-
-  /** A pane grip landed on a tab-capable parked card. Keep the dragged pane
-   * as the visible tab and add that card beside it, instead of letting the
-   * sidebar's generic drop handler park the source. Parked surface previews
-   * are not hosts; a surface must be live in a pane to accept a drop. */
-  function tabDraggedPaneWithParked(
-    parkedAssignment: string,
-    draggedAssignment: string,
-    sourcePaneId: string,
-  ): void {
-    if (
-      !isParkedTabDropTarget(parkedAssignment) ||
-      parkedAssignment === draggedAssignment
-    ) {
-      return;
-    }
-    if (sourcePaneId === MAIN_PANE_SOURCE) {
-      if (inLayout() || mainViewDragAssignment() !== draggedAssignment) return;
-      // Queue before mounting LayoutContainer. It flushes in insertion order,
-      // so put the parked tab down first and the current view last: focus ends
-      // on the view the user dragged, with no visible content swap.
-      queueTilePlacement(parkedAssignment, "1");
-      queueTilePlacement(draggedAssignment, "0");
-      applyLayout(t("workspace.tabs"), {
-        type: "split",
-        direction: "tabs",
-        children: [
-          { node: { type: "leaf" }, weight: 1 },
-          { node: { type: "leaf" }, weight: 1 },
-        ],
-      });
-      return;
-    }
-    if (layoutAssignments()?.assignments[sourcePaneId] !== draggedAssignment) {
-      return;
-    }
-    tabIntoPaneFn?.(parkedAssignment, sourcePaneId);
   }
 
   /** Show a parked item without evicting a floating window already on screen. */
@@ -5145,6 +5073,13 @@ function WorkspaceScreen(props: {
   const workspacePatchSequencer = new WorkspaceSessionPatchSequencer();
   let latestWorkspacePatchTarget: WorkspaceSessionBinding | null = null;
   let latestUiWorkspace = currentStoredWorkspace();
+  // Hydration may complete before the persistence effect's first run. Seed
+  // the queue from the saved document now, not from the first debounced edit:
+  // otherwise that edit becomes the baseline and is never sent to the server.
+  workspacePatchSequencer.reset(
+    props.workspaceSession ?? null,
+    initialSessionWorkspace ?? latestUiWorkspace,
+  );
   createEffect(() => {
     const binding = props.workspaceSession;
     const restoring = binding?.restoring() ?? true;
@@ -5175,14 +5110,27 @@ function WorkspaceScreen(props: {
       workspacePatchSequencer.submit(binding, next);
     }, WORKSPACE_SESSION_PATCH_DEBOUNCE_MS);
   });
-  onCleanup(() => {
+  const flushWorkspacePatch = () => {
     clearTimeout(workspacePatchTimer);
+    workspacePatchTimer = undefined;
     if (latestWorkspacePatchTarget) {
       workspacePatchSequencer.submit(
         latestWorkspacePatchTarget,
         latestUiWorkspace,
       );
     }
+  };
+  const flushHiddenWorkspace = () => {
+    if (document.visibilityState === "hidden") flushWorkspacePatch();
+  };
+  // A browser refresh does not dispose Solid owners. Send the latest edit
+  // before the page goes away rather than relying on the debounce or cleanup.
+  window.addEventListener("pagehide", flushWorkspacePatch);
+  document.addEventListener("visibilitychange", flushHiddenWorkspace);
+  onCleanup(() => {
+    window.removeEventListener("pagehide", flushWorkspacePatch);
+    document.removeEventListener("visibilitychange", flushHiddenWorkspace);
+    flushWorkspacePatch();
     workspacePatchSequencer.finishAfterDrain();
   });
 
@@ -5265,7 +5213,7 @@ function WorkspaceScreen(props: {
                 // Fixed positioning bypasses #root's safe-area padding.
                 // Keep the tabs below the opaque system-bar strip here too.
                 padding:
-                  "var(--yas-system-bar-inset-top, 0px) env(safe-area-inset-right, 0px) 0 env(safe-area-inset-left, 0px)",
+                  "var(--yas-system-bar-inset-top, 0px) var(--yas-safe-area-right, env(safe-area-inset-right, 0px)) 0 var(--yas-safe-area-left, env(safe-area-inset-left, 0px))",
               }
             : {}),
         }}
@@ -5290,6 +5238,14 @@ function WorkspaceScreen(props: {
             />
           )}
         </Show>
+        <ExtensionOffers
+          workspace={workspace}
+          connections={wsState().connections}
+          readOnly={isConnectionReadOnly}
+          label={(id) => connectionLabels().get(id) ?? id}
+          palette={palette()}
+          fontSize={fontSize()}
+        />
         <PrefixMap
           palette={palette()}
           fontFamily={resolvedFontWithFallback()}
@@ -5764,12 +5720,6 @@ function WorkspaceScreen(props: {
                         if (moveToPaneFn === fn) moveToPaneFn = null;
                       };
                     }}
-                    onTabIntoPane={(fn) => {
-                      tabIntoPaneFn = fn;
-                      return () => {
-                        if (tabIntoPaneFn === fn) tabIntoPaneFn = null;
-                      };
-                    }}
                     onOpenTabInPane={(fn) => {
                       openTabInPaneFn = fn;
                       return () => {
@@ -5836,7 +5786,6 @@ function WorkspaceScreen(props: {
             <PreviewPanel
               parkDropActive={paneDragActive()}
               onParkDrop={parkDraggedAssignment}
-              onTabDrop={tabDraggedPaneWithParked}
               offScreenSessions={offScreenSessions()}
               allSessions={sessions()}
               surfaces={offScreenSurfaces()}
@@ -6512,7 +6461,8 @@ function WorkspaceScreen(props: {
           <div
             aria-hidden="true"
             style={{
-              height: "env(safe-area-inset-bottom)",
+              height:
+                "var(--yas-safe-area-bottom, env(safe-area-inset-bottom))",
               "flex-shrink": 0,
               "background-color": theme().bg,
             }}
@@ -6579,48 +6529,12 @@ function PreviewPanel(props: {
   parkDropActive?: boolean;
   /** A grip drag landed here; park `assignment`, emptying `source`. */
   onParkDrop?: (assignment: string, source: string) => void;
-  /** A grip drag landed on a non-surface parked card; group both as tabs. */
-  onTabDrop?: (
-    parkedAssignment: string,
-    draggedAssignment: string,
-    source: string,
-  ) => void;
 }) {
   const [expandedId, setExpandedId] = createSignal<number | null>(null);
   const [resizeHover, setResizeHover] = createSignal(false);
   const [resizeActive, setResizeActive] = createSignal(false);
   /** The grip drag is hovering the panel (parallel to a pane's highlight). */
   const [parkOver, setParkOver] = createSignal(false);
-  const [tabDropActive, setTabDropActive] = createSignal(false);
-  let markedTabTarget: HTMLElement | null = null;
-  const cardAt = (event: DragEvent): HTMLElement | null => {
-    const origin = event.target;
-    if (!(origin instanceof Element)) return null;
-    const card = origin.closest<HTMLElement>("[data-yas-preview-assignment]");
-    const panel = event.currentTarget;
-    return card && panel instanceof HTMLElement && panel.contains(card)
-      ? card
-      : null;
-  };
-  const tabTargetAt = (event: DragEvent): HTMLElement | null => {
-    const card = cardAt(event);
-    const assignment = card?.dataset.yasPreviewAssignment;
-    return assignment && isParkedTabDropTarget(assignment) ? card : null;
-  };
-  const markTabTarget = (target: HTMLElement | null) => {
-    if (markedTabTarget === target) return;
-    if (markedTabTarget) {
-      markedTabTarget.style.removeProperty("outline");
-      markedTabTarget.style.removeProperty("outline-offset");
-    }
-    markedTabTarget = target;
-    if (target) {
-      target.style.setProperty("outline", `2px solid ${props.theme.accent}`);
-      target.style.setProperty("outline-offset", "-2px");
-    }
-    setTabDropActive(target != null);
-  };
-  onCleanup(() => markTabTarget(null));
   const resources = createMemo(() =>
     groupMusterPreviewResources(
       props.offScreenSessions,
@@ -6683,15 +6597,8 @@ function PreviewPanel(props: {
       }}
       onDragOver={(e) => {
         if (!props.onParkDrop || !isPaneDrag(e)) return;
-        const card = props.onTabDrop ? tabTargetAt(e) : null;
-        if (card?.dataset.yasPreviewAssignment) {
-          e.preventDefault();
-          e.dataTransfer!.dropEffect = "move";
-          setParkOver(false);
-          markTabTarget(card);
-          return;
-        }
-        markTabTarget(null);
+        // The whole sidebar receives parking drops, including its previews.
+        // Existing cards must not turn a parking gesture into tab grouping.
         e.preventDefault(); // allow the drop
         e.dataTransfer!.dropEffect = "move";
         if (!parkOver()) setParkOver(true);
@@ -6700,29 +6607,20 @@ function PreviewPanel(props: {
         // Ignore leaves into child elements; only clear when truly leaving.
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
           setParkOver(false);
-          markTabTarget(null);
         }
       }}
       onDrop={(e) => {
         setParkOver(false);
-        const card = props.onTabDrop ? tabTargetAt(e) : null;
-        const parkedAssignment = card?.dataset.yasPreviewAssignment;
         const assignment = tileDragAssignment(e);
         const source = paneDragSource(e);
-        markTabTarget(null);
-        if (parkedAssignment && assignment && source && props.onTabDrop) {
-          e.preventDefault();
-          e.stopPropagation();
-          props.onTabDrop(parkedAssignment, assignment, source);
-          return;
-        }
         if (assignment && source && props.onParkDrop) {
           e.preventDefault();
+          e.stopPropagation();
           props.onParkDrop(assignment, source);
         }
       }}
     >
-      <Show when={props.parkDropActive && !tabDropActive()}>
+      <Show when={props.parkDropActive}>
         <div
           style={{
             position: "absolute",

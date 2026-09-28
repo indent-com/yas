@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use time::OffsetDateTime;
+use yas_wire::Decode;
 use yas_wire::events::ActivationSet;
 
 const BYTE_PREVIEW: usize = 96;
@@ -64,6 +65,28 @@ enum EventType {
     Supervisor = 45,
     ConnectionAccept = 46,
     Error = 47,
+    GitWatchStart = 48,
+    GitWatchStop = 49,
+    GitState = 50,
+    GitRecord = 51,
+    GitFsEvent = 52,
+    FsRecord = 53,
+    FsEvent = 54,
+    FsWatchStart = 55,
+    FsWatchStop = 56,
+    FsState = 57,
+    NativeFrameRead = 58,
+    NativeFrameWrite = 59,
+    NativePayloadRead = 60,
+    NativePayloadWrite = 61,
+    NativeStateRecordRead = 62,
+    NativeStateRecordWrite = 63,
+    NativeConnect = 64,
+    NativeDisconnect = 65,
+    NativeError = 66,
+    NativeDatagramRead = 67,
+    NativeDatagramWrite = 68,
+    NativeDatagramDrop = 69,
 }
 
 const EVENT_TYPES: &[EventType] = &[
@@ -115,6 +138,28 @@ const EVENT_TYPES: &[EventType] = &[
     EventType::Supervisor,
     EventType::ConnectionAccept,
     EventType::Error,
+    EventType::GitWatchStart,
+    EventType::GitWatchStop,
+    EventType::GitState,
+    EventType::GitRecord,
+    EventType::GitFsEvent,
+    EventType::FsRecord,
+    EventType::FsEvent,
+    EventType::FsWatchStart,
+    EventType::FsWatchStop,
+    EventType::FsState,
+    EventType::NativeFrameRead,
+    EventType::NativeFrameWrite,
+    EventType::NativePayloadRead,
+    EventType::NativePayloadWrite,
+    EventType::NativeStateRecordRead,
+    EventType::NativeStateRecordWrite,
+    EventType::NativeConnect,
+    EventType::NativeDisconnect,
+    EventType::NativeError,
+    EventType::NativeDatagramRead,
+    EventType::NativeDatagramWrite,
+    EventType::NativeDatagramDrop,
 ];
 
 impl EventType {
@@ -351,6 +396,199 @@ fn describe_payload(kind: EventType, payload: &[u8]) -> Option<String> {
             };
             format!("pty={pty} stage={stage}")
         }
+        EventType::GitWatchStart
+        | EventType::GitWatchStop
+        | EventType::FsWatchStart
+        | EventType::FsWatchStop => {
+            let identity = watch_identity(
+                &mut cursor,
+                matches!(kind, EventType::GitWatchStart | EventType::GitWatchStop),
+            )?;
+            let flags = cursor.u32()?;
+            let state_flags = cursor.u16()?;
+            let refs_settle_ms = cursor.u16()?;
+            let settle_ms = cursor.u16()?;
+            let path_len = usize::from(cursor.u16()?);
+            let path = cursor.take(path_len)?;
+            format!(
+                "{identity} flags=0x{flags:x} state_flags=0x{state_flags:x} refs_settle_ms={refs_settle_ms} settle_ms={settle_ms} path={}",
+                quoted_bytes(path)
+            )
+        }
+        EventType::GitState | EventType::FsState => {
+            let identity = watch_identity(&mut cursor, matches!(kind, EventType::GitState))?;
+            format!(
+                "{identity} revision={} records={} bytes={}",
+                cursor.u64()?,
+                cursor.u32()?,
+                cursor.u64()?
+            )
+        }
+        EventType::GitFsEvent | EventType::FsEvent => {
+            let identity = watch_identity(&mut cursor, matches!(kind, EventType::GitFsEvent))?;
+            let event = cursor.bytes_u32()?;
+            let rescan = cursor.u8()? != 0;
+            let count = cursor.u32()? as usize;
+            if count > (cursor.bytes.len() - cursor.at) / 4 {
+                return None;
+            }
+            let mut paths = Vec::with_capacity(count);
+            for _ in 0..count {
+                paths.push(quoted_bytes(cursor.bytes_u32()?));
+            }
+            format!(
+                "{identity} event={} rescan={rescan} paths=[{}]",
+                quoted_bytes(event),
+                paths.join(", ")
+            )
+        }
+        EventType::GitRecord | EventType::FsRecord => {
+            let git = matches!(kind, EventType::GitRecord);
+            let identity = watch_identity(&mut cursor, git)?;
+            let revision = cursor.u64()?;
+            let watch_flags = cursor.u32()?;
+            let record_id = cursor.u64()?;
+            let record_kind = cursor.u16()?;
+            let required = cursor.u16()?;
+            let total = cursor.u32()?;
+            let offset = cursor.u32()?;
+            let body = cursor.remaining();
+            let decoded = if offset != 0 || body.len() != total as usize {
+                None
+            } else if git {
+                describe_git_record(record_kind, watch_flags, body)
+            } else {
+                describe_fs_record(record_kind, body)
+            };
+            format!(
+                "{identity} revision={revision} record={record_id} kind={record_kind} required={required} offset={offset} total={total} chunk_bytes={} {}",
+                body.len(),
+                decoded.unwrap_or_else(|| format!("body={}", quoted_bytes(body)))
+            )
+        }
+        EventType::NativeConnect | EventType::NativeDisconnect | EventType::NativeError => {
+            let session = cursor
+                .take(16)?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let detail = match kind {
+                EventType::NativeConnect => {
+                    format!("name={:?} release={:?}", cursor.name()?, cursor.name()?)
+                }
+                EventType::NativeDisconnect => format!(
+                    "elapsed_us={} received_bytes={} sent_bytes={} reason={:?}",
+                    cursor.u64()?,
+                    cursor.u64()?,
+                    cursor.u64()?,
+                    cursor.name()?
+                ),
+                _ => format!("stage={:?} error={:?}", cursor.name()?, cursor.name()?),
+            };
+            format!("session={session} {detail}")
+        }
+        EventType::NativeFrameRead
+        | EventType::NativeFrameWrite
+        | EventType::NativeDatagramRead
+        | EventType::NativeDatagramWrite
+        | EventType::NativeDatagramDrop
+        | EventType::NativePayloadRead
+        | EventType::NativePayloadWrite
+        | EventType::NativeStateRecordRead
+        | EventType::NativeStateRecordWrite => {
+            let session = cursor
+                .take(16)?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let family_id = cursor.u16()?;
+            let operation_kind = cursor.u16()?;
+            let class = cursor.u8()?;
+            let flags = cursor.u8()?;
+            let request = cursor.u32()?;
+            let watch = cursor.u32()?;
+            let payload_bytes = cursor.u32()?;
+            let wire_bytes = cursor.u64()?;
+            let trace = cursor.u64()?;
+            let family = yas_wire::schema::FAMILIES
+                .iter()
+                .find(|family| family.id == family_id);
+            let operation = family.and_then(|family| {
+                family.operations.iter().find(|operation| {
+                    operation.kind == operation_kind
+                        && operation.class == if class == 2 { 1 } else { class }
+                })
+            });
+            let name = operation.map_or("unknown", |operation| operation.name);
+            let mut text = format!(
+                "session={session} trace={trace} family={} kind={}({operation_kind}) class={} request={request} watch={watch} flags=0x{flags:x} payload_bytes={payload_bytes} wire_bytes={wire_bytes}",
+                family.map_or("unknown", |family| family.name),
+                operation.map_or("unknown", |operation| operation.name),
+                match class {
+                    0 => "event",
+                    1 => "request",
+                    2 => "result",
+                    _ => "unknown",
+                }
+            );
+            match kind {
+                EventType::NativePayloadRead | EventType::NativePayloadWrite => {
+                    let length = cursor.u32()?;
+                    let offset = cursor.u32()?;
+                    let bytes = cursor.remaining();
+                    write!(
+                        text,
+                        " offset={offset} total={length} chunk_bytes={} data={}",
+                        bytes.len(),
+                        quoted_bytes(bytes)
+                    )
+                    .ok()?;
+                }
+                EventType::NativeStateRecordRead | EventType::NativeStateRecordWrite => {
+                    text.push_str(&describe_state_header(&mut cursor)?);
+                    let index = cursor.u16()?;
+                    let record_kind = cursor.u16()?;
+                    let required = cursor.u16()?;
+                    let length = cursor.u32()?;
+                    let offset = cursor.u32()?;
+                    let bytes = cursor.remaining();
+                    let detail = (offset == 0 && bytes.len() == length as usize)
+                        .then(|| describe_native_record(family_id, name, record_kind, bytes))
+                        .flatten()
+                        .unwrap_or_else(|| format!("data={}", quoted_bytes(bytes)));
+                    write!(text, " record={index} action={}({record_kind}) required={required} offset={offset} total={length} chunk_bytes={} {detail}",
+                        match record_kind { 0 => "add", 1 => "replace", 2 => "patch", 3 => "remove", _ => "family" }, bytes.len()).ok()?;
+                }
+                _ if !cursor.finished() => {
+                    if class == 2 {
+                        let status = cursor.u16()?;
+                        let _reserved = cursor.u16()?;
+                        write!(
+                            text,
+                            " status={:?}",
+                            yas_wire::core::Status::from_code(status)
+                        )
+                        .ok()?;
+                    } else if matches!(name, "STATE" | "QUERY_STATE") {
+                        text.push_str(&describe_state_header(&mut cursor)?);
+                        write!(text, " records={}", cursor.u16()?).ok()?;
+                    } else if matches!(name, "STATE_ACK" | "QUERY_STATE_ACK") {
+                        cursor.u32()?;
+                        write!(
+                            text,
+                            " applied_revision={} credit={}",
+                            cursor.u64()?,
+                            cursor.u64()?
+                        )
+                        .ok()?;
+                    } else if family_id == yas_wire::family::TRANSFER {
+                        write!(text, " transfer={}", cursor.u32()?).ok()?;
+                    }
+                }
+                _ => {}
+            }
+            text
+        }
         EventType::FrameRead
         | EventType::FrameWrite
         | EventType::SurfaceFrame
@@ -436,6 +674,124 @@ fn describe_payload(kind: EventType, payload: &[u8]) -> Option<String> {
         | EventType::ConnectionAccept => return None,
     };
     cursor.finished().then_some(detail)
+}
+
+fn describe_state_header(cursor: &mut Cursor<'_>) -> Option<String> {
+    let watch = cursor.u32()?;
+    let phase = cursor.u8()?;
+    let flags = cursor.u8()?;
+    cursor.u16()?;
+    let from = cursor.u64()?;
+    let to = cursor.u64()?;
+    Some(format!(
+        " state_watch={watch} phase={}({phase}) state_flags=0x{flags:x} from_revision={from} to_revision={to}",
+        match phase {
+            0 => "snapshot-begin",
+            1 => "snapshot-records",
+            2 => "snapshot-end",
+            3 => "delta",
+            4 => "reset",
+            _ => "unknown",
+        }
+    ))
+}
+
+fn describe_native_record(family: u16, operation: &str, kind: u16, body: &[u8]) -> Option<String> {
+    use yas_wire::{
+        family as f,
+        state::{Record, RecordKind},
+    };
+    let record_kind = match kind {
+        0 => RecordKind::Add,
+        1 => RecordKind::Replace,
+        2 => RecordKind::Patch,
+        3 => RecordKind::Remove,
+        value => RecordKind::Family(value),
+    };
+    let remove = record_kind == RecordKind::Remove;
+    let patch = record_kind == RecordKind::Patch;
+    macro_rules! decoded {
+        ($ty:ty) => {
+            Some(format!("value={:?}", <$ty>::decode(body).ok()?))
+        };
+    }
+    macro_rules! removed {
+        ($ty:ty) => {
+            Some(format!(
+                "value={:?}",
+                <$ty>::from_state_record(&Record {
+                    kind: record_kind,
+                    required: false,
+                    body: body.to_vec(),
+                })
+                .ok()?
+            ))
+        };
+    }
+    match family {
+        f::GIT => describe_git_record(
+            kind,
+            if operation == "QUERY_STATE" {
+                yas_wire::schema::client::GIT_QUERY_WATCH as u32
+            } else {
+                0
+            },
+            body,
+        ),
+        f::FS => describe_fs_record(kind, body),
+        f::KV if remove => removed!(yas_wire::kv::RemovedEntry),
+        f::KV => {
+            let entry = yas_wire::kv::EntryRecord::decode(body).ok()?;
+            Some(format!(
+                "key={} value={entry:?}",
+                quoted_bytes(&entry.relative_key)
+            ))
+        }
+        f::TERMINAL if remove => decoded!(yas_wire::terminal::RemovedTerminal),
+        f::TERMINAL if patch => decoded!(yas_wire::terminal::TerminalPatch),
+        f::TERMINAL => decoded!(yas_wire::terminal::TerminalRecord),
+        f::SURFACE if remove => decoded!(yas_wire::surface::RemovedSurface),
+        f::SURFACE if patch => decoded!(yas_wire::surface::SurfacePatch),
+        f::SURFACE => decoded!(yas_wire::surface::SurfaceRecord),
+        f::CLIENT if remove => decoded!(yas_wire::client::RemovedClient),
+        f::CLIENT if patch => decoded!(yas_wire::client::ClientPatch),
+        f::CLIENT => decoded!(yas_wire::client::ClientRecord),
+        f::PROCESS if remove => decoded!(yas_wire::process::RemovedProcess),
+        f::PROCESS => decoded!(yas_wire::process::ProcessRecord),
+        f::EXTENSION if remove => decoded!(yas_wire::extension::RemovedExtension),
+        f::EXTENSION => decoded!(yas_wire::extension::ExtensionRecord),
+        f::CHANNEL if remove => decoded!(yas_wire::channel::RemovedListener),
+        f::CHANNEL => decoded!(yas_wire::channel::ListenerRecord),
+        f::RELAY if remove => removed!(yas_wire::relay::RemovedRoute),
+        f::RELAY => decoded!(yas_wire::relay::RouteRecord),
+        f::FONT if remove => removed!(yas_wire::font::RemovedFamily),
+        f::FONT => decoded!(yas_wire::font::FamilyRecord),
+        f::LSP if remove => decoded!(yas_wire::lsp::RemovedEntity),
+        f::LSP if patch => decoded!(yas_wire::lsp::EntityPatch),
+        f::LSP => decoded!(yas_wire::lsp::StateEntity),
+        f::MEDIA | f::DESKTOP | f::SELECTION => {
+            let record = Record {
+                kind: record_kind,
+                required: false,
+                body: body.to_vec(),
+            };
+            Some(match family {
+                f::MEDIA => format!(
+                    "value={:?}",
+                    yas_wire::media::decode_state_record(&record).ok()?
+                ),
+                f::DESKTOP => format!(
+                    "value={:?}",
+                    yas_wire::desktop::decode_state_record(&record).ok()?
+                ),
+                _ => format!(
+                    "value={:?}",
+                    yas_wire::selection::decode_state_record(&record).ok()?
+                ),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn describe_stream_start(cursor: &mut Cursor<'_>) -> Option<String> {
@@ -566,6 +922,117 @@ fn exit_reason_text(reason: u8) -> &'static str {
     }
 }
 
+fn watch_identity(cursor: &mut Cursor<'_>, git: bool) -> Option<String> {
+    let session = cursor
+        .take(16)?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let resource = cursor.u64()?;
+    let subscription = cursor.u32()?;
+    Some(format!(
+        "session={session} {}={resource} watch={subscription}",
+        if git { "repository" } else { "root" }
+    ))
+}
+
+fn record_path(path: &yas_wire::fs::Path) -> String {
+    quoted_bytes(&path.components.join(&b'/'))
+}
+
+fn describe_git_record(kind: u16, flags: u32, body: &[u8]) -> Option<String> {
+    use yas_wire::{git, schema, state::RecordKind};
+    if flags & schema::client::GIT_QUERY_WATCH as u32 != 0 {
+        let value = git::WatchedQueryValue::decode(body).ok()?;
+        return Some(format!("query={value:?}"));
+    }
+    if kind == RecordKind::Remove.wire() {
+        let value = git::RemovedEntity::decode(body).ok()?;
+        return Some(format!(
+            "entity={} key={}",
+            value.entity_kind,
+            quoted_bytes(&value.key)
+        ));
+    }
+    let value = if kind == RecordKind::Patch.wire() {
+        git::EntityPatch::decode(body).ok()?.replacement
+    } else {
+        git::EntityRecord::decode(body).ok()?
+    };
+    if let git::EntityBody::Status(status) = &value.body {
+        let path = yas_wire::fs::Path::decode(&value.key).ok()?;
+        let letter = |value: u8| {
+            " AMDRCTU?!"
+                .as_bytes()
+                .get(usize::from(value))
+                .copied()
+                .map(char::from)
+                .unwrap_or('?')
+        };
+        return Some(format!(
+            "entity=status path={} status=\"{}{}\" flags=0x{:x}",
+            record_path(&path),
+            letter(status.index_status),
+            letter(status.worktree_status),
+            status.flags
+        ));
+    }
+    Some(format!(
+        "entity={} key={} value={:?}",
+        value.entity_kind,
+        quoted_bytes(&value.key),
+        value.body
+    ))
+}
+
+fn describe_fs_record(kind: u16, body: &[u8]) -> Option<String> {
+    use yas_wire::{fs, schema, state::RecordKind};
+    if kind == RecordKind::Remove.wire() {
+        let entry = fs::RemoveRecord::decode(body).ok()?;
+        return Some(format!(
+            "path={} removed_revision={}",
+            record_path(&entry.path),
+            entry.removed_revision
+        ));
+    }
+    if kind == schema::fs::RECORD_MOVE as u16 {
+        let entry = fs::MoveRecord::decode(body).ok()?;
+        return Some(format!(
+            "from={} to={}",
+            record_path(&entry.from),
+            record_path(&entry.to)
+        ));
+    }
+    let entry = if kind == RecordKind::Patch.wire() {
+        fs::EntryPatch::decode(body).ok()?.replacement
+    } else {
+        fs::EntryRecord::decode(body).ok()?
+    };
+    let detail = match &entry.body {
+        fs::EntryBody::File {
+            byte_len,
+            content_hash,
+            inline_content,
+        } => format!(
+            "file bytes={byte_len} hash={} inline_bytes={}",
+            content_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            inline_content.as_ref().map_or(0, Vec::len)
+        ),
+        fs::EntryBody::Directory => "directory".to_owned(),
+        fs::EntryBody::Symlink { target, .. } => format!("symlink target={}", quoted_bytes(target)),
+    };
+    Some(format!(
+        "path={} entry_revision={} mode={:o} flags=0x{:x} {detail}",
+        record_path(&entry.path),
+        entry.entry_revision,
+        entry.mode,
+        entry.flags
+    ))
+}
+
 fn quoted_bytes(bytes: &[u8]) -> String {
     let shown = bytes.len().min(BYTE_PREVIEW);
     let mut output = String::from("b\"");
@@ -688,6 +1155,11 @@ impl<'a> Cursor<'a> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
+    fn bytes_u32(&mut self) -> Option<&'a [u8]> {
+        let length = self.u32()? as usize;
+        self.take(length)
+    }
+
     fn i32(&mut self) -> Option<i32> {
         Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
@@ -788,5 +1260,89 @@ mod tests {
             u64::from(EventType::Error.id()),
             yas_wire::schema::events::EVENT_SERVER_ERROR
         );
+        assert_eq!(
+            EVENT_TYPES.last().unwrap().id() as u64,
+            yas_wire::schema::events::EVENT_NATIVE_DATAGRAM_DROP
+        );
+    }
+
+    fn native_identity(family: u16, operation: u16, class: u8) -> Vec<u8> {
+        let mut bytes = vec![1; 16];
+        bytes.extend_from_slice(&family.to_le_bytes());
+        bytes.extend_from_slice(&operation.to_le_bytes());
+        bytes.extend_from_slice(&[class, 1]);
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.extend_from_slice(&45u64.to_le_bytes());
+        bytes.extend_from_slice(&11u64.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn native_rendering_names_operations_statuses_and_flow_credit() {
+        use yas_wire::{Encode, family, schema, state::StateAck};
+        let mut result = native_identity(family::GIT, schema::git::request::OPEN, 2);
+        result.extend_from_slice(&[3, 0, 0, 0]);
+        let text = describe_payload(EventType::NativeFrameWrite, &result).unwrap();
+        assert!(text.contains("trace=11 family=yas.git kind=OPEN"));
+        assert!(text.contains("status=NotFound"));
+        let mut ack = native_identity(family::KV, schema::kv::event::STATE_ACK, 0);
+        ack.extend_from_slice(
+            &StateAck {
+                subscription_id: 9,
+                applied_revision: 42,
+                cumulative_byte_limit: 1000,
+            }
+            .encode()
+            .unwrap(),
+        );
+        assert!(
+            describe_payload(EventType::NativeFrameRead, &ack)
+                .unwrap()
+                .contains("applied_revision=42 credit=1000")
+        );
+    }
+
+    #[test]
+    fn native_record_rendering_decodes_paths_and_rejects_truncated_headers() {
+        use yas_wire::{
+            Encode, family,
+            fs::{Path, RemoveRecord},
+            schema,
+            state::{Phase, StateEvent},
+        };
+        let body = RemoveRecord {
+            path: Path {
+                components: vec![b"src".to_vec(), b"gone.rs".to_vec()],
+            },
+            removed_revision: 5,
+            operation_id: None,
+        }
+        .encode()
+        .unwrap();
+        let event = StateEvent {
+            subscription_id: 9,
+            phase: Phase::Delta,
+            flags: 0,
+            from_revision: 5,
+            to_revision: 6,
+            records: vec![],
+        }
+        .encode()
+        .unwrap();
+        let mut payload = native_identity(family::FS, schema::fs::event::STATE, 0);
+        payload.extend_from_slice(&event[..24]);
+        payload.extend_from_slice(&[0, 0, 3, 0, 1, 0]);
+        payload.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&body);
+        let text = describe_payload(EventType::NativeStateRecordWrite, &payload).unwrap();
+        assert!(text.contains("phase=delta(3)"));
+        assert!(text.contains("action=remove(3)"));
+        assert!(text.contains("path=b\"src/gone.rs\" removed_revision=5"));
+        for len in 0..88 {
+            assert!(describe_payload(EventType::NativeStateRecordWrite, &payload[..len]).is_none());
+        }
     }
 }

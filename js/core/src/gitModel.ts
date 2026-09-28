@@ -168,8 +168,11 @@ export interface GitDiscoverOptions {
 
 export interface GitOpenOptions {
   watch?: boolean;
+  /** Request tracked status entries (staged/unstaged changes to index-known files). */
   status?: boolean;
+  /** Also include untracked entries. Requires `status` to have any effect. */
   untracked?: boolean;
+  /** Also include ignored entries. Requires `untracked`. */
   ignored?: boolean;
   tracking?: boolean;
   remotes?: boolean;
@@ -187,6 +190,9 @@ export interface GitRequestOptions {
 export interface GitLogWatchOptions {
   flags?: number;
   limit?: number;
+  /** Zero uses the server default; otherwise 1..65535 milliseconds. */
+  refsLatencyMs?: number;
+  statusLatencyMs?: number;
 }
 
 export function gitStatusText(status: number): string {

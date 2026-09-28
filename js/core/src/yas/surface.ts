@@ -1,5 +1,6 @@
 import {
   YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION,
+  YAS_SURFACE_VIEW_DIRECT_TOUCH_EXTENSION,
   YAS_SURFACE_COLOR_CAP_DISPLAY_P3,
   YAS_SURFACE_COLOR_CAP_HDR10_AV1,
   YAS_SURFACE_COLOR_CAP_HDR10_AV1_444,
@@ -765,6 +766,22 @@ export function surfaceColorCapabilities(
   return values[0]?.value[0] ?? 0;
 }
 
+/** Direct-touch device presence is separate from support for the TOUCH opcode. */
+export function surfaceDirectTouch(
+  extensions: readonly YasExtension[] = [],
+): boolean {
+  const values = extensions.filter(
+    (e) => e.tag === YAS_SURFACE_VIEW_DIRECT_TOUCH_EXTENSION,
+  );
+  if (
+    values.length > 1 ||
+    values.some((e) => e.value.length !== 1 || e.value[0] > 1)
+  ) {
+    throw new YasProtocolError("invalid Surface direct touch");
+  }
+  return values[0]?.value[0] === 1;
+}
+
 export function encodeSurfaceOpenView(value: YasSurfaceOpenView): Uint8Array {
   requireHandle(value.surfaceHandle, "Surface handle");
   if (
@@ -777,6 +794,7 @@ export function encodeSurfaceOpenView(value: YasSurfaceOpenView): Uint8Array {
   )
     throw new YasProtocolError("invalid Surface OPEN_VIEW parameters");
   surfaceColorCapabilities(value.extensions);
+  surfaceDirectTouch(value.extensions);
   let previous = 0;
   const codecs = new YasWriter();
   for (const codec of value.codecVersions) {
@@ -1336,6 +1354,7 @@ export class YasSurfaceView {
 
   private async configureNow(value: YasSurfaceConfigureView): Promise<void> {
     surfaceColorCapabilities(value.extensions);
+    surfaceDirectTouch(value.extensions);
     if (this.closed) throw new YasProtocolError("Surface view is closed");
     if (
       value.width === 0 ||

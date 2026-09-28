@@ -867,6 +867,21 @@ pub fn color_capabilities(extensions: &Extensions) -> Result<u8> {
     Ok(found.unwrap_or(0))
 }
 
+/// Whether this view supplies direct touch, rather than merely supporting TOUCH.
+pub fn direct_touch(extensions: &Extensions) -> Result<bool> {
+    let mut found = None;
+    for extension in &extensions.0 {
+        if extension.tag != crate::schema::surface::VIEW_DIRECT_TOUCH_EXTENSION as u16 {
+            continue;
+        }
+        if found.is_some() || extension.value.len() != 1 || extension.value[0] > 1 {
+            return Err(Error::Invalid("Surface direct touch"));
+        }
+        found = Some(extension.value[0] != 0);
+    }
+    Ok(found.unwrap_or(false))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenView {
     pub surface_handle: u64,
@@ -881,6 +896,7 @@ pub struct OpenView {
 impl Encode for OpenView {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
         color_capabilities(&self.extensions)?;
+        direct_touch(&self.extensions)?;
         handle(self.surface_handle, "zero surface handle")?;
         validate_view_geometry(self.width, self.height, self.max_fps)?;
         if self.decoder_capacity == 0
@@ -1000,6 +1016,7 @@ pub struct ConfigureView {
 impl Encode for ConfigureView {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
         color_capabilities(&self.extensions)?;
+        direct_touch(&self.extensions)?;
         view(self.view_id)?;
         validate_view_geometry(self.width, self.height, self.max_fps)?;
         if self.decoder_capacity == 0 {
@@ -1909,6 +1926,22 @@ pub fn surface_from_state_record(record: &Record) -> Result<SurfaceRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_touch_extension_requires_explicit_device_presence() {
+        let make = |value| Extension {
+            tag: crate::schema::surface::VIEW_DIRECT_TOUCH_EXTENSION as u16,
+            required: false,
+            value,
+        };
+        assert!(!direct_touch(&Extensions::default()).unwrap());
+        assert!(!direct_touch(&Extensions(vec![make(vec![0])])).unwrap());
+        assert!(direct_touch(&Extensions(vec![make(vec![1])])).unwrap());
+        for value in [vec![], vec![2], vec![1, 0]] {
+            assert!(direct_touch(&Extensions(vec![make(value)])).is_err());
+        }
+        assert!(direct_touch(&Extensions(vec![make(vec![1]), make(vec![0])])).is_err());
+    }
 
     #[test]
     fn color_capability_extensions_are_opt_in_and_bounded() {

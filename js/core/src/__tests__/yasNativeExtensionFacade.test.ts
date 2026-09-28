@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   YAS_EXTENSION_CONTROL_RESTART,
+  YAS_EXTENSION_CONTROL_REMOVE,
   YAS_EXTENSION_PHASE_RUNNING,
+  YAS_EXTENSION_PHASE_NEED_OBJECT,
   YAS_EXTENSION_RUNTIME_AUTO,
   YAS_FAMILY_EXTENSION,
   YAS_FAMILY_LIMIT_POLICIES,
 } from "../yas/generated";
-import type { YasExtensionRecord } from "../yas/extension";
+import type {
+  YasExtensionRecord,
+  YasExtensionSnapshot,
+} from "../yas/extension";
 import { YasNativeExtensionFacade } from "../yas/nativeExtensionFacade";
 import { YasWriter } from "../yas/wire";
 
@@ -85,6 +90,72 @@ function clientFor(
 }
 
 describe("YasNativeExtensionFacade", () => {
+  it("waits for confirmed removal while unrelated catalogue updates arrive", async () => {
+    const record = nativeRecord();
+    const other = { ...record, extensionHandle: 2n, name: "other" };
+    let notify!: (snapshot: YasExtensionSnapshot) => void;
+    const unsubscribe = vi.fn();
+    const catalog = {
+      snapshot: { revision: 1n, definitions: [record, other] },
+      subscribe: vi.fn((listener: typeof notify) => {
+        notify = listener;
+        return unsubscribe;
+      }),
+      unwatch: vi.fn().mockResolvedValue(undefined),
+    };
+    const client = clientFor(record, {
+      catalog,
+      control: vi.fn().mockResolvedValue(record),
+    });
+    const facade = new YasNativeExtensionFacade(connection(), client);
+    const settled = vi.fn();
+    const removal = facade
+      .controlExtension(record.extensionHandle, YAS_EXTENSION_CONTROL_REMOVE)
+      .then(settled);
+    await vi.waitFor(() => expect(catalog.subscribe).toHaveBeenCalledOnce());
+
+    // An update for a different extension is not deletion confirmation.
+    notify({
+      revision: 2n,
+      definitions: [
+        record,
+        { ...other, definitionRevision: other.definitionRevision + 1n },
+      ],
+    });
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    // A reset's empty inventory is not authoritative either.
+    notify({ revision: 0n, definitions: [] });
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    catalog.snapshot = { revision: 3n, definitions: [other] };
+    notify(catalog.snapshot);
+    await removal;
+    expect(settled).toHaveBeenCalledWith(null);
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a pending removal on disposal and releases its catalogue listener", async () => {
+    const record = nativeRecord();
+    const unsubscribe = vi.fn();
+    const client = clientFor(record, {
+      control: vi.fn().mockResolvedValue(record),
+    });
+    client.catalog.subscribe = vi.fn(() => unsubscribe);
+    const facade = new YasNativeExtensionFacade(connection(), client);
+    const removal = facade.controlExtension(
+      record.extensionHandle,
+      YAS_EXTENSION_CONTROL_REMOVE,
+    );
+    const rejected = expect(removal).rejects.toThrow("disposed");
+    await vi.waitFor(() =>
+      expect(client.catalog.subscribe).toHaveBeenCalledOnce(),
+    );
+    facade.dispose();
+    await rejected;
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
   it("controls the exact native handle, generation, and revision", async () => {
     const record = nativeRecord();
     const control = vi.fn().mockResolvedValue({
@@ -247,6 +318,7 @@ describe("YasNativeExtensionFacade", () => {
     const client = clientFor(record, { catalog, uploadObject, deploy });
     const facade = new YasNativeExtensionFacade(connection(), client);
     const module = vi.fn().mockResolvedValue(new Uint8Array([0, 97, 115, 109]));
+    const progress: string[] = [];
 
     const result = await facade.installExtension({
       contentHash,
@@ -255,11 +327,72 @@ describe("YasNativeExtensionFacade", () => {
       expectedGeneration: record.generation,
       expectedDefinitionRevision: record.definitionRevision,
       module,
+      onProgress: (stage) => progress.push(stage),
     });
 
     expect(order).toEqual(["upload", "deploy"]);
     expect(uploadObject).toHaveBeenCalledOnce();
     expect(module).toHaveBeenCalledOnce();
     expect(result).toBe(updated);
+    expect(progress).toEqual([
+      "checking",
+      "downloading",
+      "uploading",
+      "deploying",
+      "waiting",
+    ]);
+  });
+
+  it("reports lazy object upload stages and skips them for cached objects", async () => {
+    for (const cached of [false, true]) {
+      const record = nativeRecord();
+      const catalog = {
+        snapshot: { revision: 1n, definitions: [] as YasExtensionRecord[] },
+        subscribe: vi.fn(() => () => undefined),
+        unwatch: vi.fn().mockResolvedValue(undefined),
+      };
+      let uploaded = cached;
+      const client = clientFor(record, {
+        catalog,
+        deploy: vi.fn(async () => {
+          catalog.snapshot = {
+            revision: 2n,
+            definitions: [
+              {
+                ...record,
+                phase: uploaded
+                  ? YAS_EXTENSION_PHASE_RUNNING
+                  : YAS_EXTENSION_PHASE_NEED_OBJECT,
+              },
+            ],
+          };
+          return { ...record, extensions: [] };
+        }),
+        uploadObject: vi.fn(async () => {
+          uploaded = true;
+        }),
+      });
+      const progress: string[] = [];
+      const facade = new YasNativeExtensionFacade(connection(), client);
+      await facade.installExtension({
+        name: record.name,
+        contentHash: record.contentHash,
+        module: async () => new Uint8Array([1]),
+        onProgress: (stage) => progress.push(stage),
+      });
+      expect(progress).toEqual(
+        cached
+          ? ["checking", "deploying", "waiting"]
+          : [
+              "checking",
+              "deploying",
+              "waiting",
+              "downloading",
+              "uploading",
+              "deploying",
+              "waiting",
+            ],
+      );
+    }
   });
 });

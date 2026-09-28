@@ -62,6 +62,10 @@ including platform-specific unused code. WebTransport bandwidth and loss tests
 use QUIC over an in-memory link with a virtual clock; real UDP tests cover
 connection lifecycle and forwarding without measuring host throughput.
 
+Coverage summaries appear in the Actions job summary for every run, with the
+HTML report uploaded as an artifact. Same-repository PRs also receive a coverage
+comment; fork PRs use the job summary because their token cannot post comments.
+
 Signed tags run the same gates with longer fuzz campaigns, then build Linux and
 macOS tarballs plus a Windows zip. The release job uploads both versioned
 filenames and stable aliases such as:

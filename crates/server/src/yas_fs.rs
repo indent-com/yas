@@ -761,6 +761,10 @@ impl Session {
         Err(Error::ResourceExhausted)
     }
 
+    pub(crate) fn root_path(&self, root_handle: u64) -> Result<Vec<u8>, Error> {
+        Ok(self.opened(root_handle)?.root.canonical_path.clone())
+    }
+
     fn opened(&self, root_handle: u64) -> Result<OpenedRoot, Error> {
         self.ensure_open()?;
         self.inner
@@ -844,6 +848,17 @@ impl Drop for Stage {
 }
 
 impl Watch {
+    pub(crate) fn observe_events(
+        &self,
+        callback: Box<sync::backend::EventCallback>,
+    ) -> Option<sync::backend::EventObserver> {
+        self.command
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|watch| watch.observe_events(callback))
+    }
+
     pub(crate) fn root_handle(&self) -> u64 {
         self.root_handle
     }

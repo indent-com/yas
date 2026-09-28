@@ -121,6 +121,7 @@ pub(crate) enum Event {
 pub(crate) struct Sink {
     view_id: u32,
     events: mpsc::Sender<Event>,
+    pub(super) transport_rtt_us: Arc<AtomicU64>,
 }
 
 impl Sink {
@@ -171,6 +172,7 @@ impl Sink {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ViewConfig {
+    pub(crate) direct_touch: bool,
     pub(crate) width: u16,
     pub(crate) height: u16,
     pub(crate) max_fps: u16,
@@ -511,7 +513,11 @@ fn hidden_client(
         origin: ConnectionOrigin::Network,
         catalog_visible: false,
         native_identity: None,
-        native_surface: Some(Sink { view_id, events }),
+        native_surface: Some(Sink {
+            view_id,
+            events,
+            transport_rtt_us: Arc::default(),
+        }),
         lead: None,
         subscriptions: FxHashSet::default(),
         surface_subscriptions: FxHashSet::default(),
@@ -574,7 +580,7 @@ fn hidden_client(
         surface_color_capabilities: config.color_capabilities,
         surface_max_decode: (config.width, config.height),
         pressed_surface_keys: HashSet::new(),
-        direct_touch_enabled: true,
+        direct_touch_enabled: config.direct_touch,
         surface_touch_ids: HashMap::new(),
     }
 }
@@ -586,6 +592,7 @@ pub(crate) async fn register(
     config: ViewConfig,
     events: mpsc::Sender<Event>,
     write_blocked_us: Arc<AtomicU64>,
+    transport_rtt_us: Arc<AtomicU64>,
 ) -> Option<Registration> {
     let mut session = state.session.lock().await;
     if session
@@ -598,6 +605,7 @@ pub(crate) async fn register(
     let client_id = session.next_client_id.max(1);
     session.next_client_id = client_id.checked_add(1)?;
     let mut client = hidden_client(view_id, events, config, write_blocked_us);
+    client.native_surface.as_mut()?.transport_rtt_us = transport_rtt_us;
     client.surface_subscriptions.insert(surface_id);
     client
         .surface_view_sizes
@@ -605,7 +613,6 @@ pub(crate) async fn register(
     let sub = client.surface_subs.entry(surface_id).or_default();
     sub.codec_override = config.codec_support;
     sub.scaled_target = Some((config.width, config.height));
-    sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
     sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
     sub.burst_remaining = SURFACE_BURST_FRAMES;
@@ -665,7 +672,6 @@ pub(crate) async fn configure(
     sub.pending_encode = None;
     sub.codec_override = config.codec_support;
     sub.scaled_target = Some((config.width, config.height));
-    sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
     sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
     sub.nal_none_streak = 0;
@@ -674,10 +680,31 @@ pub(crate) async fn configure(
     sub.burst_remaining = SURFACE_BURST_FRAMES;
     request_surface_keyframe(sub, Instant::now(), true);
     forget_surface_inflight(client, surface_id);
+    let touch_releases = if !config.direct_touch {
+        apply_touch(
+            &mut session,
+            client_id,
+            surface_id,
+            TouchPhase::Cancel,
+            0,
+            Vec::new(),
+        )
+    } else {
+        Vec::new()
+    };
+    session
+        .clients
+        .get_mut(&client_id)
+        .unwrap()
+        .direct_touch_enabled = config.direct_touch;
     if let Some(compositor) = session.compositor.as_mut() {
         compositor.frame_clocks_dirty = true;
+        for command in touch_releases {
+            let _ = compositor.handle.command_tx.send(command);
+        }
     }
     session.sync_compositor_refresh_rate();
+    session.sync_touch_capability();
     drop(session);
     state.delivery_notify.notify_one();
     true
@@ -1162,11 +1189,262 @@ pub(crate) fn enqueue_remote_input(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn touch_capability_tracks_opted_in_views_and_cancels_on_disable() {
+        let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
+        let config = ViewConfig {
+            direct_touch: false,
+            width: 640,
+            height: 480,
+            max_fps: 60,
+            decoder_capacity: 4,
+            codec_support: CODEC_SUPPORT_H264,
+            color_capabilities: 0,
+        };
+        {
+            let mut session = state.session.lock().await;
+            for id in [7, 8] {
+                let (events, _) = mpsc::channel(16);
+                let mut client =
+                    hidden_client(id as u32, events, config, Arc::new(AtomicU64::new(0)));
+                client.surface_subscriptions.insert(3);
+                session.clients.insert(id, client);
+            }
+            assert!(
+                !session.wants_direct_touch(),
+                "mouse-only views must not create a touchscreen"
+            );
+            assert!(
+                apply_touch(
+                    &mut session,
+                    7,
+                    3,
+                    TouchPhase::Down,
+                    1,
+                    vec![TouchContact {
+                        id: 1,
+                        x: 10.0,
+                        y: 20.0
+                    }]
+                )
+                .is_empty()
+            );
+        }
+        let touch_config = ViewConfig {
+            direct_touch: true,
+            ..config
+        };
+        assert!(configure(&state, 7, 3, touch_config).await);
+        assert!(configure(&state, 8, 3, touch_config).await);
+        {
+            let mut session = state.session.lock().await;
+            assert!(session.wants_direct_touch());
+            assert_eq!(
+                apply_touch(
+                    &mut session,
+                    7,
+                    3,
+                    TouchPhase::Down,
+                    2,
+                    vec![TouchContact {
+                        id: 1,
+                        x: 10.0,
+                        y: 20.0
+                    }]
+                )
+                .len(),
+                1
+            );
+            assert_eq!(session.surface_touch_owner, Some(7));
+        }
+        assert!(configure(&state, 7, 3, config).await);
+        {
+            let session = state.session.lock().await;
+            assert_eq!(session.surface_touch_owner, None);
+            assert!(session.clients[&7].surface_touch_ids.is_empty());
+            assert!(session.wants_direct_touch(), "another touch viewer remains");
+        }
+        remove(&state, 8).await;
+        assert!(!state.session.lock().await.wants_direct_touch());
+    }
+
+    #[derive(Clone, Copy)]
+    enum Pressure {
+        None,
+        Writer,
+        Decoder,
+    }
+
+    struct PathOutcome {
+        client: ClientState,
+        delivered: usize,
+        peak_bytes: usize,
+        settled_peak_bytes: usize,
+        peak_quantizer: u8,
+    }
+
+    fn simulate_surface_path(
+        delay_ms: u64,
+        batch_ms: u64,
+        slots: u8,
+        bytes_per_second: usize,
+        pressure: Pressure,
+    ) -> PathOutcome {
+        let start = Instant::now();
+        let (events, _received) = mpsc::channel(64);
+        let mut client = hidden_client(
+            1,
+            events,
+            ViewConfig {
+                direct_touch: false,
+                width: 1920,
+                height: 1080,
+                max_fps: 60,
+                decoder_capacity: slots,
+                codec_support: CODEC_SUPPORT_AV1,
+                color_capabilities: 0,
+            },
+            Arc::default(),
+        );
+        let transport_rtt_us =
+            Arc::clone(&client.native_surface.as_ref().unwrap().transport_rtt_us);
+        client.goodput_window_start = start;
+        client.surface_goodput_window_start = start;
+        let sub = client.surface_subs.entry(1).or_default();
+        sub.max_inflight_frames = Some(usize::from(slots));
+        sub.source_frame_interval_ms = 1_000.0 / 60.0;
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        let mut due = VecDeque::new();
+        let mut wire_free_at = 0;
+        let mut last_generation = 0;
+        let mut delivered = 0;
+        let mut peak_bytes = 0;
+        let mut settled_peak_bytes = 0;
+        let mut peak_quantizer = ceiling;
+        for elapsed_ms in 0..60_000_u64 {
+            let now = start + Duration::from_millis(elapsed_ms);
+            // Two default-cadence Core Pings have completed. The independent
+            // wire test covers measurement and sharing with existing views.
+            if elapsed_ms == 22_000 {
+                transport_rtt_us.store(delay_ms * 1_000, Ordering::Relaxed);
+            }
+            while due.front().is_some_and(|at| *at <= elapsed_ms) {
+                due.pop_front();
+                record_surface_ack_at(&mut client, 1, now);
+                if elapsed_ms >= 55_000 {
+                    delivered += 1;
+                }
+            }
+            let generation = elapsed_ms * 60 / 1_000 + 1;
+            if generation == last_generation {
+                continue;
+            }
+            match pressure {
+                Pressure::None => {}
+                Pressure::Writer => {
+                    client
+                        .write_blocked_us
+                        .fetch_add(WRITE_BLOCKED_CONGESTED_US + 1, Ordering::Relaxed);
+                }
+                Pressure::Decoder => {
+                    update_surface_decoder_queue(client.surface_subs.get_mut(&1).unwrap(), 12, now);
+                }
+            }
+            step_adaptive_bandwidth(&mut client, SurfaceBandwidth::Medium, 1, now, false);
+            let q = client.surface_subs[&1]
+                .adaptive_quantizer
+                .unwrap_or(ceiling);
+            peak_quantizer = peak_quantizer.max(q);
+            // Synthetic monotonic rate response, not an encoder/visual benchmark.
+            let bytes = (20_000.0_f32 * 2.0_f32.powf((ceiling as f32 - q as f32) / 24.0)) as usize;
+            if surface_frame_credit_open_or_mark(&mut client, 1, bytes) {
+                record_surface_frame_sent(&mut client, 1, bytes, false, now);
+                let serialization_ms = if bytes_per_second == 0 {
+                    0
+                } else {
+                    (bytes as u64 * 1_000).div_ceil(bytes_per_second as u64)
+                };
+                wire_free_at = wire_free_at.max(elapsed_ms) + serialization_ms;
+                due.push_back((wire_free_at + delay_ms).div_ceil(batch_ms) * batch_ms);
+                last_generation = generation;
+            }
+            peak_bytes = peak_bytes.max(client.surface_inflight_bytes);
+            if elapsed_ms >= 55_000 {
+                settled_peak_bytes = settled_peak_bytes.max(client.surface_inflight_bytes);
+            }
+            assert!(client.surface_inflight_frames.len() <= usize::from(slots));
+        }
+        PathOutcome {
+            client,
+            delivered,
+            peak_bytes,
+            settled_peak_bytes,
+            peak_quantizer,
+        }
+    }
+
+    #[test]
+    fn healthy_delayed_surface_credit_recovers_quality_without_buying_frame_slots() {
+        for delay in [200, 300, 500] {
+            for batch in [1, 50] {
+                for slots in [16, 64] {
+                    let outcome = simulate_surface_path(delay, batch, slots, 0, Pressure::None);
+                    let client = &outcome.client;
+                    let sub = &client.surface_subs[&1];
+                    assert_eq!(
+                        sub.adaptive_quantizer, None,
+                        "delay={delay}, batch={batch}, slots={slots}, peak_q={}",
+                        outcome.peak_quantizer
+                    );
+                    assert!(sub.congested_at.is_none());
+                    assert!(surface_ack_window_ms(client) >= delay as f32);
+                    // A negotiated count window can cap cadence below 60 Hz.
+                    let possible_fps =
+                        (f64::from(slots) * 1_000.0 / (delay + batch) as f64).min(60.0);
+                    assert!(
+                        outcome.delivered as f64 >= possible_fps * 5.0 * 0.9,
+                        "delay={delay}, batch={batch}, slots={slots}: delivered={}",
+                        outcome.delivered
+                    );
+                    assert!(outcome.peak_bytes <= usize::from(slots) * 20_000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn limited_throughput_surface_credit_still_reduces_quality() {
+        let outcome = simulate_surface_path(50, 50, 16, 100_000, Pressure::None);
+        let sub = &outcome.client.surface_subs[&1];
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        assert!(sub.adaptive_quantizer.unwrap_or(ceiling) > ceiling + ADAPTIVE_STEP);
+        assert!(outcome.peak_bytes <= 16 * 20_000);
+        assert!(
+            outcome.settled_peak_bytes < 60_000,
+            "settled queue retained {} bytes",
+            outcome.settled_peak_bytes
+        );
+        assert!(outcome.delivered < 275);
+        assert!(sub.congested_at.is_none());
+    }
+
+    #[test]
+    fn delayed_surface_writer_and_decoder_pressure_still_reduce_quality() {
+        for pressure in [Pressure::Writer, Pressure::Decoder] {
+            let outcome = simulate_surface_path(300, 50, 16, 0, pressure);
+            let sub = &outcome.client.surface_subs[&1];
+            let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+            assert!(sub.adaptive_quantizer.unwrap_or(ceiling) > ceiling + ADAPTIVE_STEP);
+            assert!(sub.congested_at.is_some());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn native_configure_preserves_resize_sessions_and_rejects_stale_work() {
         let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
         let config = ViewConfig {
+            direct_touch: false,
             width: 64,
             height: 64,
             max_fps: 60,
@@ -1319,6 +1597,7 @@ mod tests {
                     i as u32 + 1,
                     events,
                     ViewConfig {
+                        direct_touch: false,
                         width: 64,
                         height: 64,
                         max_fps: 60,
@@ -1413,6 +1692,7 @@ mod tests {
                 1,
                 events,
                 ViewConfig {
+                    direct_touch: false,
                     width: 64,
                     height: 64,
                     max_fps: 60,
@@ -1699,6 +1979,7 @@ mod tests {
             1,
             events,
             ViewConfig {
+                direct_touch: false,
                 width: 640,
                 height: 480,
                 max_fps: 60,
@@ -1747,6 +2028,7 @@ mod tests {
             1,
             events,
             ViewConfig {
+                direct_touch: false,
                 width: 640,
                 height: 480,
                 max_fps: 60,
@@ -1770,6 +2052,7 @@ mod tests {
             1,
             events,
             ViewConfig {
+                direct_touch: false,
                 width: 640,
                 height: 480,
                 max_fps: 60,
@@ -1907,6 +2190,7 @@ mod tests {
                         id as u32,
                         events,
                         ViewConfig {
+                            direct_touch: true,
                             width: 640,
                             height: 480,
                             max_fps: 60,

@@ -325,6 +325,26 @@
           "value": 3
         },
         {
+          "name": "SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_PERSISTENT",
+          "value": 1
+        },
+        {
+          "name": "EXTENSION_SUPPORT_WASMI",
+          "value": 2
+        },
+        {
+          "name": "EXTENSION_SUPPORT_QUICKJS",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_COMMAND_PROVIDER",
+          "value": 8
+        },
+        {
           "name": "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION",
           "value": 1
         }
@@ -1890,7 +1910,11 @@
         },
         {
           "name": "auxiliary_subscription_details",
-          "layout": "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the family-specific resource identity (the namespace prefix for KV), request_flags are family-specific, and state_watch_flags use StateWatch flags"
+          "layout": "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the namespace prefix for KV or canonical worktree/gitdir path for Git; Git state-watch request_flags contain datasets in bits 0..15 plus GIT_WATCH_UNTRACKED/GIT_WATCH_IGNORED effective selection; Git query-watch request_flags contain GIT_QUERY_WATCH, query kind shifted by GIT_QUERY_KIND_SHIFT, and query flags in bits 0..15; state_watch_flags use StateWatch flags"
+        },
+        {
+          "name": "auxiliary_subscription_timings",
+          "layout": "ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS"
         },
         {
           "name": "family_limits",
@@ -1933,6 +1957,26 @@
         {
           "name": "AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION",
           "value": 3
+        },
+        {
+          "name": "AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "GIT_WATCH_UNTRACKED",
+          "value": 65536
+        },
+        {
+          "name": "GIT_WATCH_IGNORED",
+          "value": 131072
+        },
+        {
+          "name": "GIT_QUERY_WATCH",
+          "value": 2147483648
+        },
+        {
+          "name": "GIT_QUERY_KIND_SHIFT",
+          "value": 16
         },
         {
           "name": "MAX_ACTIVE_SUBSCRIPTIONS",
@@ -2271,6 +2315,10 @@
           "layout": "revision:u64; nonzero last committed text-input enable; retained across caret updates, changes request an input panel for existing viewers; initial snapshots do not request a panel"
         },
         {
+          "name": "view_direct_touch",
+          "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 9: enabled:u8 (0 or 1); absent means disabled; enable only for viewers with a touch device using direct-touch input; the seat advertises touch while any open view enables it; disabling cancels that view's active touch sequence"
+        },
+        {
           "name": "view_color_capabilities",
           "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 8: capabilities:u8; bit 0 accepts Display-P3 SDR, bit 1 accepts 10-bit AV1 BT.2020/PQ and HDR presentation, bit 2 additionally accepts 10-bit AV1 4:4:4 Profile 1, bit 3 accepts 8-bit AV1 4:4:4, bit 4 accepts H.264 4:4:4; unknown bits are invalid; absent means sRGB SDR; output is described by each frame COLOR_SPACE using H.273 primaries/transfer/matrix and range 0 limited, 1 full; HDR output requires AV1 codec 2 and uses 10 bits, SDR output uses 8 bits"
         },
@@ -2311,6 +2359,10 @@
         {
           "name": "VIEW_COLOR_CAPABILITIES_EXTENSION",
           "value": 8
+        },
+        {
+          "name": "VIEW_DIRECT_TOUCH_EXTENSION",
+          "value": 9
         },
         {
           "name": "COLOR_CAP_DISPLAY_P3",
@@ -5891,6 +5943,14 @@
           "layout": "StateWatch Extensions: optional tag WATCH_REFS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_STATUS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_REF_PREFIXES_EXTENSION value count:u16 followed by unique strictly raw-byte-ascending prefix:bytes_u16 entries; empty/absent prefix list means every ref"
         },
         {
+          "name": "query_watch_options",
+          "layout": "WATCH_QUERY StateWatch Extensions accept WATCH_REFS_SETTLE_MS_EXTENSION and WATCH_STATUS_SETTLE_MS_EXTENSION with WATCH zero/default semantics; ref/status selection is query-derived"
+        },
+        {
+          "name": "watch_status_selection",
+          "layout": "Additional optional Git WATCH StateWatch extension: tag WATCH_STATUS_SELECTION_EXTENSION, REQUIRED clear, value exactly one u8 of flags admitting WATCH_STATUS_UNTRACKED and WATCH_STATUS_IGNORED in addition to tracked status; unknown bits are invalid and IGNORED requires UNTRACKED, so valid values are 0, 1, and 3. Absence admits both classes for compatibility; selection only applies with the WATCH_STATUS dataset and is enforced before collection budgets. Older servers may ignore this optional extension"
+        },
+        {
           "name": "query_endpoint",
           "layout": "kind:u8,reserved:[u8;3]=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId; COMMIT,TREE,MERGE_BASE require object; EMPTY,INDEX,WORKTREE forbid object; MERGE_BASE is valid only as the left endpoint"
         },
@@ -6082,6 +6142,22 @@
         },
         {
           "name": "WATCH_REF_PREFIXES_EXTENSION",
+          "value": 3
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "WATCH_STATUS_UNTRACKED",
+          "value": 1
+        },
+        {
+          "name": "WATCH_STATUS_IGNORED",
+          "value": 2
+        },
+        {
+          "name": "WATCH_STATUS_SELECTION_FLAGS",
           "value": 3
         },
         {
@@ -10690,6 +10766,94 @@
         {
           "name": "EVENT_SERVER_ERROR",
           "value": 47
+        },
+        {
+          "name": "EVENT_GIT_WATCH_START",
+          "value": 48
+        },
+        {
+          "name": "EVENT_GIT_WATCH_STOP",
+          "value": 49
+        },
+        {
+          "name": "EVENT_GIT_STATE",
+          "value": 50
+        },
+        {
+          "name": "EVENT_GIT_RECORD",
+          "value": 51
+        },
+        {
+          "name": "EVENT_GIT_FS_EVENT",
+          "value": 52
+        },
+        {
+          "name": "EVENT_FS_RECORD",
+          "value": 53
+        },
+        {
+          "name": "EVENT_FS_EVENT",
+          "value": 54
+        },
+        {
+          "name": "EVENT_FS_WATCH_START",
+          "value": 55
+        },
+        {
+          "name": "EVENT_FS_WATCH_STOP",
+          "value": 56
+        },
+        {
+          "name": "EVENT_FS_STATE",
+          "value": 57
+        },
+        {
+          "name": "EVENT_NATIVE_FRAME_READ",
+          "value": 58
+        },
+        {
+          "name": "EVENT_NATIVE_FRAME_WRITE",
+          "value": 59
+        },
+        {
+          "name": "EVENT_NATIVE_PAYLOAD_READ",
+          "value": 60
+        },
+        {
+          "name": "EVENT_NATIVE_PAYLOAD_WRITE",
+          "value": 61
+        },
+        {
+          "name": "EVENT_NATIVE_STATE_RECORD_READ",
+          "value": 62
+        },
+        {
+          "name": "EVENT_NATIVE_STATE_RECORD_WRITE",
+          "value": 63
+        },
+        {
+          "name": "EVENT_NATIVE_CONNECT",
+          "value": 64
+        },
+        {
+          "name": "EVENT_NATIVE_DISCONNECT",
+          "value": 65
+        },
+        {
+          "name": "EVENT_NATIVE_ERROR",
+          "value": 66
+        },
+        {
+          "name": "EVENT_NATIVE_DATAGRAM_READ",
+          "value": 67
+        },
+        {
+          "name": "EVENT_NATIVE_DATAGRAM_WRITE",
+          "value": 68
+        },
+        {
+          "name": "EVENT_NATIVE_DATAGRAM_DROP",
+          "value": 69
         },
         {
           "name": "MIN_RING_BYTES",

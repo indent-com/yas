@@ -2824,7 +2824,15 @@ mod tests {
         };
         assert_eq!(name.as_str(), "work-tree.2");
 
+        // The CLI also reads YAS_SERVER_NAME; control the environment so the
+        // default assertion is not flipped by an inherited external value.
+        let previous = std::env::var_os("YAS_SERVER_NAME");
+        unsafe { std::env::set_var("YAS_SERVER_NAME", "default") };
         let cli = Cli::try_parse_from(["yas", "server"]).unwrap();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("YAS_SERVER_NAME", value) },
+            None => unsafe { std::env::remove_var("YAS_SERVER_NAME") },
+        }
         let Command::Server { name, .. } = cli.command else {
             panic!("expected server command");
         };

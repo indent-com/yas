@@ -217,6 +217,7 @@ pub struct SharedRootHandle {
     dirty_signal: Arc<AtomicBool>,
     closed: Arc<OnceLock<CloseReason>>,
     _backend: Option<backend::WatchBackend>,
+    observers: backend::EventObservers,
 }
 
 impl SharedRootHandle {
@@ -233,6 +234,10 @@ impl SharedRootHandle {
             tx: self.sender.clone(),
             dirty_signal: self.dirty_signal.clone(),
         }
+    }
+
+    pub fn observe_events(&self, callback: Box<backend::EventCallback>) -> backend::EventObserver {
+        self.observers.observe(callback)
     }
 
     fn is_closed(&self) -> bool {
@@ -338,6 +343,7 @@ fn open_root_inner(
 
     let (sender, receiver) = mpsc::sync_channel(ROOT_MESSAGE_QUEUE);
     let dirty_signal = Arc::new(AtomicBool::new(false));
+    let observers = backend::EventObservers::default();
     let backend = if watched {
         let hints = HintSender {
             tx: sender.clone(),
@@ -354,7 +360,7 @@ fn open_root_inner(
         let recursive = key.recursive && !single;
         let per_dir = backend::per_dir_watching_pays(recursive, single, !key.ignores.is_empty());
         Some(
-            backend::watch(watch_path, recursive, per_dir, hints)
+            backend::watch_observed(watch_path, recursive, per_dir, hints, observers.clone())
                 .map_err(|error| open_notify_error(&error))?,
         )
     } else {
@@ -382,6 +388,7 @@ fn open_root_inner(
         dirty_signal: dirty_signal.clone(),
         closed: closed.clone(),
         _backend: backend,
+        observers,
     });
     std::thread::Builder::new()
         .name("yas-fs-watch-root".to_owned())
@@ -738,6 +745,10 @@ pub struct WatchHandle {
 }
 
 impl WatchHandle {
+    pub fn observe_events(&self, callback: Box<backend::EventCallback>) -> backend::EventObserver {
+        self._shared.observe_events(callback)
+    }
+
     pub fn command(&self, command: WatchCommand) -> bool {
         if command == WatchCommand::Stop {
             self.stop.store(true, Ordering::Release);

@@ -131,7 +131,12 @@ async fn confirmed_view_publication_barrier_precedes_data_activation() {
             "{family_id:#06x}/{request_kind:#06x} activated before its Result write"
         );
         let mut queued = outbound.receivers.control.recv().await.unwrap();
-        queued.written.take().unwrap().send(()).unwrap();
+        queued
+            .written
+            .take()
+            .unwrap()
+            .send(tokio::time::Instant::now())
+            .unwrap();
         drop(queued);
         timeout(TEST_TIMEOUT, publication).await.unwrap().unwrap();
         wait_for_queued(&outbound.receivers, 0, 0, 1).await;

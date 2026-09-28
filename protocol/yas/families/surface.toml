@@ -243,6 +243,12 @@ value = 7
 name = "VIEW_COLOR_CAPABILITIES_EXTENSION"
 value = 8
 [[constant]]
+name = "VIEW_DIRECT_TOUCH_EXTENSION"
+value = 9
+[[type]]
+name = "view_direct_touch"
+layout = "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 9: enabled:u8 (0 or 1); absent means disabled; enable only for viewers with a touch device using direct-touch input; the seat advertises touch while any open view enables it; disabling cancels that view's active touch sequence"
+[[constant]]
 name = "COLOR_CAP_DISPLAY_P3"
 value = 1
 [[constant]]

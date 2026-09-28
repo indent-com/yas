@@ -331,6 +331,8 @@ describe("extension removal", () => {
       listExtensions: vi.fn(async () => [
         {
           ...record("systemd", DIGEST, 7n),
+          // Stop and disable change the lifecycle generation, not the handle.
+          generation: 3n,
           phase:
             lists++ === 0
               ? YAS_EXTENSION_PHASE_STOPPING

@@ -2748,6 +2748,15 @@ fn vectors(artifact: &Artifact) -> VectorArtifact {
     );
     push_u16(&mut git_watch_extensions, 0);
     push_bytes_u32(&mut git_watch_extensions, &git_prefixes);
+    push_u16(
+        &mut git_watch_extensions,
+        family_constant(artifact, "yas.git", "WATCH_STATUS_SELECTION_EXTENSION") as u16,
+    );
+    push_u16(&mut git_watch_extensions, 0);
+    push_bytes_u32(
+        &mut git_watch_extensions,
+        &[family_constant(artifact, "yas.git", "WATCH_STATUS_UNTRACKED") as u8],
+    );
     let mut git_watch_state = Vec::new();
     push_u16(&mut git_watch_state, 0);
     push_u16(&mut git_watch_state, 0);

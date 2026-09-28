@@ -10,6 +10,36 @@ pub(super) const REQUEST_ID: u32 = u32::MAX;
 pub(super) struct Heartbeat {
     pending: AtomicBool,
     replied: Notify,
+    replied_at: StdMutex<Option<tokio::time::Instant>>,
+    pub(super) rtt_us: Arc<AtomicU64>,
+}
+
+// An isolated browser pause is not distance. Require two successive exchanges
+// to raise the estimate, accept a faster sample immediately, and never turn
+// seconds of queueing into seconds of Surface credit.
+const MAX_RTT: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct RttSamples {
+    previous: Option<Duration>,
+}
+
+impl RttSamples {
+    fn record(&mut self, sample: Duration, estimate_us: &AtomicU64) {
+        if sample > MAX_RTT {
+            self.previous = None;
+            return;
+        }
+        let sample = sample.max(Duration::from_micros(500));
+        let current = estimate_us.load(Ordering::Relaxed);
+        let confirmed = self.previous.map(|previous| previous.min(sample));
+        self.previous = Some(sample);
+        if current > 0 && sample.as_micros() < u128::from(current) {
+            estimate_us.store(sample.as_micros() as u64, Ordering::Relaxed);
+        } else if let Some(confirmed) = confirmed {
+            estimate_us.store(confirmed.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Heartbeat {
@@ -33,6 +63,7 @@ impl Heartbeat {
         if !self.pending.swap(false, Ordering::AcqRel) {
             return Err(());
         }
+        *self.replied_at.lock().expect("Ping receive time") = Some(tokio::time::Instant::now());
         self.replied.notify_one();
         Ok(true)
     }
@@ -43,6 +74,7 @@ impl Heartbeat {
         if interval.is_zero() {
             std::future::pending::<()>().await;
         }
+        let mut samples = RttSamples::default();
         loop {
             tokio::time::sleep(interval).await;
             self.pending.store(true, Ordering::Release);
@@ -59,8 +91,19 @@ impl Heartbeat {
                 .expect("fixed Ping payload"),
             };
             let exchange = async {
-                out.send(frame).await.map_err(|_| ())?;
+                let written = out.send_with_receipt(frame).await.map_err(|_| ())?;
+                let sent_at = written.await.map_err(|_| ())?;
                 self.replied.notified().await;
+                let received_at = self.replied_at.lock().expect("Ping receive time").take();
+                // Writer completion excludes local queue delay; reader time
+                // excludes scheduling delay before this future resumes. A reply
+                // can race write completion, in which case it is liveness only.
+                if let Some(sample) = received_at.and_then(|at| at.checked_duration_since(sent_at))
+                {
+                    samples.record(sample, &self.rtt_us);
+                } else {
+                    samples.previous = None;
+                }
                 Ok::<(), ()>(())
             };
             if !matches!(
@@ -70,5 +113,31 @@ impl Heartbeat {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtt_requires_confirmation_and_rejects_stalls() {
+        let estimate = AtomicU64::new(0);
+        let mut samples = RttSamples::default();
+        samples.record(Duration::from_millis(800), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        samples.record(Duration::from_secs(2), &estimate);
+        samples.record(Duration::from_millis(300), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        samples.record(Duration::from_millis(500), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 300_000);
+        samples.record(Duration::from_millis(500), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 500_000);
+        samples.record(Duration::from_secs(1), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 500_000);
+        samples.record(Duration::from_secs(1), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 1_000_000);
+        samples.record(Duration::ZERO, &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 500);
     }
 }

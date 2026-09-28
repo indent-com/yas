@@ -1,6 +1,6 @@
 [package]
 name = "yas-ext-xdg-desktop"
-description = "Autostart and supervise XDG desktop applications in YAS"
+description = "Browse and launch desktop apps, and choose which start automatically"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

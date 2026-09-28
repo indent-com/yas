@@ -311,6 +311,7 @@ export class TerminalStore {
   }
 
   handleUpdate(ptyId: TerminalId, payload: Uint8Array): void {
+    if (this.disposed) return;
     this.pendingAckTerminals.push(ptyId);
 
     // No WASM yet: retain validated native Grid state until the private
@@ -356,6 +357,7 @@ export class TerminalStore {
   }
 
   handleStatusChange(status: ConnectionStatus): void {
+    if (this.disposed) return;
     if (status === "connected") {
       this.resetClientMetrics();
       this.flushClientMetrics();
@@ -468,6 +470,7 @@ export class TerminalStore {
     renderer: GlRenderer;
     canvas: HTMLCanvasElement;
   } | null {
+    if (this.disposed) return null;
     if (this.sharedRenderer?.supported) {
       return {
         renderer: this.sharedRenderer,
@@ -721,7 +724,7 @@ export class TerminalStore {
   }
 
   private syncSubscriptions(): void {
-    if (this.delegate.getStatus() !== "connected") return;
+    if (this.disposed || this.delegate.getStatus() !== "connected") return;
     for (const id of this.desired) {
       if (!this.subscribed.has(id)) {
         this.subscribed.add(id);
@@ -887,8 +890,9 @@ export class TerminalStore {
     this.syncSubscriptions();
   }
 
-  /** Permanently destroy the store — free all WASM terminals and GL resources. */
+  /** Stop the store, deferring retained WASM terminals until their last release. */
   destroy(): void {
+    if (this.disposed) return;
     this.disposed = true;
     this.stopRafProbe();
     if (this.rafProbeTimer !== null) {
@@ -900,11 +904,18 @@ export class TerminalStore {
       this.visibilityHandler = null;
     }
     this.stopMetricsHeartbeat();
-    for (const t of this.terminals.values()) t.free();
-    this.terminals.clear();
-    for (const t of this.staleTerminals.values()) t.free();
-    this.staleTerminals.clear();
-    this.retainedSurfaces = 0;
+    this.pendingFrames.clear();
+    this.pendingAckTerminals = [];
+    // Connections can be disposed before their panes. Those panes still use
+    // the terminal during blur/keyboard cleanup (and any intervening render).
+    // Honor the same retain/release contract as a terminal close; freeing here
+    // unconditionally leaves a live JS wrapper pointing at freed WASM memory.
+    for (const id of new Set([
+      ...this.terminals.keys(),
+      ...this.staleTerminals.keys(),
+    ])) {
+      this.freeTerminal(id);
+    }
     this.subscribed.clear();
     this.dirtyListeners.clear();
     this.readyListeners.clear();

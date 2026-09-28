@@ -606,6 +606,23 @@ in
               ++ lib.optional (!cfg.relay.enable) "YAS_RELAY=0"
               ++ lib.optional (lib.hasAttr user cfg.relay.remoteFiles) "YAS_REMOTES=${cfg.relay.remoteFiles.${user}}"
               ++ [ "YAS_SOCK=/run/yas/${user}/yas-default.sock" ]
+              # A system service inherits no XDG_RUNTIME_DIR, and the
+              # compositor falls back to std::env::temp_dir() when it finds
+              # none (crates/compositor/src/imp.rs, run_compositor's caller).
+              # That puts the Wayland socket in the shared /tmp, where it is
+              # one user's server against every other's: the second server to
+              # start finds wayland-0.lock owned by the first, and with
+              # fs.protected_regular=1 a sticky-directory O_CREAT on another
+              # user's file is EACCES. wayland-server reports that as
+              # PermissionDenied and stops rather than trying wayland-1, so
+              # the compositor thread panics and the unit crash-loops for
+              # every user but whoever booted first.
+              #
+              # RuntimeDirectory already gives this unit an owner-private
+              # 0700 directory; naming it here keeps each user's socket in
+              # their own, which is also where the socket the line above
+              # names already lives.
+              ++ [ "XDG_RUNTIME_DIR=/run/yas/${user}" ]
               ++ hostedEnvFor user;
           }
           // lib.optionalAttrs (hostedPassFilesFor user != [ ]) {

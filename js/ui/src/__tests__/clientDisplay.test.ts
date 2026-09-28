@@ -156,6 +156,38 @@ describe("client subscription sizes", () => {
       formatClientSubscription(YAS_FAMILY_KV, 1n, 9),
     );
   });
+
+  it("shows Git paths, effective selection, and resolved delays", async () => {
+    const g = await import("@yas-run/core");
+    const text = formatClientSubscription(YAS_FAMILY_GIT, 4n, 2, {
+      resource: new TextEncoder().encode("/repo"),
+      requestFlags:
+        g.YAS_GIT_WATCH_HEAD |
+        g.YAS_GIT_WATCH_STATUS |
+        g.YAS_CLIENT_GIT_WATCH_UNTRACKED,
+      stateWatchFlags: 0,
+      settleMs: 17,
+      refsSettleMs: 23,
+    });
+    expect(text).toContain('path "/repo"');
+    expect(text).toContain("head, status, untracked=true, ignored=false");
+    expect(text).toContain("settle 17ms");
+    expect(text).toContain("refs settle 23ms");
+    expect(
+      formatClientSubscription(YAS_FAMILY_GIT, 4n, 3, {
+        requestFlags:
+          (g.YAS_CLIENT_GIT_QUERY_WATCH |
+            (g.YAS_GIT_QUERY_LOG << g.YAS_CLIENT_GIT_QUERY_KIND_SHIFT)) >>>
+          0,
+      }),
+    ).toContain("query=log");
+    expect(
+      formatClientSubscription(YAS_FAMILY_FS, 5n, 4, {
+        requestFlags: g.YAS_FS_WATCH_RECURSIVE | g.YAS_FS_WATCH_GITIGNORE,
+        settleMs: 11,
+      }),
+    ).toContain("recursive, gitignore");
+  });
 });
 
 describe("client identity", () => {

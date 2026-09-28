@@ -1,5 +1,9 @@
 import "./share.css";
-import { mountYasWorkspace, shareTransport } from "@yas-run/ui/embed";
+import {
+  getOrCreateWorkspaceSessionDeviceId,
+  mountYasWorkspace,
+  shareTransport,
+} from "@yas-run/ui/embed";
 import { MONO_CATALOG, MONO_STACK } from "./lib/fonts";
 import {
   decryptPassphrase,
@@ -25,7 +29,12 @@ const ok = (passphrase: string, debug: boolean): PassphraseResult => ({
 function resolvePassphrase(): PassphraseResult {
   const parts = location.hash.slice(1).split("&").filter(Boolean);
   const debug = parts.includes("debug");
-  const secrets = parts.filter((part) => part !== "debug");
+  const workspaceParts = parts.filter((part) =>
+    ["workspace", "session"].includes(decodeURIComponent(part.split("=")[0])),
+  );
+  const secrets = parts.filter(
+    (part) => part !== "debug" && !workspaceParts.includes(part),
+  );
   const stored = localStorage.getItem(LAST_SHARE_KEY);
 
   if (!secrets.length) {
@@ -49,6 +58,7 @@ function resolvePassphrase(): PassphraseResult {
     if (!plaintext.endsWith(".ro")) {
       const hash = [
         encodeURIComponent(encryptPassphrase(plaintext)),
+        ...workspaceParts,
         debug && "debug",
       ]
         .filter(Boolean)
@@ -59,7 +69,10 @@ function resolvePassphrase(): PassphraseResult {
   }
 
   const decrypted = decryptPassphrase(bare);
-  if (decrypted) return ok(decrypted, debug);
+  if (decrypted) {
+    localStorage.setItem(LAST_SHARE_KEY, decrypted);
+    return ok(decrypted, debug);
+  }
   if (stored) return ok(stored, debug);
   return { ok: false, error: "This link belongs to a different browser." };
 }
@@ -92,24 +105,32 @@ async function main() {
     if (!result.ok) return showError(result.error);
 
     const wasm = await initWasm();
+    const workspaceSessionDeviceId = result.readOnly
+      ? null
+      : await getOrCreateWorkspaceSessionDeviceId();
+    const transport = shareTransport(
+      HUB_URL,
+      result.passphrase,
+      result.debug ? console : undefined,
+    );
     state.hidden = true;
     app.hidden = false;
     dispose = mountYasWorkspace(app, {
       wasm,
       fontFamily: MONO_STACK,
       fonts: MONO_CATALOG,
-      connections: [
-        {
-          id: "share",
-          label: "shared session",
-          transport: shareTransport(
-            HUB_URL,
-            result.passphrase,
-            result.debug ? console : undefined,
-          ),
-          readOnly: result.readOnly,
-        },
-      ],
+      ...(workspaceSessionDeviceId
+        ? { home: { transport, workspaceSessionDeviceId } }
+        : {
+            connections: [
+              {
+                id: "share",
+                label: "shared session",
+                transport,
+                readOnly: true,
+              },
+            ],
+          }),
       onAuthError: () => {
         dispose?.();
         dispose = undefined;
