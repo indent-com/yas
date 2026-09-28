@@ -19,7 +19,8 @@ with **no watch**:
   recency to break otherwise equal matches.
 
 Both use the same `ignore`-crate walk. Normal ignore rules filter candidates by
-default; request flags can include ignored paths. Dotfiles are included,
+default; request flags can include ignored paths. Dotfiles are included, but
+`.git` is pruned like an ignored directory unless ignored paths are included,
 symlinked directories are not followed, and each PATH record says whether it
 is a directory and whether it was ignored. `INDEX` independently selects files
 and directories; the TypeScript `indexFiles` facade requests files only.

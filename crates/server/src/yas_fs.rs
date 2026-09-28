@@ -1532,7 +1532,11 @@ fn enumerate_paths(
     }
     let visible = if include_ignored {
         let mut builder = WalkBuilder::new(&root.path);
-        builder.hidden(false).follow_links(false).require_git(false);
+        builder
+            .hidden(false)
+            .follow_links(false)
+            .require_git(false)
+            .filter_entry(not_git_dir);
         let mut visible = BTreeSet::new();
         for entry in builder.build() {
             let entry = entry.map_err(|error| Error::Io(error.to_string()))?;
@@ -1553,6 +1557,8 @@ fn enumerate_paths(
             .git_ignore(false)
             .git_global(false)
             .git_exclude(false);
+    } else {
+        builder.filter_entry(not_git_dir);
     }
     let mut paths = Vec::new();
     for entry in builder.build() {
@@ -1572,6 +1578,13 @@ fn enumerate_paths(
     }
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(paths)
+}
+
+/// Dotfiles stay visible; `.git` is pruned like an ignored directory
+/// (docs/design/fs-grep.md). With ignored paths included it is walked and
+/// marked ignored.
+fn not_git_dir(entry: &ignore::DirEntry) -> bool {
+    entry.depth() == 0 || entry.file_name() != ".git"
 }
 
 fn path_flat(path: &wire::Path) -> Vec<u8> {
@@ -1741,8 +1754,10 @@ fn grep_root(root: &Root, request: &wire::Grep) -> Result<QueryData, Error> {
             "FS GREP max_results cannot hold a file and match record",
         ));
     }
+    // Zero caps nothing: the page budget bounds each page and the cursor
+    // resumes inside a file, so no match is silently dropped.
     let max_per_file = if request.max_per_file == 0 {
-        max_results
+        usize::MAX
     } else {
         request.max_per_file as usize
     };
@@ -2850,5 +2865,92 @@ mod tests {
             cursor = page.next_cursor;
         }
         assert_eq!(matches, 3);
+    }
+
+    #[test]
+    fn grep_default_per_file_cap_keeps_every_match_across_pages() {
+        let directory = TestDir::new();
+        fs::write(
+            directory.0.join("many.txt"),
+            b"needle one\nneedle two\nneedle three\n",
+        )
+        .unwrap();
+        let root = test_root(&directory);
+        let mut cursor = Vec::new();
+        let mut lines = Vec::new();
+        loop {
+            let page = grep_root(
+                &root,
+                &wire::Grep {
+                    root_handle: 1,
+                    flags: 0,
+                    max_results: 2,
+                    max_per_file: 0,
+                    query: b"needle".to_vec(),
+                    cursor,
+                    initial_receive_credit: 0,
+                    extensions: Extensions::default(),
+                },
+            )
+            .unwrap();
+            lines.extend(page.records.iter().filter_map(|record| match record {
+                wire::QueryRecord::GrepMatch(found) => Some(found.line),
+                _ => None,
+            }));
+            if page.next_cursor.is_empty() {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(lines, [0, 1, 2]);
+    }
+
+    #[test]
+    fn grep_and_search_prune_git_metadata_unless_ignored_paths_are_included() {
+        let directory = TestDir::new();
+        fs::create_dir(directory.0.join(".git")).unwrap();
+        fs::write(directory.0.join(".git").join("config"), b"needle\n").unwrap();
+        fs::write(directory.0.join(".env"), b"needle\n").unwrap();
+        let root = test_root(&directory);
+        let grep = |flags: u16| {
+            grep_root(
+                &root,
+                &wire::Grep {
+                    root_handle: 1,
+                    flags,
+                    max_results: 0,
+                    max_per_file: 0,
+                    query: b"needle".to_vec(),
+                    cursor: Vec::new(),
+                    initial_receive_credit: 0,
+                    extensions: Extensions::default(),
+                },
+            )
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|record| match record {
+                wire::QueryRecord::GrepFile(file) => Some((path_flat(&file.path), file.flags)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(grep(0), [(b".env".to_vec(), 0)]);
+        assert_eq!(
+            grep(schema::fs::GREP_INCLUDE_IGNORED as u16),
+            [
+                (b".env".to_vec(), 0),
+                (
+                    b".git/config".to_vec(),
+                    schema::fs::QUERY_GREP_FILE_IGNORED as u16
+                ),
+            ]
+        );
+        let paths = enumerate_paths(&root, false).unwrap();
+        assert!(
+            paths
+                .iter()
+                .all(|(path, _, _)| path.components.first().map(Vec::as_slice) != Some(b".git"))
+        );
     }
 }
