@@ -607,6 +607,10 @@ impl Session {
 }
 
 impl Watch {
+    pub(crate) fn wants_diagnostics(&self) -> bool {
+        self.datasets & yas_wire::schema::lsp::WATCH_DIAGNOSTICS as u16 != 0
+    }
+
     pub(crate) async fn next(&mut self) -> Option<Result<WatchEvent, Error>> {
         while let Some(event) = self.receiver.as_mut()?.recv().await {
             match event {
