@@ -410,9 +410,23 @@ impl Session {
             self.remove_route(process_id);
             return Err(Error::Closed("mismatched Process SPAWN reply".to_owned()));
         }
-        route
-            .process_handle
-            .store(started.process_handle, Ordering::Release);
+        {
+            // Under the routes lock, like the Exit handler: either it sees
+            // this handle and records the exit replay, or this sees the
+            // exit it already published (a process that exits before SPAWN
+            // returns) and records it here. A WAIT never misses both.
+            let _routes = self.inner.routes.lock().unwrap();
+            route
+                .process_handle
+                .store(started.process_handle, Ordering::Release);
+            if let Some(exit) = route.exit.borrow().clone() {
+                self.inner
+                    .exits
+                    .lock()
+                    .unwrap()
+                    .insert(started.process_handle, exit);
+            }
+        }
         Ok(Attachment {
             session: self.clone(),
             route,
@@ -494,6 +508,17 @@ impl Session {
         let (mut exit, temporary) =
             if let Some(route) = self.route_by_handle(request.process_handle) {
                 (route.exit.subscribe(), None)
+            } else if let Some(exit) = self
+                .inner
+                .exits
+                .lock()
+                .unwrap()
+                .get(request.process_handle)
+                .cloned()
+            {
+                // It exited between the first look and the route lookup; the
+                // replay is recorded before the route is removed.
+                return Ok(exit);
             } else {
                 match self
                     .watch_process(request.process_handle, false, true)
@@ -870,22 +895,27 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                 .map_err(|_| Error::Closed("Process semantic stream queue overflowed".to_owned()))
         }
         process::NativeEvent::Exit { process_id, exit } => {
-            let route = inner
-                .routes
-                .lock()
-                .unwrap()
-                .remove(&process_id)
-                .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
             let exit = native_exit_info(exit);
-            let process_handle = route.process_handle.load(Ordering::Acquire);
-            if process_handle != 0 {
-                inner
-                    .exits
-                    .lock()
-                    .unwrap()
-                    .insert(process_handle, exit.clone());
-            }
-            route.exit.send_replace(Some(exit.clone()));
+            let route = {
+                let mut routes = inner.routes.lock().unwrap();
+                let route = routes
+                    .get(&process_id)
+                    .cloned()
+                    .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
+                let process_handle = route.process_handle.load(Ordering::Acquire);
+                if process_handle != 0 {
+                    // Record the replay before the route disappears: a WAIT
+                    // that no longer finds the route must find the exit.
+                    inner
+                        .exits
+                        .lock()
+                        .unwrap()
+                        .insert(process_handle, exit.clone());
+                }
+                routes.remove(&process_id);
+                route.exit.send_replace(Some(exit.clone()));
+                route
+            };
             let _ = route.events.try_send(Event::Exit(exit));
             Ok(())
         }

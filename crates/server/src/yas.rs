@@ -3005,6 +3005,8 @@ struct ProcessInputTransfer {
     granted: u64,
     target_window: u64,
     open: bool,
+    /// The peer sent its `CLOSE`; a second one is a protocol violation.
+    peer_closed: bool,
     receive_credit: CreditLease,
 }
 
@@ -23124,17 +23126,26 @@ impl Session {
                             .ok_or(())?;
                         let input = attachment.stdin.as_mut().ok_or(())?;
                         if !frame.header.sensitive
-                            || !input.open
+                            || input.peer_closed
                             || close.status != Status::Ok.code()
                             || close.final_data_bytes != input.received
                         {
                             None
+                        } else if !input.open {
+                            // The child closed its stdin (typically by
+                            // exiting) while this CLOSE was in flight. The
+                            // input already ended; a clean CLOSE crossing
+                            // that is not a violation, and nothing is left
+                            // to close.
+                            input.peer_closed = true;
+                            Some(None)
                         } else {
                             input.open = false;
+                            input.peer_closed = true;
                             attachment
                                 .stream_bundle_replayable
                                 .store(false, Ordering::Release);
-                            Some(attachment.control.clone())
+                            Some(Some(attachment.control.clone()))
                         }
                     };
                     let Some(control) = control else {
@@ -23146,6 +23157,9 @@ impl Session {
                         .await?;
                         return Ok(());
                     };
+                    let Some(control) = control else {
+                        return Ok(());
+                    };
                     let internal = self.internal.clone();
                     let connection = self.cancellation.clone();
                     tokio::spawn(async move {
@@ -23153,6 +23167,16 @@ impl Session {
                             result = control.close_stdin() => result,
                             _ = connection.cancelled() => return,
                         };
+                        // A process that exited (Conflict) or was reaped
+                        // (NotFound) while the CLOSE was in flight has no
+                        // stdin left to close: not a failure of its output.
+                        if let Err(
+                            super::yas_process::Error::NotFound
+                            | super::yas_process::Error::Conflict,
+                        ) = result
+                        {
+                            return;
+                        }
                         if let Err(error) = result {
                             let _ = internal
                                 .send(Internal::ProcessFailed {
@@ -25648,6 +25672,7 @@ impl Session {
                     granted,
                     target_window,
                     open: true,
+                    peer_closed: false,
                     receive_credit,
                 },
             ))
