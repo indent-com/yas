@@ -1,0 +1,137 @@
+---
+title: "fd-channel mode"
+description: "Run yas server under your own service and hand it already-connected client sockets over SCM_RIGHTS."
+sidebar:
+  order: 95
+---
+
+In fd-channel mode your process starts `yas server`, owns its lifetime, and decides which clients
+reach it. You give the server one end of a Unix socket pair at startup. Each time you accept or
+create a client connection, you send its file descriptor over that channel with `SCM_RIGHTS`, and
+the server treats it as a connected native client. Use it to embed the server in a service manager,
+a sandbox supervisor, or a gateway that does its own authentication. It works on Unix only.
+
+## Run a server in fd-channel mode
+
+<Steps titleSize="h3">
+  <Step title="Create the channel">
+    Create a `socketpair(AF_UNIX, SOCK_STREAM)`. Keep one end. The other end goes to the server.
+  </Step>
+  <Step title="Start the server with the other end">
+    Pass the descriptor to the child and name it with `--fd-channel FD` or `YAS_FD_CHANNEL=FD`.
+    Close your copy of that end after the child starts.
+
+    ```bash
+    yas server --socket "$D/yas.sock" --fd-channel 3
+    ```
+
+  </Step>
+  <Step title="Pass each client">
+    For every client, send its connected stream socket as `SCM_RIGHTS` ancillary data on your end of
+    the channel, with at least one byte of ordinary data. Close your copy of the client descriptor
+    after sending.
+  </Step>
+  <Step title="Talk yas on the client side">
+    The passed descriptor carries the ordinary native protocol: the eight-byte preface, a Core
+    `HELLO` request, then length-prefixed frames. Your code or the real client on the far end does
+    this; the channel itself carries no protocol.
+  </Step>
+</Steps>
+
+## How the server behaves
+
+- The server still binds its normal Unix socket (`--socket`, `YAS_SOCK`, or the automatic path)
+  and accepts clients there too. fd-channel adds a second way in.
+- Each received descriptor is served like an accepted socket client. Its peer identity is whatever
+  the kernel reports for that socket, so for a socket pair it is your process.
+- When you close your end of the channel, the server shuts down: it stops accepting, stops
+  processes and extensions, waits for connections to finish, and exits with status `0`.
+- `SIGTERM`, `SIGINT`, and a protocol `SHUTDOWN` request stop both the channel receiver and the
+  socket listener.
+
+This check starts a server with a channel, connects through its normal socket, then closes the
+channel:
+
+```python
+import os, socket, subprocess, tempfile, time
+
+root = tempfile.mkdtemp()
+theirs, ours = socket.socketpair()
+p = subprocess.Popen(
+    ["yas", "server", "--socket", f"{root}/yas.sock", "--name", "docsfd",
+     "--fd-channel", str(theirs.fileno())],
+    pass_fds=(theirs.fileno(),), stderr=subprocess.DEVNULL,
+    env={**os.environ, "YAS_SKIP_COMPOSITOR": "1"})
+theirs.close()
+time.sleep(1.5)
+print("socket exists:", os.path.exists(f"{root}/yas.sock"))
+out = subprocess.run(["yas", "terminal", "list"],
+                     env={**os.environ, "YAS_SOCK": f"{root}/yas.sock"}, capture_output=True)
+print("terminal list via socket rc:", out.returncode)
+ours.close()
+t = time.time()
+rc = p.wait(timeout=10)
+print(f"server exited rc={rc} after {time.time()-t:.1f}s")
+```
+
+```text
+socket exists: True
+terminal list via socket rc: 0
+server exited rc=0 after 0.0s
+```
+
+## The examples
+
+The repository has two complete programs that do everything above and then complete a handshake
+over the passed descriptor:
+[`examples/fd-channel-python.py`](https://github.com/yas-run/yas/blob/main/examples/fd-channel-python.py)
+and [`examples/fd-channel-bun.ts`](https://github.com/yas-run/yas/blob/main/examples/fd-channel-bun.ts).
+Both use only the standard library (Bun reaches `socketpair` and `sendmsg` through `bun:ffi`), and
+both read the server binary from `YAS_SERVER`, defaulting to `yas`.
+
+```bash
+python3 examples/fd-channel-python.py
+bun examples/fd-channel-bun.ts
+```
+
+```text
+HELLO: minor=1 boot=c469b17515ef70eb9dd2cd16088eb173 session=12bf18213ef39c7d045b0bb4127d4b9b receive=1048576/4194304/0/16777216
+SESSION_INFO: revision=1 families=1
+PASS
+```
+
+Each program runs these steps:
+
+1. Creates a temporary directory and points `XDG_STATE_HOME` and `XDG_CACHE_HOME` into it, so the
+   test server shares no state with your real one.
+2. Creates the channel socket pair and starts `yas server --socket <tmp>/yas.sock --no-processes --no-persistent-extensions`
+   with the channel on descriptor 3 and `YAS_FD_CHANNEL=3` (Python passes the descriptor number it
+   got). It also turns off optional services: `YAS_SKIP_COMPOSITOR=1`, `YAS_PROCESS=0`, `YAS_KV=0`,
+   `YAS_FONTS=0`, `YAS_RELAY=0`, `YAS_EXT=0`, and `YAS_CHANNEL=0`.
+3. Creates a second socket pair for the client, sends one end over the channel with `SCM_RIGHTS`,
+   and closes it locally.
+4. Writes the preface `5941530001000d0a` and a Core `HELLO` request (family `0`, kind `0`, request
+   ID `1`). The `ClientHello` offers minor versions 1 through 1, 1 MiB wire frames, 4 MiB decoded frames,
+   no datagram path, 16 MiB of buffering, a random client instance ID, a client name and release, and no
+   optional families, packed codecs, or extensions.
+5. Reads frames until the correlated `HELLO` result arrives, checks the status is `OK`, and prints
+   the server's minor version, boot ID, session ID, and receive limits.
+6. Sends Core `SESSION_INFO` (request ID `2`), checks the session ID matches, and prints the
+   catalogue revision and family count. With every optional family off and none offered, only Core
+   is negotiated, so the count is `1`.
+7. Closes both descriptors, sends `SIGTERM`, and fails if the server has not exited within 5
+   seconds.
+
+The `receive=` field is four numbers: the server's maximum wire frame, maximum decoded frame,
+maximum datagram (`0` because this stream has no datagram path), and maximum buffered bytes.
+
+Hand-written framing is there to show the boundary. A real client on the passed descriptor can be
+any yas client that speaks the native byte stream. For the frame and handshake format, see
+[The yas protocol](/internals/protocol) and [fd-channel internals](/internals/transports#fd-channel).
+
+<Aside type="note">
+
+Anything that holds a passed descriptor has the full authority of the server's user. Authenticate
+the peer before you send its socket. The server does no authentication of its own on this path.
+
+</Aside>

@@ -1,0 +1,117 @@
+---
+title: "Command menu and overlays"
+description: "Search terminals, surfaces, files, and symbols from the browser menu, run commands on any connection, and manage remotes and connected clients."
+sidebar:
+  order: 23
+---
+
+The **Menu** is a search box over everything in the current workspace. It lists terminals,
+surfaces, parked panes, actions, remotes, and installed applications, and it runs commands, opens
+files, and jumps to symbols. Other overlays open from the status bar: **Remotes**, the server's
+**Manage** panels, and the font, palette, and media settings.
+
+## Open the menu
+
+Press Ctrl+B k, or click the logo at the left of the status bar. Ctrl+B / and Ctrl+B w open the same
+menu.
+
+![The Menu with the Background, Terminals, and Actions sections](/images/browser/command-menu.png)
+
+Type to filter. The results come in sections:
+
+- **Terminals** lists every terminal. Badges mark the one that is **Focused**, the ones **In
+  layout**, and the ones that **Exited** or are **Asking** for input. Each row has **Kill** and
+  **Close**.
+- **Surfaces** lists GUI windows from the compositor.
+- **Background** lists parked panes, including editors and panels.
+- **Recent Layouts** appears while you type, with saved layouts that match.
+- **Actions** lists the commands below.
+- **Remotes** lists enabled remotes with their connection state.
+- **Applications** lists desktop entries installed on every connected server. It moves to the top
+  when your query matches one.
+
+When the workspace has more than one connection, the terminal and surface sections are grouped by
+connection name.
+
+## Actions
+
+- **New terminal** starts a shell.
+- **New web pane** opens a URL that the server can reach, in a pane.
+- **Search** opens project search across workspace files.
+- **Share URL** copies a link to the current workspace.
+- **Install app** adds yas to the home screen or app list. It is hidden when the UI already runs as
+  an installed app.
+- **Exit layout** returns to a single focused terminal.
+- **Clear local storage** resets all settings saved in this browser and reloads.
+
+## Query modes
+
+A prefix character in the search box changes what the menu searches. Ctrl+B `>`, `@`, and `#` open
+the menu with that prefix already typed.
+
+| Query            | What it does                                                                        |
+| ---------------- | ----------------------------------------------------------------------------------- |
+| `name`           | Match terminals, surfaces, panes, and layouts                                       |
+| `>command`       | Run the command in a new terminal                                                   |
+| `target>command` | Run the command in a new terminal on the connection whose name starts with `target` |
+| `@file`          | Fuzzy-find a file under the active root and open it                                 |
+| `#symbol`        | Search workspace symbols from the language server and jump to one                   |
+
+For `>cargo test`, the only result is **Run "cargo test"**. Press Enter to start it. The `#` section
+header reads **Symbols…** while the language server answers.
+
+## Menu keys
+
+- Up and Down move the selection. PageUp and PageDown jump between sections.
+- Enter activates the selected row.
+- Tab completes the selected connection name to `name>`, ready for a command.
+- Ctrl+W, or ⌘W on macOS, closes the selected terminal or surface.
+- Escape closes the menu.
+
+## Remotes
+
+Click the connection dot in the status bar to open **Remotes**. Each row shows a checkbox, a
+status dot, the remote's name, and its role and round-trip time, such as `home server · 1 ms`.
+
+- The checkbox adds the remote to the current workspace or removes it.
+- **Reconnect** drops and reopens the connection.
+- **Manage** opens that server's panels in a pane.
+- Drag a row to reorder the list. Other controls set the default remote, disable a remote, and
+  reveal its URI.
+
+To add a remote, type a name and a URI such as `ssh:host`, `local`, or `share:…` in the form at the
+bottom, then click **Add**. A name cannot be empty, contain spaces or `=`, or start with `#`. The
+list is the same one `yas remote` edits. See [Remotes](/remote/remotes).
+
+## Connected clients
+
+**Manage** opens a pane with tabs for the server. **Clients** and **Extensions** are always there.
+**XDG Desktop**, **Muster**, and **systemd** appear when those extensions run.
+
+The **Clients** tab lists every client connected to the server:
+
+- **Client** and a number identify it. **this client** marks your own browser tab.
+- **Age** is how long it has been connected. The arrows give its current download and upload rates.
+- **Terminals** and **Surfaces** list what it has open, with sizes in cells.
+- **Other subscriptions** lists what it watches, such as a key-value prefix.
+
+To disconnect another client, click **Kick**, edit the reason if you want, and click **Confirm
+kick**. A kicked `yas` command exits with status 1 and prints
+`yas: YAS server is closing with Ok: no detail`.
+
+## Status bar overlays
+
+- The font name opens a font picker with a search box, **Size**, **Thinning**, and **Apply**.
+- **Palette** switches between dark and light color palettes.
+- **Media settings** controls sound, video detail and frame rate, touch input, the on-screen
+  keyboard, and camera and microphone sharing. See
+  [Audio, camera, and microphone](/gui/audio-camera-microphone).
+- **IDE dock** and **Preview panel** toggle the left and right side panels.
+
+<Aside type="caution" title="Remote URIs are shared">
+
+The remote list lives on the home server. Every connected client can read the stored URIs,
+including `share:` passphrases, which the list masks until you click reveal. The reason you type
+for a kick is not shown by the `yas` CLI.
+
+</Aside>

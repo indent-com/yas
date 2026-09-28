@@ -1,0 +1,245 @@
+---
+title: "Running systemd user units in a session"
+description: "Run a systemd user manager as a supervised application inside a yas session, so user units start with the session and land on its compositor, bus, and audio."
+sidebar:
+  order: 46
+---
+
+A yas session has its own compositor, private D-Bus session, PipeWire instance, and portal frontend.
+It has no systemd user manager. Inside a yas terminal, `systemctl --user` reaches the host's manager
+on a desktop machine, or nothing at all on a server or container where nobody logged in.
+
+You can run `systemd --user` inside the session as a supervised application of the `xdg-desktop`
+extension. The manager inherits the session's environment, and so does every unit it starts. User
+units then start, stop, restart, socket-activate, and order themselves normally, and anything they
+launch opens on yas's compositor, bus, and audio. This setup needs no changes to yas, logind, PAM,
+lingering, or a system systemd.
+
+<Aside type="caution" title="Experimental">
+  This setup depends on the experimental compositor and runs on Linux servers
+  with systemd installed. It manages `--user` units only.
+</Aside>
+
+## How it works
+
+The `xdg-desktop` extension keeps a list of desktop entries that start with the session and restart
+when they die. For each entry it starts, it creates a Wayland socket dedicated to that application
+and spawns the `Exec` command with the session environment plus a `WAYLAND_DISPLAY` pointing at that
+socket. The manager is one such application. Units inherit `WAYLAND_DISPLAY`, `DISPLAY`,
+`PULSE_SERVER`, and the bus address from it, so no `systemctl --user import-environment` step is
+needed.
+
+## Install the wrapper script
+
+`systemd --user` cannot start bare in a yas session. The script below gives it a private runtime
+directory, resolves the Wayland socket, hands it yas's bus, and masks the units yas already runs.
+Save it on the server's `PATH`, for example as `/usr/local/bin/yas-user-manager`, and make it
+executable:
+
+```sh
+#!/bin/sh
+# Start a systemd user manager inside the yas session.
+set -e
+SYSTEMD=${SYSTEMD_BIN:-/usr/lib/systemd/systemd}
+RT=/run/user/$(id -u)/yas-session          # short: AF_UNIX paths are 108 bytes
+U=$RT/units
+mkdir -p "$RT" "$U"; chmod 700 "$RT"
+
+# The Wayland socket is a bare name under the session runtime dir, so
+# resolve it before XDG_RUNTIME_DIR moves.
+case "$WAYLAND_DISPLAY" in
+  /*) ;;
+  "") ;;
+  *) WAYLAND_DISPLAY="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ;;
+esac
+export WAYLAND_DISPLAY
+
+# One bus, yas's: point $RT/bus at it and stop systemd starting a second one.
+BUS=$DBUS_SESSION_BUS_ADDRESS
+case "$BUS" in unix:path=*) p=${BUS#unix:path=}; ln -sf "${p%%,*}" "$RT/bus" ;; esac
+ln -sf /dev/null "$U/dbus.socket"
+ln -sf /dev/null "$U/dbus-broker.service"
+# Anything yas already provides.
+for m in pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service \
+         wireplumber.service xdg-desktop-portal.service xdg-desktop-portal-gtk.service; do
+  ln -sf /dev/null "$U/$m"
+done
+
+export XDG_RUNTIME_DIR="$RT"
+export SYSTEMD_UNIT_PATH="$U:"
+unset DBUS_SESSION_BUS_ADDRESS
+"$SYSTEMD" --user --unit=basic.target &
+mgr=$!
+trap 'kill -TERM $mgr 2>/dev/null' TERM INT
+n=0
+while [ ! -S "$RT/systemd/private" ] && [ $n -lt 100 ]; do n=$((n+1)); sleep 0.1; done
+[ -n "$BUS" ] && systemctl --user set-environment DBUS_SESSION_BUS_ADDRESS="$BUS" || true
+wait $mgr
+```
+
+What each part does:
+
+- **A private `XDG_RUNTIME_DIR`.** On a host that already runs a user manager,
+  `/run/user/$UID/systemd` is taken, so the second manager needs its own directory. Keep the path
+  short. The manager's notify socket is an `AF_UNIX` socket, and a long path fails with "Notify
+  socket … not valid for AF_UNIX socket address, refusing".
+- **Resolving `WAYLAND_DISPLAY`.** The extension passes the socket's bare name, such as
+  `yas-app-facc30191dbc3c66eccffd76835b9724-0000000000000001`, which resolves against the session's
+  `XDG_RUNTIME_DIR`. The script rewrites it to an absolute path before moving `XDG_RUNTIME_DIR`.
+- **The bus.** Left alone, the manager starts its own D-Bus broker, which gives the session a second
+  bus. Masking `dbus.socket` and `dbus-broker.service` prevents that and also drops the bus address
+  from every unit's environment, so `set-environment` puts yas's address back. The `,guid=…` suffix
+  is stripped before the address is used as a path.
+- **`--unit=basic.target`.** `default.target` would pull in whatever the image's
+  `default.target.wants` holds, including second copies of services yas runs.
+- **`SYSTEMD_UNIT_PATH="$U:"`.** The trailing colon appends the normal search path. Without it no
+  unit resolves, not even `basic.target`.
+- **`wait $mgr`.** The script exits with the manager's status, which the supervisor's restart rules
+  read.
+
+On a machine with no other user manager, you can set `RT=/run/user/$(id -u)`. The manager then owns
+the standard runtime directory, and `systemctl --user` works in every terminal without extra
+environment.
+
+## Write the desktop entry
+
+Create `$XDG_DATA_HOME/applications/yas-user-manager.desktop`. `XDG_DATA_HOME` comes from the yas
+server's environment, not your shell's, and defaults to `~/.local/share`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=User service manager
+Exec=/usr/local/bin/yas-user-manager
+```
+
+The extension reads desktop entries with a small parser:
+
+- The entry's ID is the file name without `.desktop`: `yas-user-manager` here. The extension's
+  commands take this ID.
+- Entries with `NoDisplay=true`, `Hidden=true`, or `Terminal=true` are skipped.
+- Only the `[Desktop Entry]` group is read, and only unlocalized keys. `Name[fr]` is ignored.
+- `Exec` is required and follows the specification's quoting. Field codes such as `%U` are dropped,
+  so write a literal `%` as `%%`. Use a script instead of an inline `sh -c` for anything with
+  quoting.
+- The extension reads `$XDG_DATA_HOME/applications` and each `$XDG_DATA_DIRS/*/applications`,
+  without recursing. Earlier directories win.
+
+## Enable the manager
+
+<Steps titleSize="h3">
+  <Step title="Install the xdg-desktop extension">
+
+    ```bash
+    yas ext run --persist --restart always xdg-desktop https://yas.run/ext/xdg-desktop.wasm
+    ```
+
+    `--persist` stores the extension so it comes back after a server restart. Servers started with
+    `--no-persistent-extensions` refuse it. You can also install it from `yas ext manage`.
+
+  </Step>
+  <Step title="Check that the entry is listed">
+
+    ```bash
+    yas @xdg-desktop list
+    ```
+
+    ```text
+    APP	ENABLED	PHASE	NAME
+    display-im7.q16	no	-	ImageMagick (color depth=q16)
+    google-chrome	no	-	Google Chrome
+    yas-user-manager	no	-	User service manager
+    ```
+
+  </Step>
+  <Step title="Enable it">
+
+    ```bash
+    yas @xdg-desktop enable yas-user-manager
+    ```
+
+    ```text
+    enabled yas-user-manager
+    ```
+
+    `enable` starts the manager now and on every session start. The choice is stored in the
+    server's key-value store under `ext/xdg-desktop/app/yas-user-manager`, so each named instance
+    keeps its own.
+
+  </Step>
+  <Step title="Check its status">
+
+    ```bash
+    yas @xdg-desktop status yas-user-manager
+    ```
+
+    `status` prints one field per line, tab-separated:
+
+    - `app`: the entry ID.
+    - `enabled`: `yes` or `no`.
+    - `phase`: `running`, `starting`, `backoff`, or `stopped`.
+    - `failures`: crashes since the last healthy run.
+    - `last-exit`: the last exit status, when there is one.
+    - `socket`: the name of the Wayland socket for the current run.
+    - `output`: the manager's recent output, when it printed any.
+    - `windows`: surfaces that arrived on this application's socket.
+
+    `windows` counts windows by the socket they connected through, so a GUI application that one of
+    your units starts is counted here. A nonzero count shows that units open on yas's compositor.
+
+  </Step>
+</Steps>
+
+## Use systemctl
+
+Every `systemctl --user` call needs the manager's runtime directory:
+
+```bash
+alias uctl='XDG_RUNTIME_DIR=/run/user/$(id -u)/yas-session systemctl --user'
+uctl start syncthing.service
+uctl status
+```
+
+Put unit files in `/run/user/$UID/yas-session/units/`, the directory the script creates, or in the
+usual `~/.config/systemd/user`.
+
+- **`ExecStart` must be an absolute path.** A bare `alacritty` fails with `203/EXEC`.
+- **The manager's `PATH` is the yas server's `PATH`.** A server started from a systemd unit has very
+  little on it. Check with `uctl show <unit> -p Environment` before assuming a tool is reachable.
+
+## Supervision
+
+The extension applies the same rules to the manager as to any other application:
+
+- **A clean exit is not retried.** `systemctl --user exit`, or the `TERM` the extension sends on
+  `yas @xdg-desktop disable`, makes the manager exit 0. It stays stopped until you run
+  `yas @xdg-desktop enable` again.
+- **A crash backs off.** Restarts wait from 250 ms, doubling up to 30 s, with full jitter. A run that
+  lasts 60 s clears the failure count.
+- **Each run gets a new Wayland socket.** Units read `WAYLAND_DISPLAY` when they start. Units still
+  running when the manager dies go with it, and units started after a restart get the new socket.
+- **The manager survives an extension restart.** The extension spawns it detachable and re-adopts it
+  if the server itself has not restarted.
+
+Other commands: `yas @xdg-desktop start` and `stop` act on this session only and leave the stored
+choice alone. `disable` stops the manager and keeps the row. `forget` stops it and deletes the
+stored choice.
+
+## Limits
+
+- **`/run/user/$UID` must exist and be writable by the server's user.** logind creates it at login.
+  On a machine without a login session, create it once:
+
+  ```bash
+  sudo install -d -o "$USER" -g "$USER" -m 700 /run/user/$(id -u)
+  ```
+
+- **No logind.** There is no `loginctl`, no seats, no `XDG_SESSION_ID`, no lingering, and no
+  session-dependent features of `systemd-run --user --scope`. Units that require them do not start.
+- **No journald in most containers.** With no system journal, give units
+  `StandardOutput=append:%t/<name>.log` so their output goes somewhere you can read.
+- **The server's cgroup limits apply.** The manager creates unit cgroups inside whatever cgroup
+  subtree it starts in, so resource limits on the yas server apply to everything it starts.
+- **Some containers cannot run a user manager.** There `systemd --user` exits with status 1 right
+  away. `yas @xdg-desktop status` shows a `failures` count that keeps rising and `last-exit 1`.
+- **User units only.** System units are out of scope.

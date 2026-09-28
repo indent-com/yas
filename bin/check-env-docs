@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fails when a YAS_* environment variable read by the code is missing from
+# docs/site/src/content/docs/reference/environment-variables.mdx.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+page=docs/site/src/content/docs/reference/environment-variables.mdx
+
+readers='(env::var|env::var_os|var_os|read_env|env_[a-z0-9_]+|deployment_[a-z0-9_]+|setting|parse_duration)'
+{
+  grep -rhoE "${readers}\(\s*\"YAS_[A-Z0-9_]+\"" crates extensions --include='*.rs'
+  grep -rhoE 'env\s*=\s*"YAS_[A-Z0-9_]+"' crates --include='*.rs'
+  grep -rhoE 'process\.env(\.|\[")YAS_[A-Z0-9_]+' js bin extensions e2e \
+    --include='*.ts' --include='*.tsx' --include='*.mjs' --include='*.js' \
+    --exclude-dir=node_modules --exclude-dir=dist
+  grep -hoE '\$\{?YAS_[A-Z0-9_]+' install.sh
+  grep -hoE '\$env:YAS_[A-Z0-9_]+' install.ps1
+} | grep -oE 'YAS_[A-Z0-9_]+' | LC_ALL=C sort -u > "${TMPDIR:-/tmp}/yas-env-read.$$"
+
+missing=()
+while read -r name; do
+  grep -qF "\`$name\`" "$page" || missing+=("$name")
+done < "${TMPDIR:-/tmp}/yas-env-read.$$"
+rm -f "${TMPDIR:-/tmp}/yas-env-read.$$"
+
+if (( ${#missing[@]} )); then
+  echo "Undocumented environment variables (add them to $page):" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  exit 1
+fi
+echo "All YAS_* environment variables read by the code are documented."

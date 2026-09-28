@@ -1,0 +1,487 @@
+---
+title: "Transports internals"
+description: "How each yas transport carries the native protocol, from Unix sockets and WebSockets to WebRTC, SSH, the proxy daemon, and the uplink Noise layer."
+sidebar:
+  order: 113
+---
+
+Every yas transport carries the same native protocol: the 8-byte preface, a Core `HELLO`, and then
+frames. A transport only moves bytes and, where it can, datagrams. It never changes the protocol or
+picks a destination inside the stream. This page covers how each transport does that. For choosing
+a transport as a user, see [Transports](/remote/transports). For the frame layout, see
+[The yas protocol](/internals/protocol).
+
+## Transport abstraction
+
+### Rust
+
+The CLI wraps every connection in the `Transport` enum in
+[`crates/cli/src/transport.rs`](https://github.com/yas-run/yas/blob/main/crates/cli/src/transport.rs):
+
+| Variant                            | Carries                                                        |
+| ---------------------------------- | -------------------------------------------------------------- |
+| `Unix`                             | A local Unix socket.                                           |
+| `NamedPipe`                        | A Windows named pipe.                                          |
+| `Tcp`                              | A plain TCP stream.                                            |
+| `Duplex`                           | An in-memory stream, such as an SSH channel or proxied stream. |
+| `WebRtc { stream, datagram }`      | The `yas.v1` byte stream plus the `yas.v1.datagram` channel.   |
+| `Web { reader, writer, datagram }` | A WebTransport stream with an optional datagram path.          |
+
+`split_with_datagram()` turns any variant into a reader, a writer, and an optional datagram
+handle. The session code above it sees one byte stream and never branches on the transport.
+
+### TypeScript
+
+In `@yas-run/core`, every transport implements `YasTransport`:
+
+```ts
+type ConnectionStatus =
+  | "connecting"
+  | "authenticating"
+  | "connected"
+  | "disconnected"
+  | "closed"
+  | "error";
+
+interface YasTransport {
+  readonly yasFraming?: "message" | "stream";
+  readonly maxDatagramSize?: number;
+  connect(): void;
+  send(data: Uint8Array): void;
+  sendDatagram?(data: Uint8Array): void;
+  close(): void;
+  suspend?(): void;
+  reconnect?(): void;
+  readonly status: ConnectionStatus;
+  readonly bufferedAmount?: number;
+  readonly authRejected: boolean;
+  readonly lastError: string | null;
+  addEventListener(
+    type: "message" | "datagram",
+    listener: (data: ArrayBuffer | Uint8Array) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
+  // removeEventListener has the same overloads.
+}
+```
+
+`yasFraming` tells the session how to write. With `"message"`, the session sends the preface as
+one message and each frame as its own message, the WebSocket form. With `"stream"`, it writes the
+preface once and prefixes each frame with a 4-byte little-endian length. A transport that sets
+`maxDatagramSize` and `sendDatagram` offers the optional datagram path.
+
+## Unix domain socket
+
+The local server listens on a Unix socket. `YAS_SOCK` names the path exactly. Without it, yas
+picks a private directory with mode `0700` from the first usable candidate:
+
+1. `$XDG_RUNTIME_DIR`, when it is owned by you and not writable by others.
+2. A safe `$TMPDIR`.
+3. `/run/user/$UID`.
+4. `/tmp`.
+
+Inside a private base it uses a `yas/` child. Inside a shared sticky directory such as `/tmp` it
+uses `yas-$UID/`. yas checks ownership, mode, symlinks, the socket owner, and path length before
+it trusts any candidate. The socket is `yas-<name>.sock`, where the name comes from
+`YAS_SERVER_NAME` and defaults to `default`. Packaged NixOS installs also accept
+`/run/yas/$USER/yas-$YAS_SERVER_NAME.sock` and the older `/run/yas/$USER-$YAS_SERVER_NAME.sock`.
+
+Every accepted connection is checked against the peer's credentials. See
+[Security](/operating/security) for the full model.
+
+### systemd socket activation
+
+When `LISTEN_FDS=1` is set, the server adopts file descriptor 3 as its listener instead of binding
+a path. yas ships these units:
+
+| Unit                                        | Scope            | Socket                         |
+| ------------------------------------------- | ---------------- | ------------------------------ |
+| `yas-server.socket`, `yas-server.service`   | user             | `%t/yas/yas-default.sock`      |
+| `yas.socket`, `yas.service`                 | user             | The same user socket.          |
+| `yas-server@.socket`, `yas-server@.service` | system, per user | `/run/yas/%i-default.sock`     |
+| `yas-share@.service`                        | system, per user | Reads `/etc/yas/share-%i.env`. |
+
+An adopted listener reports peer UID 0 and PID 1 for connections that systemd passes along, so the
+server also accepts root. Deleting the socket file does not free the address while systemd holds
+the listener. See [System services](/operating/system-services) for setup.
+
+### fd-channel
+
+`yas server --fd-channel FD`, or `YAS_FD_CHANNEL`, makes the server read connected descriptors
+from a Unix socket with `SCM_RIGHTS`. Each received descriptor becomes a client with local-origin
+credentials. The normal socket listener keeps running. When the channel closes, the server shuts
+down and exits 0. See [fd-channel mode](/embedding/fd-channel).
+
+## WebSocket
+
+The edge accepts browsers and remote CLIs over WebSocket at `/edge`, with the `yas.v1`
+subprotocol.
+
+### Auth handshake
+
+```text
+client                          edge                       home server
+  │ upgrade, Sec-WebSocket-      │                              │
+  │ Protocol: yas.v1             │                              │
+  │ ───────────────────────────► │                              │
+  │ text: passphrase             │                              │
+  │ ───────────────────────────► │ connect to home socket,      │
+  │                              │ check peer UID               │
+  │                              │ ───────────────────────────► │
+  │ text: "ok"                   │                              │
+  │ ◄─────────────────────────── │                              │
+  │ binary: preface              │ preface, raw                 │
+  │ binary: one frame / message  │ [len:u32 LE][frame]          │
+  │ ◄──────────────────────────► │ ◄──────────────────────────► │
+```
+
+The edge replies to the passphrase with one text message:
+
+| Reply                           | Meaning                                           |
+| ------------------------------- | ------------------------------------------------- |
+| `ok`                            | Authenticated. Binary protocol messages follow.   |
+| `auth`                          | Wrong passphrase.                                 |
+| `busy`                          | Too many failed attempts. The edge is throttling. |
+| `error:home server unavailable` | The edge could not reach the home server.         |
+
+Before it forwards anything, the edge checks that the home socket belongs to the edge's own
+effective UID, to root, or to `YAS_SERVER_UID`. It uses `SO_PEERCRED` or `getpeereid`. It forwards
+the preface unchanged. For each later message it adds the 4-byte length toward the server and
+strips it toward the client. Behind a reverse proxy, `YAS_TRUSTED_PROXY_IPS` lists the addresses
+whose `X-Forwarded-For` header the edge believes. Use TLS on any address other than loopback.
+
+You can watch the handshake against a private server with an edge. Start one:
+
+```bash
+D=$(mktemp -d)
+YAS_ADDR=127.0.0.1:3398 YAS_PASSPHRASE=docs-pass yas server --socket "$D/yas.sock" --name wsdocs --edge &
+```
+
+Save this as `ws-auth.mjs`:
+
+```js
+const [url, passphrase] = process.argv.slice(2);
+const ws = new WebSocket(url, "yas.v1");
+ws.binaryType = "arraybuffer";
+ws.onopen = () => ws.send(passphrase);
+ws.onmessage = (event) => {
+  console.log(`subprotocol=${ws.protocol} reply=${JSON.stringify(event.data)}`);
+  ws.close();
+};
+ws.onclose = (event) => console.log(`closed code=${event.code}`);
+```
+
+Run it with Bun, once with the right passphrase and once with a wrong one:
+
+```bash
+bun ws-auth.mjs ws://127.0.0.1:3398/edge docs-pass
+bun ws-auth.mjs ws://127.0.0.1:3398/edge wrong-pass
+```
+
+```text
+subprotocol=yas.v1 reply="ok"
+closed code=1000
+subprotocol=yas.v1 reply="auth"
+closed code=1000
+```
+
+Stop the server with `YAS_SOCK="$D/yas.sock" yas quit`.
+
+## WebTransport
+
+WebTransport carries the preface and length-framed session on one bidirectional QUIC stream. The
+edge enables it with `YAS_WEBTRANSPORT=1`. `YAS_WEBTRANSPORT_ADDR`, `YAS_WEBTRANSPORT_PUBLIC_PORT`,
+`YAS_WEBTRANSPORT_CERT`, and `YAS_WEBTRANSPORT_KEY` set the listener, and
+`YAS_WEBTRANSPORT_PIN_CERT=1` publishes a certificate hash for pinning. The browser fetches
+`/edge-transport.json`, uncached, before every attempt to learn whether and where to connect.
+
+Authentication happens on the stream before the preface. The client sends a `u16` little-endian
+length and the credential, at most 4,096 bytes, within 30 seconds. The edge answers with one byte:
+`1` for accepted, `0` for rejected, and `2` for busy.
+
+The CLI and proxy daemon accept this URI form, with port 443 as the default:
+
+```text
+wt://host[:port]/?certHash=<sha256-hex>#secret
+```
+
+Without `certHash`, the client verifies the server through system roots. With it, the client pins
+that exact certificate hash. A direct `wt://` target in the CLI skips the stream proxy so it keeps
+its datagram path.
+
+WebTransport datagrams carry one complete event each, bounded as described in
+[The yas protocol](/internals/protocol#optional-datagrams). A receive watchdog closes the session
+after 30 seconds without incoming QUIC packets, and QUIC keepalives go out every 10 seconds.
+Losing the datagram path leaves the reliable stream running.
+
+## WebRTC DataChannel
+
+`yas share` and `yas server --share` publish a server over WebRTC using the str0m library. The
+browser, or a CLI with a `share:` target, is the consumer.
+
+### DataChannel framing
+
+The ordered, reliable `yas.v1` channel is a byte stream. SCTP message boundaries carry no meaning,
+and the 4-byte length envelope stays end to end. The browser splits writes at
+`RTCSctpTransport.maxMessageSize`, which is 256 KiB with str0m. The native side writes 64 KiB
+chunks.
+
+The forwarder charges each incoming message against a 16 MiB buffer budget per channel, with a
+1 KiB minimum charge, and rejects any single message over 1 MiB. `YAS_WEBRTC_VERBOSE=1` logs the
+channel traffic.
+
+### Datagram channel
+
+A second channel, `yas.v1.datagram`, opens with `ordered: false` and `maxRetransmits: 0`. Each
+message holds one complete event of at most 65,536 bytes. The rules match the WebTransport
+datagram path.
+
+### Signaling
+
+The forwarder and the consumer meet on a hub, `yas.run` by default. Both derive the same Ed25519
+key from the passphrase with PBKDF2-SHA256, 100,000 rounds, and the salt `https://yas.run`. The
+hex public key names the channel:
+
+```text
+producer:  wss://<hub>/channel/<pubHex>/producer
+consumer:  wss://<hub>/channel/<pubHex>/consumer
+```
+
+The hub assigns each consumer its own session UUID, so several browsers can connect at once. SDP
+offers, answers, and ICE candidates are signed, so the hub can route them but cannot forge them.
+
+A share has two secrets. The full passphrase grants read-write access. The read-only secret is a
+separate signing key. For a read-only consumer, the forwarder adds a read-only session extension to
+the first `HELLO` and then passes bytes through. The server advertises and enforces the restricted
+catalogue. See [Sharing over WebRTC](/remote/sharing).
+
+### NAT traversal
+
+Both sides get ICE servers from the hub's `/ice` endpoint. The hub returns Cloudflare TURN
+credentials when it has them configured and falls back to Google's public STUN servers. The
+forwarder refreshes its TURN allocation and permissions every 4 minutes.
+
+### Lifecycle
+
+Each peer tracks whether it has established a connection. Presence on the hub can briefly outlive
+a server restart, so the browser offers to every advertised producer session, including ones that
+appear while it builds the offer. It replays gathered ICE candidates to late arrivals. The first
+authenticated answer wins, and the browser ignores answers from the other sessions.
+
+`yas server --share`, or `YAS_SHARE=1`, runs the forwarder inside the server, so peers get a
+session directly with no socket hop and no proxy daemon. `YAS_SHARE_PASSPHRASE` sets the share's
+own secret on a server that also runs an edge. `YAS_PASSPHRASE` still covers both.
+
+## SSH tunneling
+
+The CLI and the home server's Relay family reach remote servers over SSH with an embedded client,
+russh. No system `ssh` binary is needed.
+
+```text
+yas CLI or home Relay ──SSH (russh), direct-streamlocal@openssh.com──► remote yas socket
+```
+
+The client authenticates with ssh-agent first and key files second. It reads `Hostname`, `User`,
+`Port`, and `IdentityFile` from `~/.ssh/config`. It opens `direct-streamlocal@openssh.com` channels
+to the remote socket and multiplexes every channel for a host over one TCP and SSH connection.
+
+The remote socket path follows the same cascade and checks as a local one. When yas is missing on
+the remote host, the client installs it to `~/.local/bin`.
+
+Host keys use trust on first use against `~/.ssh/known_hosts`, or the file in
+`YAS_SSH_KNOWN_HOSTS`. A new host is recorded. A known host must match its pinned key. An
+unreadable known-hosts file, a missing home directory, or a mismatched key refuses the connection.
+The client ignores `UserKnownHostsFile`, `GlobalKnownHostsFile`, and `HashKnownHosts` in
+`~/.ssh/config`.
+
+## Proxy daemon
+
+`yas proxy-daemon` keeps upstream connections open between short CLI invocations. Its socket is
+`$XDG_RUNTIME_DIR/yas/yas-proxy.sock`, with the same fallbacks as the server socket, or
+`\\.\pipe\yas-proxy` on Windows. The CLI checks the daemon's peer UID before it sends any target.
+To use a daemon owned by another UID, set both `YAS_PROXY_SOCK` and `YAS_PROXY_UID`. Set
+`YAS_PROXY=0` to bypass the daemon.
+
+### Handshake
+
+The client sends one line, and the daemon answers with one line:
+
+| Client sends                       | Daemon replies                             |
+| ---------------------------------- | ------------------------------------------ |
+| `target-yas <uri>`                 | `ok`, then raw bytes, or `error <message>` |
+| `target-yas-composite <share-uri>` | `ok composite <max-datagram> <token>`      |
+| `target-yas-datagram <token>`      | `ok`, then this socket carries datagrams   |
+| `shutdown`                         | `ok`, and the daemon exits                 |
+
+A composite connection pairs a stream socket with a datagram socket for a share. It only works with
+`share:` targets. The second socket must arrive within 5 seconds, and the daemon holds at most 128
+unpaired sides.
+
+You can try the handshake against a private daemon and server:
+
+```bash
+D=$(mktemp -d)
+yas server --socket "$D/yas.sock" --name proxydocs &
+YAS_PROXY_SOCK="$D/proxy.sock" YAS_PROXY_IDLE=60 yas proxy-daemon &
+```
+
+Save this as `proxycheck.py`:
+
+```python
+import os, socket
+
+def ask(line):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(os.environ["YAS_PROXY_SOCK"])
+    s.sendall(line.encode() + b"\n")
+    reply = s.recv(256).decode().strip()
+    print(f"{line.split()[0]:<22} -> {reply}")
+    return s
+
+server = os.environ["YAS_SOCK"]
+ask(f"target-yas socket:{server}")
+ask(f"target-yas socket:{server}.missing")
+ask(f"target-yas-composite socket:{server}")
+ask("shutdown")
+```
+
+```bash
+YAS_SOCK="$D/yas.sock" YAS_PROXY_SOCK="$D/proxy.sock" python3 proxycheck.py
+```
+
+```text
+target-yas             -> ok
+target-yas             -> error socket:/tmp/tmp.gjGe2QNtRP/yas.sock.missing: No such file or directory (os error 2)
+target-yas-composite   -> error composite proxy currently requires share:
+shutdown               -> ok
+```
+
+The last line stops the daemon. Stop the server with `YAS_SOCK="$D/yas.sock" yas quit`.
+
+### Reuse
+
+The daemon pools share sessions by decoded passphrase and normalized hub, up to 32 sessions. SSH
+connections have their own per-host pool. Socket, TCP, and WebSocket targets open a fresh upstream
+for each downstream connection.
+
+### Idle timeout and auto-start
+
+`YAS_PROXY_IDLE` sets an idle timeout in seconds, checked every 5 seconds. A daemon you start by
+hand has no timeout unless you set one. When the CLI needs a daemon and finds none, it checks the
+socket and its owner, then starts `yas proxy-daemon` detached with a 300-second idle timeout. On
+Unix it calls `setsid` and connects stdio to null. On Windows it uses `DETACHED_PROCESS` and
+`CREATE_NO_WINDOW`. The CLI polls for the socket every 50 ms for up to 5 seconds.
+
+### Upstream URIs
+
+| Form                                                         | Upstream                   |
+| ------------------------------------------------------------ | -------------------------- |
+| `socket:/path/to/yas.sock`                                   | A local Unix socket.       |
+| `tcp:host:port`                                              | A plain TCP stream.        |
+| `ws://host/edge#secret`, `wss://host/edge#secret`            | An edge over WebSocket.    |
+| `wt://host/?certHash=<hex>#secret`                           | An edge over WebTransport. |
+| `share:passphrase?hub=wss://yas.run`                         | A WebRTC share.            |
+| `ssh:user@host/name`                                         | A named server over SSH.   |
+| `uplink:https://relay.example#token=TOKEN&server=PUBLIC_KEY` | A server behind an uplink. |
+
+[URIs](/reference/uris) lists every form and where each one is accepted.
+
+## Uplink
+
+An uplink exposes a server through a relay that never sees plaintext. The user guide is
+[Uplink](/remote/uplink). This section covers the protocol.
+
+### Roles
+
+| Role             | Meaning                                                                |
+| ---------------- | ---------------------------------------------------------------------- |
+| uplink           | `yas uplink`. It connects out and bridges streams to the local server. |
+| control endpoint | An HTTPS URL that authenticates the uplink and assigns relays.         |
+| relay            | A WebTransport server that the uplink stays connected to.              |
+| consumer         | A yas client that reaches the server through the relay.                |
+
+### Inner Noise protocol
+
+Each consumer stream runs `Noise_IK_25519_AESGCM_SHA256` with the prologue `YAS-UPLINK\x02`. The
+consumer is the initiator and pins the producer's static public key. The producer checks the
+consumer's static key against its allowed list.
+
+- Every Noise message carries a 2-byte big-endian length prefix.
+- The IK message is 96 bytes and the response is 48 bytes.
+- Transport records are type 0 for data, 1 to 16,384 bytes, or type 1 for FIN.
+- Ciphertexts are 17 to 16,401 bytes.
+- Each direction rekeys every 2^20 messages.
+
+After the handshake the consumer sends `YAS-UPLINK\x02` as a confirmation. The producer checks it
+before it opens a local socket, then replies with `YAS-UPLINK\x02` and 64 random bytes of datagram
+root key material. The first 32 bytes serve the consumer-to-producer direction. The handshake must
+finish within 10 seconds, and the producer holds at most 64 pending streams per relay session.
+
+### Control endpoint
+
+The uplink sends a `GET` to the control URL with `Authorization: Bearer $YAS_UPLINK_TOKEN`. The
+response lists relays:
+
+```json
+{
+  "relays": [
+    "https://relay-1.example/u",
+    "https://relay-2.example/u#sha256=<b64url>"
+  ]
+}
+```
+
+A `#sha256=` fragment pins the relay certificate. A 401 or 403 is fatal. Other failures back off
+from 1 second, doubling to 60 seconds with 0.75 to 1.25 jitter, and honor `Retry-After`.
+
+### Consumer attachment
+
+A consumer URI looks like this:
+
+```text
+uplink:https://relay.example#token=CLIENT_TOKEN&server=SERVER_PUBLIC_KEY
+```
+
+The consumer's private key comes from `YAS_UPLINK_IDENTITY`, or from an `identity=` field in the
+fragment. The consumer requests `<control-path>/attach` with only the token as a bearer
+credential, and gets back a worker address:
+
+```json
+{ "ws": "wss://relay-worker.example/u/session" }
+```
+
+It connects to that worker, completes the bearer and `ok` exchange, and runs Noise over the binary
+messages. Messages are opaque chunks of at most 64 KiB, and the built-in consumer sends at most
+16 KiB. The token only routes. The pinned server key and the allowed client keys decide access.
+
+### Relay session
+
+The uplink shuffles the relay pool and opens a WebTransport session to each in turn, with a
+10-second keepalive and a 30-second idle timeout. The uplink never opens streams. The relay opens
+one bidirectional stream per consumer, and after Noise the uplink bridges decrypted bytes to a
+fresh local socket. Inside Noise the stream is the normal preface and length-framed session.
+
+### Encrypted datagrams
+
+Native datagrams cross the relay encrypted:
+
+```text
+route_token:16 │ counter:u64 BE │ ciphertext │ tag:16
+```
+
+The key for each direction and epoch is `HKDF-SHA256(root, salt = route_token, info =
+"YAS-UPLINK-v2-datagram" || direction:u8 || epoch:u64 BE)`, 32 bytes long, where the epoch is
+`counter / 2^20`. The nonce is 4 zero bytes followed by the counter, and the AAD is the token and
+the counter. Receivers keep a 128-packet replay window. The browser runs at most 64 crypto
+operations in flight.
+
+### Closure and reconnection
+
+A failed Noise handshake or an unavailable local socket closes that consumer stream. On `SIGINT`
+the uplink closes the relay session with application code 2. When a relay never accepts the
+session, the uplink tries the next relay in the pool. When an established session dies, it asks
+the control endpoint for a fresh pool at once and resets its backoff. When the pool runs out with
+no session, it backs off and asks again.

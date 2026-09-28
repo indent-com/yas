@@ -1,0 +1,31 @@
+---
+title: "yas open"
+description: "Open the terminal UI in the browser."
+sidebar:
+  order: 15
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Open the terminal UI in the browser
+
+Opens the browser with the local yas server and every named remote it publishes. Manage remotes with `yas remote add/remove` or through the Remotes dialog in the browser. `--on` and `--hub` are refused: the UI always starts from the local server.
+
+Examples:
+
+```text
+yas open                        # local + all configured remotes
+yas remote add rabbit ssh:rabbit
+yas open                        # now includes rabbit
+```
+
+```text
+Usage: yas open [OPTIONS]
+```
+
+Options:
+
+- `--port <PORT>`
+
+  Bind browser UI to a specific port (default: random)
+

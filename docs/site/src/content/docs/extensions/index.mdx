@@ -1,0 +1,26 @@
+---
+title: "Extensions"
+description: "Run WebAssembly and JavaScript extensions inside a yas server, including the bundled supervisor and desktop services."
+sidebar:
+  order: 10
+  group:
+    label: "Extensions"
+    icon: "ph:plug"
+---
+
+Extensions are WebAssembly or JavaScript programs that run inside the server with access to its terminals, key/value store, and channels.
+
+<CardGrid>
+  <Card title="Bundled extensions" href="/extensions/bundled">
+    The four extensions each yas release publishes: doctor, muster, systemd, and
+    xdg-desktop, and how to install them.
+  </Card>
+  <Card title="Muster and mustard" href="/extensions/muster">
+    Supervise long-running programs in yas terminals with the Muster extension,
+    and drive it from the mustard terminal UI.
+  </Card>
+  <Card title="Writing an extension" href="/extensions/writing-extensions">
+    Write a WebAssembly or JavaScript program that runs inside the yas server,
+    add `@name` commands to the CLI, and publish it in a registry.
+  </Card>
+</CardGrid>

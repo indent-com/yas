@@ -1,0 +1,371 @@
+---
+title: "Changelog"
+description: "What changed in each yas release, newest first."
+sidebar:
+  order: 130
+---
+
+What changed in each yas release, newest first. Binaries for every release are on
+[GitHub](https://github.com/yas-run/yas/releases).
+
+## 0.3.0
+
+September 24, 2026
+
+### Extension installs and updates in the browser
+
+**Manage → Extensions** runs installs, updates, and removals for each extension independently, with
+live progress and its own result on every row. You can select several extensions and act on them
+together. After you connect, a non-modal offer lists missing or outdated extensions whose
+requirements the server meets, and you can install or update them in one step. See
+[Extensions](/extensions).
+
+### Compatibility checks for extensions
+
+The extension registry publishes a `requirements.json` entry for each extension: its runtime,
+required protocol families, host operating systems, and read-only host probes. The browser checks
+these against the server and marks each extension as available, available with limitations,
+unavailable, or unknown. A check never installs anything, and **Recheck** runs it again.
+
+### Native traffic tracing
+
+`yas events` can trace native protocol traffic across every family, including individual frames,
+datagrams, state records, and full decoded payloads, plus raw Git and filesystem notifications.
+Enable it with `yas events set --events 'default,+frame.native.*,+datagram.native.*,+state.record.*'`
+and follow it with `yas events tail`. See [Events](/reference/events).
+
+### Watch diagnostics in Manage → Clients
+
+**Manage → Clients** shows each client's Git and filesystem watch paths, effective flags, and
+resolved settle delays. Clients can also request their own Git settle delays for refs and status.
+
+### Per-user compositor runtime directory
+
+When a server starts without `XDG_RUNTIME_DIR`, as a system service does, the compositor puts its
+Wayland socket in a per-user `yas-<uid>` directory. It no longer falls back to the shared `/tmp`,
+where a second user's server could fail to start and crash-loop. The NixOS module now sets an
+owner-private runtime directory. See [System services](/operating/system-services) and
+[Nix](/operating/nix).
+
+### Fixes
+
+- The first layout edit in a restored workspace is saved, and pending layout changes are written
+  when the page is hidden.
+
+## 0.2.6
+
+September 22, 2026
+
+### Frame rate instead of resolution under encoder load
+
+When a surface encoder cannot keep up, yas now delivers fewer frames at the requested resolution.
+Encoded resolution follows the view, the source window, and encoder limits only. Transport and
+decoder pressure still use bandwidth and pacing controls. See
+[Video encoding](/gui/video-encoding).
+
+### Image paste from the mobile toolbar
+
+The mobile toolbar's **Paste** action reads the device clipboard directly in the tap, so iOS
+screenshots paste into terminals as images. It prefers an image over text, uploads it to the
+server clipboard, and waits for the upload before sending the paste to the application.
+
+### Fixes
+
+- Installed iOS web apps use an opaque black status bar and a contained viewport, which keeps the
+  top controls unblurred and the footer on screen.
+- Expanding or collapsing Safari's toolbars no longer changes the workspace layout.
+- The preview sidebar is a single drop target. Dropping a pane on a preview card parks it in the
+  sidebar instead of creating a tab group.
+
+## 0.2.5
+
+September 22, 2026
+
+### Fixes
+
+- Cmd+V in a terminal pastes the browser clipboard when an application has enabled enhanced
+  keyboard input. It is never sent to the application as Super+V.
+- Closing a connection before its panes no longer leaves terminals pointing at freed memory in the
+  browser.
+
+## 0.2.4
+
+September 19, 2026
+
+### Surface quality on high-latency connections
+
+The server measures round-trip time from its existing heartbeat pings and uses it to size each
+surface view's send window. Streams over long or relayed paths no longer lower video quality
+because of an undersized window, and running out of frame slots no longer counts as a bandwidth
+limit. See [Video encoding](/gui/video-encoding).
+
+## 0.2.3
+
+September 19, 2026
+
+### Workspaces on yas.run shares
+
+Full-control shares opened at `yas.run/s` use the same workspace shell as the regular app, with the
+workspace manager, saved tabs and layouts, and the home server's remotes. Read-only shares keep
+their layout in local browser storage. Embedders select the full shell with the `home` option of
+`mountYasWorkspace`. See [Sharing over WebRTC](/remote/sharing).
+
+### Touch capability only for touch viewers
+
+Graphical applications see a touchscreen only while a viewer on a touch device uses direct touch
+input. Mouse-only viewers no longer make sites such as video players switch to touch controls. See
+[Keyboard, mouse, and touch](/browser/keyboard-mouse-touch).
+
+## 0.2.2
+
+September 18, 2026
+
+### Git status without ignored files
+
+A Git watch can select which status classes it collects: tracked, untracked, or ignored. When
+ignored files are left out, the server prunes ignored directories before collecting status, so a
+large generated directory no longer fills the status entry limit. Tracked files stay visible even
+when they match ignore rules. See [Git](/code/git).
+
+### Fixes
+
+- Pane contents, including terminals, surfaces, and the last picture of an idle window, survive
+  splits, nesting, and moves between tiled and floating layouts. Restoring a saved workspace no
+  longer hangs.
+- Layout updates keep focus in the active control, including editor search and rename fields.
+- Chromium keeps its cursor after replacing its Wayland pointer object.
+- Waydroid starts with yas private audio. Child processes receive `PULSE_RUNTIME_PATH`.
+
+## 0.2.1
+
+September 16, 2026
+
+### Wide-gamut and HDR surfaces
+
+The compositor preserves Display P3 and HDR content from Wayland applications through composition,
+encoding, captures, and PipeWire sharing. Each viewer negotiates sRGB, Display P3, or 10-bit AV1 PQ
+output based on what its browser can decode and present. Software encoders, NVENC, VA-API, and
+Vulkan Video all support managed color. See [Color and HDR](/gui/color-and-hdr).
+
+### Kitty keyboard protocol
+
+Terminals in the browser and in the native viewer support the
+[Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) when an application
+enables it: distinct modified Enter, Tab, and Backspace, key release and repeat events, and all five
+enhancement flags. Without negotiation, Ctrl+Enter sends `\x1b[13;5u` and Enter sends `\r`.
+`yas terminal attach` passes the application's keyboard mode through to your host terminal. See
+[Keyboard, mouse, and touch](/browser/keyboard-mouse-touch).
+
+### Font export on by default
+
+The server now exports font files by default and lists only faces whose embedding metadata permits
+export. Set `YAS_FONT_EXPORT=0` to turn export off and empty the font catalogue. See
+[Environment variables](/reference/environment-variables).
+
+### Workspaces kept through reconnects
+
+A brief disconnect keeps terminal and surface lists, pane assignments, and mounted canvases in place
+while the status indicator shows recovery. Relay routes also stay in place, so an interrupted home
+link no longer rebuilds every remote workspace. See [Workspaces](/browser/workspaces).
+
+### Directional moves that follow the layout tree
+
+Moving a pane with the keyboard exchanges it with its sibling, or extracts it beside its group, by
+following the container tree instead of screen geometry. Left and right reorder tabs, up and down
+reorder stacked views, and Shift+Arrow moves a floating window by 10 pixels. See
+[Workspaces](/browser/workspaces).
+
+### Smaller terminal updates
+
+The server sends each terminal view only the cells that changed since its last frame, with
+scroll detection and optional LZ4 compression. A one-cell edit in a 182 by 150 terminal now takes at
+most 18 bytes of grid data.
+
+### Surface streaming latency and memory
+
+Surface streams start and resize faster, buffer less video, and keep control input responsive on
+congested links. Write pressure from one surface view no longer lowers the quality of another. Set
+`YAS_WEBTRANSPORT_STATS=1` on the edge to log QUIC round-trip time, congestion window, and loss
+every five seconds.
+
+### New database format
+
+The server's KV store and extension catalogue use redb 4. Database files written by 0.2.0 and
+earlier are not migrated, so the server needs fresh database files. See
+[Key-value store](/code/key-value-store).
+
+### Fixes
+
+- Pasting a Wayland application's clipboard into a terminal with Cmd+V or Ctrl+Shift+V works on
+  macOS without browser clipboard permission.
+- On iPad, you can drag sidebar cards into the layout with a mouse or trackpad.
+- Open menus stay open when a new surface appears. The keyboard prefix stays armed across blur.
+- Newly bound Wayland keyboards receive focus, and each pointer entry resets a stale custom cursor.
+- Surface canvases recover after a lost or failed canvas context and repaint or request a fresh
+  keyframe.
+- Tiled windows no longer show stale frames after moving, and inserting a sibling pane keeps
+  existing canvases.
+- Windows keep their scale while a pane resize is pending.
+- The font picker keeps its selection across disconnects and hides faces the server cannot
+  export.
+- A terminal's output reader can no longer read another terminal's output after its descriptor is
+  reused.
+- The compositor no longer aborts when Brave starts.
+- Nix builds of the release packages include CMake for bundled Opus.
+
+## 0.2.0
+
+September 15, 2026
+
+### End-to-end encrypted uplinks
+
+Uplinks now authenticate both ends with pinned X25519 keys and encrypt all traffic with Noise IK
+before any request reaches the local server. A relay can no longer control the server it forwards
+to. Both endpoints must upgrade, generate new identities, and exchange public keys. Ed25519 pins
+and bearer-only or plaintext streams are rejected. `@yas-run/core` adds `YasUplinkTransport` and
+`YasNoiseTransport` for browsers. See [Uplink](/remote/uplink).
+
+### Complete terminal output before exit
+
+A terminal publishes its exit only after all of its output has been read and parsed, so the final
+screen matches what the program wrote. See [Reading output](/terminals/reading-output).
+
+### WebRTC share reliability
+
+A browser opening a share offers to every advertised server session, so a stale entry left by a
+server restart no longer causes repeated timeouts. Reliable channels budget incoming data by bytes,
+and browser writes are split at the negotiated SCTP message size. TURN over TCP and TLS keeps
+partial messages across interrupted reads. See [Sharing over WebRTC](/remote/sharing).
+
+### Audio recovery and latency compensation
+
+Audio restarts after a full window of lost datagrams, and duplicated or reordered frames are treated
+as loss. Latency reports from a viewer expire after five seconds, so a stalled viewer no longer
+holds the shared sink at an old correction. See
+[Audio, camera, and microphone](/gui/audio-camera-microphone).
+
+### Tensorlake GPU sandboxes
+
+Scripts in `bin/` build a yas image with Ubuntu, systemd, PipeWire, and browsers and start it in a
+Tensorlake GPU sandbox. See [Tensorlake](/operating/tensorlake).
+
+### Fixes
+
+- Terminals render at native resolution in the top-left of their pane instead of being scaled
+  with CSS. Sidebar and switcher previews scale to fit. In embeds, `fitWidth` opts a passive
+  preview into scaling and centering.
+- Moving the pointer within a surface keeps the application's hidden cursor hidden, including
+  during video playback.
+- Clicking the hint in an empty pane opens the shortcut map.
+- Share pages are titled "shared session" instead of "shared terminal".
+- The Windows CLI reserves an 8 MiB main-thread stack and no longer overflows at startup.
+
+## 0.1.4
+
+September 9, 2026
+
+### Fixes
+
+- The server no longer rescans the font catalogue continuously. On Linux, its own file reads
+  triggered new scans.
+
+## 0.1.3
+
+September 9, 2026
+
+### Repository moved to yas-run
+
+The project moved to [github.com/yas-run/yas](https://github.com/yas-run/yas). The install scripts,
+license text, and npm packages point there. Releases no longer update the `pcarrier/homebrew-tap`
+Homebrew formula. See [Installing yas](/getting-started/installing).
+
+## 0.1.2
+
+September 9, 2026
+
+### Exclusive lock per server instance
+
+A server holds an exclusive lock on its instance's KV database. A second server with the same state
+exits, even when started on another socket. See [Named instances](/terminals/named-instances).
+
+### More host APIs for QuickJS extensions
+
+QuickJS extensions can read command stdin, run processes, inspect Git, read and write files, hash
+with BLAKE3, and make deadline-bounded network exchanges. Each call is capability-checked and uses
+the server's negotiated protocol families. See
+[Writing extensions](/extensions/writing-extensions).
+
+### Audio on Debian 12
+
+Audio works with PipeWire 0.3.65, as shipped in Debian 12. yas provides its own versions of PipeWire
+calls that older libraries do not export. See
+[Audio, camera, and microphone](/gui/audio-camera-microphone).
+
+### NVENC in containers
+
+NVENC matches its CUDA device to the compositor's GPU by Vulkan device UUID. This works in
+containers that expose no `/dev/dri` nodes, and on drivers that cannot export sync file
+descriptors. See [Video encoding](/gui/video-encoding).
+
+### Fixes
+
+- Share offers are authenticated before the server allocates peer resources, so unauthenticated
+  presence messages cannot fill all peer slots.
+- `yas share` rejects a blank or whitespace-only passphrase, including a blank
+  `YAS_SHARE_PASSPHRASE` that would mask `YAS_PASSPHRASE`.
+- WebTransport uses quinn-proto 0.11.15, which fixes CVE-2026-25800.
+- File writes keep the existing file's permissions when no mode is given.
+- Single file operations from the CLI and the browser file tree (write, mkdir, rename, remove,
+  link) no longer fail with an unsupported atomic batch error.
+- New terminals start at the size of the pane they open in.
+- A small preview no longer locks a surface to H.264 when a higher-ranked encoder can handle the
+  full-size pane.
+- Symbol search in the switcher returns results once the language server is ready. Opening a file
+  no longer reports it missing before its contents arrive.
+- `@muster list` uses `-` for an empty PHASE column.
+
+## 0.1.1
+
+September 7, 2026
+
+### Clipboard handling
+
+Terminal output can no longer write to your clipboard with OSC 52. Copying a terminal selection
+that extends past the visible rows fetches the text from the server within the same gesture. A copy
+in any pane or connection replaces stale Wayland selections everywhere, and pasting into a Wayland
+window waits until the server has stored the clipboard. See
+[Clipboard, media, and notifications](/gui/clipboard-media-notifications).
+
+### Fixes
+
+- WebRTC shares allow 30 seconds to connect on restrictive networks, and TURN over TCP no longer
+  drops connectivity checks that arrive during setup.
+- Surface video no longer builds up latency behind a deep browser decoder queue.
+- The mobile toolbar pastes a Wayland application's clipboard into the editor.
+
+## 0.1.0
+
+September 7, 2026
+
+The first public release.
+
+- Terminal multiplexing in the browser: `yas open` starts a server and opens a workspace with
+  terminals rendered by WebGL. See [Workspaces](/browser/workspaces).
+- CLI control of terminals for scripts and agents: `yas terminal start`, `show`, `send`,
+  `journal`, and `output`, plus `yas run` for pipe-oriented processes. See
+  [Controlling terminals](/terminals/controlling-terminals).
+- Named remotes over SSH with automatic install on first connection, and named local instances.
+  See [Remotes](/remote/remotes).
+- Sharing over WebRTC with `yas share`, including read-only links. See
+  [Sharing over WebRTC](/remote/sharing).
+- An experimental headless Wayland compositor on Linux that streams GUI windows as H.264 or AV1
+  video, with `yas surface` commands to list, capture, click, and type. See
+  [Running GUI apps](/gui/running-gui-apps).
+- Port forwarding and a SOCKS5 proxy with `yas forward` and `yas socks`. See
+  [Port forwarding](/remote/port-forwarding).
+- Uplinks, `yas edge` for persistent browser access, and the `@yas-run/react` and
+  `@yas-run/solid` embedding packages. See [Embedding yas](/embedding).
+- Bundled extensions (`@muster`, `@systemd`, `@xdg-desktop`, `@doctor`) and `yas ext manage`. See
+  [Bundled extensions](/extensions/bundled).
+- Linux on x86_64 and arm64 with the full feature set, and terminal multiplexing on macOS arm64 and
+  Windows x86_64.

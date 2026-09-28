@@ -1,0 +1,31 @@
+---
+title: "yas uplink-url"
+description: "Print a consumer URL using the producer's YAS_UPLINK_IDENTITY."
+sidebar:
+  order: 20
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Print a consumer URL using the producer's `YAS_UPLINK_IDENTITY`
+
+Run on the producer. Derives its public key locally; the URL contains the consumer routing token and server public key, never a private key.
+
+```text
+Usage: yas uplink-url [OPTIONS] --client-token <CLIENT_TOKEN> <URL>
+```
+
+Arguments:
+
+- `<URL>`
+
+  Control endpoint URL (e.g. https://relay.example)
+
+Options:
+
+- `--client-token <CLIENT_TOKEN>`
+
+  Consumer routing token supplied by the relay service
+
+  Required. Environment: `YAS_UPLINK_CLIENT_TOKEN`.
+

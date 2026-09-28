@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Regenerates docs/site/src/content/docs/reference/cli from the clap
+# definitions in crates/cli/src/cli.rs. The yas-cli unit test
+# `checked_in_cli_reference_is_current` fails in CI when this is stale.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec cargo run --quiet -p yas-cli -- generate --markdown docs/site/src/content/docs/reference/cli

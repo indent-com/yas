@@ -1,4 +1,4 @@
-//! Stateless request handlers: log, tree, blob, merge-base (docs/git.md).
+//! Stateless request handlers: log, tree, blob, merge-base (docs/design/git.md).
 //! Each takes a semantic request, does bounded work against a thread-local
 //! repository, and returns an owned semantic response.
 
@@ -23,7 +23,7 @@ impl RepoHandle {
         let repo = self.local();
         let fail = |status: u8| commits_response(req.nonce, status, 0, &[], &[]);
 
-        // Reject undefined flag bits (docs/git.md: INVALID on unknown flags).
+        // Reject undefined flag bits (docs/design/git.md: INVALID on unknown flags).
         const KNOWN_LOG_FLAGS: u8 = GIT_LOG_FIRST_PARENT
             | GIT_LOG_TOPO
             | GIT_LOG_FULL_MESSAGE
@@ -178,7 +178,7 @@ impl RepoHandle {
             }
         };
         // Header before object: TOO_LARGE must report the true size
-        // (docs/git.md) without ever materializing an over-cap blob.
+        // (docs/design/git.md) without ever materializing an over-cap blob.
         let header = match repo.find_header(blob_id) {
             Ok(header) => header,
             Err(_) => return fail(GIT_STATUS_NOT_FOUND, 0),
@@ -402,7 +402,7 @@ fn commit_info(
 /// base — neither side's full ancestry is ever materialized. Results come
 /// newest-first and may still contain redundant entries (an ancestor of
 /// another candidate) in criss-cross histories; callers reduce them.
-/// Capped at `budget` visited commits and cancellable (docs/git.md walk
+/// Capped at `budget` visited commits and cancellable (docs/design/git.md walk
 /// budget); like git itself, ordering leans on commit times, so extreme
 /// clock skew can degrade the answer, never the bounds.
 fn paint_bases(
@@ -515,7 +515,7 @@ fn reduce_bases(
 }
 
 /// Best merge base of `a` and `b` — the newest maximal common ancestor —
-/// memoized, bounded, and cancellable (docs/git.md walk budget).
+/// memoized, bounded, and cancellable (docs/design/git.md walk budget).
 pub(crate) fn bounded_merge_base(
     repo: &gix::Repository,
     memo: &MergeMemo,
@@ -578,7 +578,7 @@ pub(crate) fn walk_log(
     if follow && path_filter.is_none() {
         return Err(GIT_STATUS_INVALID);
     }
-    // FOLLOW tracks a single file (docs/git.md): a directory path is
+    // FOLLOW tracks a single file (docs/design/git.md): a directory path is
     // WRONG_TYPE. Check against the resolved tips.
     if follow && let Some(filter) = &path_filter {
         for tip in &tips {

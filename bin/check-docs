@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# The docs CI gate: every YAS_* variable is documented, and the site
+# typechecks, builds, and passes nimbus-docs lint. The CLI reference staleness
+# check runs with the Rust tests (`checked_in_cli_reference_is_current`).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec nix develop --accept-flake-config -c bash -c '
+  set -euo pipefail
+  bin/check-env-docs
+  pnpm --dir docs/site install --ignore-workspace --frozen-lockfile --ignore-scripts
+  pnpm --dir docs/site run check
+'

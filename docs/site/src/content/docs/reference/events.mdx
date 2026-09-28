@@ -1,0 +1,202 @@
+---
+title: "Event journal"
+description: "Configure, read, follow, and record the server's binary event journal with yas events."
+sidebar:
+  order: 125
+---
+
+The event journal is a fixed-size ring buffer of typed records that every server keeps in memory. It records server lifecycle, client connections, PTY activity, and, when you turn them on, low-level protocol and subsystem events. Use it to see what a server did, follow activity live, or write a binary recording for later analysis. `yas events` manages it. The specification is [docs/design/events.md](https://github.com/yas-run/yas/blob/main/docs/design/events.md).
+
+## Show the configuration
+
+```bash
+yas events config
+```
+
+```text
+protocol	yas.events.v1
+revision	5
+size	1048576
+used	7131
+records	80
+dropped	0
+next_sequence	80
+events	server.start,server.stop,task.start,task.stop,client.connect,client.disconnect,client.reject,config.change,stream.start,stream.stop,protocol.error,pty.create,pty.exit,pty.remove,pty.deadline,server.capacity,git.watch.start,git.watch.stop,fs.watch.start,fs.watch.stop,client.native.connect,client.native.disconnect,client.native.error
+bitset	018300000000ffff:0000000000000007:0000000000000000:0000000000000000
+```
+
+Each line is a tab-separated field and value:
+
+- `protocol`: the journal protocol version.
+- `revision`: the configuration revision. It increases on every change.
+- `size`: ring capacity in bytes.
+- `used`: bytes the retained records occupy.
+- `records`: records currently retained.
+- `dropped`: records lost to wrapping, shrinking, or exceeding the ring size.
+- `next_sequence`: the sequence number the next record gets.
+- `events`: the event types being recorded.
+- `bitset`: the same selection as four 64-bit activation words in hex.
+
+## Change what is recorded
+
+`yas events set` replaces the ring size, the event selection, or both. The server applies the change immediately and prints the new configuration.
+
+```bash
+yas events set --events 'default,+pty.*' --size 4194304
+```
+
+```text
+protocol	yas.events.v1
+revision	6
+size	4194304
+...
+events	server.start,...,pty.deadline,server.capacity,pty.read,pty.write,pty.parse,pty.snapshot,pty.resize,pty.input,git.watch.start,...
+```
+
+- `--size BYTES` sets the ring capacity, from 4096 to 67104768 bytes (64 MiB minus 4 KiB). Shrinking keeps the newest records.
+- `--events SPEC` sets the selection. See [Selectors](#selectors).
+- `--if-revision N` applies the change only if the configuration is still at revision `N`. Use it when several tools share a server.
+
+Return to the startup selection with `yas events set --events default`. To set the startup selection and size, use `YAS_EVENTS` and `YAS_EVENTS_SIZE` (see [Environment variables](/reference/environment-variables#event-journal)).
+
+### Selectors
+
+A selector is a comma-separated list of terms, applied left to right:
+
+- `default`: the default set shown above.
+- `all` or `none`.
+- An exact event name, such as `pty.read`.
+- `prefix.*`: every event whose name starts with `prefix.`, including nested names. `client.*` matches `client.native.connect`.
+
+Prefix a term with `+` to add it or `-` to remove it. When the first term has a sign, the list starts from the default set; otherwise it starts empty. `pty.*` alone selects only PTY events, while `+pty.*` adds them to the defaults.
+
+An unknown name fails without changing anything:
+
+```bash
+yas events set --events 'nosuch.*'
+```
+
+```text
+yas: unknown event selector "nosuch.*"
+```
+
+## Read the ring
+
+`yas events dump` prints every retained record once and exits.
+
+```bash
+yas events dump | tail -2
+```
+
+```text
+2026-09-28T05:31:37.553592866Z +860.776308806s #82 client.native.disconnect session=0af1545a558da9bf089a4ebd540cfe46 elapsed_us=14562 received_bytes=98 sent_bytes=210 reason="transport cancellation/EOF; drained 0 queued frame(s)"
+2026-09-28T05:31:37.563223453Z +860.785939393s #83 client.native.connect session=4f5600c68d4f162fc9f9e4bec8fb6605 name="yas-cli" release="0.3.0"
+```
+
+The first line is a header that starts with `#`:
+
+```bash
+yas events dump | head -2
+```
+
+```text
+# yas.events.v1 capacity=1048576 retained_bytes=12417 retained_records=138 dropped=0 next_sequence=138 enabled=server.start,server.stop,...
+2026-09-28T05:17:16.777292202Z +0.000008142s #0 server.start version="0.3.0" server="docs"
+```
+
+The header repeats the ring size, bytes and records retained, the drop count, the next sequence number, and the enabled event types. Each record line after it has these fields, separated by spaces:
+
+- The wall-clock time in UTC.
+- Seconds since the server started.
+- `#` and the sequence number.
+- The event name.
+- `required`, when the record type is one a reader must understand.
+- The payload as `key=value` pairs. Byte payloads print as `b"..."`.
+
+`--binary` writes the self-describing binary format instead, and `-o PATH` writes to a local file.
+
+## Follow events live
+
+`yas events tail` prints the retained records and then each new record as it happens, until you stop it. `--from-now` skips the retained records.
+
+```bash
+yas events tail --from-now
+```
+
+```text
++867.628806254s #92 pty.read required pty=5 bytes=4 data=b"hi\r\n"
++867.628837288s #93 pty.parse required pty=5 bytes=4 elapsed=0.000016429s
++867.628893089s #94 pty.exit required pty=5 status=0 reason="exited"
+```
+
+Tail lines omit the wall-clock time. `-o PATH` writes to a local file, `--append` appends to it, and `--binary` writes binary batches. When the tail cannot keep up, the server skips ahead and reports how many records it lost; the observed work is never slowed down.
+
+## Record to a file on the server
+
+A recording is a server-side task that writes events to a file on the server's filesystem. It keeps running after the command that started it exits, and it stops when the server stops.
+
+<Steps titleSize="h3">
+<Step title="Start a recording">
+
+```bash
+yas events record start --from-now /tmp/rec.events
+```
+
+```text
+3
+```
+
+The command prints the recording ID after the file header is written. Without `--from-now` the file starts with the retained ring. `--append` appends to an existing file.
+
+</Step>
+<Step title="List recordings">
+
+```bash
+yas events record list
+```
+
+```text
+3	running	4	466	0	from-now	truncate	/tmp/rec.events
+```
+
+The tab-separated fields are ID, state, records written, bytes written, records lost, history mode (`history` or `from-now`), write mode (`truncate` or `append`), path, and the error for a failed recording.
+
+</Step>
+<Step title="Stop it">
+
+```bash
+yas events record stop 3
+```
+
+The command prints nothing on success. A stopped recording no longer appears in `yas events record list`.
+
+</Step>
+</Steps>
+
+Recording files use the binary journal format and start with the magic bytes `YASEVT01`. Set `YAS_EVENTS_FILE` to start a recording when the server starts.
+
+## Event types
+
+| Group          | Events                                                                                                                                                                                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Server         | `server.start`, `server.stop`, `server.capacity`, `server.error`, `task.start`, `task.stop`, `config.change`, `supervisor.event`, `session.lock`                                                                                                                           |
+| Clients        | `client.connect`, `client.disconnect`, `client.reject`, `client.control`, `client.native.connect`, `client.native.disconnect`, `client.native.error`, `connection.accept`                                                                                                  |
+| Streams        | `stream.start`, `stream.stop`, `protocol.error`, `outbox.queue`                                                                                                                                                                                                            |
+| Wire           | `frame.read`, `frame.write`, `message.read`, `message.write`, `frame.native.read`, `frame.native.write`, `payload.native.read`, `payload.native.write`, `state.record.read`, `state.record.write`, `datagram.native.read`, `datagram.native.write`, `datagram.native.drop` |
+| Delivery       | `tick.start`, `tick.stop`, `tick.nudge`                                                                                                                                                                                                                                    |
+| PTY            | `pty.create`, `pty.exit`, `pty.remove`, `pty.deadline`, `pty.read`, `pty.write`, `pty.parse`, `pty.snapshot`, `pty.resize`, `pty.input`                                                                                                                                    |
+| Compositor     | `compositor.event`, `compositor.command`, `surface.encode`, `surface.frame`, `audio.frame`                                                                                                                                                                                 |
+| Files and Git  | `fs.request`, `fs.watch.start`, `fs.watch.stop`, `fs.record`, `fs.event`, `fs.state`, `git.request`, `git.watch.start`, `git.watch.stop`, `git.record`, `git.fs_event`, `git.state`                                                                                        |
+| Other requests | `kv.request`, `lsp.request`, `net.request`, `process.request`, `extension.request`, `channel.request`                                                                                                                                                                      |
+
+<Aside type="caution" title="Sensitive data">
+
+PTY, wire, and content events record raw bytes, including anything typed into a terminal. They are off by default. Any client that can reach the server can turn them on and read them, so treat recordings as secrets.
+
+</Aside>
+
+## Limits
+
+- One client connection can run up to 16 tails at once and up to 4 dumps at once.
+- The server advertises a limit of 64 detached recordings.
+- A record larger than the ring is counted in `dropped` and not stored.

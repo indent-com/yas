@@ -1,4 +1,4 @@
-//! Git introspection engine (docs/git.md).
+//! Git introspection engine (docs/design/git.md).
 //!
 //! A per-repository engine thread owns the mutable-state stream
 //! snapshots: HEAD, refs, in-progress operation, upstream tracking, stash,
@@ -60,7 +60,7 @@ impl Cancel {
     }
 }
 
-/// Environment-tunable budgets (docs/git.md limits table).
+/// Environment-tunable budgets (docs/design/git.md limits table).
 pub struct Budgets {
     pub blob_max: u64,
     pub log_default: usize,
@@ -351,7 +351,7 @@ pub(crate) fn is_zero_oid(oid: &GitOid) -> bool {
 }
 
 /// Reversible text for possibly non-UTF-8 repo bytes (paths, ref names): the
-/// escaping scheme of docs/fs-watch.md, via the fssync helpers.
+/// escaping scheme of docs/design/fs-watch.md, via the fssync helpers.
 pub(crate) fn escape_bstr(bytes: &[u8]) -> String {
     yas_fssync::escape_bytes(bytes)
 }
@@ -360,7 +360,7 @@ pub(crate) fn decode_path_bytes(s: &str) -> Option<Vec<u8>> {
     yas_fssync::unescape_to_bytes(s)
 }
 
-/// Lossy-flagged UTF-8 for names/emails/messages (docs/git.md: re-encoded
+/// Lossy-flagged UTF-8 for names/emails/messages (docs/design/git.md: re-encoded
 /// server-side, `LOSSY` when bytes were replaced).
 pub(crate) fn utf8_lossy_flag(bytes: &[u8]) -> (String, bool) {
     match std::str::from_utf8(bytes) {
@@ -370,7 +370,7 @@ pub(crate) fn utf8_lossy_flag(bytes: &[u8]) -> (String, bool) {
 }
 
 /// Re-encode commit text (names, emails, message) to UTF-8, honoring the
-/// commit's `encoding` header (docs/git.md). A recognized non-UTF-8 label
+/// commit's `encoding` header (docs/design/git.md). A recognized non-UTF-8 label
 /// is decoded through it; otherwise (absent, UTF-8, or unknown label) we
 /// fall back to lossy UTF-8. The bool is the `LOSSY` flag.
 pub(crate) fn commit_text(bytes: &[u8], encoding: Option<&[u8]>) -> (String, bool) {

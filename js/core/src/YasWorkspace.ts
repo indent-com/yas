@@ -298,7 +298,7 @@ export class YasWorkspace {
   }
 
   /**
-   * Mirror a directory tree from one connection's server (docs/fs-watch.md):
+   * Mirror a directory tree from one connection's server (docs/design/fs-watch.md):
    * a live map plus per-record callbacks. See `YasNativeWorkspaceConnection.syncFs`.
    */
   async syncFs(
@@ -310,7 +310,7 @@ export class YasWorkspace {
   }
 
   /**
-   * Open a git repository on one connection's server (docs/git.md): live
+   * Open a git repository on one connection's server (docs/design/git.md): live
    * state plus oid-addressed reads. See `YasNativeWorkspaceConnection.openRepo`.
    */
   async openRepo(

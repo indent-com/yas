@@ -1,0 +1,451 @@
+---
+title: "yas git"
+description: "Inspect git repositories on the server (https://docs.yas.run/code/git)"
+sidebar:
+  order: 9
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Inspect git repositories on the server (https://docs.yas.run/code/git)
+
+```text
+Usage: yas git [OPTIONS] <COMMAND>
+```
+
+## yas git status
+
+Branch, ahead/behind, stash, and working-tree status.
+
+```text
+Usage: yas git status [OPTIONS]
+```
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--watch`
+
+  Keep watching, reprinting whenever the status changes
+
+- `--json`
+
+  NDJSON output (one state snapshot per line)
+
+## yas git log
+
+Commit history, newest first
+
+Examples:
+
+```text
+yas git log                 # HEAD
+yas git log v1.0            # from a tag
+yas git log main..feature   # a range
+yas git log --watch main..HEAD
+yas git log --follow -- src/main.rs
+```
+
+```text
+Usage: yas git log [OPTIONS] [REV] [-- <PATHSPEC>...]
+```
+
+Arguments:
+
+- `[REV]`
+
+  Revision or range to log (default: HEAD). A ref, (short) oid, HEAD~N, or a range A..B / A...B
+
+- `[PATHSPEC]...`
+
+  Restrict to commits touching this path (after `--`)
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `-n, --limit <LIMIT>`
+
+  Maximum commits to print
+
+  Default: `20`.
+
+- `--watch`
+
+  Keep the log live, refreshing as its endpoint refs move
+
+- `--follow`
+
+  Follow a single file across renames (needs a path)
+
+- `--first-parent`
+
+  Follow only the first parent of each merge
+
+- `--full-message`
+
+  Include the full commit message, not just the subject
+
+- `--topo`
+
+  Topological order (parents after children) within the page
+
+- `--json`
+
+  NDJSON output (one commit per line)
+
+## yas git diff
+
+Changed files (unstaged by default), optionally with per-file hunks
+
+Examples:
+
+```text
+yas git diff                # worktree vs index (unstaged)
+yas git diff --staged       # index vs HEAD (staged)
+yas git diff main           # worktree vs a commit
+yas git diff main dev       # between two commits
+yas git diff main..dev      # same as: main dev
+yas git diff main...dev     # since they diverged (merge base)
+yas git diff --merge-base main # worktree vs where main forked
+yas git diff HEAD~2 -- src  # limited to a path
+```
+
+```text
+Usage: yas git diff [OPTIONS] [REVS]... [-- <PATHSPEC>...]
+```
+
+Arguments:
+
+- `[REVS]...`
+
+  Revisions to compare: none (worktree vs index), one (that revision vs the worktree, or the index with `--staged`), two (between them), or a single A..B / A...B range. Each is a ref, (short) oid, or HEAD~N
+
+- `[PATHSPEC]...`
+
+  Restrict to this path (after `--`)
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--staged`
+
+  Compare the index to HEAD (staged changes) instead of the worktree
+
+- `--merge-base`
+
+  Compare against where the revision forked, not its tip, so the new side can be the worktree — `A...B` always ends at a commit (git's `--merge-base`)
+
+- `-p, --patch`
+
+  Show per-file hunks, not just the changed-file list
+
+- `--binary`
+
+  With `-p`, include binary content as a GIT binary patch block, so `git apply --binary` can replay it (git's `--binary`)
+
+- `--json`
+
+  NDJSON output
+
+## yas git show
+
+Print an object's bytes (like `git cat-file` / `git show`)
+
+Examples:
+
+```text
+yas git show HEAD:src/main.rs   # a file at a revision
+yas git show v1.0:Cargo.toml
+yas git show HEAD               # the commit object itself
+yas git show HEAD:src           # a directory, listed like ls-tree
+```
+
+```text
+Usage: yas git show [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  REV[:PATH]. REV names a commit; reach trees and blobs by PATH. Omit PATH for the commit object (in `git cat-file commit` layout); a directory PATH is listed like ls-tree, and `REV:` lists the root tree. Omit REV (`:path`) for HEAD
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--max-len <MAX_LEN>`
+
+  Stop after this many bytes
+
+  Default: `8388608`.
+
+## yas git ls-tree
+
+List one tree level (like `git ls-tree`)
+
+TSV: MODE TYPE OID&lt;TAB&gt;NAME. Not recursive — pass a path to descend.
+
+```text
+Usage: yas git ls-tree [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  REV[:PATH]; omit PATH for the root tree
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output
+
+## yas git ls-files
+
+List the index (like `git ls-files --stage`)
+
+TSV: MODE STAGE OID&lt;TAB&gt;PATH. Conflicted paths appear once per stage (1 = base, 2 = ours, 3 = theirs).
+
+```text
+Usage: yas git ls-files [OPTIONS] [PATH]
+```
+
+Arguments:
+
+- `[PATH]`
+
+  Restrict to this path prefix
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output
+
+## yas git merge-base
+
+Best common ancestors of two or more revisions
+
+Exits 1 when the histories are unrelated, as git does.
+
+```text
+Usage: yas git merge-base [OPTIONS] <REVS> <REVS>...
+```
+
+Arguments:
+
+- `<REVS>...`
+
+  Two or more revisions
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output
+
+## yas git blame
+
+Who last touched each line (like `git blame`)
+
+Prints `OID LINE) TEXT`-less attribution: one row per contiguous range, since the ranges are what the server computes. Resolve the oids with `yas git log` if you want authors.
+
+```text
+Usage: yas git blame [OPTIONS] <PATH>
+```
+
+Arguments:
+
+- `<PATH>`
+
+  File to blame
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--rev <REV>`
+
+  Revision to blame from (default: HEAD)
+
+- `--start <START>`
+
+  First line (1-based); with `--lines`, the start of the range
+
+- `--lines <LINES>`
+
+  How many lines to attribute — a viewport blame is cheap, a whole large file is not
+
+- `-M, --follow`
+
+  Follow renames (git's `-M`)
+
+- `--json`
+
+  NDJSON output
+
+## yas git reflog
+
+A ref's reflog (like `git reflog`)
+
+The only way to name an oid no longer reachable from any ref — an amended or reset-away commit that `log` cannot reach.
+
+```text
+Usage: yas git reflog [OPTIONS] [REF_NAME]
+```
+
+Arguments:
+
+- `[REF_NAME]`
+
+  Ref to read (default: HEAD)
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `-n, --limit <LIMIT>`
+
+  Maximum entries to print
+
+  Default: `20`.
+
+- `--reverse`
+
+  Oldest first (default is newest first, like git)
+
+- `--json`
+
+  NDJSON output
+
+## yas git discover
+
+Find repositories under a path
+
+TSV: WORKDIR&lt;TAB&gt;GITDIR. Deduped by gitdir, so several paths resolving to one repository report once.
+
+```text
+Usage: yas git discover [OPTIONS] [PATH]
+```
+
+Arguments:
+
+- `[PATH]`
+
+  Directory to search (relative to the client's cwd)
+
+  Default: `.`.
+
+Options:
+
+- `--depth <DEPTH>`
+
+  How deep to descend
+
+  Default: `4`.
+
+- `--nested`
+
+  Descend into repositories after finding one
+
+- `--bare`
+
+  Report bare repositories too
+
+- `--json`
+
+  NDJSON output
+
+## yas git fetch
+
+Fetch from a remote, reporting per-ref what happened
+
+Runs the server's own `git fetch`, so its credential helpers and config apply. Exits 1 if any ref was refused — unlike `git fetch`, which can exit 0 having refused one refspec of several.
+
+```text
+Usage: yas git fetch [OPTIONS] [REMOTE] [REFSPECS]...
+```
+
+Arguments:
+
+- `[REMOTE]`
+
+  Remote name (default: origin)
+
+- `[REFSPECS]...`
+
+  Refspecs to fetch (default: the remote's configured ones)
+
+Options:
+
+- `--repo <REPO>`
+
+  Repository path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--prune`
+
+  Delete remote-tracking refs the remote no longer has
+
+- `--anchor`
+
+  Anchor fetched tips under refs/yas/fetch/ so a concurrent gc cannot prune them
+
+- `--timeout <TIMEOUT>`
+
+  Give up after this many seconds
+
+  Default: `120`.
+
+- `--json`
+
+  NDJSON output
+

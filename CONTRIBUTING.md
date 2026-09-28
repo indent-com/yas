@@ -1,34 +1,37 @@
 Reading material:
 
-- ARCHITECTURE.md
-- EMBEDDING.md
+- https://docs.yas.run (source in docs/site)
 - README.md
 - SERVICES.md
 - SKILL.md
 - UNSAFE.md
-- nix/README.md
 - crates/website/README.md
 
 # Contributing to yas
 
-This document helps LLM agents (and humans) contribute to the yas codebase. It covers the development workflow, code conventions, and project structure. For the system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md). For user-facing documentation, see [README.md](./README.md).
+This document helps LLM agents (and humans) contribute to the yas codebase. It covers the development workflow, code conventions, and project structure. For the system architecture, see [Internals](https://docs.yas.run/internals) on the docs site. User-facing documentation lives in [`docs/site`](docs/site) and is published at [docs.yas.run](https://docs.yas.run).
 
 ## Documentation maintenance guide
 
-When making changes, update the relevant docs in the same PR.
+When making changes, update the relevant docs in the same PR. User and internals documentation
+lives in the docs site under [`docs/site`](docs/site) (published at
+[docs.yas.run](https://docs.yas.run)); its [AGENTS.md](docs/site/AGENTS.md) has the writing rules
+and page layout.
 
-| Document                   | Scope                                                                                                                       | Update when...                                                                                                               |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `README.md`                | User-facing overview: installation, usage, features                                                                         | CLI flags, install methods, or supported platforms change                                                                    |
-| `ARCHITECTURE.md`          | System internals: data flow, crate responsibilities, transport layers, rendering pipeline                                   | Crates are added/removed/renamed, data flow between components changes, or new transport/rendering mechanisms are introduced |
-| `CONTRIBUTING.md`          | Developer workflow: building, testing, code conventions, project structure                                                  | Build steps, test commands, directory layout, or dev tooling changes                                                         |
-| `SERVICES.md`              | Hosted services, CI/CD, and running as a service (Homebrew, systemd)                                                        | CI jobs are added/removed/changed, deployment targets change, new secrets are introduced, or the release process is modified |
-| `EMBEDDING.md`             | Embedding yas in other apps: React components (`@yas-run/react`), embedding `yas server` as a library                       | Public embedding APIs, component props, or integration patterns change                                                       |
-| `SKILL.md`                 | LLM agent skill definition: install instructions and pointer to `yas learn`. Served at `yas.run/SKILL.md` by `yas-website`. | Install methods change or the `learn` subcommand output changes                                                              |
-| `crates/cli/src/learn.md`  | Full CLI reference printed by `yas learn`: usage patterns, subcommand details, transport options, escapes                   | CLI subcommands, flags, output conventions, or transport options change                                                      |
-| `UNSAFE.md`                | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                                    | Unsafe code is added, removed, or its safety invariants change                                                               |
-| `nix/README.md`            | nix-darwin and NixOS service module configuration examples                                                                  | Nix module options or usage patterns change                                                                                  |
-| `crates/website/README.md` | `yas.run` website, signaling hub, and Fly deployment                                                                        | Website routes, signaling, deployment, or environment variables change                                                       |
+| Document                                                         | Scope                                                                                    | Update when...                                                                                  |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `docs/site/src/content/docs/<section>/`                          | User guides, operating, embedding, extensions, and internals pages                       | Any user-visible behavior, component API, deployment option, or internal mechanism changes      |
+| `docs/site/src/content/docs/reference/cli/`                      | Generated CLI reference                                                                  | CLI subcommands, flags, or help text change: run `bin/generate-cli-docs` (a Rust test enforces) |
+| `docs/site/src/content/docs/reference/environment-variables.mdx` | Every `YAS_*` variable the code reads                                                    | A variable is added, removed, or changes meaning (`bin/check-env-docs` enforces)                |
+| `docs/site/src/content/docs/changelog.mdx`                       | Hand-written notes per release                                                           | Every release: add a section in the release pull request                                        |
+| `README.md`                                                      | Short overview, install, and links to the docs                                           | Install methods change                                                                          |
+| `CONTRIBUTING.md`                                                | Developer workflow: building, testing, code conventions, project structure               | Build steps, test commands, directory layout, or dev tooling changes                            |
+| `SERVICES.md`                                                    | Hosted services, CI/CD, and releases                                                     | CI jobs, deployment targets, secrets, or the release process change                             |
+| `SKILL.md`                                                       | Agent skill definition, served at `yas.run/SKILL.md` by `yas-website`                    | Install methods change or the `learn` subcommand output changes                                 |
+| `crates/cli/src/learn.md`                                        | CLI guide printed by `yas learn`, also rendered on the docs site                         | CLI subcommands, flags, output conventions, or transport options change                         |
+| `docs/protocol.md`, `docs/design/`                               | Protocol entry point and design documents; `docs/design/yas.md` is normative             | The protocol or a designed subsystem changes                                                    |
+| `UNSAFE.md`                                                      | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on | Unsafe code is added, removed, or its safety invariants change                                  |
+| `crates/website/README.md`                                       | `yas.run` website, signaling hub, and Fly deployment                                     | Website routes, signaling, deployment, or environment variables change                          |
 
 ## Getting started
 
@@ -405,7 +408,7 @@ Wayland app → compositor thread → CompositorEvent::SurfaceCommit
 
 Hardware AV1 (NVENC, VA-API) goes to 8192x4352; everything else stops at 3840x2160. The ceiling is applied per viewer rather than per surface — `surface_encode_cap()` in `crates/server/src/lib.rs` resolves it from the backend that won the chain, and `mediated_size_for_surface()` translates each ceiling into compositor pixels at that viewer's requested scale before taking the widest across a surface's subscribers. This lets a sub-1× viewer drive a larger 1× source while `per_client_encode_target()` still downsamples into the viewer's smaller encoded frame. A viewer's ceiling is also intersected with the decode size negotiated by the native Surface client; clients that report nothing are held at 3840x2160 encoded pixels.
 
-`--surface-encoders` / `YAS_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,av1-vulkan,h264-vulkan,h264-software,av1-software` — NVENC and VA-API are tried before the compositor-resident Vulkan Video tier, which remains ahead of software. Vulkan Video uses the same per-client target size, surface pacing gate, adaptive quantizer, and one-frame delivery discipline as the other encoders; only speed control is unavailable. A refused 4:4:4 profile retries the same Vulkan codec at 4:2:0 before a 4:2:0 refusal advances to the encoders below it (see `docs/server.md` for how that is decided, and for the two ways 4:4:4 can come back no). `YAS_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) is the ceiling on the bit budget — adaptation is always on and only moves cheaper than what you set, and `YAS_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `YAS_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `YAS_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`). Inbound media has the mirror-image knobs: `--camera-codecs` / `--microphone-codecs` (or `YAS_MEDIA_CAMERA_CODECS` / `YAS_MEDIA_MICROPHONE_CODECS`) narrow what viewers may send, and viewers pick within that from the media panel.
+`--surface-encoders` / `YAS_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,av1-vulkan,h264-vulkan,h264-software,av1-software` — NVENC and VA-API are tried before the compositor-resident Vulkan Video tier, which remains ahead of software. Vulkan Video uses the same per-client target size, surface pacing gate, adaptive quantizer, and one-frame delivery discipline as the other encoders; only speed control is unavailable. A refused 4:4:4 profile retries the same Vulkan codec at 4:2:0 before a 4:2:0 refusal advances to the encoders below it (see [Compositor internals](https://docs.yas.run/internals/compositor) for how that is decided, and for the two ways 4:4:4 can come back no). `YAS_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) is the ceiling on the bit budget — adaptation is always on and only moves cheaper than what you set, and `YAS_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `YAS_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `YAS_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`). Inbound media has the mirror-image knobs: `--camera-codecs` / `--microphone-codecs` (or `YAS_MEDIA_CAMERA_CODECS` / `YAS_MEDIA_MICROPHONE_CODECS`) narrow what viewers may send, and viewers pick within that from the media panel.
 
 ### Testing surfaces without a browser
 

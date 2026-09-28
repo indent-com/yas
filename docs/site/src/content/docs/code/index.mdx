@@ -1,0 +1,34 @@
+---
+title: "Files, Git, and code intelligence"
+description: "Read, search, and write files, inspect Git repositories, and query language servers on a yas server."
+sidebar:
+  order: 6
+  group:
+    label: "Files, Git, and code intelligence"
+    icon: "ph:code"
+---
+
+These commands run on the server next to the code, locally or through any remote.
+
+<CardGrid>
+  <Card title="Files" href="/code/files">
+    Read, search, write, and watch files on a server with yas fs, with content
+    hashes that stop two writers from overwriting each other.
+  </Card>
+  <Card title="Git" href="/code/git">
+    Read status, history, diffs, file contents, and blame from repositories on a
+    server with yas git, and fetch from their remotes.
+  </Card>
+  <Card title="Language servers" href="/code/language-servers">
+    Ask the language servers on a server for definitions, references, symbols,
+    completions, diagnostics, and rename plans with yas lsp.
+  </Card>
+  <Card title="Key-value store" href="/code/key-value-store">
+    Store small values on a server with yas kv, update them with
+    compare-and-swap, and watch a key prefix for changes.
+  </Card>
+  <Card title="Code panels in the browser" href="/code/code-panels">
+    Browse files, branches, and history, search a project, and edit code with
+    language server help in the yas browser UI.
+  </Card>
+</CardGrid>

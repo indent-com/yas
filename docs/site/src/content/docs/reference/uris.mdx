@@ -1,0 +1,106 @@
+---
+title: "URI schemes"
+description: "The grammar of every target URI yas accepts in --on, YAS_TARGET, yas.target, and saved remotes."
+sidebar:
+  order: 124
+---
+
+A target URI names a yas server and the transport to reach it. You pass one to `--on`, set it in `YAS_TARGET` or the `yas.target` key of [yas.conf](/reference/configuration-files#yasconf), or save it as a [remote](/remote/remotes). Every CLI command that talks to a server accepts the same forms.
+
+```bash
+yas --on "socket:$D/yas.sock" terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+1			sh -c 'echo hi; sleep 1'		exited(0)
+```
+
+## Choosing a target
+
+The CLI uses the first of these that is set:
+
+1. `--on URI`
+2. `YAS_TARGET`
+3. `yas.target` in `yas.conf`
+4. `local`
+
+## Grammar
+
+```text
+target  = "local"
+        | "local:" name
+        | "socket:" path
+        | "ssh:" [ user "@" ] host [ ":" socket-path ]
+        | "tcp:" host ":" port
+        | ( "ws://" | "wss://" ) authority path [ "?" query ] [ "#" passphrase ]
+        | "wt://" authority [ path ] [ "?certHash=" hex ] [ "#" passphrase ]
+        | "uplink:" https-url "#token=" token "&server=" public-key [ "&identity=" private-key ]
+        | "share:" secret [ "?hub=" url ]
+        | "proxy:" target
+        | remote-name
+```
+
+The CLI checks prefixes in this order: `proxy:`, `ssh:`, `tcp:`, `wt://`, `ws://` or `wss://`, `uplink:`, `socket:`, `share:`, `local`, `local:`. Anything else is looked up as a remote name.
+
+## Schemes
+
+| Form                                          | Transport                                  | Notes                                                                                                                                                                                                                                        |
+| --------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `local`                                       | Unix socket or named pipe                  | The default instance. Starts a server if none is listening. Honors `YAS_SOCK`.                                                                                                                                                               |
+| `local:NAME`                                  | Unix socket or named pipe                  | The [named instance](/terminals/named-instances) `NAME`. Starts it if none is listening.                                                                                                                                                     |
+| `socket:/path`                                | Unix socket or named pipe                  | An explicit socket path. Never starts a server.                                                                                                                                                                                              |
+| `ssh:[user@]host[:/socket]`                   | Embedded SSH client                        | Connects to the remote user's default socket, or `socket` when given. When yas is missing, installs it into `~/.local` with `curl` or `wget`. Starts a server when none is listening. There is no port field; set a port in `~/.ssh/config`. |
+| `tcp:host:port`                               | Raw TCP                                    | Unencrypted. Use only on a trusted network.                                                                                                                                                                                                  |
+| `ws://host/edge#pass`, `wss://host/edge#pass` | WebSocket to a [yas edge](/operating/edge) | The fragment is the edge passphrase, percent-decoded. Use `wss://` off loopback.                                                                                                                                                             |
+| `wt://host:port/#pass`                        | WebTransport to a yas edge                 | `?certHash=HEX` pins a self-signed certificate.                                                                                                                                                                                              |
+| `uplink:https://relay/#token=T&server=K`      | [Uplink](/remote/uplink) through a relay   | `token` is the routing token and `server` is the server's public key. The client private key comes from `identity=` or `YAS_UPLINK_IDENTITY`.                                                                                                |
+| `share:SECRET`                                | WebRTC through the hub                     | `SECRET` is the share passphrase, which grants full access, or a read-only token ending in `.ro`. `?hub=URL` overrides `--hub` and `YAS_HUB`. See [Sharing](/remote/sharing).                                                                |
+| `proxy:TARGET`                                | Per-user proxy                             | Routes `TARGET` through the proxy even where the CLI would connect directly.                                                                                                                                                                 |
+| `NAME`                                        | Whatever `NAME` points to                  | A remote name, resolved recursively. A cycle is an error.                                                                                                                                                                                    |
+
+Passphrases go in the URI fragment because a fragment is never sent in an HTTP request line, so it stays out of access logs and `Referer` headers.
+
+## The per-user proxy
+
+By default the CLI connects to `ssh:`, `tcp:`, `ws://`, `wss://`, `uplink:`, and `share:` targets through a per-user proxy process. The proxy keeps the SSH, WebSocket, or WebRTC session open between commands, so the second command skips the handshake. `wt://` targets always connect in-process. `local`, `local:NAME`, and `socket:` never use the proxy.
+
+Set `YAS_PROXY=0` to connect in-process. The error text shows which path a command took:
+
+```bash
+yas --on tcp:127.0.0.1:1 terminal list
+YAS_PROXY=0 yas --on tcp:127.0.0.1:1 terminal list
+```
+
+```text
+yas: yas-proxy: tcp:127.0.0.1:1: Connection refused (os error 111)
+yas: cannot connect to 127.0.0.1:1: Connection refused (os error 111)
+```
+
+## Errors
+
+An unrecognized target prints the accepted forms:
+
+```bash
+yas --on bogus terminal list
+```
+
+```text
+yas: unknown target 'bogus' (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], or a name from yas.remotes)
+```
+
+An invalid instance name fails before any connection:
+
+```bash
+yas --on 'local:bad/name' terminal list
+```
+
+```text
+yas: invalid local server name: server name may contain only ASCII letters, digits, '-', '_', and '.'
+```
+
+<Aside type="caution">
+
+The CLI resolves a bare remote name from the local `yas.remotes` file. Remotes added with `yas remote add` live in the home server's `remotes` KV key, so the CLI does not find them and prints the `unknown target` error above. Pass the full URI instead. See [Configuration files](/reference/configuration-files#yasremotes).
+
+</Aside>

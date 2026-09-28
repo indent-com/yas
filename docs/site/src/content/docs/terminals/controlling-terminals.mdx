@@ -1,0 +1,229 @@
+---
+title: "Controlling terminals"
+description: "Start, list, type into, attach to, signal, and close terminals on a yas server from the command line."
+sidebar:
+  order: 31
+---
+
+`yas terminal` manages the terminals on a server from any shell or script. A terminal keeps running after the command that started it returns, and every command below works the same against a local server, an SSH remote, or any other target you pass with `--on`. `yas t` is a short alias, and `yas terminal` with no subcommand lists terminals.
+
+## Start a terminal
+
+`yas terminal start` creates a terminal and prints its ID:
+
+```bash
+yas terminal start -t shell
+```
+
+```text
+2
+```
+
+With no command, the terminal runs your default shell as an interactive login shell (`$SHELL -li`, or `/bin/sh` when `SHELL` is unset on the server).
+
+Name a program to run it directly:
+
+```bash
+yas terminal start -t sleeper -- sleep 600
+```
+
+yas executes the program without a shell, so rc files are not read and shell syntax such as pipes, redirection, globs, and `&&` has no meaning. Pass `--shell` (`-c`) to run one string through the server's login shell (`$SHELL -lic`):
+
+```bash
+yas terminal start -t greet --cwd /usr/share --env GREETING=hello --shell 'echo "$GREETING from $(pwd)"'
+```
+
+```text
+1
+```
+
+Options go before the command. Everything after the first bare word belongs to the command. Put `--` before the command when its own flags could be mistaken for yas options.
+
+- `--tag`, `-t` labels the terminal. The tag shows in `yas terminal list` and in the browser, and `yas terminal grep --tag` filters on it.
+- `--cwd DIR` sets the working directory. Without it the terminal starts in the server's working directory. A directory that cannot be entered fails the start.
+- `--env KEY=VALUE` sets an environment variable and is repeatable. It overrides the value the terminal would otherwise inherit from the server. Naming the same variable twice is an error.
+- `--rows` and `--cols` set the initial size. The default is 24 rows by 80 columns. Scripts that read output should use `--cols 200` or wider to avoid wrapped lines.
+- `--wait --timeout SECONDS` blocks until the program exits. See [Wait for a terminal to exit](#wait-for-a-terminal-to-exit).
+- `--deadline SECONDS` makes the server stop the terminal after that many seconds, even if the client that started it is gone.
+
+Terminals inherit the server's environment. The server sets `TERM=xterm-256color` and `COLORTERM=truecolor`, and on Linux it adds the variables graphical programs need to reach the compositor.
+
+## List terminals
+
+```bash
+yas terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+1	greet		echo "$GREETING from $(pwd)"		exited(0)
+2	shell	user@e2b: /tmp		/tmp	running
+3	sleeper		sleep 600	/tmp	running
+```
+
+The output is tab-separated with one header row. `yas terminal ls` is the same command.
+
+- **ID** is the number every other `yas terminal` command takes. IDs are never reused while the server runs.
+- **TAG** is the label from `--tag`, or empty.
+- **TITLE** is the window title the program set with an escape sequence. Shells often put the user, host, and directory there. It is empty when the program sets none.
+- **COMMAND** is what was started: the argument list, quoted where needed, or the `--shell` string. It is empty for the default shell.
+- **CWD** is the terminal's live working directory. yas takes it from the shell's OSC 7 reports when the shell sends them (see [Shell integration](/terminals/shell-integration)), and otherwise asks the operating system for the process's directory. It is empty after the program exits.
+- **STATUS** is `running`, or how the program ended:
+  - `exited(N)`: the program exited with code N.
+  - `signal(N, Name)`: a signal ended it, such as `signal(15, Terminate)`.
+  - A reason can follow after a colon. `signal(15, Terminate): deadline` means the deadline stopped it.
+
+`yas terminal cwd ID` prints only the working directory of one terminal:
+
+```bash
+yas terminal cwd 2
+```
+
+```text
+/tmp
+```
+
+## Type into a terminal
+
+`yas terminal send` writes text to the terminal as if you typed it:
+
+```bash
+yas terminal send 2 'ls /usr/share | head -3\n'
+yas terminal show 2
+```
+
+```text
+user@e2b:/tmp$ ls /usr/share | head -3
+ImageMagick-7
+X11
+alsa
+user@e2b:/tmp$
+```
+
+`send` understands C-style escapes:
+
+| Escape | Sends                                 |
+| ------ | ------------------------------------- |
+| `\n`   | Carriage return (0x0D), the Enter key |
+| `\r`   | Carriage return (0x0D)                |
+| `\t`   | Tab (0x09)                            |
+| `\\`   | One backslash                         |
+| `\0`   | NUL (0x00)                            |
+| `\xHH` | The byte with hex value HH            |
+
+`\n` sends a carriage return because that is what a real terminal sends for Enter. Send `\x0a` when you need a literal line feed. Any other backslash sequence is sent as typed. Control keys are bytes: `\x03` is Ctrl+C, `\x04` is Ctrl+D, and `\x1b` is Escape.
+
+```bash
+yas terminal send 2 'sleep 100\n'
+yas terminal send 2 '\x03'
+```
+
+`send` does not understand key names in braces. `{Enter}` and `{Return}` are sent as literal text. Braced key names belong to `yas surface type`, which types into graphical windows.
+
+Pass `-` to read the text from standard input:
+
+```bash
+printf 'echo from stdin\n' | yas terminal send 2 -
+```
+
+Sending to a terminal whose program has exited does nothing and still exits with status 0.
+
+## Click and scroll
+
+`yas terminal click ID COL ROW` clicks at a cell, counting from zero at the top left. `yas terminal mouse ID EVENT COL ROW` sends `down`, `up`, `move`, `click`, `hover`, `wheel-up`, or `wheel-down`, with `--button left|middle|right`. The server encodes the event in whatever mouse mode the program enabled.
+
+```bash
+yas terminal click 2 5 3
+yas terminal mouse 2 wheel-up 5 3
+```
+
+## Attach from your own terminal
+
+```bash
+yas terminal attach 2
+```
+
+`attach` puts your terminal in raw mode, forwards your keystrokes, and draws the remote screen in the alternate screen, so your own scrollback is kept. Press Ctrl+] to detach. If the program exits while you are attached, `attach` exits with its status. It needs a real terminal on standard input:
+
+```text
+yas: stdin is not a terminal (attach needs a tty)
+```
+
+## Resize
+
+```bash
+yas terminal resize 2 120 40
+```
+
+The arguments are columns, then rows. The size is a request. The server reconciles the sizes every attached client asks for, so a browser tab showing the same terminal can keep it larger.
+
+## Stop and remove terminals
+
+A terminal's program can end in three ways: it exits on its own, you send it a signal, or its deadline passes. The terminal stays listed with its output until you close it.
+
+Send a signal with `kill`. It goes to the terminal's process group. The default is `TERM`, and names or numbers work:
+
+```bash
+yas terminal kill 3 INT
+```
+
+Arm or refresh a deadline on a running terminal with `deadline`. The countdown restarts on every call, and `0` clears it. Repeating the call on an interval makes a dead-man switch: if your script dies, the terminal outlives it by at most one interval.
+
+```bash
+yas terminal start -t guard --deadline 60 -- sleep 600
+yas terminal deadline 5 30
+```
+
+Remove a terminal with `close`. This ends its program if it is still running and discards its output:
+
+```bash
+yas terminal close 1
+```
+
+Exited terminals the server keeps are bounded. When more than 1024 have exited, the oldest are removed first. `YAS_MAX_EXITED` on the server changes the limit, and `0` removes it. Stopping the server with `yas quit` ends every terminal.
+
+## Wait for a terminal to exit
+
+`yas terminal wait` blocks until the program exits, prints its status, and exits with a matching code:
+
+```bash
+yas terminal wait 3 --timeout 5
+echo "exit=$?"
+```
+
+```text
+signal(2, Interrupt)
+exit=130
+```
+
+`start --wait` does the same for a new terminal. It prints the ID, then the status:
+
+```bash
+yas terminal start --wait --timeout 30 -- sh -c 'sleep 1; exit 3'
+echo "exit=$?"
+```
+
+```text
+4
+exited(3)
+exit=3
+```
+
+| Outcome                  | Exit code of `wait` and `start --wait` |
+| ------------------------ | -------------------------------------- |
+| `exited(N)`              | N                                      |
+| `signal(N, ...)`         | 128 + N                                |
+| `--timeout` passed first | 124, with a message on standard error  |
+
+`--timeout` only bounds how long the command waits. The terminal keeps running after a timeout. Use `--deadline` to stop the terminal itself.
+
+To wait for a line of output instead of an exit, see [Reading terminal output](/terminals/reading-output).
+
+<Aside type="caution" title="Limits in yas 0.3.0">
+
+- `yas terminal restart ID` fails with `failed with Unsupported` for any terminal started by another connection. Every CLI command opens its own connection, so restarting from the CLI does not work. Start a new terminal with the same command instead.
+- Starting a program that cannot be found fails with `failed with ResourceExhausted` rather than a not-found message.
+
+</Aside>
+
+`yas terminal record ID` writes timestamped output frames to a file. For every subcommand and flag, see the [`yas terminal` reference](/reference/cli/terminal).

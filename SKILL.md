@@ -35,7 +35,7 @@ filesystem, git, and language-server commands. Beyond terminals it can:
   compare-and-swap writes. Handy as host-local scratch space for scripts.
 - **Command journal** — `yas terminal journal|output` and
   `history --since`, given a shell that emits OSC 133 (see
-  `docs/shell-integration.md`). `wait --pattern` matches only output
+  https://docs.yas.run/terminals/shell-integration). `wait --pattern` matches only output
   produced after the wait began.
 
 ## Install

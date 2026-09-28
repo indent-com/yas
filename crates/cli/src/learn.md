@@ -133,7 +133,7 @@ a resulting State update. See `docs/events.md` for payload layouts and timing co
 ## Commands in a live shell
 
 A shell that emits OSC 133 records each command (see
-`docs/shell-integration.md`). Without that, the journal is empty.
+https://docs.yas.run/terminals/shell-integration). Without that, the journal is empty.
 
 ```bash
 yas terminal send "$ID" "cargo test\n"

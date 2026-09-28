@@ -1,0 +1,217 @@
+---
+title: "Writing an extension"
+description: "Write a WebAssembly or JavaScript program that runs inside the yas server, add `@name` commands to the CLI, and publish it in a registry."
+sidebar:
+  order: 103
+---
+
+An extension is a program that the server runs inside itself. It is either a WebAssembly module,
+which runs in the Wasmi interpreter, or a JavaScript file, which runs in QuickJS. The server picks
+the runtime from the file contents: a file that starts with the Wasm magic bytes runs in Wasmi, and
+anything else runs as JavaScript. An extension talks to the server over the same yas protocol a
+client uses, so it can run processes, read files, watch the key-value store, and answer CLI commands.
+
+## Run a script
+
+A JavaScript extension is an ES module whose default export is a function. It returns an integer
+exit code or `undefined`, which counts as 0. The global `yas` object exposes the attempt context and
+the host functions.
+
+```js
+export default function main() {
+  const args = yas.context.argv;
+  console.log(
+    `server ${yas.context.serverName} passed ${args.length} argument(s)`,
+  );
+  return args.length === 0 ? 2 : 0;
+}
+```
+
+Every token after the file is an argument for the extension. Options for `yas ext run` go before
+the name.
+
+```bash
+yas ext run args args.js one two; echo "exit=$?"
+yas ext run args args.js; echo "exit=$?"
+```
+
+```text
+exit=0
+exit=2
+```
+
+`yas ext run` waits for the attempt to finish and exits with its code. `console.log` lines are log
+output, and the CLI prints them on stderr. An uncaught exception ends the attempt as `trapped` and
+the CLI exits 1. `--json` prints NDJSON instead: one `status` record per lifecycle change, one record
+per output chunk (`stdout`, `stderr`, `log`, or `gap`, with `data` as a byte array), and a final
+`status` record whose `last_exit` holds `kind`, `code`, and `detail`. For a trapped attempt,
+`detail` carries the exception and its stack.
+
+## Add a command with the TypeScript SDK
+
+A persistent extension can register a command namespace. `yas @NAME ARGS` then runs the
+extension's handler, streams its stdout and stderr, and exits with its code. The helpers live in
+[`extensions/typescript`](https://github.com/yas-run/yas/blob/main/extensions/typescript):
+`yas.ts` declares the host object and `command.ts` provides `serveCommands`.
+
+<Steps titleSize="h3">
+  <Step title="Copy the SDK and write the handler">
+    Copy `command.ts` and `yas.ts` into a `typescript/` directory next to your project, then write
+    `src/main.ts`:
+
+    ```ts
+    import { type CommandDescriptor, serveCommands } from "../typescript/command";
+
+    const DESCRIPTOR: CommandDescriptor = {
+      protocol: "yas.cli.v1",
+      summary: "Print a greeting from the server",
+      commands: [
+        {
+          path: [],
+          summary: "Greet someone",
+          usage: "[NAME] [--json]",
+          options: [{ names: ["--json"], takes_value: false, help: "emit one application/json result" }],
+        },
+      ],
+    };
+
+    export default function main(): number {
+      return serveCommands(DESCRIPTOR, ({ args }) => {
+        const json = args.includes("--json");
+        const name = args.find((arg) => arg !== "--json") ?? "world";
+        const greeting = { greeting: `hello, ${name}`, server: yas.context.serverName };
+        if (json) {
+          return { result: { contentType: "application/json", data: `${JSON.stringify(greeting)}\n` } };
+        }
+        return { stdout: `${greeting.greeting} from ${greeting.server}\n` };
+      });
+    }
+    ```
+
+  </Step>
+  <Step title="Bundle it into one file">
+    QuickJS loads one dependency-free file. Bun strips the types and inlines the imports.
+
+    ```bash
+    npx -y bun@1 build src/main.ts --target=browser --format=esm --minify --outfile=dist/greet.js
+    ```
+
+  </Step>
+  <Step title="Install it as a persistent extension">
+
+    ```bash
+    yas ext run --persist --restart always greet dist/greet.js
+    ```
+
+    ```text
+    id:73e8a36a470ee481	greet	revision=1	phase=running	restart=always	attempt=1	hash=a154613c24da2aa3e0a29ea82bd63aae480a8dc9774f63056c6a0bb913ef64e9
+    ```
+
+    The fields are the extension id, the name, the definition revision, the lifecycle phase, the
+    restart policy, the attempt number, and the BLAKE3 digest of the module.
+
+  </Step>
+  <Step title="Call it">
+
+    ```bash
+    yas ext commands
+    yas @greet
+    yas @greet Ada --json
+    ```
+
+    ```text
+    @greet	 Print a greeting from the server
+    hello, world from docs
+    {"greeting":"hello, Ada","server":"docs"}
+    ```
+
+  </Step>
+</Steps>
+
+`yas @greet --help` prints help built from the descriptor's `summary`, `usage`, and `options`.
+A `--json` after the command name belongs to your handler. A `--json` before it is the root CLI
+option, which wraps the invocation in NDJSON records:
+
+```bash
+yas --json @greet Ada
+```
+
+```text
+{"data":[104,101,108,108,111,44,32,65,100,97,32,102,114,111,109,32,100,111,99,115,10],"type":"stdout"}
+{"code":0,"detail":"","type":"exit"}
+```
+
+Only a named persistent extension can register commands. The namespace is the extension's name.
+
+## Manage installed extensions
+
+- `yas ext list` prints one line per extension in the format above. `yas ext status --json NAME`
+  prints the full record, including the runtime and the last exit.
+- `yas ext update NAME FILE` replaces the module in place and keeps the id. The revision goes up.
+- `yas ext attach NAME` follows retained and future output.
+- `yas ext stop`, `start`, and `restart` control the running attempt. `yas ext disable` stops it
+  durably. `yas ext remove` deletes a disabled extension.
+- `yas ext run --detach` returns once a transient extension is running.
+
+Persistent definitions live in `extensions.redb` under the instance's state directory, and module
+objects live under the instance's cache directory. The server restores them on start.
+`yas server --no-persistent-extensions` or `YAS_ALLOW_EXT_PERSIST=0` refuses new persistent
+definitions. `YAS_EXT=0` turns the extension runtime off.
+
+## What an extension can reach
+
+A JavaScript extension calls the host functions on `yas`: `runProcessJson`, `fsRead`, `fsWrite`,
+`fsIndexFilesJson`, `gitInspectJson`, `environmentJson`, `netExchange`, `blake3`, clocks, `sleep`,
+`random`, `log`, and the command functions. `yas.supports(family, class, kind)` tells you whether
+the server offers an operation. The full list with types is in
+[`yas.ts`](https://github.com/yas-run/yas/blob/main/extensions/typescript/yas.ts).
+
+A Wasm extension gets the whole protocol through the Rust crate
+[`yas-guest`](https://github.com/yas-run/yas/blob/main/crates/guest/README.md). It opens a session
+with `yas_guest::entry!` and a `Client`, and has typed helpers for the key-value store
+(`open_kv`, then `get`, `put`, `delete`, `watch`), channels (listen, accept, send), terminals, and
+the command protocol. Build it for `wasm32-unknown-unknown` with the custom `getrandom` backend
+described in the README. The crate's
+[`examples`](https://github.com/yas-run/yas/blob/main/crates/guest/examples) show a minimal module,
+a command provider, and a terminal subscriber. Muster is a complete Wasm extension in
+[`extensions/muster`](https://github.com/yas-run/yas/blob/main/extensions/muster).
+
+## Resource limits
+
+Each attempt runs with a memory cap (`YAS_EXT_MEMORY_MAX`, 128 MiB by default) and a fuel slice
+that bounds how long the server waits to cancel it. Fuel does not cap total CPU time. The server
+runs at most `YAS_EXT_MAX_RUNNING` extensions at once: one fewer than the CPU count, between 1 and 4. It
+refuses modules over `YAS_EXT_MODULE_MAX` (64 MiB), and it keeps at most 4 MiB of output per
+extension. Each limit variable has a matching `yas server` flag, such as `--ext-max-running` for `YAS_EXT_MAX_RUNNING`.
+[Environment variables](/reference/environment-variables) lists all of them.
+
+## Publish to a registry
+
+A registry is an HTTPS directory holding `manifest.json` and the module files. Each manifest entry
+has `name`, `description`, `file`, `blake3`, and optionally `bytes`, `brotli_bytes`, and
+`requirements`. The yas repository builds its own registry with
+[`bin/extensions`](https://github.com/yas-run/yas/blob/main/bin/extensions), which writes
+`extensions/dist/manifest.json`. `requirements` follows the version 1 format in
+[`extensions/README.md`](https://github.com/yas-run/yas/blob/main/extensions/README.md): runtime,
+command-provider support, host OS, required families, and read-only probes. The browser uses it to
+decide what to offer.
+
+```bash
+yas ext manage --from https://example.com/ext
+```
+
+`yas ext manage` shows a picker in the terminal. It downloads each module, checks it against the
+manifest's `blake3` and `bytes`, and installs it as a persistent extension that restarts always.
+The browser's Extensions tab installs from the same format. A registry the browser reads needs CORS
+headers. Publish the digest next to each URL so users can pin it with `#blake3`, as shown in
+[Bundled extensions](/extensions/bundled).
+
+<Aside type="caution" title="Limits">
+  - An extension runs with the server's full authority over the machine. See
+  [Security model](/operating/security). - `yas ext manage` needs an interactive
+  terminal. It accepts `https://` URLs and plain `http://` only on loopback. -
+  When a transient extension finishes within about 200 ms, `yas ext run` can
+  miss its output, with or without `--json`. Run it with `--persist` and read
+  the output with `yas ext attach NAME`. - A trapped attempt prints no message
+  in human output. Run with `--json` to read the exception.
+</Aside>

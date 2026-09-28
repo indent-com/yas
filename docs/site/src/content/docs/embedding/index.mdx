@@ -1,0 +1,34 @@
+---
+title: "Embedding yas"
+description: "Put yas terminals and surfaces in your own app, or connect to a yas server from your own service."
+sidebar:
+  order: 9
+  group:
+    label: "Embedding yas"
+    icon: "ph:puzzle-piece"
+---
+
+Use the browser components to show terminals and surfaces in your own UI, a server-side client to drive a yas server from Node or Bun, or fd-channel mode to hand yas an already connected socket.
+
+<CardGrid>
+  <Card title="React" href="/embedding/react">
+    Render yas terminals and surfaces inside a React app with the @yas-run/react
+    components and hooks.
+  </Card>
+  <Card title="Solid" href="/embedding/solid">
+    Render yas terminals and surfaces inside a Solid app with the @yas-run/solid
+    components and primitives.
+  </Card>
+  <Card title="Rendering surfaces in your app" href="/embedding/surfaces">
+    Show a graphical window from the yas compositor in your own page with
+    YasSurfaceView or YasSurfaceCanvas.
+  </Card>
+  <Card title="Node and Bun clients" href="/embedding/node-clients">
+    Drive a local yas server from a server-side JavaScript program over its Unix
+    socket with @yas-run/core.
+  </Card>
+  <Card title="fd-channel mode" href="/embedding/fd-channel">
+    Run yas server under your own service and hand it already-connected client
+    sockets over SCM_RIGHTS.
+  </Card>
+</CardGrid>

@@ -1,0 +1,191 @@
+---
+title: "Language servers"
+description: "Ask the language servers on a server for definitions, references, symbols, completions, diagnostics, and rename plans with yas lsp."
+sidebar:
+  order: 63
+---
+
+`yas lsp` answers code questions with the language servers installed on the machine that runs the
+server. yas picks a language server from the file's extension and the project markers around it,
+starts it, and keeps it warm for later queries. The browser editor uses the same servers. Every
+command works against a remote with `--on`.
+
+## Ask a question
+
+Positions are `PATH:LINE:COL`, with 1-based lines and columns. The examples use this file:
+
+```text
+1  #[path = "greeting.rs"]
+2  mod greet;
+3
+4  fn main() {
+5      let name = "world";
+6      println!("{}", greet::hello(name));
+7  }
+```
+
+A cold language server needs time to index. The first query fails until it is ready:
+
+```text
+yas: LSP query failed with Busy: Warming
+```
+
+`yas lsp wait` blocks until the language servers for the current directory are ready. Run it
+before the first query in a script:
+
+```bash
+yas lsp wait
+yas lsp def src/main.rs:6:28
+```
+
+```text
+src/greeting.rs:2:8
+```
+
+`def` prints the location of the definition. Add `--json` for an object:
+
+```text
+{"col":8,"endCol":13,"endLine":2,"line":2,"path":"src/greeting.rs","type":"location"}
+```
+
+`line` and `col` are the start and `endLine` and `endCol` the end, all 1-based.
+
+## Queries
+
+| Command                     | Prints                                                       |
+| --------------------------- | ------------------------------------------------------------ |
+| `def PATH:LINE:COL`         | Where the symbol is defined                                  |
+| `refs PATH:LINE:COL`        | Every use of the symbol. `--declaration` adds the definition |
+| `signature PATH:LINE:COL`   | The signature of the call around the position, then its docs |
+| `complete PATH:LINE:COL`    | Completions as tab-separated label, kind, and detail         |
+| `symbols QUERY`             | Workspace symbols that match the query                       |
+| `symbols --file PATH`       | The outline of one file                                      |
+| `diagnostics [PATH]`        | Errors and warnings, for the workspace or one path           |
+| `rename PATH:LINE:COL NAME` | The edits a rename would make                                |
+
+```bash
+yas lsp refs --declaration src/greeting.rs:2:8
+yas lsp signature src/main.rs:6:33
+yas lsp symbols --file src/main.rs
+yas lsp complete src/main.rs:6:28
+```
+
+The four commands print, in order:
+
+```text
+src/main.rs:6:27
+src/greeting.rs:2:8
+fn hello(name: &str) -> String
+Build a greeting for `name`.
+module greet — src/main.rs:1:1
+function main — src/main.rs:4:1
+hello	2	fn(&str) -> String
+```
+
+The symbol lines give the kind, the name, and the location. In the completion line, `2` is the
+language server's numeric completion kind.
+
+## Plan a rename
+
+`rename` prints the edits and never applies them:
+
+```bash
+yas lsp rename src/greeting.rs:2:8 greet_user
+```
+
+```text
+src/main.rs:6:27-6:32 -> greet_user
+src/greeting.rs:2:8-2:13 -> greet_user
+```
+
+Each line is a file, a start and end position, and the replacement text. `--json` prints one edit
+object per line with a `newText` field. Apply the edits yourself, or use **Rename** in the browser
+editor, which applies them.
+
+## Watch diagnostics
+
+`diagnostics --watch` prints current diagnostics and reprints them as they change. It shows files
+the language server has opened, so run a query against a file first:
+
+```bash
+yas lsp diagnostics --watch
+```
+
+```text
+src/main.rs:6:33: error: [E0425] cannot find value `nme` in this scope
+src/main.rs:6:33: hint: [E0425] a local variable with a similar name exists: `name`
+```
+
+Each line is the position, the severity, the code in brackets, and the message. `--json` adds the
+`source`, such as `rustc`.
+
+## See and stop language servers
+
+```bash
+yas lsp list
+```
+
+```text
+HANDLE	LANGUAGE	PROFILE	PHASE	PROGRESS	RSS	BACKEND	MESSAGE
+9410977261536021622	rust-analyzer	auto	ready	255	617406464	rust-analyzer
+```
+
+- `HANDLE` identifies the process for `yas lsp stop HANDLE`.
+- `PHASE` is the startup state, such as `ready` or `failed`. `MESSAGE` explains a failure.
+- `RSS` is resident memory in bytes.
+
+A language server stops after 15 minutes without queries. It restarts on the next query.
+
+## Supported language servers
+
+yas runs a language server only when its command is on the server's `PATH`. It looks for the root
+markers from the file's directory upward and never climbs above the git repository root.
+
+| Server                     | Command                              | Root markers                                                | Extensions                                    |
+| -------------------------- | ------------------------------------ | ----------------------------------------------------------- | --------------------------------------------- |
+| rust-analyzer              | `rust-analyzer`                      | `Cargo.toml`, outermost                                     | `rs`                                          |
+| gopls                      | `gopls`                              | `go.work` outermost, else `go.mod` nearest                  | `go`                                          |
+| typescript-language-server | `typescript-language-server --stdio` | `tsconfig.json`, `jsconfig.json`, `package.json`            | `ts` `tsx` `js` `jsx` `mjs` `cjs` `mts` `cts` |
+| pyright                    | `pyright-langserver --stdio`         | `pyproject.toml`, `setup.py`, `requirements.txt`, `Pipfile` | `py` `pyi`                                    |
+| clangd                     | `clangd`                             | `compile_commands.json`, `compile_flags.txt`, `.clangd`     | `c` `cc` `cpp` `cxx` `h` `hh` `hpp` `m` `mm`  |
+| zls                        | `zls`                                | `build.zig`                                                 | `zig`                                         |
+| ruby-lsp                   | `ruby-lsp`                           | `Gemfile`                                                   | `rb`                                          |
+| nixd                       | `nixd`                               | `flake.nix` outermost, else `default.nix` or `shell.nix`    | `nix`                                         |
+| bash-language-server       | `bash-language-server start`         | `.git`                                                      | `sh` `bash`                                   |
+| lua-language-server        | `lua-language-server`                | `.luarc.json`, `.luarc.jsonc`, else `.git`                  | `lua`                                         |
+| taplo                      | `taplo lsp stdio`                    | `.taplo.toml`, `taplo.toml`, else `.git`                    | `toml`                                        |
+| yaml-language-server       | `yaml-language-server --stdio`       | `.git`                                                      | `yaml` `yml`                                  |
+| marksman                   | `marksman server`                    | `.marksman.toml`, else `.git`                               | `md` `markdown`                               |
+
+## Configure a language server
+
+Override an entry, or add one, in `yas.conf` with `lsp.<id>.<field> = value` lines. The file is
+`$XDG_CONFIG_HOME/yas/yas.conf`, or `~/.config/yas/yas.conf` when that variable is unset:
+
+```text
+lsp.gopls.command = gopls -remote=auto
+lsp.mylang.command = mylang-lsp --stdio
+lsp.mylang.roots = mylang.toml
+lsp.mylang.extensions = ml mli
+```
+
+- `command` is the argument list, split on spaces. A new id needs a `command`.
+- `roots` and `extensions` are space-separated lists.
+- `root_policy` is `nearest` or `outermost`.
+- `init` and `settings` are JSON for the initialization options and workspace settings.
+
+The server reads the file each time it resolves a language server for a file, so edits apply to
+language servers started afterward. See
+[Configuration files](/reference/configuration-files).
+
+<Aside type="note" title="Limits in this release">
+
+- `yas lsp hover` fails with `Internal: no detail`. Hover in the browser editor shows nothing.
+- `diagnostics` without `--watch` prints nothing. Use `--watch`.
+- `--root` defaults to your shell's current directory. The help text says the server's.
+- The server disables `yas lsp` with `YAS_LSP=0`. `YAS_LSP_IDLE_SECS` and other limits are listed
+  in [Environment variables](/reference/environment-variables).
+
+</Aside>
+
+Full flags are in the [`yas lsp` reference](/reference/cli/lsp).

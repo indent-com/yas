@@ -1,7 +1,110 @@
 ---
 title: "yas"
-description: "Documentation for yas, a terminal multiplexer and experimental Wayland compositor for browsers and AI agents."
+description:
+  "yas is a terminal multiplexer and experimental Wayland compositor that streams terminals and
+  graphical apps to browsers and lets scripts and AI agents drive them from the command line."
+tableOfContents: false
 ---
 
-yas runs terminals on a server and keeps them running while you come and go. This site is being
-built; the full documentation follows.
+yas runs terminals on a server and keeps them running while you come and go. Open them from a
+browser on any device, reattach after a laptop sleeps or a network changes, and share a live
+session with a link. Every action in the browser is also a CLI subcommand, so a script or an AI
+agent can start a terminal, type into it, wait for a command to finish, and read the output. On
+Linux, the same server runs a headless Wayland compositor and streams graphical apps as video.
+
+yas is one binary with no required dependencies. It runs on Linux, macOS, and Windows; the
+compositor is Linux only.
+
+<Steps titleSize="h3">
+  <Step title="Install yas">
+
+    ```bash
+    curl -sf https://yas.run | sh
+    ```
+
+    On Windows, run `irm https://yas.run/install.ps1 | iex` in PowerShell. See
+    [Installing yas](/getting-started/installing).
+
+  </Step>
+  <Step title="Open it in a browser">
+
+    ```bash
+    yas open
+    ```
+
+    The server starts on first use, and the browser opens the workspace. See
+    [Workspaces and layout](/browser/workspaces).
+
+  </Step>
+  <Step title="Drive a terminal from the command line">
+
+    ```bash
+    yas terminal start htop   # prints the new terminal's ID
+    yas terminal show 1       # prints its visible text
+    ```
+
+    See [Controlling terminals](/terminals/controlling-terminals).
+
+  </Step>
+  <Step title="Reach another machine">
+
+    Save an SSH host with `yas remote add box ssh:box`, then `yas open` shows it next to your local
+    server. yas installs itself on the remote the first time. To give someone else a link, run
+    `yas share`. See [Remotes](/remote/remotes) and [Sharing over WebRTC](/remote/sharing).
+
+  </Step>
+</Steps>
+
+## Use yas
+
+<CardGrid>
+  <Card title="Using yas in the browser" href="/browser">
+    Arrange terminals and windows in tiled workspaces, and find anything from
+    the command menu.
+  </Card>
+  <Card title="Terminals and processes" href="/terminals">
+    Start, type into, read, and wait on terminals from scripts, and run
+    processes without a PTY.
+  </Card>
+  <Card title="Graphical applications" href="/gui">
+    Run Wayland and X11 apps on a headless Linux server and stream them to the
+    browser.
+  </Card>
+  <Card title="Connecting to other machines" href="/remote">
+    Reach servers over SSH, share them over WebRTC, pass through untrusted
+    relays, and forward ports.
+  </Card>
+  <Card title="Files, Git, and code intelligence" href="/code">
+    Search files, inspect repositories, and query language servers on the
+    server.
+  </Card>
+  <Card title="yas for agents" href="/agents">
+    Give an AI agent terminals, files, Git, and a screen it can control.
+  </Card>
+</CardGrid>
+
+## Build on yas
+
+<CardGrid>
+  <Card title="Running yas as a service" href="/operating">
+    Serve the browser UI persistently, run under systemd or Nix, and understand
+    the security model.
+  </Card>
+  <Card title="Embedding yas" href="/embedding">
+    Put yas terminals and surfaces in your own React or Solid app, or talk to a
+    server from Node.
+  </Card>
+  <Card title="Extensions" href="/extensions">
+    Run WebAssembly and JavaScript inside the server, including the bundled
+    Muster supervisor.
+  </Card>
+  <Card title="Internals" href="/internals">
+    How the server, compositor, protocol, transports, and browser renderer work.
+  </Card>
+  <Card title="Reference" href="/reference">
+    Every CLI command, environment variable, configuration file, and URI scheme.
+  </Card>
+  <Card title="Changelog" href="/changelog">
+    What changed in each release.
+  </Card>
+</CardGrid>

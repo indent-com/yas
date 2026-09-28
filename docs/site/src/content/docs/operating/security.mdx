@@ -1,0 +1,149 @@
+---
+title: "Security model"
+description: "Who can do what on a yas server: full-control connections, read-only shares, uplink keys, and the switches that narrow them."
+sidebar:
+  order: 84
+---
+
+A yas server has one level of access for everything that connects normally: full control, with the
+authority of the operating system user that runs the server. The only reduced level is the read-only
+link of a WebRTC share. yas has no accounts, roles, or per-client permissions. When people who do not
+trust each other need access, give each of them their own server, running as their own user, with
+its own socket and passphrase.
+
+## What a connection can do
+
+A client that connects to the server's socket, or through an edge, a share's full link, SSH, or an
+uplink, can:
+
+- Start terminals and processes, and send input to any terminal.
+- Read and write any file the server's user can.
+- Read the server's environment.
+- Open network connections from the server's host.
+- Read everything in the server's [key-value store](/code/key-value-store).
+- List and connect every route the server publishes, using credentials the server holds.
+- List other clients, disconnect them, and shut the server down.
+
+## Credentials
+
+### The browser passphrase
+
+The passphrase an [edge](/operating/edge) asks for is a full-control credential.
+The edge decides only whether to let a browser in. It does not limit what the session can do
+afterwards.
+
+- The browser sends the passphrase in the clear as its first WebSocket message. Any edge reachable
+  from beyond loopback needs HTTPS in front of it. Plain `ws://` on an untrusted network hands the
+  server to anyone watching the traffic.
+- Store an Argon2 hash from `yas hash-passphrase` instead of the plaintext. A server started with
+  `--edge` keeps `YAS_PASSPHRASE` in its environment, and every full-control client can read the
+  server's environment.
+- After five failed attempts within five minutes, a client address is locked out for a minute.
+  Behind a proxy, set `YAS_TRUSTED_PROXY_IPS` so clients are told apart.
+
+### Share links
+
+`yas share` prints two links. The link with the passphrase is full control, like the edge. The
+read-only link carries a different token and gets a fixed, least-authority set of operations that
+the server enforces. A read-only consumer can:
+
+- Watch terminals, scroll them, read and search their output.
+- Watch graphical windows and capture screenshots.
+- Receive audio and video streams.
+- Read the font catalogue.
+
+It cannot see other clients, create or resize terminals, send keystrokes or clicks, reach files, Git,
+the key-value store, the network, extensions, or routes, or shut the server down. Every operation
+outside that set is rejected. See [Sharing over WebRTC](/remote/sharing).
+
+### Uplink identities
+
+An [uplink](/remote/uplink) passes through a relay you do not have to trust. The producer accepts a
+consumer only after an end-to-end handshake with an X25519 key on its allowlist (`--allow-client` or
+`YAS_UPLINK_CLIENT_KEYS`). The consumer pins the producer's public key. The relay's bearer tokens
+route traffic and grant nothing on the server. A consumer that passes the handshake has full
+control. Keys and the allowlist are read at startup, so restart the uplink to revoke a key.
+
+## The server socket
+
+The server listens on a Unix socket in a directory only its user can open. The automatic path is
+below a private directory created with mode `0700`, and the socket itself is `0700`. Anyone who can
+connect to the socket has full control, so filesystem permissions are the access check.
+
+Clients check the other direction. Before sending anything, the CLI and the edge ask the kernel
+which user owns the server end of the socket, and refuse a server running as anyone other than
+themselves or root.
+
+- `YAS_SERVER_UID` names a different expected user for the CLI and the edge, for a deliberate
+  cross-user setup. It changes the user that is accepted. The check cannot be turned off.
+- `YAS_PROXY_UID` does the same for `yas proxy-daemon`, the per-user process that keeps SSH and
+  WebRTC connections open between CLI commands. Cross-user use also needs an explicitly permissioned
+  `YAS_PROXY_SOCK`.
+
+Root is always accepted, because a socket created by systemd socket activation reports root as its
+owner, and root can act as any user anyway.
+
+## Routes and stored remotes
+
+Saved remotes live in the home server's key-value store under the `remotes` key, credentials and
+all. Every client of that server can read them. When the server connects a route, it uses the stored
+credential itself and never sends it to the client, and route listings and routine errors omit
+connection URIs and credentials. Anyone who can read the store can still read the stored entry.
+
+Set `YAS_RELAY=0` on the home server to stop publishing routes.
+
+## Network access
+
+`yas forward`, `yas socks`, and the browser's port previews open connections from the server's host.
+By default the server reaches anything its host can reach, so every client can use it as a proxy.
+Restrict it with `--allow-forward`:
+
+```bash
+yas server --allow-forward '*.svc.internal:443' --allow-forward 10.0.0.0/8
+```
+
+- Patterns are `host[:ports]`. The host is a name, a `*.suffix` glob, an address, a CIDR block, or
+  `*`. Ports are a comma-separated list of `n` or `n-m`. `YAS_ALLOW_FORWARD` takes the same patterns,
+  comma-separated.
+- Loopback is always allowed.
+- Address and CIDR rules are checked against the resolved address that is dialed. Name rules allow
+  whatever the name resolves to.
+- An unparsable pattern is dropped with a message. If none parse, only loopback is allowed.
+- Skipping TLS verification on a relayed stream needs `--allow-forward-insecure`.
+- `YAS_NET=0` turns network access off entirely.
+
+Local listeners bind to loopback by default: the edge at `127.0.0.1:3264`, `yas forward` at
+`127.0.0.1`, `yas socks` at `127.0.0.1`, and `yas open` at `127.0.0.1`. A forward or SOCKS listener
+has no authentication, so binding it to another address exposes what it reaches to that network.
+
+## Fonts
+
+The server lists its installed fonts to every client, and browsers can download font files so text
+renders the same everywhere. A font list can fingerprint a machine.
+
+- Only faces whose embedding metadata permits it are listed and exported.
+- `YAS_FONT_EXPORT=0` stops file downloads and empties the catalogue.
+- `YAS_FONTS=0` turns the font service off.
+- Font file paths never leave the server.
+
+## Extensions
+
+[Extensions](/extensions/writing-extensions) run inside the server process with the authority of a
+normal connection. Wasm extensions run in Wasmi, which contains memory faults. JavaScript extensions
+run in QuickJS, which enforces heap and stack limits, but QuickJS itself is C code inside the server.
+Neither runtime is a sandbox that limits what an extension can reach.
+
+- Installing an extension is as powerful as connecting. An extension installed with `--persist`
+  runs again every time the server starts.
+- `--no-persistent-extensions` or `YAS_ALLOW_EXT_PERSIST=0` refuses persistent extensions and
+  skips restoring them. It is the recovery path for an extension that breaks the server.
+- `YAS_EXT=0` turns the extension service off. `YAS_CHANNEL=0` turns off the channels extensions use
+  to talk to clients.
+- Resource limits (`YAS_EXT_*`) contain memory, CPU slots, and storage. They are not permissions.
+
+<Aside type="note" title="What limits do and do not do">
+
+Connection, queue, transfer, and byte limits protect the server from running out of resources and
+clean up after a client disconnects. They do not protect one authenticated client from another.
+
+</Aside>

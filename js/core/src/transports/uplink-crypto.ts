@@ -1,5 +1,5 @@
 /** Noise IK / AES-GCM primitives. The browser owns every cryptographic operation.
- * Wire constants and shared vectors: crates/uplink, docs/uplink.md.
+ * Wire constants and shared vectors: crates/uplink, docs/design/uplink.md.
  * This module is internal; the public transport serializes reliable operations. */
 export type Bytes = Uint8Array<ArrayBuffer>;
 export const NOISE_PROTOCOL = "Noise_IK_25519_AESGCM_SHA256";

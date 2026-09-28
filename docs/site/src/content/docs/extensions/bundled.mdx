@@ -1,0 +1,149 @@
+---
+title: "Bundled extensions"
+description: "The four extensions each yas release publishes: doctor, muster, systemd, and xdg-desktop, and how to install them."
+sidebar:
+  order: 101
+---
+
+Each yas release publishes four extensions built from the repository's
+[`extensions/`](https://github.com/yas-run/yas/tree/main/extensions) directory. They run inside the
+server like any other [extension](/extensions/writing-extensions), and each adds an `@name` command to
+the CLI. None is installed by default.
+
+## Install one
+
+Install from the browser, from an inline picker in your terminal, or with one command.
+
+- **Browser:** open the **Extensions** tab of an expanded remote. It lists the registry's extensions
+  and offers the ones whose requirements the server meets.
+- **Terminal picker:** run `yas ext manage`. Space or a click cycles a row between install, update,
+  and uninstall, `d` marks uninstall, and Enter applies the changes.
+- **Command:** name the extension and its URL.
+
+  ```bash
+  yas ext run --persist --restart always doctor https://yas.run/ext/doctor.js
+  ```
+
+  ```text
+  id:a3aebeb8a9a1f28e	doctor	revision=1	phase=running	restart=always	attempt=1	hash=7b5d48a6822fd299516a7163218e8e03381b3213990a21c7891908bed4e40a6b
+  ```
+
+`--persist` stores the extension in the server so it starts again after a restart, and creates its
+`@name` command. The extension is per [instance](/terminals/named-instances): servers with different
+`--name` values each have their own installed copies.
+
+## Where releases put them
+
+The release workflow builds the extensions once and uploads them as GitHub Release assets next to a
+`manifest.json` that lists each file's name, description, BLAKE3 digest, size, and requirements.
+
+- `https://yas.run/ext/FILE`, with `https://yas.run/ext/manifest.json`, serves the latest release
+  only. It is the default registry for `yas ext manage` and the browser.
+- `https://github.com/yas-run/yas/releases/download/vVERSION/FILE` keeps every version.
+
+| Extension   | File               | Runtime |
+| ----------- | ------------------ | ------- |
+| doctor      | `doctor.js`        | QuickJS |
+| muster      | `muster.wasm`      | Wasmi   |
+| systemd     | `systemd.wasm`     | Wasmi   |
+| xdg-desktop | `xdg-desktop.wasm` | Wasmi   |
+
+To pin one exact object, append its digest from the manifest as a URL fragment. The server then
+reuses an object it already has and downloads only when it lacks that digest:
+
+```bash
+yas ext run --persist --restart always doctor \
+  'https://github.com/yas-run/yas/releases/download/v0.3.0/doctor.js#7b5d48a6822fd299516a7163218e8e03381b3213990a21c7891908bed4e40a6b'
+```
+
+## doctor
+
+`@doctor` checks the protocol handshake, the extension runtime, the server's identity, clocks and
+entropy, and lists which features the server offers. It exits non-zero only when a check fails.
+
+```bash
+yas @doctor
+yas @doctor --json
+```
+
+`--json` prints one JSON document with schema `yas.doctor.v1`. See
+[Troubleshooting](/operating/troubleshooting#run-doctor) for sample output.
+
+## muster
+
+Muster supervises long-running programs in terminals. You describe each program in a JSON file in
+the instance's configuration directory, and Muster starts them in dependency order, restarts them when
+they crash or when you edit the file, and records why. Every program runs in an ordinary terminal you
+can attach to. Use `yas mustard` for a full-screen view.
+
+```bash
+yas @muster list
+yas @muster status clock
+yas @muster restart clock
+```
+
+See [Muster and mustard](/extensions/muster).
+
+## systemd
+
+The systemd extension shows the host's system and user units and reads the journal. It runs
+`systemctl` and `journalctl` through the server and refreshes when D-Bus signals a change, or every
+second without `gdbus`.
+
+```bash
+yas @systemd status
+yas @systemd list --scope system ssh
+yas @systemd watch sshd
+yas @systemd logs -u sshd.service -n 50
+yas @systemd logs -u sshd.service --follow
+```
+
+`watch` and `logs` print one JSON object per line. The browser's **systemd** tab on an expanded remote
+shows a filterable unit table and a journal reader, and appears only on servers running this
+extension.
+
+Arguments given after the module path at install time tune it:
+
+- `--scopes system,user`: which managers to watch. Default both.
+- `--interval-ms N`: refresh interval while someone is watching. Default `5000`.
+- `--idle-interval-ms N`: refresh interval while nobody is. Default `30000`.
+- `--debounce-ms N`: how long to coalesce D-Bus notifications. Default `250`.
+- `--no-signals`: poll only.
+
+Put `gdbus` on the server's `PATH` for signal-driven updates. On NixOS, add `pkgs.glib.bin` to
+`services.yas.extensions.path`.
+
+## xdg-desktop
+
+xdg-desktop starts graphical applications with the session and restarts them when they exit. It
+reads installed applications from `.desktop` files under `$XDG_DATA_DIRS`.
+
+```bash
+yas @xdg-desktop list
+yas @xdg-desktop enable legcord
+yas @xdg-desktop status legcord
+yas @xdg-desktop start legcord
+yas @xdg-desktop stop legcord
+yas @xdg-desktop disable legcord
+yas @xdg-desktop forget legcord
+```
+
+- `enable` and `disable` set what happens at the next session start. They are stored in the
+  instance's key-value store.
+- `start` and `stop` act now and leave the stored choice alone.
+- `disable` keeps the application's row and failure count. `forget` deletes the stored choice.
+
+`status` counts an application's windows from the Wayland endpoint the extension created for it, so
+a window that reports a misleading app ID is still counted under the right application. The browser
+shows the same list in the **XDG Desktop** tab of an expanded remote.
+
+A server started from a service manager inherits no login environment. Set `XDG_DATA_DIRS` in the
+service, or the extension finds only applications under `/usr/local/share`, `/usr/share`, and
+`~/.local/share`. The [NixOS module](/operating/nix) sets it for you.
+
+<Aside type="note" title="Platform limits">
+
+xdg-desktop starts graphical applications through the compositor, which runs on Linux only. The
+systemd extension needs systemd on the server's host.
+
+</Aside>

@@ -1,0 +1,301 @@
+---
+title: "yas lsp"
+description: "Query language servers on the server (https://docs.yas.run/code/language-servers)"
+sidebar:
+  order: 11
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Query language servers on the server (https://docs.yas.run/code/language-servers)
+
+Language servers are discovered by project markers (Cargo.toml, go.mod, tsconfig.json, …), spawned lazily, and stay warm across invocations. Positions are 1-based PATH:LINE:COL. First calls in a fresh workspace may report "warming up" — retry, or run `yas lsp wait`.
+
+```text
+Usage: yas lsp [OPTIONS] <COMMAND>
+```
+
+## yas lsp def
+
+Definition of the symbol at PATH:LINE:COL.
+
+```text
+Usage: yas lsp def [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  Position, 1-based (e.g. src/main.rs:10:4)
+
+Options:
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output (one location per line)
+
+## yas lsp refs
+
+References to the symbol at PATH:LINE:COL.
+
+```text
+Usage: yas lsp refs [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  Position, 1-based (e.g. src/main.rs:10:4)
+
+Options:
+
+- `--declaration`
+
+  Include the declaration itself
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output (one location per line)
+
+## yas lsp hover
+
+Type and docs of the symbol at PATH:LINE:COL.
+
+```text
+Usage: yas lsp hover [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  Position, 1-based (e.g. src/main.rs:10:4)
+
+Options:
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output
+
+## yas lsp complete
+
+Completions at PATH:LINE:COL (TSV: LABEL, KIND, DETAIL)
+
+What a language server offers for the identifier being typed there. `cut -f1` gives a plain label list.
+
+```text
+Usage: yas lsp complete [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  Position, 1-based (e.g. src/main.rs:10:4)
+
+Options:
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output
+
+## yas lsp signature
+
+Signature help at PATH:LINE:COL
+
+Prints the signature, underlines the active parameter, then any documentation.
+
+```text
+Usage: yas lsp signature [OPTIONS] <SPEC>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  Position, 1-based (e.g. src/main.rs:10:4)
+
+Options:
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output
+
+## yas lsp symbols
+
+Search workspace symbols, or outline one file with `--file`.
+
+```text
+Usage: yas lsp symbols [OPTIONS] [QUERY]
+```
+
+Arguments:
+
+- `[QUERY]`
+
+  Fuzzy symbol query (workspace-wide; empty lists everything the server returns)
+
+Options:
+
+- `--file <FILE>`
+
+  Outline this file instead of searching the workspace
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output (one symbol per line)
+
+## yas lsp diagnostics
+
+Current diagnostics for the workspace or one path
+
+Exit code 1 when diagnostics exist, 0 when clean.
+
+```text
+Usage: yas lsp diagnostics [OPTIONS] [PATH]
+```
+
+Arguments:
+
+- `[PATH]`
+
+  Only diagnostics for this file or directory
+
+Options:
+
+- `--watch`
+
+  Keep watching, reprinting as diagnostics change
+
+- `--wait`
+
+  Wait for language servers to finish indexing, then for the next published diagnostics (or 5 seconds without any server update)
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output (one diagnostic per line)
+
+## yas lsp rename
+
+Rename plan for the symbol at PATH:LINE:COL (prints the edits, never applies them)
+
+```text
+Usage: yas lsp rename [OPTIONS] <SPEC> <NEW_NAME>
+```
+
+Arguments:
+
+- `<SPEC>`
+
+  Position, 1-based (e.g. src/main.rs:10:4)
+
+- `<NEW_NAME>`
+
+  The new name
+
+Options:
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--json`
+
+  NDJSON output (one edit per line)
+
+## yas lsp wait
+
+Block until the workspace's language servers are ready.
+
+```text
+Usage: yas lsp wait [OPTIONS]
+```
+
+Options:
+
+- `--root <ROOT>`
+
+  Workspace path on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--timeout <TIMEOUT>`
+
+  Give up after this many seconds
+
+  Default: `600`.
+
+## yas lsp list
+
+List running language servers.
+
+```text
+Usage: yas lsp list [OPTIONS]
+```
+
+Options:
+
+- `--json`
+
+  NDJSON output (one server per line)
+
+## yas lsp stop
+
+Stop a language server by opaque handle (see `yas lsp list`)
+
+```text
+Usage: yas lsp stop [OPTIONS] <SERVER_HANDLE>
+```
+
+Arguments:
+
+- `<SERVER_HANDLE>`
+
+  Opaque server handle from `yas lsp list`
+

@@ -1,0 +1,200 @@
+---
+title: "Muster and mustard"
+description: "Supervise long-running programs in yas terminals with the Muster extension, and drive it from the mustard terminal UI."
+sidebar:
+  order: 102
+---
+
+Muster is a bundled extension that keeps a set of programs running in terminals: a database, a dev
+server, a file watcher. You describe each program, called a unit, in a JSON file. Muster starts units
+in dependency order, restarts them when they crash or when you edit their file, and keeps a journal of
+every decision. A supervised unit is an ordinary yas terminal, so you can attach to it, read its
+output, and type into it. `yas mustard` is a full-screen terminal UI for the same data.
+
+## Set it up
+
+<Steps titleSize="h3">
+  <Step title="Install Muster">
+
+    ```bash
+    yas ext run --persist --restart always muster https://yas.run/ext/muster.wasm
+    ```
+
+  </Step>
+  <Step title="Write a unit">
+    Muster reads `~/.config/yas/instances/NAME/muster/`, where `NAME` is the server's instance name
+    (`default` unless you started it with `--name`). `$XDG_CONFIG_HOME` replaces `~/.config` when set.
+
+    ```bash
+    mkdir -p ~/.config/yas/instances/default/muster
+    cat > ~/.config/yas/instances/default/muster/clock.json <<'EOF'
+    {
+      "description": "Print the time every two seconds",
+      "shell": "while true; do date; sleep 2; done",
+      "readyWhen": "spawn"
+    }
+    EOF
+    ```
+
+    Muster watches the directory and starts the unit within a moment. There is no reload command.
+
+  </Step>
+  <Step title="Check it">
+
+    ```bash
+    yas @muster list
+    ```
+
+    ```text
+    NAME	PHASE	PTY	RESTARTS	DESCRIPTION
+    clock	running	1	0	Print the time every two seconds
+    ```
+
+    `PTY` is the terminal ID. `yas terminal list` shows the same terminal tagged `muster/clock/0`.
+
+  </Step>
+</Steps>
+
+If the directory did not exist when Muster started, it retries the watch after 5 seconds, doubling up
+to a minute. `yas @muster rewatch` retries now.
+
+## Units
+
+Each top-level `.json` file is a unit named after the file. A unit needs exactly one of:
+
+- `command`: an argument vector, run directly with no shell and no startup files.
+- `shell`: a command line run by the server's login shell.
+
+Other fields:
+
+- `description`: shown in listings.
+- `cwd`: working directory.
+- `env`, `envFile`: environment variables, and `.env` files read at every start. `env` wins over
+  files, and later files win over earlier ones. Values reach the process environment and never appear
+  in `@muster status`, the journal, or the browser.
+- `requires`: units that must be ready first. The unit stops when one of them stops being ready.
+- `wants`: units to start alongside, without waiting.
+- `after`: ordering only.
+- `type`: `oneshot` for a task that is done when it exits 0.
+- `readyWhen`: when the unit counts as ready: `spawn`, `{"delay":"2s"}`, `{"path":"/tmp/x.sock"}`,
+  `{"log":"listening on"}`, `{"tcp":"127.0.0.1:5432"}`, `{"http":"http://127.0.0.1:10001/"}`, or
+  `manual` (declare it with `yas @muster ready NAME`).
+- `restartOnFailure`, `restartOnAbnormal`, `restartOnChange`: default on. `restartOnSuccess`: default
+  off.
+- `startLimit`: consecutive failures before the unit stays `failed`. Default 5. `0` means no limit.
+- `keep`: exited terminals to keep per unit for inspection. Default 1.
+- `stopSignal`, `timeoutStop`, `stopCommand`, `reloadCommand`, `timeoutStart`, `restartDelay`,
+  `autostart`.
+
+Print the full JSON Schema with `yas @muster schema`. Dependency cycles are refused when the files
+load.
+
+Retries back off from one second, doubling to 30 seconds, with jitter. Every restart is a new
+terminal. The previous run stays addressable up to `keep`, so `yas terminal journal ID` reads the run
+that crashed.
+
+A `command` unit gets the server's `PATH`, which under a service manager is often minimal. Put a
+`PATH=` line in a shared `envFile`. A program that is not found produces a terminal that exits 1 and
+prints nothing. `yas @muster doctor` resolves `command[0]` and names the problem.
+
+### Stacks
+
+A subdirectory with a `stack.json` is a stack of unit templates with parameters. A top-level file
+with `"stack"` creates an instance of it, and its units are named `INSTANCE/TEMPLATE`. Templates use
+`${NAME}` substitution, and a `{"kind":"ports"}` parameter can take `auto` to pick a free port block.
+A file with `"include"` pulls in a directory of ordinary units. A file with `"worktrees"` creates one
+instance per Git worktree of a repository.
+
+```bash
+yas @muster stacks
+yas @muster instantiate yas epic PORTS=auto
+```
+
+`instantiate` writes the instance file and starts it, and refuses to write a file that would not load.
+
+## Command reference
+
+| Command                         | What it does                                            |
+| ------------------------------- | ------------------------------------------------------- |
+| `yas @muster list`              | Every unit and instance, with phase, terminal, restarts |
+| `yas @muster status NAME`       | One unit or instance, with its retained runs            |
+| `yas @muster start NAME`        | Start a unit, or every unit of an instance              |
+| `yas @muster stop NAME`         | Stop and hold it until started again                    |
+| `yas @muster restart NAME`      | Stop, then start in a new terminal                      |
+| `yas @muster reload NAME`       | Run `reloadCommand`, or restart when there is none      |
+| `yas @muster ready NAME`        | Mark a `readyWhen: manual` unit ready                   |
+| `yas @muster log -n 20`         | The supervision journal                                 |
+| `yas @muster cat NAME`          | The file behind a unit or instance                      |
+| `yas @muster env NAME --values` | The environment a start would resolve                   |
+| `yas @muster stacks`            | Stacks and their parameters                             |
+| `yas @muster doctor`            | Problems in the directory                               |
+| `yas @muster rewatch`           | Retry directories whose watch failed                    |
+| `yas @muster schema`            | JSON Schema for unit files                              |
+
+`yas @muster log` prints one line per event with its sequence number, unit, event, and resulting
+phase:
+
+```text
+1	clock	loaded	stopped
+2	clock	start	waiting	autostart
+3	clock	spawn	activating	policy
+4	clock	ready	running	spawn
+```
+
+A unit's phase is one of `stopped`, `waiting` (a requirement is not ready), `activating` (started,
+not yet ready), `running`, `exited` (a `oneshot` that succeeded), `backoff` (waiting to retry),
+`failed`, or `held` (stopped by hand).
+
+## mustard
+
+`yas mustard` opens a full-screen view of Muster on the current server. It needs an interactive
+terminal and prints `yas: mustard needs an interactive terminal` otherwise. Use `--on` to open another
+server's Muster.
+
+The screen has these panels:
+
+- **Muster:** a tree of stacks, units, their current and retained terminals, and their windows.
+- **Details:** the selected unit's phase, readiness condition, and runs, or a window's size and
+  title.
+- **Terminal:** live output of the selected terminal. You can scroll it and type into it.
+- **Events:** the supervision journal. Drag its header to resize it.
+
+The footer shows the key hints, connection state, and the Muster directory.
+
+### Keys
+
+Press `?` for the full list.
+
+| Key                      | Action                                                        |
+| ------------------------ | ------------------------------------------------------------- |
+| `↑` `↓` or `j` `k`       | Select a stack, unit, terminal, or window                     |
+| `←` `→` or `h` `l`       | Collapse or expand                                            |
+| `Home` `End`             | First or last item                                            |
+| `Enter` or `Space`       | Expand, or open the selected terminal for input               |
+| `i` or click             | Send input to the terminal                                    |
+| `Ctrl-]`                 | Return from terminal input to navigation                      |
+| `PgUp` `PgDn`            | Scroll the terminal (hold `Shift` while sending input)        |
+| `Shift+Home` `Shift+End` | Oldest or latest output                                       |
+| Mouse wheel              | Scroll history. `Shift` overrides an application's mouse mode |
+| `s` `x` `r`              | Start, stop, or restart the selected stack or unit            |
+| `R` `w` `g`              | Reload, rewatch, or resync                                    |
+| `q` or `Ctrl-C`          | Quit                                                          |
+
+Typing into a terminal jumps back to the latest output. Retained terminals stay scrollable after their
+process exits.
+
+## Options
+
+- `YAS_MUSTER_DIR`: read units from this directory instead of the instance's configuration
+  directory. Set it in the server's environment.
+- Muster publishes its state on the `yas.muster.v1` channel. The browser's **Manage** pane shows a
+  **Muster** tab while it is running.
+
+<Aside type="note" title="Limits">
+
+- Muster reads only its configuration directory and the directories its files name. It never
+  discovers `.yas/muster` in a repository on its own, so cloning a repository does not run its code.
+- Muster writes only to the top level of its configuration directory, when you run `instantiate`.
+- Updating Muster with `yas ext update` keeps running units. The new version adopts their terminals.
+
+</Aside>

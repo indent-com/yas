@@ -1,0 +1,197 @@
+---
+title: "Nix modules"
+description: "Run a yas server, its browser edge, and its WebRTC share from a NixOS or nix-darwin configuration."
+sidebar:
+  order: 83
+---
+
+The yas flake exports a NixOS module that runs one server per listed user as a systemd service, and a
+nix-darwin module that runs one server for the current user as a launchd agent. Both can have the
+server also serve the browser edge and publish a WebRTC share, so one service does all three.
+
+## Add the flake
+
+```nix
+{
+  inputs.yas.url = "github:yas-run/yas";
+}
+```
+
+Import `inputs.yas.nixosModules.yas` or `inputs.yas.darwinModules.yas`. The `default` attribute of
+each is the same module. Both use the flake's `yas` package unless you set `services.yas.package`.
+
+## NixOS
+
+```nix
+{ inputs, ... }: {
+  imports = [ inputs.yas.nixosModules.yas ];
+
+  services.yas = {
+    enable = true;
+    users = [ "alice" "bob" ];
+
+    # Keyed by the user whose server serves them.
+    edges.alice = {
+      port = 3264;
+      passFile = "/run/secrets/yas-alice-edge.env";
+      trustedProxyIps = [ "127.0.0.1" ];
+      webTransport = {
+        enable = true;
+        addr = "0.0.0.0";
+        port = 3264;
+        publicPort = 443;
+        openFirewall = true;
+        certificateFile = "/run/secrets/yas-alice-edge.crt";
+        keyFile = "/run/secrets/yas-alice-edge.key";
+      };
+    };
+
+    shares.alice.passFile = "/run/secrets/yas-alice-share.env";
+  };
+}
+```
+
+Each user in `users` gets a `yas-server@USER` service that starts at boot, runs as that user, and
+restarts on failure. The server binds `/run/yas/USER/yas-default.sock` itself. There is no socket
+unit. Clients running as that user find the socket without setting `YAS_SOCK`.
+
+Keys of `edges` and `shares` must appear in `users`. The build fails with an assertion otherwise.
+
+### Server options
+
+- `users`: users that get a server. Default `[ ]`.
+- `shell`: shell for new terminals. Defaults to the user's login shell.
+- `scrollback`: scrollback rows per terminal. Default `10000`.
+- `languageServers`: packages added to the server's `PATH` for
+  [language servers](/code/language-servers). yas ships none.
+- `extensions.persistent`: allow extensions installed with `--persist` and restore them at startup.
+  Default `true`. Setting `false` is the recovery switch for an extension that breaks the server.
+- `extensions.path`: packages added to `PATH` for programs that extensions start. `pkgs.glib.bin`
+  supplies `gdbus`, which lets the `systemd` extension react to unit changes instead of polling.
+- `fonts.enable`, `fonts.allowExport`, `fonts.dirs`: the server font catalogue, whether browsers may
+  download font files, and extra font directories. Export defaults to on.
+- `relay.enable`: publish saved remotes to clients as routes. Default `true`.
+- `relay.remoteFiles.USER`: a `yas.remotes` file for that user's server. See
+  [Remote files](#remote-files).
+- `x11.enable`, `x11.package`: put `xwayland-satellite` on the server's `PATH` so X11 applications
+  run. Default on.
+- `audio.enable`: capture audio with a private PipeWire and send it to browsers as Opus. Default off.
+- `audio.bitrate`: Opus bitrate in bits per second. Default `64000`.
+- `audio.realtime`: enable RTKit so the audio thread can run at realtime priority. Default `true`.
+- `gpuLibraries`: libraries added to `LD_LIBRARY_PATH` for GPU compositing and hardware encoding.
+  Defaults to `libva`, `libgbm`, and `vulkan-loader`. The driver directory `/run/opengl-driver` is
+  always added. Set `[ ]` to use software encoders only.
+
+The service also puts `/run/wrappers`, the user's Nix profiles, `fontconfig` when fonts are enabled, and
+`xdg-desktop-portal` on `PATH`, and sets `XDG_DATA_DIRS` from the user's profiles so the
+`xdg-desktop` extension finds installed applications.
+
+## nix-darwin
+
+```nix
+{ inputs, ... }: {
+  imports = [ inputs.yas.darwinModules.yas ];
+
+  services.yas = {
+    enable = true;
+
+    edge = {
+      enable = true;
+      port = 3264;
+      passFile = "/run/secrets/yas-edge.env";
+    };
+
+    share = {
+      enable = true;
+      passFile = "/run/secrets/yas-share.env";
+    };
+  };
+}
+```
+
+The module installs a launchd user agent labeled `com.yas.server` that runs at load and is kept
+alive. It starts the server through `/bin/sh -lc`, so the server gets your login shell's `PATH`.
+Output goes to `/tmp/yas-server.log`.
+
+The nix-darwin module has one `edge` and one `share`, each with its own `enable` option. It shares
+`shell`, `scrollback`, `languageServers`, `fonts`, and `relay` with the NixOS module, and adds:
+
+- `socketPath`: the server's socket path. Defaults to the automatic owner-only path.
+- `relay.remoteFile`: a single `yas.remotes` file.
+
+`audio` options exist on nix-darwin but have no effect, because audio capture is Linux only.
+
+## Edge and share options
+
+These options sit under `edges.USER` on NixOS and under `edge` on nix-darwin. They set the variables
+described in [Serving the browser with yas edge](/operating/edge).
+
+- `passFile`: required. An environment file with the passphrase.
+- `addr`: TCP bind address. Default `127.0.0.1`.
+- `port`: TCP port. Default `3264`.
+- `trustedProxyIps`: exact reverse-proxy addresses allowed to set `X-Forwarded-For`. Default `[ ]`.
+- `webTransport.enable`: add the QUIC listener. Default off.
+- `webTransport.addr`, `webTransport.port`: UDP bind. Default `127.0.0.1` and `3264`.
+- `webTransport.publicPort`: UDP port advertised to browsers. Default `3264`.
+- `webTransport.certificateFile`, `webTransport.keyFile`: PEM paths as strings. Set both or neither.
+  The build fails if only one is set.
+- `webTransport.pinCertificate`: advertise your certificate's hash. Default off.
+- `webTransport.openFirewall`: open the UDP port in the NixOS firewall. NixOS only.
+
+Share options sit under `shares.USER` on NixOS and under `share` on nix-darwin:
+
+- `passFile`: required. An environment file with the passphrase.
+- `hub`: signaling hub URL. Defaults to `wss://yas.run`.
+- `quiet`: keep the share URL, which contains the passphrase, out of the log. Default `true`.
+- `verbose`: print connection diagnostics. Default off.
+- `verboseWebrtc`: print ICE, SDP, and DataChannel tracing. Default off.
+
+## Secrets
+
+A `passFile` is an environment file. It holds one line:
+
+```text
+YAS_PASSPHRASE='$argon2id$v=19$m=19456,t=2,p=1$...'
+```
+
+- Use a hash from `yas hash-passphrase` for an edge. A share needs the plaintext, because the
+  passphrase derives the share's keys.
+- When one server has both an edge and a share, give each its own secret: `YAS_EDGE_PASSPHRASE` in
+  the edge's file and `YAS_SHARE_PASSPHRASE` in the share's. `YAS_PASSPHRASE` answers for both when
+  you want one secret.
+- Quote the value. On nix-darwin the file is sourced by `/bin/sh`, so an unquoted `$` in a hash is
+  expanded.
+- Pass paths as strings, as in the examples. A Nix path literal such as `./edge.env` copies the file
+  into the world-readable Nix store.
+- The file must be readable by the server. On NixOS, systemd reads `EnvironmentFile=` as root before
+  it drops to the user.
+
+## Transport security
+
+An edge passphrase grants full control of its home server. The edge listener is plain HTTP, so
+`addr` defaults to loopback. Change it only when a TLS reverse proxy sits in front, and list the
+proxy's address in `trustedProxyIps`. See [Security model](/operating/security).
+
+`webTransport` binds UDP directly and uses its own TLS certificate. The example binds it to
+`0.0.0.0` and opens the firewall because QUIC does not pass through an HTTP proxy. Without
+`certificateFile`, the edge generates a 13-day certificate on every start. Use a stable certificate
+for a service so open pages reconnect after a restart.
+
+## Remote files
+
+`relay.remoteFiles.USER` on NixOS and `relay.remoteFile` on nix-darwin set `YAS_REMOTES`. The server
+reads that file once, the first time it starts with no saved remotes, and copies its entries into
+its own key-value store. After that the store is the catalogue. Later edits to the file have no
+effect, and remotes you add with `yas remote add` are stored in the server. See
+[Remotes](/remote/remotes).
+
+The file may contain SSH identities and passphrases, and any client of the server can read saved
+remotes, credentials included.
+
+<Aside type="caution" title="Not every edge option is exposed">
+
+The modules have no option for `YAS_SERVER_UID`. The NixOS edge always runs inside the user's own
+server, so the check it controls does not apply. To set another variable, add it to the unit or agent
+yourself, for example with `systemd.services."yas-server@alice".environment`.
+
+</Aside>

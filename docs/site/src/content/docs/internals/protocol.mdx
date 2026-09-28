@@ -1,0 +1,223 @@
+---
+title: "The yas protocol"
+description: "How a yas session starts, how frames are laid out, and how families, statuses, and datagrams fit together."
+sidebar:
+  order: 112
+---
+
+yas has one native, versioned protocol. Every client, from the CLI to the browser, speaks it to the
+server. This page explains the shape of that protocol for a reader. The normative rules live in
+the [yas v1 design](https://github.com/yas-run/yas/blob/main/docs/design/yas.md), and the exact
+IDs, layouts, and limits live in the generated [wire registry](/reference/wire-registry).
+
+## Session shape
+
+The transport selects yas before any protocol bytes flow. A named local socket, the `yas.v1`
+WebSocket subprotocol, a WebTransport endpoint, the `yas.v1` WebRTC DataChannel, and an SSH
+stream to the server socket all carry the same protocol. A listener never sniffs for another wire
+format.
+
+The client sends the 8-byte preface `5941530001000d0a` and follows it with one uncompressed Core
+`HELLO` request. The server's `HELLO` result selects the protocol minor version, receive limits,
+family versions, packed codecs, and platform properties. No other operation is legal until `HELLO`
+succeeds.
+
+```text
+client                                            server
+  │ preface 59 41 53 00 01 00 0d 0a                  │
+  │ Core HELLO request (id 1)                        │
+  │   minor range, receive limits, client instance,  │
+  │   name, release, family offers, codecs           │
+  │ ───────────────────────────────────────────────► │
+  │ Core HELLO result (id 1)                         │
+  │   status, minor, boot ID, session ID, limits,    │
+  │   family descriptors                             │
+  │ ◄─────────────────────────────────────────────── │
+  │ any negotiated request or event                  │
+```
+
+A session connects to one server. To reach another server, a client opens a complete nested
+session through the Relay family. Transport paths and channel numbers never pick a destination.
+
+## Reliable framing
+
+On an ordered byte stream, the preface appears once and every later frame carries a 4-byte
+little-endian length envelope:
+
+```text
+[frame_len:u32][frame:frame_len]
+```
+
+The envelope is not part of the frame. WebSocket sends the preface as its own binary message and
+then one frame per message, so it drops the envelope. The WebRTC `yas.v1` DataChannel and the
+WebTransport bidirectional stream are treated as byte streams and keep it.
+
+Each frame starts with a generated header:
+
+```text
+event:            family:u16 │ kind:u16 │ meta:u8                    (5 bytes)
+request / result: family:u16 │ kind:u16 │ meta:u8 │ request_id:u32   (9 bytes)
+
+meta bits 0-1  class: 0 event, 1 request, 2 result
+meta bit  2    compressed
+meta bit  3    sensitive
+meta bits 4-7  reserved
+```
+
+Every request gets one correlated result. Events are one-way and follow the sequencing and
+recovery rules of their family.
+
+You can open a session by hand. Start a private server:
+
+```bash
+D=$(mktemp -d)
+yas server --socket "$D/yas.sock" --name protodocs &
+export YAS_SOCK="$D/yas.sock"
+```
+
+Save this as `hello.py`. It sends the preface and `HELLO`, then two Core `PING` requests:
+
+```python
+import os, socket, struct
+
+PREFACE = bytes.fromhex("5941530001000d0a")
+
+def read_exact(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("server closed the stream")
+        buf += chunk
+    return buf
+
+def send_request(s, family, kind, request_id, payload=b""):
+    frame = struct.pack("<HHBI", family, kind, 1, request_id) + payload
+    s.sendall(struct.pack("<I", len(frame)) + frame)
+
+def read_result(s, request_id):
+    while True:
+        frame = read_exact(s, struct.unpack("<I", read_exact(s, 4))[0])
+        family, kind, meta = struct.unpack_from("<HHB", frame)
+        if meta & 3 == 2 and struct.unpack_from("<I", frame, 5)[0] == request_id:
+            status, _flags, detail_len = struct.unpack_from("<HHI", frame, 9)
+            return family, kind, status, frame[17 + detail_len:]
+
+def text(value):
+    raw = value.encode()
+    return struct.pack("<H", len(raw)) + raw
+
+hello = b"".join([
+    struct.pack("<HH", 1, 1),                           # minor_range 1..1
+    struct.pack("<IIIQ", 1 << 20, 4 << 20, 0, 16 << 20), # receive limits, no datagrams
+    os.urandom(16),                                     # client_instance
+    text("hello.py"), text("docs"),                     # client_name, client_release
+    struct.pack("<H", 0), b"\x00", struct.pack("<I", 0) # no offers, codecs, extensions
+])
+
+s = socket.socket(socket.AF_UNIX)
+s.connect(os.environ["YAS_SOCK"])
+s.sendall(PREFACE)
+send_request(s, 0, 0, 1, hello)
+family, kind, status, body = read_result(s, 1)
+minor = struct.unpack_from("<H", body)[0]
+limits = struct.unpack_from("<IIIQ", body, 36)
+print(f"HELLO status={status} minor={minor} receive_limits={limits}")
+
+send_request(s, 0, 1, 2)                            # PING without its u64 payload
+print("bad PING status=%d" % read_result(s, 2)[2])
+send_request(s, 0, 1, 3, struct.pack("<Q", 0))      # PING with sender_monotonic_ns
+print("PING status=%d" % read_result(s, 3)[2])
+```
+
+```bash
+python3 hello.py
+```
+
+```text
+HELLO status=0 minor=1 receive_limits=(1048576, 4194304, 0, 16777216)
+bad PING status=1
+PING status=0
+```
+
+Status 1 is `INVALID`: the first `PING` omits its required payload. Stop the server with
+`yas quit` when you finish.
+
+## Optional datagrams
+
+A reliable session can pair with an unreliable datagram path. WebTransport uses native datagrams.
+WebRTC uses a second DataChannel, `yas.v1.datagram`, which is unordered with zero retransmits.
+
+Each datagram holds one complete event with no length envelope. Its size is bounded by the
+physical path, the peer's `HELLO` receive datagram limit, and the hard limit of 65,536 bytes. Only
+event kinds the registry marks as datagram-eligible may use the path, and those frames must be
+sensitive and uncompressed. Requests, results, terminal frames, keyframes, and codec
+configuration stay on the reliable stream.
+
+Loss, duplication, and reordering are normal. Each eligible family owns its sequencing, recovery,
+and statistics. The receiver drops and counts a malformed or forbidden datagram without closing the
+session. When the datagram path is absent, congested, or closed, every family falls back to the
+reliable stream.
+
+## Families and resources
+
+Core negotiates a static registry of families, and each family is its own namespace. The
+[wire registry](/reference/wire-registry) lists all 20 with their IDs and dependencies. There is no
+global message table.
+
+Resource handles are opaque within one server boot and one family. Families that carry state use
+revisioned watches, bounded snapshots, patches, acknowledgements, and explicit reset rules.
+Mutations that must survive a lost result carry operation IDs. Large bodies travel as bounded
+Transfer descriptors.
+
+Packed codecs are payload formats with their own versions, selected during `HELLO`. The terminal
+grid, surface video, media audio and video, and event records each keep a compact representation
+without becoming a second protocol.
+
+## Common status registry
+
+Every result starts with a prefix: `status:u16`, `flags:u16` (zero), and a length-prefixed detail
+string, followed by the operation's body. Statuses come from one shared registry:
+
+| Value | Status        | Value | Status               |
+| ----- | ------------- | ----- | -------------------- |
+| 0     | `OK`          | 7     | `RESOURCE_EXHAUSTED` |
+| 1     | `INVALID`     | 8     | `RATE_LIMITED`       |
+| 2     | `UNSUPPORTED` | 9     | `TIMEOUT`            |
+| 3     | `NOT_FOUND`   | 10    | `CANCELLED`          |
+| 4     | `CONFLICT`    | 11    | `STALE`              |
+| 5     | `BUSY`        | 12    | `IO`                 |
+| 6     | `UNAVAILABLE` | 13    | `INTERNAL`           |
+
+Family documents define when each status applies. Families never allocate private status numbers.
+
+## Working directory tracking
+
+The server reads OSC 7 reports from each PTY and stores the working directory on the Terminal
+resource. Terminal state patches push changes to watchers, and the Terminal `CWD` query returns
+the stored path. Terminal `CREATE` and `RESTART` can start in the server default, an exact path,
+or a snapshot of another terminal's directory. Other families refer to that directory through the
+terminal's opaque handle. See [shell integration](/terminals/shell-integration) to emit OSC 7.
+
+## Browser renderer boundary
+
+The browser validates and applies `yas.terminal.grid/1` frames in TypeScript. It then serializes one
+complete grid into a private, compressed snapshot for the WASM renderer. That snapshot carries no
+family header or resource handle. Surface and media frames pass through their typed family clients
+before they reach WebCodecs or audio workers. Datagrams go through the same validation.
+
+## Changing the protocol
+
+The TOML files in
+[`protocol/yas/`](https://github.com/yas-run/yas/blob/main/protocol/yas/README.md) are the source
+of truth. Edit the schema and the family implementation, then regenerate the Rust constants,
+TypeScript metadata, wire registry, inspection data, and shared vectors from the repository root:
+
+```bash
+direnv exec . cargo xtask protocol
+```
+
+`cargo xtask protocol --check` rejects a checked-in diff and compares the schema against the
+retained `protocol/yas/history/v1.json` baseline. New IDs may only be appended. The check rejects
+removed or reused IDs and changed layouts or metadata. `cargo check -p yas-wire` runs the same
+checks, and `cargo test -p yas-wire` decodes every registered vector.

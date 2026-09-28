@@ -1,0 +1,50 @@
+---
+title: "Graphical applications"
+description: "Run Wayland and X11 apps on a headless Linux server and stream them to browsers as video."
+sidebar:
+  order: 4
+  group:
+    label: "Graphical applications"
+    icon: "ph:app-window"
+---
+
+On Linux, every yas server runs a headless Wayland compositor. Graphical apps started in its terminals appear as surfaces you can view in the browser and drive from the CLI.
+
+<CardGrid>
+  <Card title="Running GUI apps" href="/gui/running-gui-apps">
+    Launch Linux GUI applications from a terminal onto the server's headless
+    Wayland compositor, then list, capture, and drive their windows from the
+    CLI.
+  </Card>
+  <Card title="Video encoding and GPUs" href="/gui/video-encoding">
+    Choose which video encoders the server uses for surfaces, how it picks one
+    per viewer, and how GPU compositing and hardware encoding are detected.
+  </Card>
+  <Card title="Color and HDR" href="/gui/color-and-hdr">
+    How yas carries wide-gamut and HDR output from Wayland applications to each
+    browser, and what a viewer without an HDR or P3 display receives.
+  </Card>
+  <Card
+    title="Audio, camera, and microphone"
+    href="/gui/audio-camera-microphone"
+  >
+    Hear application audio in the browser, and lend a browser's microphone or
+    camera to applications on the yas compositor.
+  </Card>
+  <Card
+    title="Clipboard, media players, and notifications"
+    href="/gui/clipboard-media-notifications"
+  >
+    Read and set the compositor clipboard, control MPRIS media players, and see
+    tray icons, notifications, and portal requests from Linux applications in
+    the browser.
+  </Card>
+  <Card
+    title="Running systemd user units in a session"
+    href="/gui/systemd-user-units"
+  >
+    Run a systemd user manager as a supervised application inside a yas session,
+    so user units start with the session and land on its compositor, bus, and
+    audio.
+  </Card>
+</CardGrid>

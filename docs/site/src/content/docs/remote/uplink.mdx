@@ -1,0 +1,134 @@
+---
+title: "Uplink"
+description: "Expose a server through a relay you do not trust, with end-to-end encryption between X25519 keys that each side pins."
+sidebar:
+  order: 53
+---
+
+`yas uplink` makes a server reachable from outside its network through a relay. The server connects out to the relay and keeps that connection open, so it needs no open inbound port. Every client connection is encrypted end to end between two X25519 keys: the server pins the public keys of the clients it accepts, and each client pins the server's public key. The relay forwards ciphertext. It can see addresses, traffic sizes, timing, and routing tokens, and it can refuse service, but it cannot read the session, inject input, or impersonate an allowed client.
+
+An uplink needs a relay service that implements the uplink control endpoint. The service gives you three values:
+
+- A control URL, such as `https://relay.example`. It must use HTTPS.
+- A producer token for the server, which yas reads from `YAS_UPLINK_TOKEN`.
+- A client token for each consumer, which goes into the connection URL.
+
+A client that connects successfully has full control of the server, as the user the server runs as.
+
+## Set up an uplink
+
+<Steps titleSize="h3">
+  <Step title="Create the client's identity">
+
+    On the client machine, generate a private key once, keep it in your secret configuration, and print its public key:
+
+    ```bash
+    export YAS_UPLINK_IDENTITY="$(yas uplink-keygen --private)"
+    yas uplink-public-key
+    ```
+
+    ```text
+    1QizK_8hW2Ap15A_rRYtrntr_etQMcb5xbDXe23iRBw
+    ```
+
+    Send the public key to the server's operator over a channel you trust, not through the relay. One client key can be allowed on many servers.
+
+  </Step>
+  <Step title="Create the server's identity">
+
+    On the server machine, do the same with a separate key:
+
+    ```bash
+    export YAS_UPLINK_IDENTITY="$(yas uplink-keygen --private)"
+    ```
+
+    Load the same private key on every later start. A new key changes the public key that clients pin.
+
+  </Step>
+  <Step title="Start the uplink">
+
+    Make sure the server is running, then start the uplink with the producer token and each allowed client key:
+
+    ```bash
+    yas server &
+    export YAS_UPLINK_TOKEN=PRODUCER_TOKEN
+    yas uplink https://relay.example --allow-client CLIENT_PUBLIC_KEY
+    ```
+
+    When a relay accepts the session, the uplink prints `[uplink] connected to relay HOST:PORT` to stderr. It logs only the host and port, because a relay URL is a credential.
+
+    `yas uplink` bridges each authenticated client to the server at `YAS_SOCK`, or the `default` instance. It does not start the server.
+
+  </Step>
+  <Step title="Print the connection URL">
+
+    On the server machine, with its identity still in `YAS_UPLINK_IDENTITY`:
+
+    ```bash
+    YAS_UPLINK_CLIENT_TOKEN='tok+en&1' yas uplink-url https://relay.example
+    ```
+
+    ```text
+    uplink:https://relay.example/#token=tok%2Ben%261&server=YwWEA_BUpvbND6O2YZ89U_SWFto4VhDc5n8M-HhRoSY
+    ```
+
+    The URL holds the client token, percent-encoded, and the server's public key. It never holds a private key. `yas uplink-url` works offline. Send the URL to the client over a trusted channel.
+
+  </Step>
+  <Step title="Connect from the client">
+
+    With the client's own key in `YAS_UPLINK_IDENTITY`:
+
+    ```bash
+    yas --on 'uplink:https://relay.example/#token=CLIENT_TOKEN&server=SERVER_PUBLIC_KEY' terminal list
+    ```
+
+    To show the server in the browser, save the URL as a remote on your home server with `yas remote add sandbox 'uplink:…'`. The home server dials the route with the `YAS_UPLINK_IDENTITY` in its own environment. See [Remotes](/remote/remotes).
+
+  </Step>
+</Steps>
+
+## Commands and variables
+
+- `yas uplink URL` runs the producer. It requires `YAS_UPLINK_TOKEN`, an identity, and at least one allowed client.
+- `--identity KEY` or `YAS_UPLINK_IDENTITY` is the server's private key. Prefer the variable so the key stays out of process arguments.
+- `--allow-client KEY` allows one client public key. Repeat it, or set `YAS_UPLINK_CLIENT_KEYS` to a comma-separated list.
+- `yas uplink-keygen` prints a key pair as JSON with `private_key` and `public_key`. `--private` prints only the private key.
+- `yas uplink-public-key` prints the public key of the private key in `YAS_UPLINK_IDENTITY`.
+- `yas uplink-url URL` prints a connection URL. `--client-token TOKEN` overrides `YAS_UPLINK_CLIENT_TOKEN`.
+
+```bash
+yas uplink-keygen
+```
+
+```text
+{"private_key":"zeeL-bbxEzNMxmxVjseroZm8ArzsK-kiWFPlO7bxqZI","public_key":"1QizK_8hW2Ap15A_rRYtrntr_etQMcb5xbDXe23iRBw"}
+```
+
+Keys are exactly 43 characters of unpadded base64url, encoding 32 bytes. yas rejects padding, `+` and `/`, and other lengths.
+
+In a connection URL, `token` and `server` are required. An optional `identity=PRIVATE_KEY` field overrides the client's `YAS_UPLINK_IDENTITY`. `yas remote list` masks everything after `#` unless you pass `--reveal`.
+
+## Reconnection
+
+`yas uplink` keeps running until you stop it:
+
+- It asks the control endpoint for a pool of relays, shuffles it, and tries each relay in turn.
+- When an established session ends, it prints `[uplink] session ended: …` and asks the control endpoint for a fresh pool at once.
+- When no relay in the pool accepts a session, it prints `[uplink] relay pool exhausted; re-querying in Ns` and waits.
+- When the control endpoint is unreachable or returns an error, it retries. Waits start at 1 second, double up to 60 seconds, and vary by 25% either way. A `Retry-After` header sets the wait instead.
+- A `401` or `403` from the control endpoint means the producer token is wrong. The uplink exits.
+- A relay that stops responding is detected within 30 seconds.
+- **Ctrl+C** closes the active session on the relay before exiting.
+
+The uplink reads its identity and allowed clients once, at startup. To rotate a key or revoke a client, restart the uplink with the new values. Connections that are already open keep their access until they disconnect.
+
+## Browser clients
+
+A web app can connect to an uplink directly with `YasUplinkTransport` from `@yas-run/core`, using a key pair generated with WebCrypto. Serve that app from an origin you trust independently of the relay, because a relay that can replace the app's JavaScript can use its keys. See [Embedding yas](/embedding).
+
+<Aside type="note">
+
+There is no plaintext fallback and no trust on first use. Both ends must have keys configured, and URLs of the older form `uplink:https://relay.example#CLIENT_TOKEN` are rejected. The Noise protocol, record format, and control endpoint are described in [Transports](/internals/transports).
+
+</Aside>

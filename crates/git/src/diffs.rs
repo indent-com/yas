@@ -1,4 +1,4 @@
-//! Diff, patch, index, and worktree-status handlers (docs/git.md).
+//! Diff, patch, index, and worktree-status handlers (docs/design/git.md).
 //!
 //! Every diff view is the same primitive: flatten two endpoints (commit /
 //! tree / index / worktree) into path→(mode, oid) maps, then walk them in
@@ -43,7 +43,7 @@ struct Side {
     /// Worktree entries lazily hash/compare on demand.
     worktree: bool,
     /// An untracked worktree entry that git ignores; drives the `!`
-    /// porcelain letter (docs/git.md STATUS record).
+    /// porcelain letter (docs/design/git.md STATUS record).
     ignored: bool,
 }
 
@@ -149,7 +149,7 @@ fn flatten(
             let object = repo.find_object(id).map_err(|_| GIT_STATUS_NOT_FOUND)?;
             let tree = object.peel_to_tree().map_err(|_| GIT_STATUS_NOT_FOUND)?;
             // A non-empty filter descends to its entry first and traverses
-            // only that subtree — never the whole tree (docs/git.md:
+            // only that subtree — never the whole tree (docs/design/git.md:
             // `path` filters to a subtree).
             let (tree, prefix) = if filter.is_empty() {
                 (tree, Vec::new())
@@ -1249,7 +1249,7 @@ impl RepoHandle {
     ) -> Response<Vec<OwnedGitDiffRecord>> {
         let repo = self.local();
         let fail = |status: u8| diff_response(req.nonce, status, 0, &[]);
-        // Reject undefined flag bits (docs/git.md: INVALID on unknown flags).
+        // Reject undefined flag bits (docs/design/git.md: INVALID on unknown flags).
         const KNOWN_DIFF_FLAGS: u8 = GIT_DIFF_RENAMES
             | GIT_DIFF_UNTRACKED
             | GIT_DIFF_IGNORED
@@ -1376,7 +1376,7 @@ impl RepoHandle {
             } else {
                 0
             };
-            // BINARY dflag (docs/git.md DIFF_ENTRY): NUL in the first 8 KiB
+            // BINARY dflag (docs/design/git.md DIFF_ENTRY): NUL in the first 8 KiB
             // of either present side (deletions included — the old blob is
             // available). Skipped for submodules (no bytes). Sniffed with
             // bounded reads, never whole-blob materialization.
@@ -2535,7 +2535,7 @@ pub(crate) fn append_status_records(
         let cell = cells.entry(new_path).or_default();
         if untracked_entry {
             // Ignored files carry '!'; plain untracked carry '?'
-            // (docs/git.md STATUS record porcelain letters).
+            // (docs/design/git.md STATUS record porcelain letters).
             let letter = if change.new.as_ref().is_some_and(|s| s.ignored) {
                 b'!'
             } else {

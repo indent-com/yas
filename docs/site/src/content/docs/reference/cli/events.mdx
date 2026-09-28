@@ -1,0 +1,149 @@
+---
+title: "yas events"
+description: "Inspect and configure the server's binary event journal."
+sidebar:
+  order: 4
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Inspect and configure the server's binary event journal.
+
+```text
+Usage: yas events [OPTIONS] <COMMAND>
+```
+
+## yas events config
+
+Show config revision, ring use/loss counters, and active event types.
+
+```text
+Usage: yas events config [OPTIONS]
+```
+
+## yas events set
+
+Replace ring size and/or activation bitset.
+
+```text
+Usage: yas events set [OPTIONS]
+```
+
+Options:
+
+- `--size <SIZE>`
+
+  Ring capacity in bytes (4 KiB through just under 64 MiB)
+
+- `--events <SPEC>`
+
+  Activation selectors: default, all, none, exact names, category.\*, with optional + or - prefixes
+
+- `--if-revision <REVISION>`
+
+  Apply only while the server configuration is still at this revision
+
+## yas events dump
+
+Print one retained event snapshot.
+
+```text
+Usage: yas events dump [OPTIONS]
+```
+
+Options:
+
+- `-o, --output <LOCAL_PATH>`
+
+  Local output path; defaults to stdout. Use - for stdout explicitly
+
+- `--binary`
+
+  Write the self-describing binary journal instead of text
+
+## yas events tail
+
+Follow events in the foreground, writing stdout or a local file
+
+The stream ends with this client connection. A connection may own at most four concurrent event tails.
+
+```text
+Usage: yas events tail [OPTIONS]
+```
+
+Options:
+
+- `-o, --output <LOCAL_PATH>`
+
+  Local output path; defaults to stdout. Use - for stdout explicitly
+
+- `--append`
+
+  Append to `--output` instead of truncating it
+
+- `--from-now`
+
+  Follow only events produced after this command starts
+
+- `--binary`
+
+  Write concatenated native events-v1 batches instead of text
+
+## yas events record
+
+Manage detached recordings written by the server.
+
+```text
+Usage: yas events record [OPTIONS] <COMMAND>
+```
+
+### yas events record start
+
+Start a detached recording to a path on the server
+
+Returns an ID only after the initial header/history has been flushed. The server permits at most eight detached recordings process-wide.
+
+```text
+Usage: yas events record start [OPTIONS] <SERVER_PATH>
+```
+
+Arguments:
+
+- `<SERVER_PATH>`
+
+  Destination path on the server
+
+Options:
+
+- `--append`
+
+  Append instead of truncating the server file
+
+- `--from-now`
+
+  Record only events produced after this command starts
+
+### yas events record list
+
+List recordings as TSV: ID, STATE, RECORDS, BYTES, LOST, HISTORY, MODE, PATH, ERROR.
+
+```text
+Usage: yas events record list [OPTIONS]
+```
+
+### yas events record stop
+
+Stop and flush a server recording
+
+Returns an error if any recording write or final flush failed.
+
+```text
+Usage: yas events record stop [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Recording ID from `yas events record start` or `list`
+

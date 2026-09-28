@@ -1,0 +1,163 @@
+---
+title: "Port forwarding and SOCKS"
+description: "Reach services on the server's network from local ports, over TCP, UDP, or TLS, or through a local SOCKS5 proxy."
+sidebar:
+  order: 54
+---
+
+`yas forward` opens local ports that connect to hosts and ports the server can reach, like `ssh -L`, and also forwards UDP. `yas socks` opens one local SOCKS5 proxy that reaches anything the server can reach, like `ssh -D`. Both work over every transport the CLI uses, so `--on` picks the server: a named instance, an SSH host, a share, or an uplink.
+
+## Forward a port
+
+Give a spec in the form `[kind/][bind:]port:host:hostport`:
+
+```bash
+yas forward 38124:localhost:38123
+```
+
+```text
+yas: forwarding tcp 127.0.0.1:38124 → localhost:38123
+```
+
+Local port 38124 now reaches port 38123 on the server's `localhost`. The line on stderr gives the kind, the local address, and the target. `host` is resolved on the server. The command runs until you press **Ctrl+C** or its connection to the server closes.
+
+Forward several ports over one connection by listing them. A local port of `0` picks a free port, and the stderr line reports which:
+
+```bash
+yas forward 38124:localhost:38123 0:localhost:38123
+```
+
+```text
+yas: forwarding tcp 127.0.0.1:38124 → localhost:38123
+yas: forwarding tcp 127.0.0.1:41979 → localhost:38123
+```
+
+yas binds every listener before it serves any. If one bind fails, nothing runs and the command exits with status 1:
+
+```text
+yas: cannot bind 127.0.0.1:80: Permission denied (os error 13)
+```
+
+### Kinds
+
+- `tcp/` is the default. Bytes pass through unchanged, including any TLS the local client speaks.
+- `udp/` forwards datagrams. Each local source address gets its own flow on the server, so replies return to the right sender. Use it for request and response traffic such as DNS.
+- `tls/` listens in plaintext locally, and the server opens a TLS connection to the target. `curl http://localhost:8443/` then reaches an `https://` service. `--alpn h2,http/1.1` offers ALPN protocols. `--insecure` skips certificate verification, and works only when the server was started with `--allow-forward-insecure`.
+
+```bash
+yas forward udp/38131:127.0.0.1:38130
+```
+
+```text
+yas: forwarding udp 127.0.0.1:38131 → 127.0.0.1:38130
+```
+
+The yas connection is reliable and ordered, so forwarded UDP gets retransmission and head-of-line blocking. Protocols with their own congestion control, such as QUIC, perform poorly over it.
+
+## Save forwards
+
+Name a spec to keep it:
+
+```bash
+yas forward add web 8080:localhost:3000
+yas forward add dns udp/5353:resolver.internal:53
+yas forward list
+```
+
+```text
+web = 8080:localhost:3000
+dns = udp/5353:resolver.internal:53
+web   8080:localhost:3000
+dns   udp/5353:resolver.internal:53
+```
+
+`add` prints the stored entry and `list` prints one entry per line: the name, padded, then the spec. `add` checks the spec before saving it and replaces an entry with the same name.
+
+- `yas forward --all` starts every enabled entry over one connection. Add specs after `--all` to forward them too.
+- `yas forward toggle NAME` disables an entry without deleting it, or enables it again. `list` marks disabled entries `(disabled)`.
+- `yas forward rm NAME` deletes an entry.
+
+Saved forwards live in `~/.config/yas/yas.forwards`, on the machine where you run `yas forward`, with mode 0600. Set `YAS_FORWARDS` to use another file. Each line is `name = spec`, and a line starting with `# ` is a disabled entry:
+
+```text
+web = 8080:localhost:3000
+dns = udp/5353:resolver.internal:53
+# wide = 0.0.0.0:9000:localhost:9000
+```
+
+An entry does not name a server. `yas forward --all` uses `--on` or the default target, the same as any other command.
+
+## Run a SOCKS5 proxy
+
+```bash
+yas socks 1080
+```
+
+```text
+yas: SOCKS5 proxy on 127.0.0.1:1080 → the server's network
+```
+
+Point a client at it and send host names, so the server resolves them:
+
+```bash
+curl -x socks5h://localhost:1080 http://localhost:38123/
+```
+
+The `h` in `socks5h://` makes curl send the name instead of resolving it locally. The proxy then reaches hosts your machine cannot look up. In Firefox, set `network.proxy.socks_remote_dns`. A client that resolves names itself still works, but reaches only names your machine can resolve.
+
+The listen address is `[bind:]port`. Port `0` picks a free port and the stderr line reports it.
+
+The proxy supports the CONNECT command with no authentication. Failures return the SOCKS reply code for the real cause, so the client can report it:
+
+- `0x04`, host unreachable: the name does not resolve on the server.
+- `0x05`, connection refused: the connection failed or timed out.
+- `0x02`, not allowed: the server's `--allow-forward` rules deny the target.
+- `0x07`, command not supported: BIND and UDP ASSOCIATE.
+
+```bash
+curl -x socks5h://localhost:1080 http://no-such-host.invalid/
+```
+
+```text
+curl: (97) cannot complete SOCKS5 connection to no-such-host.invalid. (4)
+```
+
+## Bind addresses
+
+Forwards and the SOCKS proxy listen on `127.0.0.1` unless you name a bind address. Anyone who can connect to a listener uses the server's network with no passphrase, so a wildcard address opens that access to your whole network. Name one only when you mean it:
+
+```bash
+yas forward 0.0.0.0:9000:localhost:9000
+yas socks 0.0.0.0:1080
+```
+
+Bracket IPv6 addresses: `[::1]:8080:localhost:3000`.
+
+## Restrict what the server reaches
+
+By default, forwards and SOCKS reach anything the server can reach. Start the server with `--allow-forward` to allow only matching targets:
+
+```bash
+yas server --allow-forward '*.internal:443' --allow-forward '10.0.0.0/8:5432,6000-6010'
+```
+
+- Each pattern is `host[:ports]`. `host` is a name, a `*.suffix` glob, an IP address, a CIDR block, or `*`. `ports` is a comma-separated list of `n` or `n-m`. Without ports, every port matches.
+- Repeat the flag, or set `YAS_ALLOW_FORWARD` to a comma-separated list. The server uses the patterns from both. In the variable a comma always separates patterns, so a pattern there can name only one port or one range.
+- Loopback targets are always allowed.
+- A name glob matches the name the client asked for, whatever address it resolves to. A CIDR block matches the resolved address.
+- A pattern that does not parse is dropped with a message. If none parse, the server reaches loopback only.
+- `YAS_NET=0` on the server turns forwarding and SOCKS off.
+
+A forward to a denied target starts normally and fails on each connection. The client's connection closes and the forward prints the reason:
+
+```text
+yas: 127.0.0.1:44586: example.com:80: Net OPEN failed with Unavailable: Unavailable
+```
+
+<Aside type="note">
+
+- A forward ends with its process. Its listener is on your machine, so there is nothing on the server to reattach to.
+- Read-only [share](/remote/sharing) visitors cannot forward ports.
+- Opening a TCP connection times out after 10 seconds, and so does a TLS handshake.
+
+</Aside>

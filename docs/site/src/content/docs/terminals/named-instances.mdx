@@ -1,0 +1,136 @@
+---
+title: "Named instances"
+description: "Run several isolated yas servers on one machine, each with its own name, socket, settings, and state."
+sidebar:
+  order: 35
+---
+
+A machine can run more than one yas server at once. Each server has a name, and the name selects its socket, its key-value store and extension database, its cache, and its `@muster` directory, so two instances share no terminals or settings. Use a separate instance to keep an experiment, a test run, or an agent's work apart from your everyday server. Instances work the same way on Linux, macOS, and Windows.
+
+## Start a named instance
+
+A server without `--name` is named `default`. Give it another name with `--name` or `YAS_SERVER_NAME`:
+
+```bash
+yas server --name work
+```
+
+Names are 1 to 64 characters of ASCII letters, digits, `-`, `_`, and `.`. A name cannot end with `.` or be a reserved Windows device name such as `CON` or `COM1`. Anything else is rejected before the server starts:
+
+```text
+error: invalid value 'my instance' for '--name <NAME>': server name may contain only ASCII letters, digits, '-', '_', and '.'
+```
+
+## Address an instance
+
+Pass `--on local:NAME` to any command. If no server with that name is running, yas starts one in the background first:
+
+```bash
+yas --on local:test terminal start -t build -- sleep 600
+yas --on local:test terminal list
+```
+
+```text
+1
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+1	build		sleep 600	/tmp	running
+```
+
+Setting `YAS_SERVER_NAME` in the client's environment has the same effect for commands without `--on`:
+
+```bash
+YAS_SERVER_NAME=test yas terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+1	build		sleep 600	/tmp	running
+```
+
+Stop an instance the same way you stop any server:
+
+```bash
+yas --on local:test quit
+```
+
+To make an instance the default target, or to show it in the browser beside your home server, save it as a remote with `yas remote add work local:work`. See [Remotes](/remote/remotes).
+
+## Where an instance keeps its files
+
+Every path includes the instance name.
+
+| What                                | Linux                                | macOS                                               | Windows                                   |
+| ----------------------------------- | ------------------------------------ | --------------------------------------------------- | ----------------------------------------- |
+| Socket                              | `$XDG_RUNTIME_DIR/yas/yas-NAME.sock` | `$TMPDIR/yas/yas-NAME.sock`                         | `\\.\pipe\yas-USERNAME-NAME`              |
+| Key-value store, extension database | `~/.local/state/yas/instances/NAME/` | `~/Library/Application Support/yas/instances/NAME/` | `%APPDATA%\yas\instances\NAME\`           |
+| Extension object cache              | `~/.cache/yas/instances/NAME/wasm/`  | `~/Library/Caches/yas/instances/NAME/wasm/`         | `%LOCALAPPDATA%\yas\instances\NAME\wasm\` |
+
+- `@muster` reads its configuration from `$XDG_CONFIG_HOME/yas/instances/NAME/muster/`, or `~/.config/yas/instances/NAME/muster/` when `XDG_CONFIG_HOME` is unset, on every platform.
+- On Linux, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` replace `~/.local/state`, `~/.cache`, and `~/.config` when set.
+- The socket goes in the first usable private runtime directory: `$XDG_RUNTIME_DIR`, then `$TMPDIR`, then `/run/user/UID`, then `/tmp`. In a shared directory such as `/tmp`, yas uses a per-user subdirectory, `yas-UID`, in place of `yas`.
+- Settings the browser stores, including `@xdg-desktop` choices and the saved remotes catalogue, live in the instance's key-value store, so each instance has its own.
+
+This is the layout of an instance named `test` on Linux:
+
+```text
+$XDG_RUNTIME_DIR/yas/yas-test.sock
+$XDG_RUNTIME_DIR/yas/yas-test.sock.lock
+$XDG_STATE_HOME/yas/instances/test/extensions.redb
+$XDG_STATE_HOME/yas/instances/test/kv.redb
+$XDG_STATE_HOME/yas/instances/test/kv.redb.server.lock
+$XDG_CACHE_HOME/yas/instances/test/wasm/lru-v1
+$XDG_CACHE_HOME/yas/instances/test/wasm/objects
+$XDG_CACHE_HOME/yas/instances/test/wasm/tmp
+```
+
+## One server per instance
+
+A running server holds an exclusive lock on `kv.redb.server.lock` beside its key-value store. A second server with the same name exits, even when you give it a different socket:
+
+```bash
+yas server --name test --socket /tmp/second.sock
+```
+
+```text
+yas-server: server instance 'test' is already running (held by pid 162230); cannot acquire /home/you/.local/state/yas/instances/test/kv.redb.server.lock: lock acquisition failed because the operation would block
+```
+
+This stops two servers from splitting one key-value store and extension database between them.
+
+## Override individual paths
+
+These environment variables on the server take precedence over the paths derived from the name:
+
+- `YAS_SOCK` sets the socket path. `yas server --socket PATH` does the same. Clients also read `YAS_SOCK` to find their server.
+- `YAS_KV_PATH` sets the key-value store file. The lock file follows it as `<path>.server.lock`.
+- `YAS_EXTENSION_PATH` sets the extension database file.
+- `YAS_WASM_CACHE` sets the extension object cache directory.
+- `YAS_MUSTER_DIR` sets the `@muster` configuration directory.
+
+Pointing two instances at the same file with these variables makes them share it on purpose. Two servers that resolve to the same `YAS_KV_PATH` still cannot run at once.
+
+## Run yas commands inside an instance's terminals
+
+Terminals inherit the server's environment, including `YAS_SOCK`. A `yas` command typed in a terminal therefore targets the server named by the inherited `YAS_SOCK`, or the `default` instance when it is unset.
+
+To make commands inside an instance's terminals target that instance, start the server with `YAS_SOCK` set to its own socket:
+
+```bash
+W=$(mktemp -d)
+YAS_SOCK="$W/yas.sock" yas server --name work &
+YAS_SOCK="$W/yas.sock" yas terminal start --cols 200 --wait --timeout 5 -- sh -c 'echo YAS_SOCK=$YAS_SOCK; yas terminal list'
+YAS_SOCK="$W/yas.sock" yas terminal show 1
+```
+
+```text
+YAS_SOCK=/tmp/tmp.iXT5Xm44ra/yas.sock
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+1		sh -c 'echo YAS_SOCK=$YAS_SOCK; yas terminal list'	/tmp	running
+```
+
+<Aside type="caution">
+
+- A server started from a shell whose `YAS_SOCK` names another server passes that value to all its terminals. `yas` commands inside them then act on the other server. This includes instances started automatically by `--on local:NAME`, which inherit the environment of the command that started them.
+- `yas server --export-sock` (`YAS_EXPORT_SOCK=1`) and `--inject-path` (`YAS_INJECT_PATH=1`) are meant to set `YAS_SOCK` and append the `yas` binary's directory to `PATH` in new terminals. In yas 0.3.0 they have no effect on terminals. Use the `YAS_SOCK` approach above, and make sure `yas` is on the server's `PATH`.
+
+</Aside>

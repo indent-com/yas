@@ -1,0 +1,385 @@
+---
+title: "yas fs"
+description: "Mirror server filesystem state (https://docs.yas.run/code/files)"
+sidebar:
+  order: 8
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Mirror server filesystem state (https://docs.yas.run/code/files)
+
+```text
+Usage: yas fs [OPTIONS] <COMMAND>
+```
+
+## yas fs sync
+
+Mirror a directory tree from the server, streaming changes
+
+Prints the initial snapshot once it is coherent, then one line per change (`+` added, `~` modified, `-` deleted, `>` moved). With `--json`, emits one NDJSON event per record (`upsert`, `delete`, `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
+
+```text
+Usage: yas fs sync [OPTIONS] <PATH>
+```
+
+Arguments:
+
+- `<PATH>`
+
+  Path on the server (absolute, or relative to the client's cwd)
+
+Options:
+
+- `--content`
+
+  Sync file contents too (hashes always sync)
+
+- `--no-recursive`
+
+  Watch only the path and its immediate children
+
+- `--gitignore`
+
+  Honor .gitignore, `$GIT_DIR/info/exclude` and core.excludesFile
+
+- `--dot-ignore`
+
+  Honor .ignore files (ripgrep's convention)
+
+- `--ignore`
+
+  Shorthand for `--gitignore` `--dot-ignore` `--exclude-git`
+
+- `--exclude-git`
+
+  Skip .git directories and gitfiles
+
+- `--exclude <PATTERN>`
+
+  Skip paths matching a gitignore-syntax pattern (repeatable)
+
+- `--once`
+
+  Exit after the initial snapshot instead of streaming
+
+- `--json`
+
+  NDJSON event output
+
+## yas fs write
+
+Write a file from stdin, with conflict detection
+
+Content is read from stdin. By default an unconditional overwrite; `--create` fails if the file exists, `--if-hash` writes only if the current content matches. Exit 1 on conflict.
+
+```text
+Usage: yas fs write [OPTIONS] <PATH>
+```
+
+Arguments:
+
+- `<PATH>`
+
+  Path to write, relative to `--root`
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--if-hash <IF_HASH>`
+
+  Write only if the current content hash equals this hex value
+
+- `--create`
+
+  Create only if the path does not already exist
+
+- `--force`
+
+  Overwrite unconditionally (ignore any precondition)
+
+- `--parents`
+
+  Create missing parent directories
+
+- `--durable`
+
+  fsync the file and its parent before returning
+
+- `--mode <MODE>`
+
+  File mode in octal (e.g. 644); default preserves or umask
+
+- `--json`
+
+  JSON result output
+
+## yas fs mkdir
+
+Create a directory.
+
+```text
+Usage: yas fs mkdir [OPTIONS] <PATH>
+```
+
+Arguments:
+
+- `<PATH>`
+
+  Path to create, relative to `--root`
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--parents`
+
+  Create missing parent directories
+
+- `--mode <MODE>`
+
+  Directory mode in octal (e.g. 700)
+
+- `--json`
+
+  JSON result output
+
+## yas fs rm
+
+Remove a file or directory subtree.
+
+```text
+Usage: yas fs rm [OPTIONS] <PATH>
+```
+
+Arguments:
+
+- `<PATH>`
+
+  Path to remove, relative to `--root`
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--if-hash <IF_HASH>`
+
+  Remove only if the current content hash equals this hex value
+
+- `--json`
+
+  JSON result output
+
+## yas fs mv
+
+Rename or move a file or subtree.
+
+```text
+Usage: yas fs mv [OPTIONS] <FROM> <TO>
+```
+
+Arguments:
+
+- `<FROM>`
+
+  Source path, relative to `--root`
+
+- `<TO>`
+
+  Destination path, relative to `--root`
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--parents`
+
+  Create missing parent directories of the destination
+
+- `--json`
+
+  JSON result output
+
+## yas fs ln
+
+Create a hard link, or a symlink with `-s` (like ln(1))
+
+```text
+Usage: yas fs ln [OPTIONS] <TARGET> <LINK>
+```
+
+Arguments:
+
+- `<TARGET>`
+
+  Existing file path relative to `--root`; with `-s`, the verbatim symlink target (relative, absolute, or dangling)
+
+- `<LINK>`
+
+  Link path to create, relative to `--root`
+
+Options:
+
+- `-s, --symlink`
+
+  Create a symlink instead of a hard link
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `--if-hash <IF_HASH>`
+
+  Replace only if the current entry's content hash equals this hex value (a symlink's hash covers its target bytes)
+
+- `--force`
+
+  Replace an existing entry unconditionally
+
+- `--parents`
+
+  Create missing parent directories of the link
+
+- `--json`
+
+  JSON result output
+
+## yas fs grep
+
+Search file contents across a tree (docs/design/fs-grep.md)
+
+Examples:
+
+```text
+yas fs grep needle                    # literal, case-insensitive
+yas fs grep -e 'fn \\w+' --root crates # regex
+yas fs grep -sw Config                # case-sensitive whole word
+yas fs grep --no-ignore TODO          # include gitignored files
+yas fs grep -l needle                 # matching paths only
+```
+
+Prints PATH:LINE:TEXT, like grep(1). Exits 1 when nothing matched.
+
+```text
+Usage: yas fs grep [OPTIONS] <PATTERN>
+```
+
+Arguments:
+
+- `<PATTERN>`
+
+  Pattern: a literal string, or a regex with `-e`
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `-e, --regex`
+
+  Treat the pattern as a regular expression
+
+- `-s, --case-sensitive`
+
+  Match case exactly (the default is case-insensitive)
+
+- `-w, --word`
+
+  Match whole words only
+
+- `--no-ignore`
+
+  Search gitignored files and `.git` too. Results stay in path order; ignored files are marked in `--json`. Much slower on a tree with build output
+
+- `-m, --max-matches <MAX_MATCHES>`
+
+  Stop after this many matching files (0 = no limit)
+
+  Default: `0`.
+
+- `-l, --files-with-matches`
+
+  Print only the paths that contain a match
+
+- `--json`
+
+  NDJSON output, one object per match
+
+## yas fs cat
+
+Print a file's contents to stdout (bytes, unmodified)
+
+```text
+Usage: yas fs cat [OPTIONS] <PATH>
+```
+
+Arguments:
+
+- `<PATH>`
+
+  File path relative to `--root`
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+## yas fs find
+
+Fuzzy-find files by path (docs/design/fs-search.md)
+
+Scores a subsequence match over each root-relative path, best first. Exits 1 when nothing matched.
+
+```text
+Usage: yas fs find [OPTIONS] <QUERY>
+```
+
+Arguments:
+
+- `<QUERY>`
+
+  Query to match against paths
+
+Options:
+
+- `--root <ROOT>`
+
+  Root directory on the server (relative to the client's cwd)
+
+  Default: `.`.
+
+- `-n, --limit <LIMIT>`
+
+  Maximum number of paths to return
+
+  Default: `50`.
+
+- `--json`
+
+  NDJSON output, one object per path
+

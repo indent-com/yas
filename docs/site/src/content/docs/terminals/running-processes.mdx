@@ -1,0 +1,113 @@
+---
+title: "Running processes"
+description: "Run a program on the server with yas run, connected to your standard input, output, and error, and get its exit code back."
+sidebar:
+  order: 34
+---
+
+`yas run` starts a program on the server without a terminal and connects it to your own standard streams. Input you pipe in reaches the program's stdin, its stdout and stderr arrive on yours, and `yas run` exits with the program's exit code. Use it for pipe-oriented work such as tests, builds, and filters, where you want the output as bytes rather than a terminal screen. It works against any target you pass with `--on`.
+
+## Run a program
+
+```bash
+yas run --in /usr/share --env GREETING=hello -- sh -c 'echo "$GREETING from $(pwd)"; echo oops >&2; exit 4'
+echo "exit=$?"
+```
+
+```text
+hello from /usr/share
+oops
+exit=4
+```
+
+Options go before the program. Put `--` before the program when its own flags could be mistaken for yas options.
+
+- `--in DIR` sets the working directory on the server. Without it the program starts in the server's working directory.
+- `--env KEY=VALUE` sets an environment variable and is repeatable. The program otherwise inherits the server's environment.
+
+## Pipe data through it
+
+stdin, stdout, and stderr stay separate, so you can redirect each the way you would for a local program:
+
+```bash
+printf 'b\na\nc\n' | yas run sort
+```
+
+```text
+a
+b
+c
+```
+
+```bash
+yas run sh -c 'echo out; echo err >&2' 2>/dev/null
+```
+
+```text
+out
+```
+
+The streams carry raw bytes. There is no terminal, so programs see pipes, print no colors unless told to, and do not wait for keyboard input.
+
+## Exit codes
+
+`yas run` exits with the program's own exit code:
+
+```bash
+yas run -- ls /nonexistent
+echo "exit=$?"
+```
+
+```text
+ls: cannot access '/nonexistent': No such file or directory
+exit=2
+```
+
+A program ended by a signal gives 128 plus the signal number, the same as a local shell:
+
+```bash
+yas run sh -c 'kill -TERM $$'
+echo "exit=$?"
+```
+
+```text
+exit=143
+```
+
+When yas itself fails, for example because the program cannot be found, it prints an error and exits with 1.
+
+## No shell
+
+yas executes the program directly. It does not split a string into words or interpret pipes, redirection, globs, variables, or `&&`. A whole command line in one argument is looked up as a program name:
+
+```bash
+yas run 'echo hi | wc'
+echo "exit=$?"
+```
+
+```text
+yas: YAS request 0x0040/0x0002 failed with NotFound: no detail
+exit=1
+```
+
+Run a shell explicitly when you need shell syntax:
+
+```bash
+yas run sh -c 'echo hi | wc -c'
+```
+
+```text
+3
+```
+
+## When to use a terminal instead
+
+A process started by `yas run` belongs to that command. When `yas run` exits or its connection drops, the server stops the program. Nothing keeps its output for later.
+
+Use `yas terminal start` when the program needs a terminal (an editor, `htop`, a prompt that reads a password), when it should keep running after you disconnect, or when you want to read its output later. See [Controlling terminals](/terminals/controlling-terminals).
+
+<Aside type="note">
+  The program runs as the server's user with no sandbox, the same authority as a
+  terminal. An operator can turn `yas run` off with `yas server --no-processes`
+  or `YAS_PROCESS=0`.
+</Aside>

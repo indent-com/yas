@@ -1,0 +1,50 @@
+---
+title: "How yas compares"
+description: "How yas differs from ttyd, gotty, Eternal Terminal, Mosh, and xterm.js with node-pty, and when another tool fits better."
+sidebar:
+  order: 127
+---
+
+This page compares yas with other tools that put a terminal in a browser or keep a remote shell connected. The yas column describes the current release on Linux. On macOS and Windows the server multiplexes terminals only; the Wayland compositor and GUI streaming are Linux-only.
+
+## Feature comparison
+
+|                            | yas                                                                  | ttyd             | gotty            | Eternal Terminal       | Mosh               | xterm.js + node-pty           |
+| -------------------------- | -------------------------------------------------------------------- | ---------------- | ---------------- | ---------------------- | ------------------ | ----------------------------- |
+| Architecture               | Single binary                                                        | Single binary    | Single binary    | Client and daemon      | Client and server  | Library; you write the server |
+| Terminals per server       | Many                                                                 | One per instance | One per instance | One per connection     | One per connection | Whatever you build            |
+| Browser access             | Yes                                                                  | Yes              | Yes              | No                     | No                 | Yes                           |
+| Delta updates              | Only changed cells                                                   | No               | No               | No                     | Screen state diffs | No                            |
+| LZ4 compression            | Terminal frames                                                      | No               | No               | No                     | No                 | No                            |
+| Per-client pacing          | Yes, from each client's render and ACK timing                        | No               | No               | SSH-style flow control | No                 | No                            |
+| GPU rendering              | WebGPU, then WebGL2                                                  | No               | No               | Not applicable         | Not applicable     | WebGL addon                   |
+| Transports                 | Unix socket, SSH, TCP, WebSocket, WebTransport, WebRTC, uplink relay | WebSocket        | WebSocket        | TCP                    | UDP                | WebSocket                     |
+| Embeddable components      | React and Solid                                                      | No               | No               | No                     | No                 | Yes                           |
+| Wayland compositor         | Built in, headless, experimental                                     | No               | No               | No                     | No                 | No                            |
+| GUI app streaming          | H.264 and AV1                                                        | No               | No               | No                     | No                 | No                            |
+| CLI for scripts and agents | Yes                                                                  | No               | No               | No                     | No                 | No                            |
+| Built-in SSH               | Yes                                                                  | No               | No               | Yes                    | Yes                | No                            |
+
+The yas column was checked against the code. The other columns come from the yas README and describe those projects as the yas maintainers understand them; check each project's own documentation before you rely on a specific entry.
+
+## What the yas entries mean
+
+- **Terminals per server.** One `yas server` holds any number of terminals. Every client sees the same set, and a terminal keeps running when its last viewer disconnects. See [Controlling terminals](/terminals/controlling-terminals).
+- **Only changed cells.** The server parses PTY output into a cell grid and sends each view a keyframe, then patches against the last frame that view received. Each view has its own baseline, so a slow viewer does not force full redraws on a fast one.
+- **LZ4.** Terminal frames use a lossless LZ4 wrapper when it saves at least eight bytes.
+- **Per-client pacing.** The server estimates each client's RTT, delivery rate, and render rate from frame acknowledgements. It limits frames in flight per client, so a phone on a slow link cannot delay a desktop on a fast one. See [Server internals](/internals/server#per-client-frame-pacing).
+- **GPU rendering.** The browser renders terminals with WebGPU, falls back to WebGL2, and falls back again to Canvas 2D when neither GPU API exists. See [Frontend internals](/internals/frontend#gpu-renderers).
+- **Transports.** Every transport carries the same yas protocol. See [Transports](/remote/transports) and [URI schemes](/reference/uris).
+- **Embeddable.** `@yas-run/react` and `@yas-run/solid` render terminals and surfaces inside your own application. See [React](/embedding/react) and [Solid](/embedding/solid).
+- **Compositor and GUI streaming.** GUI applications started in a yas terminal on Linux open windows in the headless compositor. The server encodes each window as H.264 or AV1 per viewer. See [Running GUI apps](/gui/running-gui-apps).
+- **CLI.** Every capability is a `yas` subcommand with parseable output. See [Using yas from an agent](/agents/using-yas-from-an-agent).
+- **Built-in SSH.** `ssh:host` targets use an embedded SSH client. It installs yas on the host when it is missing and starts a server there.
+
+## When another tool fits better
+
+- You want to publish one fixed command as a web page with nothing else running: ttyd or gotty.
+- You want your own local terminal emulator connected to a remote shell that survives reconnects, and you never need a browser: Eternal Terminal.
+- Your network drops TCP connections or changes your address often, and a shell in your local terminal is all you need: Mosh, which runs over UDP.
+- You are building a Node.js application and want to own the PTY lifecycle and the terminal widget in your own server code: xterm.js with node-pty.
+- You need GUI application streaming from a macOS or Windows host: a remote desktop tool. The yas compositor runs only on Linux.
+- You need to confine what a connected user can do on the machine: a sandboxing layer outside yas. A yas connection has the same authority as a login shell for the server's user. See [Security](/operating/security).

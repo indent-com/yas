@@ -1,0 +1,34 @@
+---
+title: "Connecting to other machines"
+description: "Reach yas servers over SSH, WebRTC, and relays, and forward ports into their networks."
+sidebar:
+  order: 5
+  group:
+    label: "Connecting to other machines"
+    icon: "ph:globe-hemisphere-west"
+---
+
+Use an SSH remote when you can reach the machine over SSH, a share for a link anyone with the passphrase can open, and an uplink when the only path is a relay you do not trust.
+
+<CardGrid>
+  <Card title="Remotes" href="/remote/remotes">
+    Point the CLI at another server with --on, save named remotes, and choose
+    which servers the browser shows next to your own.
+  </Card>
+  <Card title="Sharing over WebRTC" href="/remote/sharing">
+    Publish a server through the yas.run hub so anyone with the passphrase can
+    open it in a browser or reach it from the CLI.
+  </Card>
+  <Card title="Uplink" href="/remote/uplink">
+    Expose a server through a relay you do not trust, with end-to-end encryption
+    between X25519 keys that each side pins.
+  </Card>
+  <Card title="Port forwarding and SOCKS" href="/remote/port-forwarding">
+    Reach services on the server's network from local ports, over TCP, UDP, or
+    TLS, or through a local SOCKS5 proxy.
+  </Card>
+  <Card title="Choosing a transport" href="/remote/transports">
+    Which connection each yas command and URI uses, from local Unix sockets to
+    SSH, WebSocket, WebTransport, and WebRTC, and what the proxy daemon adds.
+  </Card>
+</CardGrid>

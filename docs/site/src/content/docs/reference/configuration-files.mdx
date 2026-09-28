@@ -1,0 +1,120 @@
+---
+title: "Configuration files"
+description: "The files yas reads and writes on disk: yas.conf, yas.forwards, yas.remotes, per-instance state and cache, and sockets."
+sidebar:
+  order: 123
+---
+
+This page lists every file yas keeps on disk and where it lives on each platform. The CLI reads the configuration directory. The server writes per-instance state, cache, and socket files.
+
+## Configuration directory
+
+| Platform        | Path                                         |
+| --------------- | -------------------------------------------- |
+| Linux and macOS | `$XDG_CONFIG_HOME/yas`, else `~/.config/yas` |
+| Windows         | `%APPDATA%\yas`, else `C:\ProgramData\yas`   |
+
+The directory holds three files, all plain text with one `key = value` entry per line. yas writes each file with mode `0600`, replacing it atomically while it holds the lock file `yas.lock` in the same directory.
+
+### yas.conf
+
+`yas.conf` holds CLI settings. The CLI reads one key, `yas.target`, as the default target for commands run without `--on`. Set it with `yas remote set-default`:
+
+```bash
+yas remote set-default local:docs
+cat ~/.config/yas/yas.conf
+```
+
+```text
+yas: default target set to 'local:docs'
+yas.target = local:docs
+```
+
+The CLI chooses a target in this order: `--on`, then `YAS_TARGET`, then `yas.target`, then the local server. `YAS_CONFIG` replaces the path of this file.
+
+### yas.forwards
+
+`yas.forwards` holds named port forwards. Each line is `name = spec`, where `spec` uses the same syntax as `yas forward`. A line that starts with `# ` is a disabled entry. yas never creates this file on its own.
+
+```bash
+yas forward add web 8080:localhost:3000
+yas forward list
+cat ~/.config/yas/yas.forwards
+```
+
+```text
+web = 8080:localhost:3000
+web  8080:localhost:3000
+web = 8080:localhost:3000
+```
+
+- `yas forward --all` starts every enabled entry.
+- `yas forward remove web` deletes an entry.
+- `YAS_FORWARDS` replaces the path of this file.
+
+See [Port forwarding](/remote/port-forwarding).
+
+### yas.remotes
+
+`yas.remotes` is an import file. The saved remotes that clients see live in the home server's `remotes` KV key, which `yas remote add` and `yas remote remove` edit. When a server starts and the `remotes` key does not exist, the server reads `yas.remotes` once and stores its entries in that key. After that the server ignores the file.
+
+Each line is `name = uri`. A line that starts with `# ` is a disabled remote. `YAS_REMOTES` replaces the path of this file.
+
+<Aside type="caution">
+
+In the current release, `yas --on NAME` resolves `NAME` from the local `yas.remotes` file and ignores the server's `remotes` key. A remote added with `yas remote add` works in the browser but fails on the CLI with `unknown target`. The same applies to `yas.target` when it names such a remote, which makes every command without `--on` fail. Use a full URI with `--on`, or set `yas remote set-default` to a URI. If the file is missing when the CLI looks up a name, the CLI creates it with the single entry `local = local`.
+
+</Aside>
+
+## Instance state and cache
+
+Every server is a named instance (`default` unless you pass `--name` or set `YAS_SERVER_NAME`). Its files live under `yas/instances/<name>/` inside a platform base directory.
+
+| Platform | State base                               | Cache base                         |
+| -------- | ---------------------------------------- | ---------------------------------- |
+| Linux    | `$XDG_STATE_HOME`, else `~/.local/state` | `$XDG_CACHE_HOME`, else `~/.cache` |
+| macOS    | `~/Library/Application Support`          | `~/Library/Caches`                 |
+| Windows  | `%APPDATA%`                              | `%LOCALAPPDATA%`                   |
+
+| File                              | Location                | Override                                |
+| --------------------------------- | ----------------------- | --------------------------------------- |
+| `kv.redb`                         | state                   | `YAS_KV_PATH`                           |
+| `kv.redb.server.lock`             | beside the KV database  | follows `YAS_KV_PATH`                   |
+| `extensions.redb`                 | state                   | `YAS_EXTENSION_PATH`, then `YAS_EXT_DB` |
+| `wasm/` (extension object cache)  | cache                   | `YAS_WASM_CACHE`                        |
+| `muster/` (muster unit directory) | configuration directory | `YAS_MUSTER_DIR`                        |
+
+A private server named `docs` with `XDG_STATE_HOME` and `XDG_CACHE_HOME` set to a temporary directory produced this layout:
+
+```text
+state/yas/instances/docs/extensions.redb
+state/yas/instances/docs/kv.redb
+state/yas/instances/docs/kv.redb.server.lock
+cache/yas/instances/docs/wasm/lru-v1
+cache/yas/instances/docs/wasm/objects
+cache/yas/instances/docs/wasm/tmp
+```
+
+The server locks `kv.redb.server.lock` before it opens the KV or extension databases. A second server that resolves the same KV path exits instead of starting. Browser workspaces, remotes, and `@xdg-desktop` state are KV entries, so they stay separate per instance.
+
+## Sockets and runtime directories
+
+On Linux and macOS the server listens on a Unix socket. The CLI and the server pick the same path in this order:
+
+1. `YAS_SOCK`, when set.
+2. The packaged system path `/run/yas/<user>/yas-<name>.sock` (or the older `/run/yas/<user>-<name>.sock`), when it exists and passes ownership checks.
+3. An automatic path: `yas-<name>.sock` in the first usable base below.
+
+| Base                                            | Socket directory        |
+| ----------------------------------------------- | ----------------------- |
+| `$XDG_RUNTIME_DIR`, when only you can write it  | `$XDG_RUNTIME_DIR/yas/` |
+| `$TMPDIR`, when only you can write it           | `$TMPDIR/yas/`          |
+| `$TMPDIR`, when it is a shared sticky directory | `$TMPDIR/yas-<uid>/`    |
+| `/run/user/<uid>`                               | `/run/user/<uid>/yas/`  |
+| `/tmp`                                          | `/tmp/yas-<uid>/`       |
+
+yas creates the socket directory with mode `0700`. A `<socket>.lock` file sits beside each socket. On Windows the server listens on the named pipe `\\.\pipe\yas-<USERNAME>-<name>`.
+
+Instance names are 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. A name cannot end in `.` and cannot be a Windows reserved device name. See [Named instances](/terminals/named-instances).
+
+The compositor creates its Wayland socket `wayland-<N>` in `XDG_RUNTIME_DIR`, choosing the first free number from 0 to 32.

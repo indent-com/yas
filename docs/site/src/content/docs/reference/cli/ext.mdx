@@ -1,0 +1,253 @@
+---
+title: "yas ext"
+description: "Run and manage extensions."
+sidebar:
+  order: 12
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Run and manage extensions.
+
+```text
+Usage: yas ext [OPTIONS] <COMMAND>
+```
+
+## yas ext manage
+
+Choose extensions to install, update, or uninstall.
+
+```text
+Usage: yas ext manage [OPTIONS]
+```
+
+Options:
+
+- `--from <URL>`
+
+  Registry base URL serving manifest.json and extension modules (https://, or http:// on a loopback host)
+
+  Default: `https://yas.run/ext`.
+
+## yas ext run
+
+Execute a Wasm or JavaScript extension.
+
+```text
+Usage: yas ext run [OPTIONS] <NAME> [MODULE] [ARGS]...
+```
+
+Arguments:
+
+- `<NAME>`
+
+  A label, or the unique durable name under `--persist`
+
+- `[MODULE ARGS]...`
+
+  Wasm or JavaScript extension (a path or an https:// URL), then UTF-8 arguments
+
+Options:
+
+- `--detach`
+
+  Return once the extension has reached RUNNING
+
+- `--persist`
+
+  Store an enabled, desired-running definition (implies `--detach`)
+
+- `--restart <RESTART>`
+
+  Attempt restart policy
+
+  Default: `never`. Values: `never`, `on-failure`, `always`.
+
+- `--json`
+
+  Emit NDJSON lifecycle and output records
+
+## yas ext list
+
+List visible extensions.
+
+```text
+Usage: yas ext list [OPTIONS]
+```
+
+Options:
+
+- `--json`
+
+  Emit one NDJSON record per extension
+
+## yas ext status
+
+Show one extension's current lifecycle snapshot.
+
+```text
+Usage: yas ext status [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext attach
+
+Follow retained and future output from an extension.
+
+```text
+Usage: yas ext attach [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext start
+
+Start a stopped extension
+
+Marks it desired-running and begins an attempt. Already running is not an error: this is the verb for "I want this up", and it is idempotent.
+
+```text
+Usage: yas ext start [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext stop
+
+Stop a running extension
+
+Clears desired-running and cancels the current attempt. Durable enable state is untouched — see `disable` for the answer that survives a restart of the server.
+
+```text
+Usage: yas ext stop [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext update
+
+Replace a persistent extension definition.
+
+```text
+Usage: yas ext update [OPTIONS] <NAME> [MODULE] [ARGS]...
+```
+
+Arguments:
+
+- `<NAME>`
+
+  Exact persistent extension name
+
+- `[MODULE ARGS]...`
+
+  Replacement Wasm or JavaScript extension, then UTF-8 arguments
+
+Options:
+
+- `--restart <RESTART>`
+
+  Replace the stored restart policy (preserved when omitted)
+
+  Values: `never`, `on-failure`, `always`.
+
+- `--json`
+
+  Emit an NDJSON lifecycle record
+
+## yas ext restart
+
+Start a fresh attempt immediately.
+
+```text
+Usage: yas ext restart [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext enable
+
+Durably enable a persistent extension.
+
+```text
+Usage: yas ext enable [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext disable
+
+Durably disable a persistent extension.
+
+```text
+Usage: yas ext disable [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext remove
+
+Remove a disabled, quiescent persistent extension.
+
+```text
+Usage: yas ext remove [OPTIONS] <SELECTOR>
+```
+
+Arguments:
+
+- `<SELECTOR>`
+
+Options:
+
+- `--json`
+
+## yas ext commands
+
+List live extension-provided command namespaces.
+
+```text
+Usage: yas ext commands [OPTIONS]
+```
+

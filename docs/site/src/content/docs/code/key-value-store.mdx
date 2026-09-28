@@ -1,0 +1,143 @@
+---
+title: "Key-value store"
+description: "Store small values on a server with yas kv, update them with compare-and-swap, and watch a key prefix for changes."
+sidebar:
+  order: 64
+---
+
+Every yas server keeps a small key-value store on disk. The browser UI keeps its workspaces,
+remotes, workspace roots, and unsaved editor buffers there. You can use the same store from scripts
+with `yas kv`: to pass state between jobs, to publish a build status that a browser or another
+script watches, or to take a lock with compare-and-swap. Every command works against a remote with
+`--on`.
+
+## Put and get values
+
+`put` takes the value as an argument, or reads it from stdin when you omit it. It prints nothing on
+success:
+
+```bash
+yas kv put build/status passed
+echo "compiled 12 crates" | yas kv put build/log
+yas kv get build/status
+```
+
+```text
+passed
+```
+
+`get` prints the value's bytes exactly, with no trailing newline added. When the key does not
+exist, `get` prints nothing and exits 1, so it works as a test:
+
+```bash
+if yas kv get build/status >/dev/null; then echo "status is set"; fi
+```
+
+`rm` deletes a key. Deleting a key that does not exist succeeds.
+
+## List a prefix
+
+```bash
+yas kv ls build/
+```
+
+```text
+log	19
+status	6
+```
+
+Each line is the key with the prefix removed, a tab, and the value's size in bytes. `--values` adds
+the value as a third column. `--json` prints one object per key:
+
+```text
+{"hash":"1d37026f70d1a99408cdd069a6c31912b755ec437273ba32b48cc0912168127b","key":"log","mtime_ns":1790573648685361920,"revision":28,"size":19,"type":"upsert","value":null}
+```
+
+- `hash` is the BLAKE3 hash of the value, in hex.
+- `revision` is the store revision of the last change to this key.
+- `mtime_ns` is the time of that change in nanoseconds since the Unix epoch.
+- `value` is `null` unless you pass `--values`.
+
+Run `yas kv ls` with no prefix to list every key.
+
+## Update without losing a race
+
+`put` with no flag overwrites the value. To change a value only if nobody else changed it since you
+read it, pass the hash you last saw to `--if-hash`:
+
+```bash
+yas kv put --json build/status failed
+```
+
+```text
+{"hash":"d870b786a9622723a593e11de1164dc326af679b04c967a8c4aa1a3ff9e0d242","key":"build/status","mtime_ns":1790573648740939572,"revision":29,"size":6}
+```
+
+```bash
+yas kv put --if-hash 0000000000000000000000000000000000000000000000000000000000000000 build/status x
+```
+
+```text
+yas: build/status changed under us (current hash d870b786a9622723a593e11de1164dc326af679b04c967a8c4aa1a3ff9e0d242)
+```
+
+A conflict exits 1 and prints the current hash. Read the value again, recompute, and retry with that
+hash. `rm` accepts `--if-hash` too.
+
+- `--force` overwrites or deletes unconditionally.
+- `--durable` waits until the change is on disk before it returns. Without it, `put` and `rm` return
+  once the server has accepted the change, and the write reaches disk shortly after.
+- `--json` prints the new hash, revision, time, and size.
+
+## Watch a prefix
+
+`ls --watch` prints the current keys, then one line per change:
+
+```bash
+yas kv ls build/ --watch
+```
+
+```text
+log	19
+status	6
+step	1
+status	2
+- step
+```
+
+The first two lines are the snapshot. Then another shell set `build/step`, changed `build/status`,
+and deleted `build/step`. A set prints the key and its new size. A delete prints `-` and the key.
+With `--json`, a delete is `{"key":"step","type":"delete"}`.
+
+## Where the data lives
+
+The store is one file per instance:
+
+- Linux: `$XDG_STATE_HOME/yas/instances/NAME/kv.redb`, or `~/.local/state/yas/instances/NAME/kv.redb`
+  when `XDG_STATE_HOME` is unset.
+- macOS: `~/Library/Application Support/yas/instances/NAME/kv.redb`.
+- Windows: `%APPDATA%\yas\instances\NAME\kv.redb`.
+
+`NAME` is the instance name. `YAS_KV_PATH` sets another path. Values survive a server restart.
+
+The browser UI uses these prefixes. Change them only if you know the format:
+
+- `ui/` holds workspaces. See [Workspaces and layout](/browser/workspaces).
+- `remotes` holds the remote list that `yas remote` edits.
+- `roots` holds the browser's workspace roots, one `name = /path` line each.
+- `editor/buf/` holds unsaved editor buffers.
+- `tabs/` and `web/` hold panel and web pane state.
+
+<Aside type="note" title="Limits">
+
+- A key is at most 256 bytes. A value is at most 4 MiB (`YAS_KV_VALUE_MAX`).
+- The store holds at most 16,384 keys (`YAS_KV_MAX_ENTRIES`) and 256 MiB in total
+  (`YAS_KV_TOTAL_MAX`).
+- Every client of the server can read and write every key. Do not store secrets there.
+- The server disables the store with `YAS_KV=0`.
+- The `yas kv put` help says writes are compare-and-swap by default. A `put` without `--if-hash`
+  overwrites.
+
+</Aside>
+
+Full flags are in the [`yas kv` reference](/reference/cli/kv).

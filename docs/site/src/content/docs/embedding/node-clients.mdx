@@ -1,0 +1,213 @@
+---
+title: "Node and Bun clients"
+description: "Drive a local yas server from a server-side JavaScript program over its Unix socket with @yas-run/core."
+sidebar:
+  order: 94
+---
+
+A server-side program can use `@yas-run/core` to drive a yas server on the same machine: start
+terminals, send input, and wait for commands to exit. It connects over the server's Unix socket,
+uses the same `YasWorkspace` API as the browser components, and needs no edge or passphrase. The
+Node, Bun, and Deno pieces live under the `@yas-run/core/node` subpath so browser bundles never
+import `node:net`.
+
+## Install
+
+```bash
+npm install --legacy-peer-deps @yas-run/core @yas-run/browser
+```
+
+`@yas-run/browser` is the WebAssembly module the workspace uses for terminal state. `loadYasWasm()`
+from `@yas-run/core/node` reads its `.wasm` file from disk and initializes it, so you never handle
+the bytes yourself. Pass a path to `loadYasWasm(path)` to load the file from somewhere else.
+
+<Aside type="caution" title="Limits in 0.3.0">
+
+- Run these programs with Bun. The published `@yas-run/core` 0.3.0 uses extensionless relative
+  imports, and Node's ES module loader fails with `ERR_MODULE_NOT_FOUND` on the first one.
+- `NodeUnixSocketTransport`, `BunUnixSocketTransport`, and `DenoUnixSocketTransport` add a length
+  prefix to the protocol preface, which the server expects raw. The server closes the connection
+  after HELLO and the transport retries forever. The example below uses a small transport that
+  writes the byte stream unchanged.
+- npm needs `--legacy-peer-deps` because `@yas-run/core` 0.3.0 declares
+  `@yas-run/browser >=0.9.0` as a peer while the matching package is 0.3.0.
+
+</Aside>
+
+## Run a command and read its exit status
+
+Save this as `run-command.mjs`. It starts one command in a new terminal on the server named by
+`YAS_SOCK`, waits for it to exit, and exits with the same status.
+
+```js
+import net from "node:net";
+import {
+  YasWorkspace,
+  exitCodeFromStatus,
+  formatExitStatus,
+  nullLogger,
+} from "@yas-run/core";
+import { loadYasWasm } from "@yas-run/core/node";
+
+// Carries the native byte stream unchanged: preface, then length-prefixed frames.
+class UnixStreamTransport {
+  yasFraming = "stream";
+  status = "disconnected";
+  authRejected = false;
+  lastError = null;
+  #socket = null;
+  #listeners = {
+    message: new Set(),
+    statuschange: new Set(),
+    datagram: new Set(),
+  };
+
+  constructor(path) {
+    this.path = path;
+  }
+  #setStatus(status) {
+    this.status = status;
+    for (const listener of this.#listeners.statuschange) listener(status);
+  }
+  connect() {
+    if (this.#socket) return;
+    this.#setStatus("connecting");
+    const socket = net.createConnection(this.path);
+    this.#socket = socket;
+    socket.on("connect", () => this.#setStatus("connected"));
+    socket.on("data", (chunk) => {
+      const copy = new Uint8Array(chunk.byteLength);
+      copy.set(chunk);
+      for (const listener of this.#listeners.message) listener(copy.buffer);
+    });
+    socket.on("error", (error) => (this.lastError = error.message));
+    socket.on("close", () => {
+      this.#socket = null;
+      if (this.status !== "closed") this.#setStatus("disconnected");
+    });
+  }
+  send(data) {
+    this.#socket?.write(data);
+  }
+  close() {
+    this.#setStatus("closed");
+    this.#socket?.destroy();
+    this.#socket = null;
+  }
+  addEventListener(type, listener) {
+    this.#listeners[type]?.add(listener);
+  }
+  removeEventListener(type, listener) {
+    this.#listeners[type]?.delete(listener);
+  }
+}
+
+const socketPath = process.env.YAS_SOCK;
+if (!socketPath) throw new Error("set YAS_SOCK to the server's Unix socket");
+
+const workspace = new YasWorkspace({
+  wasm: await loadYasWasm(),
+  logger: nullLogger,
+  connections: [
+    {
+      id: "default",
+      transport: {
+        type: "custom",
+        transport: new UnixStreamTransport(socketPath),
+      },
+    },
+  ],
+});
+
+await new Promise((resolve) =>
+  workspace.getConnection("default").onReady(resolve),
+);
+
+const session = await workspace.createSession({
+  connectionId: "default",
+  rows: 24,
+  cols: 80,
+  command: process.argv[2] ?? "echo hello; exit 3",
+});
+console.log("started", session.id);
+
+const exited = await workspace.awaitSessionExit(session.id, {
+  timeoutMs: 30_000,
+});
+console.log("status", exited.exitStatus, formatExitStatus(exited.exitStatus));
+console.log("exit code", exitCodeFromStatus(exited.exitStatus));
+
+workspace.dispose();
+process.exit(exitCodeFromStatus(exited.exitStatus));
+```
+
+- `nullLogger` silences the workspace. Leave `logger` out to print lifecycle events to the console.
+- `onReady` fires once the server's HELLO has arrived. `createSession` rejects with
+  `Terminal family is not ready or was not negotiated` before that.
+- `command` runs through the server's login shell. Pass `argv: ["prog", "arg"]` instead to start a
+  program directly.
+
+Run it against a private server:
+
+```bash
+D=$(mktemp -d); yas server --socket "$D/yas.sock" --name docs &
+export YAS_SOCK="$D/yas.sock"
+bun run-command.mjs; echo "shell exit: $?"
+bun run-command.mjs 'kill -9 $$'; echo "shell exit: $?"
+yas terminal list
+yas quit
+```
+
+```text
+started default:terminal:1
+status 3 exited(3)
+exit code 3
+shell exit: 3
+started default:terminal:2
+status -9 signal(9)
+exit code 137
+shell exit: 137
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+1			echo hello; exit 3		exited(3)
+2			kill -9 $$		signal(9, Kill)
+```
+
+The session ID has the form `<connection>:terminal:<pty>`. The terminals stay on the server after
+your program exits, as the `yas terminal list` output shows.
+
+## Exit status
+
+When a terminal's process ends, its `YasSession.state` becomes `"exited"` and `exitStatus` holds the
+raw status from the server. While the process runs, `exitStatus` is `null`.
+
+- `0` or more: the process exited normally with that code.
+- Below `0`: a signal ended the process; the value is the negated signal number.
+- `EXIT_STATUS_UNKNOWN` (`-2147483648`): the status has not been collected.
+
+Two helpers match the `yas` CLI:
+
+- `exitCodeFromStatus(status)` returns a shell-style code: the code itself, `128 + signal` for a
+  signal, or `1` when unknown.
+- `formatExitStatus(status)` returns `exited(<code>)`, `signal(<n>)`, or `exited` when unknown.
+
+To react to exits without awaiting one terminal, subscribe to the workspace:
+
+```js
+workspace.subscribe(() => {
+  for (const s of workspace.getSnapshot().sessions) {
+    if (s.state === "exited" && s.exitStatus !== null) {
+      console.log(s.id, "exited with code", exitCodeFromStatus(s.exitStatus));
+    }
+  }
+});
+```
+
+## Other operations
+
+The workspace here is the same object the browser components use. `sendInput(id, bytes)`,
+`resizeSession(id, rows, cols)`, `killSession(id, signal)`, `closeSession(id)`, and
+`search(query)` all work from a script. See
+[Workspace operations](/embedding/react#workspace-operations).
+
+For one-off scripting from a shell, the `yas` CLI does the same work without code. See
+[Controlling terminals](/terminals/controlling-terminals).

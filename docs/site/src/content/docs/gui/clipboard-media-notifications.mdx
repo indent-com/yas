@@ -1,0 +1,201 @@
+---
+title: "Clipboard, media players, and notifications"
+description: "Read and set the compositor clipboard, control MPRIS media players, and see tray icons, notifications, and portal requests from Linux applications in the browser."
+sidebar:
+  order: 45
+---
+
+Each yas compositor on Linux runs a private D-Bus session with the desktop services Linux
+applications expect: a clipboard, notifications, tray icons, an MPRIS bridge for media players, and a
+desktop portal backend. yas turns each of them into browser UI and, where it helps scripts, into CLI
+commands. Nothing on this page touches the host's own desktop session.
+
+<Aside type="caution" title="Experimental">
+  These services belong to the experimental compositor and run on Linux servers
+  only. They need `dbus-daemon` on the server's `PATH`. Without it, applications
+  get no session bus and none of these services start.
+</Aside>
+
+## Clipboard
+
+`yas clipboard` reads and sets the clipboard that applications on the compositor share.
+
+```bash
+yas clipboard list
+```
+
+```text
+STRING
+TEXT
+UTF8_STRING
+chromium/x-internal-source-rfh-token
+chromium/x-source-url
+text/plain
+text/plain;charset=utf-8
+```
+
+`list` prints one MIME type per line: the formats the current clipboard owner offers. This example
+follows a copy in Chrome. `yas clipboard` with no subcommand runs `list`.
+
+Read the clipboard with `get`. It asks for `text/plain` unless you pass `--mime`:
+
+```bash
+yas clipboard get
+yas clipboard get --mime image/png > shot.png
+```
+
+Set it from an argument or from standard input:
+
+```bash
+yas clipboard set "hello"
+echo "hello" | yas clipboard set
+yas clipboard set --mime image/png < shot.png
+```
+
+- `set` offers `text/plain;charset=utf-8` unless you pass `--mime`. It offers exactly that one type.
+- `--primary` sets the primary selection, which a middle click pastes, instead of the clipboard.
+- Setting the clipboard takes ownership from whichever application held it.
+
+After `yas clipboard set`, read the value back with the same MIME type you set. A plain `get` asks
+for `text/plain`, which the offer does not include:
+
+```bash
+yas clipboard set "pasted by yas"
+yas clipboard get
+yas clipboard get --mime "text/plain;charset=utf-8"
+```
+
+```text
+yas: YAS request 0x0021/0x0005 failed with NotFound: no detail
+pasted by yas
+```
+
+## Media players
+
+Applications that publish the MPRIS D-Bus interface, such as music and video players, show up as
+media players. `yas media` lists and controls them:
+
+```bash
+yas media list
+```
+
+```text
+ID	STATE	ACTIVE	ART	PLAYER	TITLE	ARTIST
+```
+
+The output is tab-separated, one player per line after the header:
+
+- `ID`: the player ID the control commands take.
+- `STATE`: `playing`, `paused`, or `stopped`.
+- `ACTIVE`: `yes` for the one player yas treats as current, otherwise `no`.
+- `ART`: `url` or `asset` when the track has artwork, `-` when it has none.
+- `PLAYER`: the player's name.
+- `TITLE` and `ARTIST`: the current track.
+
+This example ran with no player open, so only the header prints. `yas media` with no subcommand runs
+`list`.
+
+Control a player:
+
+```bash
+yas media play
+yas media pause 2
+yas media toggle
+yas media stop
+yas media next
+yas media previous
+yas media raise
+```
+
+Each command takes an optional player ID. Without one, it targets the active player, then a playing
+player, then the player with the lowest ID. `raise` brings the player's window forward. `toggle`
+also answers to `play-pause`, and `previous` to `prev`. With no players the command fails:
+
+```text
+yas: no desktop media players
+```
+
+A player becomes active when it starts playing, or when you select or control it. It stays active
+while paused until another player starts.
+
+### In the browser
+
+The browser shows now-playing state with play, pause, previous, next, seek, and open-player
+controls. It also registers the active player with the browser's Media Session API, so media keys,
+the lock screen, and the operating system's now-playing controls work. Read-only viewers see the
+players and cannot control them.
+
+Set `YAS_MPRIS=0` on the server to turn the bridge off. `YAS_MPRIS_MAX_PLAYERS` and
+`YAS_MPRIS_ARTWORK_BYTES` lower the player count and artwork memory limits.
+
+## Notifications
+
+yas owns `org.freedesktop.Notifications` on the private bus, so `notify-send` and any application
+that posts desktop notifications works. This call from a yas terminal posts one:
+
+```bash
+busctl --user call -- org.freedesktop.Notifications /org/freedesktop/Notifications \
+  org.freedesktop.Notifications Notify susssasa{sv}i \
+  demo 0 "" "Build finished" "All tests passed" 0 0 -1
+```
+
+```text
+u 1
+```
+
+The reply is the notification ID. In the browser:
+
+- When the yas page is visible, the notification appears as a toast with its action buttons.
+- When the page is hidden and you have allowed system notifications, the browser shows an operating
+  system notification. Clicking it focuses yas and runs the notification's default action if the
+  notification is still active.
+- Otherwise it waits behind the bell in the status bar.
+
+The bell's menu lists active notifications and has **Enable system notifications**, which is the only
+place yas asks for browser notification permission. Replacing a notification updates it in place.
+The dismiss button on a toast or card tells the application the notification was dismissed.
+
+Every viewer sees every notification. The first viewer to act on one removes it for the others.
+
+Options, set on the server:
+
+- `YAS_NOTIFICATION_TIMEOUT_MS`: how long a notification stays when the application asks for the
+  default timeout. Default `10000`.
+- `YAS_NOTIFICATION_TIMEOUT_MIN_MS` and `YAS_NOTIFICATION_TIMEOUT_MAX_MS`: clamp the timeouts
+  applications request. Defaults `1000` and `86400000`.
+
+## Tray icons
+
+yas runs a StatusNotifierItem watcher and host, so applications that create tray icons get one. Tray
+icons appear at the right end of the browser's status bar. Items marked passive move to the overflow
+menu, and items that need attention get a warning color. Click, right-click, and scroll are sent to
+the application, and an application menu opens as a regular browser menu.
+
+`YAS_ICON_THEME` names the icon theme yas looks up icons in, before the required `hicolor` fallback.
+Default `hicolor`.
+
+Set `YAS_DESKTOP=0` on the server to turn off notifications, tray icons, and the Desktop family that
+carries them to viewers. Use it when viewers should not see notification text.
+
+## Desktop portals
+
+When `xdg-desktop-portal` is installed on the server, yas starts it on the private bus with yas's own
+backend for two portals:
+
+- **ScreenCast:** an application that asks to share a window gets a picker in the browser. The
+  picker lists yas surfaces. The chosen window goes straight from the compositor into the private
+  PipeWire graph. The browser's media panel shows the share under **Live now**.
+- **Access:** permission questions from other portals, such as the Camera portal, appear as a dialog
+  in the browser.
+
+Only a viewer with write access can answer a portal request. Other portals, such as file choosers,
+use whichever backends are installed on the server. Window sharing needs the private PipeWire
+instance described in [Audio, camera, and microphone](/gui/audio-camera-microphone).
+
+Set `YAS_PORTALS=0` on the server to not start the portal frontend.
+
+<Aside type="note">
+  Unsandboxed applications on the compositor share one D-Bus session and one
+  PipeWire graph. Any of them can read the clipboard, a shared camera, or a
+  shared window.
+</Aside>

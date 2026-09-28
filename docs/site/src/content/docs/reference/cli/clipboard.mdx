@@ -1,0 +1,65 @@
+---
+title: "yas clipboard"
+description: "Manage the clipboard."
+sidebar:
+  order: 7
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Manage the clipboard.
+
+```text
+Usage: yas clipboard [OPTIONS] [COMMAND]
+```
+
+## yas clipboard list
+
+List available MIME types on the clipboard.
+
+```text
+Usage: yas clipboard list [OPTIONS]
+```
+
+## yas clipboard get
+
+Read clipboard content.
+
+```text
+Usage: yas clipboard get [OPTIONS]
+```
+
+Options:
+
+- `--mime <MIME>`
+
+  MIME type to retrieve (default: text/plain)
+
+  Default: `text/plain`.
+
+## yas clipboard set
+
+Set clipboard content.
+
+```text
+Usage: yas clipboard set [OPTIONS] [TEXT]
+```
+
+Arguments:
+
+- `[TEXT]`
+
+  Text to set (if omitted, reads from stdin)
+
+Options:
+
+- `--mime <MIME>`
+
+  MIME type (default: text/plain;charset=utf-8)
+
+  Default: `text/plain;charset=utf-8`.
+
+- `--primary`
+
+  Set the primary selection (what middle click pastes) instead of the clipboard.  Displaces whichever app currently owns it
+

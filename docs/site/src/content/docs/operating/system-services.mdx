@@ -1,0 +1,132 @@
+---
+title: "Running yas as a system service"
+description: "Start a yas server at login or boot with the checked-in systemd units, and let systemd create its socket."
+sidebar:
+  order: 82
+---
+
+A yas server normally starts the first time a client needs it and runs until you stop it. To have
+one waiting at login or at boot, run it under systemd with the unit files in the repository's
+[`systemd/`](https://github.com/yas-run/yas/tree/main/systemd) directory. On macOS, the
+[nix-darwin module](/operating/nix) runs the server as a launchd agent.
+
+The installer does not install these units. Copy the ones you need into place.
+
+## Run a user service
+
+A user service runs as you, inherits your session's environment, and stops when your user manager
+stops.
+
+<Steps titleSize="h3">
+  <Step title="Copy the units">
+
+    ```bash
+    mkdir -p ~/.config/systemd/user
+    cp systemd/yas.socket systemd/yas.service ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    ```
+
+  </Step>
+  <Step title="Enable the socket">
+
+    ```bash
+    systemctl --user enable --now yas.socket
+    ```
+
+    systemd creates `$XDG_RUNTIME_DIR/yas/yas-default.sock` right away. The first client to connect
+    starts `yas.service`.
+
+  </Step>
+  <Step title="Connect">
+    `yas terminal list` finds the socket without configuration, because it is the default instance's
+    automatic path.
+  </Step>
+</Steps>
+
+`ExecStart=yas server` relies on `yas` being on the user manager's `PATH`. Edit the line to an
+absolute path, such as `~/.local/bin/yas`, if it is not.
+
+To keep terminals running after you log out, enable lingering with `loginctl enable-linger $USER`.
+
+## Units
+
+| Unit                                         | Scope                 | Socket                     | Notes                                                    |
+| -------------------------------------------- | --------------------- | -------------------------- | -------------------------------------------------------- |
+| `yas.socket` / `yas.service`                 | user                  | `%t/yas/yas-default.sock`  | Conflicts with `yas-server.socket`                       |
+| `yas-server.socket` / `yas-server.service`   | user                  | `%t/yas/yas-default.sock`  | Same socket under the older name                         |
+| `yas-server@.socket` / `yas-server@.service` | system, one per user  | `/run/yas/%i-default.sock` | `%i` is the user name, and the service runs as that user |
+| `yas-share@.service`                         | system, one per share | none                       | Runs `yas share --quiet` with `/etc/yas/share-%i.env`    |
+
+`%t` is the user's runtime directory, normally `/run/user/UID`.
+
+- Every server unit uses `Type=notify` and `Restart=no`. A server stays up after its last client
+  disconnects, and stopping it closes its terminals: `systemctl --user stop yas.service`.
+- `WorkingDirectory=~` starts new terminals in the home directory.
+- `yas-server@alice.socket` creates `/run/yas/alice-default.sock`, owned by `alice` with mode
+  `0700`. Clients running as `alice` find that path without setting `YAS_SOCK`.
+- `yas-share@.service` restarts on failure. It reads `YAS_PASSPHRASE` from
+  `/etc/yas/share-NAME.env`, a root-owned file with mode `0600` that contains one line:
+
+  ```text
+  YAS_PASSPHRASE='a long random passphrase'
+  ```
+
+  Start it with `systemctl enable --now yas-share@NAME.service`. See
+  [Sharing over WebRTC](/remote/sharing) for what the share publishes.
+
+To add a browser edge or a share to a server unit, set `YAS_EDGE=1` or `YAS_SHARE=1` in the service
+and supply the passphrase with `EnvironmentFile=`. One process then serves terminals, the browser,
+and the share. See [Serving the browser with yas edge](/operating/edge).
+
+```ini
+# ~/.config/systemd/user/yas.service.d/edge.conf
+[Service]
+Environment=YAS_EDGE=1
+EnvironmentFile=%h/.config/yas/edge.env
+```
+
+## Socket activation
+
+When systemd passes a listening socket, the server adopts it instead of creating its own. It uses the
+socket only when `LISTEN_FDS` is `1` and `LISTEN_PID` matches its own process ID. Otherwise it binds
+its usual path. With `-v`, the server prints `using socket activation (fd 3)` when it adopts the
+socket.
+
+The socket file exists only while the `.socket` unit owns it. Deleting the file does not free the
+address: systemd keeps the listener and passes it to every restart of the service, so clients get
+"no such file" errors until you restart the `.socket` unit itself.
+
+A socket created by the system manager for `yas-server@.socket` reports root as its owner to
+connecting clients, whichever user the service runs as. Clients and edges accept a root-owned server
+socket, so the system units work without `YAS_SERVER_UID`. User units are unaffected, because the
+user manager already runs as you.
+
+## Readiness
+
+With `Type=notify`, systemd waits for the server to report that it is ready before it marks the
+service started. The server sends `READY=1` to `NOTIFY_SOCKET` once it is accepting connections.
+A standalone `yas edge` sends it once it is listening. `yas share` sends it once it has registered
+with the signaling hub, so `yas-share@.service` counts as started only after the share is reachable.
+
+## Man pages and completions
+
+`yas generate` writes man pages and shell completions under a prefix's `share` directory. The
+installer runs it for you. Run it again after installing a binary by hand:
+
+```bash
+yas generate ~/.local/share
+```
+
+It creates `man/man1`, `bash-completion/completions`, `zsh/site-functions`, and
+`fish/vendor_completions.d` below the directory you give it.
+
+<Aside type="note" title="Platform notes">
+
+- Readiness notification is Linux only. Socket activation works wherever the service manager sets
+  `LISTEN_FDS` and `LISTEN_PID`.
+- On NixOS, use the [NixOS module](/operating/nix) instead of copying units. It starts one server per
+  user at boot without a socket unit.
+- A system service does not read your login shell's startup files. Terminals and extensions see the
+  unit's `PATH` and environment. Set what they need with `Environment=` or `EnvironmentFile=`.
+
+</Aside>

@@ -1,0 +1,132 @@
+---
+title: "Color and HDR"
+description: "How yas carries wide-gamut and HDR output from Wayland applications to each browser, and what a viewer without an HDR or P3 display receives."
+sidebar:
+  order: 43
+---
+
+Applications on the yas compositor can draw in wide gamuts and in HDR. yas composites that output
+without clipping it, then encodes a separate stream for each viewer: HDR for a viewer that can show
+HDR, Display-P3 for a wide-gamut display, and sRGB for everyone else. Viewers with different
+displays can watch the same window at the same time.
+
+<Aside type="caution" title="Experimental">
+  Color management is part of the experimental compositor and runs on Linux
+  servers only.
+</Aside>
+
+## What applications can send
+
+Applications describe their buffers with the Wayland color-management protocol
+(`wp_color_manager_v1`, version 2). An application that does not use it is treated as sRGB and
+takes the ordinary 8-bit path.
+
+- **Color spaces:** Display-P3, DCI-P3, BT.2020 with PQ or HLG, Windows scRGB, and every named
+  primary set and transfer function in the protocol, including Adobe RGB and BT.1886. Custom
+  primaries, white points, and power curves are accepted.
+- **ICC profiles:** v2 and v4 display and color-space profiles, up to the protocol's 32 MiB limit.
+  A profile yas cannot build a transform for fails through the protocol with `unsupported`.
+- **Rendering intents:** perceptual, relative, relative with black-point compensation, absolute,
+  and saturation.
+- **HDR metadata:** mastering display primaries and luminance, and content light levels. A declared
+  content-light peak takes precedence over the mastering peak.
+- **Buffer formats:** 8-bit, 10-bit (2:10:10:10), 16-bit integer, and 16-bit float RGB, in shared
+  memory or DMA-BUF, subject to the Vulkan driver's format support.
+
+The compositor advertises BT.2020 with PQ and a 203-nit reference white as its preferred
+description. A window that mixes color-managed and untagged content is composited in linear
+BT.2020 at 16-bit float precision, so values above SDR white survive blending and scaling.
+
+## What each viewer receives
+
+The browser reports what its display and decoder can do. The server picks the stream for each view
+from that report:
+
+| Viewer                                                                 | Stream                                           |
+| ---------------------------------------------------------------------- | ------------------------------------------------ |
+| SDR display, or a client that reports no color support                 | sRGB, tone- and gamut-mapped, 8-bit H.264 or AV1 |
+| Wide-gamut display with a Display-P3 canvas                            | Display-P3 SDR, 8-bit H.264 or AV1               |
+| HDR display with 10-bit AV1 decode and an extended-range WebGPU canvas | BT.2020 PQ HDR, 10-bit AV1                       |
+
+A viewer's stream changes when its display changes. Moving a browser window from an HDR monitor to
+an SDR one makes the browser renegotiate, and the server switches that view at the next keyframe.
+
+### Browser requirements
+
+- **Display-P3:** a wide-gamut display and a browser that supports Display-P3 canvases. P3 works
+  with H.264, so it needs no AV1 decoder.
+- **HDR:** an HDR display, a 10-bit AV1 decoder, and WebGPU with an extended-range `rgba16float`
+  canvas. The browser also decodes a 1,000-nit AV1 test frame and checks that the result is brighter
+  than SDR white. Accepting the decoder configuration is not enough.
+- A view that may show HDR uses AV1 for its whole lifetime, because a view cannot change codec
+  family once it is open.
+
+How bright HDR looks depends on the browser, the operating system, and the monitor. Browsers do not
+report a display's peak luminance, so yas leaves HDR display adaptation to the browser.
+
+### Encoder support
+
+| Encoder              | P3 and managed SDR | HDR                             |
+| -------------------- | ------------------ | ------------------------------- |
+| Software H.264       | Yes                | No                              |
+| Software AV1 (rav1e) | Yes                | 10-bit                          |
+| NVENC H.264          | Yes                | No                              |
+| NVENC AV1            | Yes                | 10-bit, depending on the GPU    |
+| VA-API H.264         | Yes                | No                              |
+| VA-API AV1           | Yes                | 10-bit, depending on the driver |
+| Vulkan Video H.264   | Yes                | No                              |
+| Vulkan Video AV1     | Yes                | 10-bit, depending on the driver |
+
+HDR needs an AV1 encoder. With an H.264-only encoder list, HDR content reaches every viewer as P3 or
+sRGB. See [Video encoding and GPUs](/gui/video-encoding) for the encoder list.
+
+## SDR fallback
+
+A viewer that cannot show HDR receives a server-side conversion. It keeps shadow detail, rolls off
+highlights above 75% of diffuse white, compresses out-of-gamut colors toward neutral, and encodes
+to sRGB or P3. When the application supplies mastering or content-light metadata, the curve maps the
+declared peak to SDR white so highlight detail survives. A P3 viewer receives the mapped highlights
+in its wider gamut.
+
+If a viewer's HDR or 4:4:4 stream fails repeatedly in practice, the browser drops that capability
+and reopens the view with a profile that works.
+
+## Sharing windows through PipeWire
+
+An application that captures a yas window through the ScreenCast portal can negotiate these
+formats:
+
+- BT.2020 PQ, as 16-bit float RGBA or packed 10-bit RGB,
+- Display-P3, 8-bit RGBA,
+- sRGB, 8-bit RGBA.
+
+A capture client that does not ask for a color space gets sRGB. Color-aware clients can request P3
+or PQ. Viewer cameras shared into the compositor stay 8-bit RGBA. See
+[Audio, camera, and microphone](/gui/audio-camera-microphone) for the PipeWire instance these
+streams use.
+
+## Screenshots
+
+`yas surface capture` keeps managed color in both formats:
+
+- **PNG:** 16-bit RGB with a `cICP` chunk that names the color space.
+- **AVIF:** 12-bit 4:4:4 AV1 with matching color metadata in the container and the bitstream.
+
+HDR windows are captured as BT.2020 PQ, and color-managed SDR windows as Display-P3. An untagged
+window gives an ordinary 8-bit sRGB PNG:
+
+```bash
+yas surface capture 1
+file surface-1.png
+```
+
+```text
+surface-1.png
+surface-1.png: PNG image data, 1920 x 1080, 8-bit/color RGBA, non-interlaced
+```
+
+<Aside type="note">
+  An image viewer has to read the `cICP` chunk to show a wide-gamut or HDR PNG
+  correctly. Older PNG readers ignore it and display the image with the wrong
+  colors.
+</Aside>

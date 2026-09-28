@@ -1,0 +1,106 @@
+---
+title: "yas remote"
+description: "Manage the server's named remotes."
+sidebar:
+  order: 14
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Manage the server's named remotes
+
+Named remotes let you refer to frequently-used destinations by a short name instead of a full URI. They are stored in a server's `remotes` key/value entry, readable by every client of that server, which is also the catalogue its Relay publishes to the browser. These verbs edit the home server (`YAS_SOCK`, else the default local instance) unless `--on` names another; `YAS_TARGET` and `yas.target` do not redirect them. `--on NAME`, `YAS_TARGET`, and `yas.target` look names up on the home server, and one can be set as the CLI default target with `yas remote set-default`. A legacy ~/.config/yas/yas.remotes file is imported once into a server that has no catalogue yet.
+
+Examples:
+
+```text
+yas remote add rabbit ssh:rabbit
+yas remote add prod ssh:alice@prod.example.com
+yas remote add lab share:mysecret
+yas remote add sandbox 'uplink:https://relay.example#token=TOKEN&server=PUBLIC_KEY' # uses YAS_UPLINK_IDENTITY
+yas remote list
+yas remote remove rabbit
+yas --on rabbit terminal list
+yas remote set-default rabbit
+```
+
+```text
+Usage: yas remote [OPTIONS] [COMMAND]
+```
+
+## yas remote list
+
+List all named remotes.
+
+```text
+Usage: yas remote list [OPTIONS]
+```
+
+Options:
+
+- `--reveal`
+
+  Show embedded credentials in full instead of masking them
+
+## yas remote add
+
+Add or update a named remote.
+
+```text
+Usage: yas remote add [OPTIONS] <NAME> [URI]
+```
+
+Arguments:
+
+- `<NAME>`
+
+  Name for the remote
+
+- `[URI]`
+
+  URI to connect to (ssh:host, tcp:h:p, socket:/p, share:pass, local). Omit to be prompted interactively
+
+## yas remote remove
+
+Remove a named remote.
+
+```text
+Usage: yas remote remove [OPTIONS] <NAME>
+```
+
+Arguments:
+
+- `<NAME>`
+
+  Name of the remote to remove
+
+## yas remote toggle
+
+Disable or enable a named remote without removing it. Disabled remotes stay in the catalogue but are not published by the Relay, and `--on NAME` refuses them until re-enabled.
+
+```text
+Usage: yas remote toggle [OPTIONS] <NAME>
+```
+
+Arguments:
+
+- `<NAME>`
+
+  Name of the remote to toggle
+
+## yas remote set-default
+
+Set the default remote in yas.conf
+
+Writes `yas.target` in this machine's yas.conf. After this, commands without `--on` connect to this remote. A name is looked up on the home server at each connection.
+
+```text
+Usage: yas remote set-default [OPTIONS] <TARGET>
+```
+
+Arguments:
+
+- `<TARGET>`
+
+  Name or URI to use as the default target. Pass an empty string or "local" to reset to local
+

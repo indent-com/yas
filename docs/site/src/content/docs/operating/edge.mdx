@@ -1,0 +1,194 @@
+---
+title: "Serving the browser with yas edge"
+description: "Serve the yas web app from your own machine and let a browser in with a passphrase over WebSocket or WebTransport."
+sidebar:
+  order: 81
+---
+
+The edge is the small web server that gives a browser access to a yas server. It serves the bundled
+web app, asks for a passphrase, and then forwards the browser's session to one server on the same
+machine: the home server. Run it as its own process with `yas edge`, or inside the server with
+`yas server --edge`.
+
+Every setting is an environment variable. Neither command takes edge flags.
+
+<Aside type="danger" title="The passphrase is full control">
+
+A browser that knows the passphrase can do anything the home server can: start processes, read and
+write files, open network connections, and connect every route the server holds credentials for.
+Treat it like an SSH key. See [Security model](/operating/security).
+
+</Aside>
+
+## Run an edge
+
+<Steps titleSize="h3">
+  <Step title="Hash the passphrase">
+    Store an Argon2 hash instead of the plaintext. `yas hash-passphrase` reads the passphrase from its
+    argument, or from standard input when you omit it or pass `-`.
+
+    ```bash
+    printf 'correct horse battery staple\n' | yas hash-passphrase
+    ```
+
+    ```text
+    $argon2id$v=19$m=19456,t=2,p=1$iztxVHm2uRfGhQme2gDQsg$mOacAISoMfaghWr8ehx1nBtGB68IdYnHsf1R+4Rm5nA
+    ```
+
+    The hash is salted, so each run prints a different string. Browsers still type the plaintext.
+
+  </Step>
+  <Step title="Start the edge">
+    Put the hash in `YAS_PASSPHRASE` and start the edge. Single quotes keep the shell from expanding
+    the `$` signs.
+
+    ```bash
+    YAS_PASSPHRASE='$argon2id$v=19$m=19456,t=2,p=1$iztx...' yas edge
+    ```
+
+    ```text
+    yas edge: listening on 127.0.0.1:3264 (WebSocket)
+    ```
+
+    The edge connects to the server named by `YAS_SOCK`, or to the `default` instance's socket when
+    `YAS_SOCK` is unset.
+
+  </Step>
+  <Step title="Open it">
+    Open `http://127.0.0.1:3264/` and enter the plaintext passphrase.
+  </Step>
+</Steps>
+
+To serve the browser from the server process itself, pass `--edge` or set `YAS_EDGE=1`. The same
+variables apply, and you run one process instead of two:
+
+```bash
+YAS_PASSPHRASE='$argon2id$...' yas server --edge
+```
+
+A server-hosted edge that cannot start logs the reason and keeps the server running. A standalone
+`yas edge` exits with status 1 instead.
+
+## Options
+
+- `YAS_PASSPHRASE`: the passphrase, as plaintext or as a PHC string from `yas hash-passphrase`. A
+  value that starts with `$argon2` is treated as a hash. Required, and must not be empty or
+  whitespace.
+- `YAS_EDGE_PASSPHRASE`: the edge's own passphrase. It takes precedence over `YAS_PASSPHRASE`, so a
+  server that runs both `--edge` and `--share` can use a different secret for each.
+- `YAS_ADDR`: the TCP listen address. Defaults to `127.0.0.1:3264`. Use `[::1]:3264` when a proxy
+  connects over IPv6 loopback.
+- `YAS_SOCK`: the home server's socket.
+- `YAS_SERVER_UID`: the numeric user ID the home server must run as. See
+  [Cross-user deployments](#cross-user-deployments).
+- `YAS_TRUSTED_PROXY_IPS`: reverse-proxy addresses allowed to set `X-Forwarded-For`.
+- `YAS_WEBTRANSPORT` and the related variables below.
+
+## Put TLS in front
+
+The edge listens with plain HTTP and WebSocket. The browser sends the passphrase as the first
+WebSocket message, so anyone who can see the traffic can read it. Keep the default loopback address
+unless a TLS reverse proxy (Caddy, nginx, a cloud load balancer) terminates HTTPS in front of the
+edge. The edge does not enforce this. Binding `YAS_ADDR` to a public address is your decision.
+
+The proxy must forward WebSocket upgrades on the `/edge` path and pass the `Sec-WebSocket-Protocol:
+yas.v1` header through. The edge rejects a WebSocket upgrade on `/edge` without that subprotocol
+with `400`, and returns `404` for a WebSocket upgrade on any other path. Every other path serves the
+web app.
+
+### Trusted proxies
+
+The edge limits password guessing per client address: after five failed attempts within five
+minutes, that address is locked out for a minute. Behind a proxy, every browser shares the proxy's
+address, so one person's typos lock out everyone.
+
+Set `YAS_TRUSTED_PROXY_IPS` to the proxy's exact addresses, comma-separated, to fix this:
+
+```bash
+YAS_TRUSTED_PROXY_IPS=127.0.0.1,::1 yas edge
+```
+
+- Only a direct peer on the list may supply `X-Forwarded-For`. The edge reads the header from right
+  to left and uses the first address that is not on the list.
+- Entries must be single addresses. CIDR ranges are rejected at startup:
+
+  ```text
+  yas edge: invalid YAS_TRUSTED_PROXY_IPS: "10.0.0.0/8" is not an exact IPv4 or IPv6 address
+  ```
+
+- Configure the proxy to append the real client address to `X-Forwarded-For`. Never list addresses
+  that untrusted clients can connect from.
+
+## WebTransport
+
+WebSocket delivers everything in order, so one lost packet delays the video and audio behind it.
+With WebTransport enabled, the edge also listens on UDP with QUIC and carries video, audio, and
+other loss-tolerant events as datagrams. The browser tries WebTransport and falls back to WebSocket.
+
+```bash
+YAS_PASSPHRASE='...' YAS_WEBTRANSPORT=1 yas server --edge
+```
+
+```text
+yas edge: listening on 127.0.0.1:3264 (WebSocket)
+yas edge: listening on 127.0.0.1:3264 (WebTransport)
+```
+
+The browser learns where to connect from `/edge-transport.json`:
+
+```bash
+curl http://127.0.0.1:3264/edge-transport.json
+```
+
+```text
+{"webTransport":{"port":3264,"certificateHash":"1b15bc1ac4bf8a692f796447d0759a425cba6ff335918180b0a0a70fe209eaea"}}
+```
+
+`port` is the UDP port the browser dials. `certificateHash` is present when the browser should pin
+the certificate by its SHA-256 hash instead of checking it against system roots. Without
+WebTransport, the file contains `{"webTransport":null}`.
+
+- `YAS_WEBTRANSPORT=1`: enable the UDP listener. Any other value leaves it off.
+- `YAS_WEBTRANSPORT_ADDR`: the UDP bind address. Defaults to `YAS_ADDR`. TCP and UDP can use the
+  same port number.
+- `YAS_WEBTRANSPORT_PUBLIC_PORT`: the UDP port advertised to browsers, when a firewall or port
+  forward exposes a different port. Defaults to the bind port.
+- `YAS_WEBTRANSPORT_CERT` and `YAS_WEBTRANSPORT_KEY`: PEM files for a stable TLS certificate chain
+  and key. Set both or neither.
+- `YAS_WEBTRANSPORT_PIN_CERT=1`: advertise the hash of your own certificate too. Browsers accept a
+  pinned certificate only when it is valid for at most two weeks.
+
+Without a certificate, the edge generates a self-signed one valid for 13 days and advertises its
+hash. A restart generates a new certificate. The web app fetches `/edge-transport.json` before every
+connection attempt, so open pages pick up the new hash when they reconnect. Use a real certificate
+for a service.
+
+QUIC traffic does not pass through an HTTP reverse proxy. Open the UDP port directly.
+
+## Cross-user deployments
+
+Before it forwards a session, the edge asks the kernel which user owns the other end of the home
+server's socket. It accepts only its own user ID and root. When the edge and the server deliberately
+run as different users, set `YAS_SERVER_UID` to the server's numeric user ID. The variable changes
+which user is accepted. There is no way to turn the check off.
+
+A mismatch leaves the edge running, and each browser login fails with a "home server unavailable"
+message. The edge logs the reason:
+
+```text
+yas edge: cannot connect to home server: refusing native home server at /tmp/tmp.hCo2xhdX0A/yas.sock: native home-server peer UID 1001 does not match expected UID 12345
+```
+
+Root is accepted because a socket created by systemd socket activation reports root as its owner.
+You do not need `YAS_SERVER_UID` for the units in
+[Running yas as a system service](/operating/system-services).
+
+<Aside type="note" title="Limits">
+
+- The edge forwards to exactly one home server. Other machines appear in the browser as routes the
+  home server publishes. See [Remotes](/remote/remotes).
+- A login attempt that is refused by the lockout receives `busy`, and the web app keeps the
+  passphrase and retries. A wrong passphrase receives `auth`.
+- The peer user check runs on Linux and macOS. It does not apply on Windows.
+
+</Aside>

@@ -1,0 +1,160 @@
+---
+title: "Audio, camera, and microphone"
+description: "Hear application audio in the browser, and lend a browser's microphone or camera to applications on the yas compositor."
+sidebar:
+  order: 44
+---
+
+Each yas compositor on Linux runs its own private PipeWire instance. Applications you start from a
+yas terminal play into it, and the server streams the mix to browsers as Opus. The same instance
+carries input the other way: a viewer can lend a browser microphone or camera, which appears to
+applications as an ordinary PipeWire source.
+
+<Aside type="caution" title="Experimental">
+  Audio, camera, and microphone support belong to the experimental compositor
+  and run on Linux servers only.
+</Aside>
+
+## Requirements
+
+The server needs these programs on its `PATH` and this library resolvable by the dynamic loader:
+
+- `pipewire`, `pipewire-pulse`, `pw-loopback`, `pw-dump`, and `wpctl`,
+- `dbus-daemon`, for the compositor's private D-Bus session,
+- `libpipewire-0.3.so.0`, loaded at runtime. Set `LD_LIBRARY_PATH` if it lives outside the default
+  search path.
+
+yas also starts `wireplumber` as a minimal session manager, with hardware monitoring turned off.
+
+## What applications see
+
+The private instance never touches the host's audio. Terminals inherit variables that point at it:
+
+- `PIPEWIRE_REMOTE`: the private PipeWire socket.
+- `PULSE_SERVER` and `PULSE_RUNTIME_PATH`: the private PulseAudio-compatible socket, for applications
+  that speak PulseAudio.
+
+Applications play into a sink named **Output**, which is the default. There is nothing to configure
+inside the application.
+
+When PipeWire is unavailable, yas sets `PULSE_SERVER=/dev/null` in terminals. PulseAudio clients
+then fail at once, instead of hanging while they try to start a PulseAudio daemon or reaching the
+host's sound server:
+
+```bash
+yas terminal send 1 'echo $PULSE_SERVER\n'
+yas terminal show 1
+```
+
+```text
+/dev/null
+```
+
+## Listen in the browser
+
+Open **Media settings** in the status bar. The **Sound** section controls desktop audio for this
+browser:
+
+- **Desktop sound**: turn playback on or off for this viewer.
+- **Play through**: the output device the browser plays to.
+- **Sound quality** and **Bitrate**: the Opus bitrate, from 32 to 256 kbps, or **Desktop default**.
+
+All viewers of a compositor share one Opus encoder. The server encodes at the highest bitrate any
+connected viewer asks for, and at 64 kbps when every viewer leaves it at **Desktop default**.
+`YAS_AUDIO_BITRATE` sets the bitrate, in bits per second, that the encoder starts at before a viewer
+connects.
+
+Audio and video carry timestamps from the same clock. The browser measures how far audio lags the
+focused window's video and reports it. yas publishes that delay to applications as PipeWire sink
+latency, so video players can schedule their own frames to match. yas never delays the video or your
+input.
+
+## Share a microphone or camera
+
+<Steps titleSize="h3">
+  <Step title="Open the media panel">
+    Click **Media settings** in the status bar and find **Share from this
+    device**.
+  </Step>
+  <Step title="Pick the device and the target">
+    Choose the microphone or camera. If several connected servers accept input,
+    choose one under **Send to**.
+  </Step>
+  <Step title="Turn on sharing">
+    Turn on **Microphone** or **Camera**. The browser asks for permission the
+    first time. The panel shows the share under **Live now**, and a camera share
+    shows a mirrored local preview.
+  </Step>
+</Steps>
+
+A microphone appears to applications as a PipeWire source named **Input**, and a camera as a video
+source named **Camera**. The source exists only while the share is live. yas does not publish a
+silent microphone or a black camera when nobody is sharing.
+
+The browser starts a device only when you turn it on. Page loads, reconnects, and application
+requests never open a device. A share ends when you turn it off, the browser track ends, the viewer
+disconnects, or the server receives no media for 10 seconds. It does not resume after a reconnect.
+
+Rules for multiple viewers:
+
+- One viewer at a time can share a microphone, and one a camera. A second viewer's attempt is
+  refused. It does not take over the device.
+- Every viewer, including read-only viewers, sees in the panel that a device is being shared.
+- A read-only viewer cannot share a device.
+
+Any application on the compositor can read a shared device. The panel says "this YAS desktop"
+because all processes in the session share one PipeWire graph.
+
+### Formats
+
+The browser chooses a format from what it can encode and what the server accepts. You can pin one
+in the panel under **Capture quality and formats**.
+
+- **Microphone:** Opus (mono, 48 kHz, 20 ms packets) when the browser has an Opus encoder, otherwise
+  uncompressed 16-bit PCM.
+- **Camera:** AV1, H.264, their 4:4:4 variants, or Motion JPEG. The default request is 1280×720 at
+  30 fps. The ceiling is 1920×1080 at 30 fps. Motion JPEG defaults to 15 fps.
+
+Applications that use the xdg-desktop-portal Camera portal find the camera while a viewer is
+sharing one, when `xdg-desktop-portal` is installed on the server. See
+[Clipboard, media players, and notifications](/gui/clipboard-media-notifications#desktop-portals).
+
+## Restrict what viewers may send
+
+Limit the formats the server accepts with server flags:
+
+```bash
+yas server --camera-codecs mjpeg,h264 --microphone-codecs pcm
+```
+
+- `--camera-codecs` (or `YAS_MEDIA_CAMERA_CODECS`): any of `mjpeg`, `h264`, `av1`, `h264-444`,
+  `av1-444`. Each name is one format, so `h264` does not include `h264-444`.
+- `--microphone-codecs` (or `YAS_MEDIA_MICROPHONE_CODECS`): `pcm`, `opus`.
+- `mjpeg` and `pcm` are always accepted, even when omitted. They are the formats every browser can
+  produce.
+- The flag wins over the variable. An invalid flag value stops the server. An invalid variable is
+  ignored.
+
+The panel shows formats the server does not accept as disabled, with the reason.
+
+Compressed camera streams are decoded inside the server. `YAS_MEDIA_CAMERA_DECODERS` sets the
+decoder order, default `nvdec,vaapi,vulkan,software`. Software decoding is always the last resort,
+and `software` alone turns off hardware decoding.
+
+## Turn features off
+
+- `YAS_MEDIA_INPUT=0`: turn off microphone and camera input. `YAS_MEDIA_MICROPHONE=0` and
+  `YAS_MEDIA_CAMERA=0` turn off one kind.
+- `YAS_PORTALS=0`: turn off the desktop portals, including window sharing through ScreenCast.
+- `YAS_AUDIO=0`: do not start PipeWire for audio output.
+
+<Aside type="caution" title="YAS_AUDIO=0 alone keeps audio on">
+  yas starts the private PipeWire instance when any of audio output, media
+  input, or ScreenCast needs it. Once it runs, desktop sound is offered to
+  viewers. To stop PipeWire entirely, set `YAS_AUDIO=0`, `YAS_MEDIA_INPUT=0`,
+  and `YAS_PORTALS=0` together.
+</Aside>
+
+Without the programs or library listed under [Requirements](#requirements), the server runs with no
+audio, microphone, camera, or window sharing. Start the server with `--verbose` to log which
+program or library is missing.

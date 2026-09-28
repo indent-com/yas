@@ -1,0 +1,269 @@
+---
+title: "yas surface"
+description: "Manage compositor surfaces."
+sidebar:
+  order: 5
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Manage compositor surfaces.
+
+```text
+Usage: yas surface [OPTIONS] [COMMAND]
+```
+
+## yas surface list
+
+List all compositor surfaces (TSV: ID, TITLE, SIZE, APP_ID)
+
+```text
+Usage: yas surface list [OPTIONS]
+```
+
+## yas surface close
+
+Close a compositor surface (sends xdg_toplevel close event)
+
+```text
+Usage: yas surface close [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+## yas surface capture
+
+Capture a screenshot of a surface.
+
+```text
+Usage: yas surface capture [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+Options:
+
+- `-o, --output <OUTPUT>`
+
+  Output file path (default: surface-&lt;id&gt;.png). Format is inferred from the extension (.png or .avif) unless `--format` is given
+
+- `-f, --format <FORMAT>`
+
+  Image format: png or avif (default: inferred from `--output`, else png)
+
+- `--width <WIDTH>`
+
+  Resize the surface to this width (pixels) before capturing
+
+- `--height <HEIGHT>`
+
+  Resize the surface to this height (pixels) before capturing
+
+- `--scale <SCALE>`
+
+  Render scale in 120ths (wp_fractional_scale_v1 units). 120 = 1x, 240 = 2x, 180 = 1.5x, etc. Resizes the surface to its current (or `--width/--height`) logical size at this scale before capturing. Default (0) leaves the surface's scale alone
+
+  Default: `0`.
+
+## yas surface click
+
+Click at coordinates on a surface.
+
+```text
+Usage: yas surface click [OPTIONS] <ID> <X> <Y>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+- `<X>`
+
+  X coordinate (pixels)
+
+- `<Y>`
+
+  Y coordinate (pixels)
+
+Options:
+
+- `--button <BUTTON>`
+
+  Mouse button: left, right, middle, back, or forward [default: left]
+
+  Default: `left`.
+
+## yas surface key
+
+Send a key press to a surface (e.g. Return, Escape, a, ctrl+a)
+
+```text
+Usage: yas surface key [OPTIONS] <ID> <KEY>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+- `<KEY>`
+
+  Key name (e.g. a, Return, Escape, F1, ctrl+a, shift+Tab)
+
+## yas surface scroll
+
+Scroll a surface
+
+AMOUNT is in wheel detents — one notch of a physical wheel, which is what an app treats as a scroll step. Positive scrolls down (or right with `--horizontal`). Fractions are allowed.
+
+```text
+Usage: yas surface scroll [OPTIONS] <ID> <AMOUNT>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+- `<AMOUNT>`
+
+  Wheel detents; positive = down/right, negative = up/left
+
+Options:
+
+- `--horizontal`
+
+  Scroll horizontally instead of vertically
+
+- `--smooth`
+
+  Send it the way a trackpad does: smooth surface pixels with no detent count, and `finger` as the source.
+
+  The default speaks as a wheel, which carries `axis_value120` and so takes an entirely different path through every toolkit `--` and through Xwayland, which reads detents outright when they are present and divides the smooth value when they are not. A wheel test therefore says nothing about trackpad scrolling.
+
+## yas surface focus
+
+Give a surface keyboard and pointer focus.
+
+```text
+Usage: yas surface focus [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+## yas surface text
+
+Commit literal UTF-8 text to a surface
+
+Unlike `type`, this sends the text itself rather than synthesised US-QWERTY keystrokes, so non-ASCII characters actually arrive. It has no \{braces\} syntax — use `key` for special keys.
+
+```text
+Usage: yas surface text [OPTIONS] <ID> <TEXT>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+- `<TEXT>`
+
+  Text to commit
+
+## yas surface type
+
+Type text into a surface (xdotool-style: \{Return\}, \{ctrl+a\} for special keys)
+
+```text
+Usage: yas surface type [OPTIONS] <ID> <TEXT>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+- `<TEXT>`
+
+  Text to type
+
+## yas surface record
+
+Record raw encoded video from a compositor surface
+
+Writes Annex B (H.264) or OBU (AV1) that ffplay can play directly. Records until `--frames` or `--duration` is reached, or Ctrl+C.
+
+```text
+Usage: yas surface record [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Surface ID
+
+Options:
+
+- `-o, --output <OUTPUT>`
+
+  Output file path (default: surface-&lt;id&gt;.h264, or surface-&lt;id&gt;.obu for AV1)
+
+- `-f, --frames <FRAMES>`
+
+  Maximum number of frames to record (0 = unlimited)
+
+  Default: `0`.
+
+- `-d, --duration <DURATION>`
+
+  Maximum duration in seconds (0 = unlimited)
+
+  Default: `0`.
+
+- `-c, --codec <CODEC>`
+
+  Codec(s) to announce as supported (comma-separated or repeated). Accepted values: h264, av1, h264-444, av1-444. The `-444` variants also announce 4:4:4 chroma for that codec; the server encodes 4:4:4 only when its own chroma setting and encoder allow it, and falls back to 4:2:0 otherwise. Default: h264 and av1 at 4:2:0
+
+- `-s, --size <SIZE>`
+
+  Ask for the surface at this size, as WIDTHxHEIGHT in physical pixels (e.g. 5120x2880), optionally at a device pixel ratio: WIDTHxHEIGHT@DPR (e.g. 1200x900@3).  Default: whatever other viewers have already negotiated, at 1x.
+
+  The ratio is what makes this viewer a high-DPI one for size mediation: the surface is composited at the highest ratio any viewer claims, and lower-ratio viewers are served a downscale of it.  Claiming one is the only way to exercise that split without a browser.
+
+  Recording writes the bitstream to a file rather than decoding it, so this is also announced as the decode ceiling — which is what lets a recording reach resolutions above the H.264 ceiling that the server will not send to a client that hasn't asked.
+
+- `--encode-size <ENCODE_SIZE>`
+
+  Encode only this recorder's stream at WIDTHxHEIGHT without resizing or participating in mediation for the compositor surface. Useful for exercising a server-side encoder when the native-size stream would use Vulkan Video
+
+- `--fps <FPS>`
+
+  Display refresh rate to advertise to the server. This drives the compositor source clock during browser-free timing tests
+
+  Default: `60`.
+
+- `--timing <TIMING>`
+
+  Also write per-frame timing to this path as CSV: `pts_ms,arrival_ms,bytes,key`.
+
+  `pts_ms` is the capture clock stamped at compositor commit; `arrival_ms` is when the frame reached this process.  Their difference is the delivery jitter a viewer has to absorb, so this measures the pipeline's timing without needing a browser.
+

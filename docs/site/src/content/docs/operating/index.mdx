@@ -1,0 +1,41 @@
+---
+title: "Running yas as a service"
+description: "Serve the browser UI persistently, run yas under systemd, launchd, or Nix, and understand who can do what."
+sidebar:
+  order: 8
+  group:
+    label: "Running yas as a service"
+    icon: "ph:hard-drives"
+---
+
+Run yas permanently on a machine you administer.
+
+<CardGrid>
+  <Card title="Serving the browser with yas edge" href="/operating/edge">
+    Serve the yas web app from your own machine and let a browser in with a
+    passphrase over WebSocket or WebTransport.
+  </Card>
+  <Card
+    title="Running yas as a system service"
+    href="/operating/system-services"
+  >
+    Start a yas server at login or boot with the checked-in systemd units, and
+    let systemd create its socket.
+  </Card>
+  <Card title="Nix modules" href="/operating/nix">
+    Run a yas server, its browser edge, and its WebRTC share from a NixOS or
+    nix-darwin configuration.
+  </Card>
+  <Card title="Security model" href="/operating/security">
+    Who can do what on a yas server: full-control connections, read-only shares,
+    uplink keys, and the switches that narrow them.
+  </Card>
+  <Card title="GPU sandboxes on Tensorlake" href="/operating/tensorlake">
+    Build a yas image from a checkout and start it in a Tensorlake GPU sandbox
+    with a public HTTPS edge and a WebRTC share.
+  </Card>
+  <Card title="Troubleshooting" href="/operating/troubleshooting">
+    Find out why a yas server misbehaves with @doctor, the event journal, the
+    client list, verbose logs, and fixes for common failures.
+  </Card>
+</CardGrid>

@@ -90,26 +90,10 @@ and publishes the fixed-version vendored terminal crate before
 
 ## Local service installation
 
-`yas generate <prefix>/share` writes man pages and shell completions beside an
-installation. Checked-in user units live in [`systemd/`](systemd/); NixOS and
-nix-darwin modules are documented in [`nix/README.md`](nix/README.md).
-
-For a user service on Linux:
-
-```sh
-systemctl --user enable --now yas.socket
-```
-
-System installations can run read-only WebRTC shares with
-`yas-share@.service`; each instance reads `/etc/yas/share-<name>.env` for its
-passphrase. Persistent authenticated browser access is provided by `yas edge`.
-The NixOS and nix-darwin modules expose named `edges` and `shares` options.
-
-For Homebrew on macOS:
-
-```sh
-brew services start yas
-```
+Running yas under systemd, launchd, or the Nix modules is documented at
+[docs.yas.run/operating/system-services](https://docs.yas.run/operating/system-services) and
+[docs.yas.run/operating/nix](https://docs.yas.run/operating/nix). The checked-in user units live
+in [`systemd/`](systemd/).
 
 ## Uplink services
 
@@ -129,4 +113,4 @@ private identities. Keys and the producer allowlist are loaded at startup;
 restart the uplink service to apply rotation or revocation. Upgrading from
 bearer-only uplinks requires configuring both endpoints and updating consumer
 URIs. Relays must forward opaque TLS records and encrypted datagrams. See
-[uplink setup and protocol](docs/uplink.md).
+[uplink setup](https://docs.yas.run/remote/uplink) and the [uplink protocol](docs/design/uplink.md).

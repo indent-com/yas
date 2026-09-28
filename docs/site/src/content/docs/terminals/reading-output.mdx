@@ -1,0 +1,199 @@
+---
+title: "Reading terminal output"
+description: "Read a terminal's screen, scrollback, per-command output, and new output since a cursor, and wait for commands to finish."
+sidebar:
+  order: 32
+---
+
+yas keeps each terminal's parsed screen and scrollback on the server, so any client can read what a program printed without having watched it happen. This page covers the commands that read output and the ones that block until something happens. They work on every terminal. The per-command commands, `journal` and `output`, need a shell that marks its commands with OSC 133 (see [Shell integration](/terminals/shell-integration)).
+
+## Read the screen
+
+`yas terminal show` prints what is on screen now:
+
+```bash
+yas terminal show 1
+```
+
+```text
+hello from /usr/share
+```
+
+The output has one line per terminal row, including blank rows below the last line of text.
+
+- `--ansi` keeps color and style escape sequences.
+- `--cols N` and `--rows N` resize the terminal before reading, so a narrow terminal does not wrap long lines.
+
+## Read scrollback
+
+`yas terminal history` prints scrollback plus the screen. Without options it prints everything, up to 10,000 lines per terminal by default, so pass a position and a limit:
+
+```bash
+yas terminal history 9 --from-end 3 --limit 3
+```
+
+```text
+96
+97
+98
+```
+
+- `--from-end N` starts N lines from the bottom. `0` is the newest line.
+- `--from-start N` starts N lines from the top. `0` is the oldest retained line.
+- `--limit N` caps the number of lines.
+- `--ansi`, `--cols`, and `--rows` work as they do for `show`.
+
+## Read what is new since a cursor
+
+`history --since CURSOR` prints only text appended after a cursor, then prints the next cursor on standard error. Feed that cursor back in and each byte arrives once:
+
+```bash
+c=$(yas terminal history 6 --since start 2>&1 >/dev/null | cut -d' ' -f2)
+yas terminal send 6 'echo again\n'
+yas terminal history 6 --since "$c"
+```
+
+```text
+echo again
+again
+$
+cursor: 14:2
+```
+
+A cursor is a line sequence number and an optional column, `SEQ` or `SEQ:COL`. Sequence numbers count every line since the terminal started, so they keep naming the same text while it scrolls. `start` means the oldest retained text.
+
+- `--json` prints one object with the text and the cursors:
+
+  ```text
+  {"alt_screen":false,"cursor":"10:2","evicted":false,"next_cursor":"12:2","pty":6,"text":"echo next\nnext\n$","truncated":false}
+  ```
+
+  `next_cursor` is where to continue. `truncated` is true when the reply hit the size cap. `evicted` is true when part of the requested range had already scrolled out of the scrollback. `alt_screen` is true when the program is on the alternate screen, where full-screen programs draw. Text there does not advance the cursor.
+
+- `--max-bytes N` caps the reply. The default is 256 KiB.
+
+The text includes everything the terminal printed, including the shell's echo of typed commands and its prompt.
+
+## List the commands a shell ran
+
+With OSC 133 shell integration, the server records each command: its text, exit code, duration, and the range of output it produced.
+
+```bash
+yas terminal journal 6
+```
+
+```text
+INDEX	STATUS	EXIT	MS	START_SEQ	END_SEQ	COMMAND
+0	exited	0	0	1	1	cd /usr/share
+1	exited	0	8	2	5	ls | head -3
+2	exited	1	0	6	6	false
+3	exited	0	2005	7	8	sleep 2; echo "tests passed"
+```
+
+- **INDEX** numbers commands per terminal. Indices are never reused, so you can pass one to `yas terminal output`.
+- **STATUS** is `running`, `exited`, or `incomplete`. A command is incomplete when a new prompt appeared before it reported an exit, which happens after Ctrl+C or with a shell that only marks prompts.
+- **EXIT** is the exit code, or `-` when the shell did not report one.
+- **MS** is how long the command ran, in milliseconds.
+- **START_SEQ** and **END_SEQ** bound the command's output as line sequence numbers, the same numbers `history --since` uses.
+- **COMMAND** is the command line as the shell drew it.
+
+`journal` prints the newest 20 records. `--from INDEX` starts at an index, `--limit N` changes the count, and `--json` prints one object per record. A terminal whose shell sends no markers has an empty journal, and `journal` says so on standard error:
+
+```text
+yas: no commands recorded — does the shell emit OSC 133? See https://docs.yas.run/terminals/shell-integration
+```
+
+The server keeps the last 256 records per terminal. `YAS_TERM_JOURNAL_MAX` changes that, and `YAS_TERM_JOURNAL=0` turns the journal off.
+
+## Run a command in a live shell and collect its result
+
+`yas terminal output` prints one command's output. With `--wait`, it blocks on the server until the running command finishes, or until the next command starts and finishes when none is running. It then prints the output and exits with the command's exit code:
+
+```bash
+yas terminal send 6 'sleep 2; echo "tests passed"\n'
+yas terminal output 6 --wait 60
+echo "exit=$?"
+```
+
+```text
+tests passed
+exit=0
+```
+
+A failing command passes its code through, and a timeout exits with 124:
+
+```bash
+yas terminal send 6 'sh -c "sleep 1; exit 4"\n'
+yas terminal output 6 --wait 60; echo "exit=$?"
+yas terminal send 6 'sleep 5\n'
+yas terminal output 6 --wait 1; echo "exit=$?"
+```
+
+```text
+exit=4
+exit=124
+```
+
+Pass an index to read an older command:
+
+```bash
+yas terminal output 6 1
+```
+
+```text
+ImageMagick-7
+X11
+alsa
+```
+
+- `--json` prints the text with its index and next cursor: `{"index":1,"next_cursor":"5:0","output_evicted":false,"text":"ImageMagick-7\nX11\nalsa","truncated":false}`.
+- `--max-bytes N` caps the output. The default is 256 KiB, and the reply says where to continue.
+
+## Wait for a terminal to exit or print a line
+
+`yas terminal wait ID --timeout SECONDS` blocks until the terminal's program exits and exits with its code. See [Controlling terminals](/terminals/controlling-terminals#wait-for-a-terminal-to-exit).
+
+`--pattern REGEX` returns as soon as a line of output matches, printing the line and exiting with 0. It matches only output produced after the wait began, so text already on screen does not satisfy it. On a terminal that has already exited, `wait` returns the exit status immediately.
+
+```bash
+yas terminal wait "$ID" --timeout 120 --pattern 'BUILD (SUCCESS|FAILURE)'
+```
+
+## Search output
+
+`yas terminal grep PATTERN [ID...]` searches scrollback and screen with ripgrep-style options. Lines that wrapped across rows are joined before matching.
+
+```bash
+yas terminal grep alsa
+```
+
+```text
+pty:2 (tag=shell) (title=user@e2b: /tmp)
+4:alsa
+pty:6 (tag=dev)
+5:alsa
+```
+
+With no IDs it searches every terminal. Pass IDs to search only those terminals. `--tag`, `--title`, `--running`, and `--exited` filter which terminals it searches.
+
+## Trace server events
+
+The server also keeps a binary journal of its own events: clients connecting and disconnecting, terminals exiting, and, when enabled, protocol traffic. Use it to debug what happened to a terminal or a client.
+
+```bash
+yas events tail --from-now
+```
+
+```text
++465.001310130s #261 client.native.connect session=c912f50e6838fd79683fb1718d28ec76 name="yas-cli" release="0.3.0"
++465.017231233s #263 pty.exit required pty=17 status=0 reason="exited"
+```
+
+`yas events dump` prints the retained history and `yas events config` shows which event types are on. See [Events](/reference/events).
+
+<Aside type="caution" title="Limits in yas 0.3.0">
+
+- `yas terminal wait --pattern` on a running terminal fails with `YAS Terminal query returned 36 bytes; collection limit is 1`. `yas terminal history --since now` fails with the same error. Use `output --wait` with shell integration, or poll `history --since` from a cursor.
+- A `--since` cursor past the end of the output fails with `failed with Internal`.
+
+</Aside>

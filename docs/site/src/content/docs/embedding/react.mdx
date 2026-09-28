@@ -1,0 +1,282 @@
+---
+title: "React"
+description: "Render yas terminals and surfaces inside a React app with the @yas-run/react components and hooks."
+sidebar:
+  order: 91
+---
+
+`@yas-run/react` puts yas terminals and graphical surfaces inside your own React app. It is a thin
+wrapper over `@yas-run/core`: a `YasWorkspace` from core owns the connections, each connection owns
+its terminals, and a `YasTerminal` component draws one terminal by ID on a WebGL canvas. The
+browser connects to a yas edge, a WebRTC share, an uplink, or any transport you write.
+
+## Install
+
+```bash
+npm install --legacy-peer-deps @yas-run/react @yas-run/core @yas-run/browser react react-dom
+```
+
+- `@yas-run/core` holds the workspace, transports, and renderers.
+- `@yas-run/browser` is the WebAssembly module that turns terminal state into vertex data.
+- React 18 or later is a peer dependency.
+
+<Aside type="caution" title="Peer dependency range in 0.3.0">
+
+`@yas-run/core` 0.3.0 declares `@yas-run/browser >=0.9.0` as a peer, but the matching browser
+package is 0.3.0. npm refuses the install with `ERESOLVE` unless you pass `--legacy-peer-deps`.
+pnpm and Yarn print a warning and continue.
+
+</Aside>
+
+## Render a terminal
+
+You need a server with an edge that the browser can reach. For a local test, start a private
+server that serves the edge on port 3399:
+
+```bash
+D=$(mktemp -d)
+YAS_PASSPHRASE=docs-test-pass YAS_ADDR=127.0.0.1:3399 \
+  yas server --socket "$D/yas.sock" --name docs --edge &
+```
+
+```text
+yas edge: listening on 127.0.0.1:3399 (WebSocket)
+```
+
+This component connects to that edge, opens a shell when the server has no terminals, and renders
+the focused one. It ran unchanged against yas 0.3.0 with React 19 and the Vite 8 dev server.
+
+```tsx
+import { useEffect, useMemo } from "react";
+import { YasWorkspace } from "@yas-run/core";
+import {
+  YasTerminal,
+  YasWorkspaceProvider,
+  useYasConnection,
+  useYasFocusedSession,
+  useYasSessions,
+  useYasWorkspace,
+} from "@yas-run/react";
+
+const wasm = import("@yas-run/browser").then(async (mod) => {
+  await mod.default();
+  return mod;
+});
+
+export function App({ url, passphrase }: { url: string; passphrase: string }) {
+  const workspace = useMemo(
+    () =>
+      new YasWorkspace({
+        wasm,
+        connections: [
+          { id: "default", transport: { type: "websocket", url, passphrase } },
+        ],
+      }),
+    [url, passphrase],
+  );
+  useEffect(() => () => workspace.dispose(), [workspace]);
+
+  return (
+    <YasWorkspaceProvider workspace={workspace} fontSize={14}>
+      <TerminalScreen />
+    </YasWorkspaceProvider>
+  );
+}
+
+function TerminalScreen() {
+  const workspace = useYasWorkspace();
+  const connection = useYasConnection("default");
+  const sessions = useYasSessions();
+  const focused = useYasFocusedSession();
+
+  useEffect(() => {
+    if (!connection?.ready || sessions.length > 0) return;
+    void workspace
+      .createSession({ connectionId: "default", rows: 24, cols: 80 })
+      .then((session) => workspace.focusSession(session.id));
+  }, [connection?.ready, sessions.length, workspace]);
+
+  const sessionId = focused?.id ?? sessions[0]?.id ?? null;
+  useEffect(() => {
+    workspace.setVisibleSessions(sessionId ? [sessionId] : []);
+  }, [sessionId, workspace]);
+
+  return (
+    <YasTerminal
+      sessionId={sessionId}
+      style={{ width: "100vw", height: "100vh" }}
+    />
+  );
+}
+```
+
+Mount it with `url="ws://127.0.0.1:3399/edge"` and `passphrase="docs-test-pass"`. Two details in
+this example are required:
+
+- Wait for `connection.ready` before calling `createSession`. Before the server's HELLO arrives,
+  the call rejects with `Terminal family is not ready or was not negotiated`.
+- Call `setVisibleSessions` with the terminals on screen. A terminal created by this client
+  streams immediately, but a terminal that already existed on the server draws nothing until it is
+  listed as visible.
+
+Stop the private server when you are done:
+
+```bash
+YAS_SOCK="$D/yas.sock" yas quit
+```
+
+## Components
+
+### `YasWorkspaceProvider`
+
+Puts the workspace and default rendering settings in context. Every component and hook below must
+have one as an ancestor, or it throws `YAS components require a YasWorkspaceProvider ancestor`.
+
+| Prop           | Type              | Purpose                                                    |
+| -------------- | ----------------- | ---------------------------------------------------------- |
+| `workspace`    | `YasWorkspace`    | The workspace every descendant reads.                      |
+| `palette`      | `TerminalPalette` | Default color palette. `PALETTES` in core lists built-ins. |
+| `fontFamily`   | `string`          | Default CSS font family.                                   |
+| `fontSize`     | `number`          | Default font size in CSS pixels.                           |
+| `advanceRatio` | `number`          | Default glyph advance-width to units-per-em ratio.         |
+| `textGamma`    | `number`          | Default coverage gamma for glyph antialiasing.             |
+| `children`     | `ReactNode`       | Your tree.                                                 |
+
+### `YasTerminal`
+
+Renders one terminal in a `<div>` with `position: relative` and `overflow: hidden`. Font, palette,
+advance ratio, and gamma props override the provider's values.
+
+| Prop             | Type                                            | Default                                                   |
+| ---------------- | ----------------------------------------------- | --------------------------------------------------------- |
+| `sessionId`      | `SessionId \| null`                             | required; `null` draws nothing                            |
+| `fontFamily`     | `string`                                        | provider, then `ui-monospace, monospace`                  |
+| `fontSize`       | `number`                                        | provider, then `13`                                       |
+| `palette`        | `TerminalPalette`                               | provider                                                  |
+| `readOnly`       | `boolean`                                       | `false`                                                   |
+| `resizable`      | `boolean`                                       | `true`                                                    |
+| `fitWidth`       | `boolean`                                       | `false`                                                   |
+| `showCursor`     | `boolean`                                       | `true`                                                    |
+| `onRender`       | `(renderMs: number) => void`                    | none                                                      |
+| `scrollbarColor` | `string`                                        | `rgba(255,255,255,0.3)`                                   |
+| `scrollbarWidth` | `number`                                        | `4`                                                       |
+| `advanceRatio`   | `number`                                        | provider                                                  |
+| `textGamma`      | `number`                                        | provider, then `1.4` on Apple platforms and `1` elsewhere |
+| `className`      | `string`                                        | none                                                      |
+| `style`          | `CSSProperties`                                 | none                                                      |
+| `surfaceRef`     | `(surface: YasTerminalSurface \| null) => void` | none                                                      |
+
+- `resizable` resizes the remote terminal to fit the component. Set it to `false` for a passive
+  preview that must keep the host's size.
+- `readOnly` stops keyboard and mouse input. Sizing still follows `resizable`.
+- `fitWidth` scales and centers a passive preview to the container's width. It has no effect while
+  `resizable` is true.
+- `surfaceRef` receives the core `YasTerminalSurface` after mount and `null` on unmount.
+
+Pass a `ref` to get a `YasTerminalHandle` with `terminal` (the WASM terminal, or `null`), `rows`,
+`cols`, `status`, and `focus()`. The component takes `ref` as a plain prop, which React 19 passes
+through to function components.
+
+### `YasSurfaceView`
+
+Renders one graphical window from a terminal's compositor. See
+[Rendering surfaces in your app](/embedding/surfaces) for props, sizing, and input.
+
+## Hooks
+
+Each hook subscribes to the workspace snapshot with `useSyncExternalStore`, so components re-render
+when connections, terminals, or focus change.
+
+| Hook                                                  | Returns                                                          |
+| ----------------------------------------------------- | ---------------------------------------------------------------- |
+| `useYasWorkspace()`                                   | The `YasWorkspace` from context.                                 |
+| `useYasWorkspaceState()`                              | The whole `YasWorkspaceSnapshot`.                                |
+| `useYasSessions()`                                    | Every terminal on every connection.                              |
+| `useYasSession(sessionId)`                            | One terminal, or `null`.                                         |
+| `useYasFocusedSession()`                              | The focused terminal, or `null`.                                 |
+| `useYasConnection(connectionId?)`                     | One connection snapshot, or `null`.                              |
+| `useYasWorkspaceConnection(workspace, id, transport)` | Nothing. Adds the connection on mount and removes it on unmount. |
+
+`useYasConnection()` without an ID returns the only connection when there is one, then the focused
+terminal's connection, then the first connection. A connection snapshot carries `status`, `ready`,
+`error`, `rttMs`, and `supports*` flags for optional server features such as `supportsCompositor`
+and `supportsGit`.
+
+The hooks are also exported from `@yas-run/react/hooks`.
+
+## Workspace operations
+
+Call these on the object from `useYasWorkspace()`.
+
+- `createSession({ connectionId, rows, cols, command?, argv?, cwd?, cwdFromSessionId?, env?, tag?, deadlineMs?, subscribe? })`
+  starts a terminal and resolves with its `YasSession`. `command` runs through the server's login
+  shell; `argv` runs a program directly.
+- `closeSession(id)`, `restartSession(id)`, and `killSession(id, signal = 15)` end or restart a
+  terminal.
+- `awaitSessionExit(id, { timeoutMs? })` resolves when the terminal exits or closes.
+- `focusSession(id | null)` sets the focused terminal.
+- `setVisibleSessions(ids)` sets which terminals stream frames to this client.
+- `sendInput(id, bytes)`, `resizeSession(id, rows, cols)`, and `scrollSession(id, offset)` drive a
+  terminal without a component.
+- `search(query, { connectionId? })` searches terminal titles, screens, and scrollback on one or
+  every connection.
+- `addConnection({ id, transport })`, `removeConnection(id)`, and `reconnectConnection(id)` manage
+  connections after construction.
+- `dispose()` closes every connection.
+
+## Transports from TypeScript
+
+A connection's `transport` is either a configuration object or a `YasTransport` instance. The
+configuration types are:
+
+| `type`      | Fields                           | Builds                      | Use it for                                         |
+| ----------- | -------------------------------- | --------------------------- | -------------------------------------------------- |
+| `websocket` | `url`, `passphrase`, `options?`  | `YasEdgeWebSocketTransport` | A yas edge at `wss://host/edge`.                   |
+| `share`     | `hubUrl`, `passphrase`, `debug?` | `createShareTransport(...)` | A WebRTC share, read-write or read-only by secret. |
+| `uplink`    | `url`, `identity`, `options?`    | `YasUplinkTransport`        | A server behind an uplink relay.                   |
+| `custom`    | `transport`                      | your object                 | Anything else.                                     |
+
+`@yas-run/core` and its `@yas-run/core/transports` subpath export these constructors:
+
+- `YasEdgeWebSocketTransport(url, passphrase, options?)`: the baseline browser path to an edge.
+  Exported from the package root.
+- `YasWebTransportTransport(url, passphrase, { serverCertificateHash? })`: an edge's WebTransport
+  listener, which adds unreliable datagrams for surface and media events. Pass a hex SHA-256 hash,
+  or a function that resolves one before every attempt, for a self-signed certificate. Exported
+  from `@yas-run/core/transports`.
+- `createShareTransport(hubUrl, passphrase, debug?)`: signals through the hub and opens WebRTC
+  DataChannels to `yas share`.
+- `createWebRtcDataChannelTransport(peerConnection, options?)`: uses an `RTCPeerConnection` you
+  negotiated yourself. It opens `yas.v1` and, unless `datagrams: false`, `yas.v1.datagram`.
+  Exported from `@yas-run/core/transports`.
+- `YasUplinkTransport(url, privateKey, options?)`: connects through an uplink relay with WebCrypto.
+  `generateUplinkKeyPair()` and `uplinkPublicKey(privateKey)` create and read identities.
+- `YasNoiseTransport(carrier, privateKey, serverPublicKey, options?)`: runs the uplink's Noise
+  handshake over a carrier transport you supply.
+- `NodeUnixSocketTransport`, `BunUnixSocketTransport`, and `DenoUnixSocketTransport`: local Unix
+  sockets from server-side runtimes, exported from `@yas-run/core/node`. See
+  [Node and Bun clients](/embedding/node-clients).
+
+The edge, WebTransport, DataChannel, uplink, and Unix transports accept these options:
+
+- `reconnect`: reconnect automatically after a drop. Default `true`.
+- `reconnectDelay`: first retry delay in milliseconds. Default `500`.
+- `maxReconnectDelay`: longest retry delay. Default `10000`.
+- `reconnectBackoff`: delay multiplier per retry. Default `1.5`.
+- `connectTimeoutMs`: connection timeout. The edge WebSocket has none; the others default to
+  `10000`.
+
+The share transport manages its own retries, starting at 1 second and backing off to 30 seconds.
+
+To write your own transport, implement `YasTransport`: `connect()`, `send(bytes)`, `close()`,
+`status`, `authRejected`, `lastError`, and `addEventListener` / `removeEventListener` for
+`message`, `statuschange`, and optionally `datagram`. Set `yasFraming` to `"stream"` when your
+transport carries the raw byte stream (preface, then length-prefixed frames), or leave it as
+`"message"` when each message is one frame without the length prefix, as on the edge WebSocket.
+
+<Aside type="note">
+
+The edge passphrase grants full control of the home server. Serve the edge over `wss://` whenever
+the browser is not on the same machine. See [Serving the browser with yas edge](/operating/edge).
+
+</Aside>

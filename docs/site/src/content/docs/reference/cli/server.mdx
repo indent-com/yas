@@ -1,0 +1,251 @@
+---
+title: "yas server"
+description: "Run the yas terminal multiplexer server."
+sidebar:
+  order: 24
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Run the yas terminal multiplexer server.
+
+```text
+Usage: yas server [OPTIONS]
+```
+
+Options:
+
+- `--name <NAME>`
+
+  Isolate this server's socket, databases, caches, and extension settings under NAME (or set `YAS_SERVER_NAME`)
+
+  Default: `default`. Environment: `YAS_SERVER_NAME`.
+
+- `--socket <SOCKET>`
+
+  IPC socket/pipe path (or set `YAS_SOCK`)
+
+- `--shell-flags <SHELL_FLAGS>`
+
+  Shell flags (default: li, or set `YAS_SHELL_FLAGS`)
+
+- `--scrollback <SCROLLBACK>`
+
+  Scrollback buffer size in lines
+
+- `--fd-channel <FD_CHANNEL>`
+
+  Accept clients via fd-passing on this file descriptor (Unix only)
+
+- `--export-sock`
+
+  Export the server socket path as `YAS_SOCK` in spawned terminals (or set `YAS_EXPORT_SOCK=1`). Without it, terminals still never inherit a `YAS_SOCK` that names a different server
+
+- `--inject-path`
+
+  Append the server binary's directory to PATH in spawned terminals, so `yas` is callable inside them (or set `YAS_INJECT_PATH=1`)
+
+- `--max-ptys <N>`
+
+  Maximum number of live terminals. Overrides `YAS_MAX_PTYS`; unlimited by default. Exited terminals are bounded separately by `YAS_MAX_EXITED`. A create refused past the cap answers CREATE2(WANT_STATUS) with a budget status instead of hanging
+
+- `--surface-encoders <LIST>`
+
+  Surface video encoders to try, best first: av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, av1-vulkan, h264-vulkan, h264-software, av1-software (or set `YAS_SURFACE_ENCODERS`). The first entry a viewer can decode and this host can build wins
+
+- `--camera-codecs <LIST>`
+
+  Camera formats viewers may send: mjpeg, h264, av1, h264-444, av1-444 (or set `YAS_MEDIA_CAMERA_CODECS`). Each name selects one format — h264 does not imply h264-444. mjpeg is always accepted. Narrows what this host can decode; never widens it
+
+- `--microphone-codecs <LIST>`
+
+  Microphone formats viewers may send: pcm, opus (or set `YAS_MEDIA_MICROPHONE_CODECS`). pcm is always accepted — it is the fallback a browser reaches when it cannot encode Opus
+
+- `--allow-forward <PATTERN>`
+
+  Restrict what the TCP/UDP relay may reach: host[:ports], where host is a name, a \*.suffix glob, an address, a CIDR block, or \*, and ports is a comma-separated list of n or n-m. Repeatable (or set `YAS_ALLOW_FORWARD` to a comma-separated list). Unrestricted when absent; loopback is always permitted
+
+- `--allow-forward-insecure`
+
+  Permit relayed TLS streams to skip certificate verification (or set `YAS_ALLOW_FORWARD_INSECURE=1`). Right for a self-signed dev server on loopback, wrong for anything reached across a network
+
+- `--no-persistent-extensions`
+
+  Refuse durable extensions and do not restore desired definitions (or set `YAS_ALLOW_EXT_PERSIST=0`). Transient extensions still run. This is the recovery path for a persistent definition that breaks the server it starts in
+
+- `--edge`
+
+  Serve the browser here too, instead of running `yas edge` beside this server (or set `YAS_EDGE=1`). Needs `YAS_PASSPHRASE`; listens on `YAS_ADDR` (default 127.0.0.1:3264)
+
+- `--share`
+
+  Publish this server over WebRTC from here too, instead of running `yas share` beside it (or set `YAS_SHARE=1`). Set `YAS_PASSPHRASE` for a share whose URL survives a restart
+
+- `--no-extensions`
+
+  Disable extensions (equivalent to `YAS_EXT=0`)
+
+- `--no-channels`
+
+  Disable native channels (equivalent to `YAS_CHANNEL=0`)
+
+- `--ext-max-running <N>`
+
+  Maximum concurrent running extension attempts
+
+- `--ext-max-persistent <N>`
+
+  Maximum persistent extension definitions
+
+- `--ext-max-transient <N>`
+
+  Maximum active transient extension supervisors
+
+- `--ext-follow-max-per-client <N>`
+
+  Maximum followed extensions per client
+
+- `--ext-follow-max <N>`
+
+  Maximum extension follower cursors server-wide
+
+- `--ext-argument-store-max <BYTES>`
+
+  Maximum retained extension argument bytes
+
+- `--ext-module-max <BYTES>`
+
+  Maximum raw extension-object bytes (hard ceiling: 64 MiB)
+
+- `--ext-object-cache-max <BYTES>`
+
+  Maximum extension object-cache bytes
+
+- `--ext-object-cache-max-entries <N>`
+
+  Maximum extension object-cache entries
+
+- `--ext-upload-max-per-client <N>`
+
+  Maximum active uploads per client
+
+- `--ext-upload-max-active <N>`
+
+  Maximum active extension uploads server-wide
+
+- `--ext-upload-timeout <SECONDS>`
+
+  Active-upload idle timeout in seconds
+
+- `--ext-pending-timeout <SECONDS>`
+
+  Pending extension-creation timeout in seconds
+
+- `--ext-max-validating <N>`
+
+  Maximum concurrent module validations
+
+- `--ext-memory-max <BYTES>`
+
+  Maximum runtime memory bytes per attempt
+
+- `--ext-outbox-max <BYTES>`
+
+  Queued extension egress byte ceiling
+
+- `--ext-outbox-messages-max <N>`
+
+  Maximum queued messages per extension endpoint
+
+- `--ext-outbox-timeout <SECONDS>`
+
+  Full extension-output no-progress timeout in seconds
+
+- `--ext-job-max-per-client <N>`
+
+  Maximum active tracked jobs per extension endpoint
+
+- `--ext-job-max <N>`
+
+  Maximum active tracked extension jobs server-wide
+
+- `--ext-job-pending-max-per-client <N>`
+
+  Maximum pending tracked jobs per extension endpoint
+
+- `--ext-job-pending-max <N>`
+
+  Maximum pending tracked extension jobs server-wide
+
+- `--ext-job-bytes-max-per-client <BYTES>`
+
+  Maximum tracked-job request bytes per extension endpoint
+
+- `--ext-job-bytes-max <BYTES>`
+
+  Maximum tracked-job request bytes server-wide
+
+- `--ext-output-retain-max <BYTES>`
+
+  Maximum retained extension output bytes server-wide
+
+- `--ext-terminal-retain <SECONDS>`
+
+  Terminal replay lease for transient extensions, in seconds
+
+- `--ext-command-store-max <BYTES>`
+
+  Maximum command-record and discovery-snapshot bytes
+
+- `--ext-command-snapshot-max <N>`
+
+  Maximum active command-discovery snapshots
+
+- `--ext-table-elements-max <N>`
+
+  Maximum aggregate Wasm table elements per attempt
+
+- `--ext-value-stack-max <BYTES>`
+
+  Maximum interpreter value-stack bytes per attempt
+
+- `--ext-call-depth-max <N>`
+
+  Maximum Wasmi call depth per attempt
+
+- `--ext-stack-size <BYTES>`
+
+  Native stack bytes per extension thread
+
+- `--ext-fuel-slice <N>`
+
+  Fuel replenished per extension driver slice
+
+- `--channel-max-listen-per-client <N>`
+
+  Maximum channel listeners per client
+
+- `--channel-max-listeners <N>`
+
+  Maximum channel listeners server-wide
+
+- `--channel-max-per-client <N>`
+
+  Maximum connected channel handles per client
+
+- `--channel-max-connected <N>`
+
+  Maximum connected channel pairs server-wide
+
+- `--channel-buffer-max <BYTES>`
+
+  Maximum reserved channel-window bytes server-wide
+
+- `-v, --verbose`
+
+  Enable verbose logging
+
+- `--no-processes`
+
+  Disable native non-PTY child processes (or set `YAS_PROCESS=0`)
+

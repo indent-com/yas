@@ -1,0 +1,225 @@
+---
+title: "Troubleshooting"
+description: "Find out why a yas server misbehaves with @doctor, the event journal, the client list, verbose logs, and fixes for common failures."
+sidebar:
+  order: 86
+---
+
+When a server does not do what you expect, start with the tools yas has for looking at itself: the
+`@doctor` extension, the event journal, the client list, and the server's own log. The last section
+lists failures with the message each one prints.
+
+## Run @doctor
+
+`@doctor` is a bundled extension that checks the path a command takes through the server: the
+protocol handshake, the extension runtime, and which features the server offers. It does not test
+audio, video encoding, or the compositor.
+
+<Steps titleSize="h3">
+  <Step title="Install it">
+
+    ```bash
+    yas ext run --persist --restart always doctor https://yas.run/ext/doctor.js
+    ```
+
+  </Step>
+  <Step title="Run it">
+
+    ```bash
+    yas @doctor
+    ```
+
+    ```text
+    Checks
+      ✓ protocol: YAS v1 minor 1
+      ✓ command transport: yas.cli.v1 invocation arrived over a native channel
+      ✓ extension identity: @doctor revision 1, attempt 1
+      ✓ lifecycle: persistent, enabled, and desired-running
+      ✓ server identity: docs 0.3.0, boot 31f8747b1cc19e30dbbc7fefc92cee6e
+      ✓ clocks: 1.124 ms monotonic sleep; realtime available
+      ✓ entropy: 32 of 32 requested bytes returned
+
+    Native families
+      ✓ available: terminal, surface, desktop, media, files, git, LSP, KV, process, network,
+                   channel, extension, environment
+      ○ absent:    none
+
+    Summary
+      healthy — 7 passed, 0 warnings, 0 failed; 0 optional capabilities absent
+    ```
+
+  </Step>
+</Steps>
+
+- **Checks** marks each check `✓` (pass), `!` (warning), or `✗` (failure).
+- **Native families** lists the features the server offers. A feature turned off with a switch such
+  as `YAS_KV=0`, or not built for the platform, appears under **absent**. Absent is not a failure.
+- **Summary** reads `healthy` when no check failed and `degraded` otherwise.
+
+`@doctor` exits with status 0 when healthy and 1 when degraded. `yas @doctor --json` prints the same
+report as one JSON document with `"schema": "yas.doctor.v1"`.
+
+## Read the event journal
+
+The server records events in an in-memory ring: clients connecting and disconnecting, terminals
+starting and exiting, watches, protocol errors, and configuration changes.
+
+```bash
+yas events config         # ring size, use, dropped records, active event types
+yas events dump           # print everything retained
+yas events tail           # print retained events, then follow new ones
+yas events tail --from-now
+```
+
+`yas events tail --from-now` while starting a terminal prints lines like these:
+
+```text
++349.116068828s #34 client.native.connect session=a883b5f445baa4ef178ad3f2d50d7e61 name="yas-cli" release="0.3.0"
++349.125851578s #35 client.native.disconnect session=a883b5f445baa4ef178ad3f2d50d7e61 elapsed_us=9779 received_bytes=80 sent_bytes=49 reason="transport cancellation/EOF; drained 0 queued frame(s)"
++349.198022995s #36 pty.exit required pty=2 status=0 reason="exited"
+```
+
+Each line has the time since the server started, the sequence number, the event type, and its
+fields. `yas events dump` also prefixes each line with the wall-clock time.
+
+By default only low-volume lifecycle events are recorded. Turn on more with selectors:
+
+```bash
+yas events set --events 'default,+frame.*,+pty.*'
+```
+
+- `YAS_EVENTS` sets the selectors when the server starts. `all` records everything.
+- `YAS_EVENTS_SIZE` sets the ring size in bytes. Default `1048576`.
+- `YAS_EVENTS_FILE` streams binary events to a file on the server from startup.
+- `yas events record start` writes a recording to a server-side file while the server runs.
+
+See [Events](/reference/events) for every event type and field.
+
+## List connected clients
+
+```bash
+yas client list
+```
+
+```text
+# server docs 0.3.0 on linux/x86_64/gnu
+ID	AGE_S	OUT_BYTES_S	IN_BYTES_S	SUBSCRIPTIONS	TERMINALS	SURFACES	ORIGIN
+3e5cdc45ad3a698d3d00596f03919b95	55	0	0	terminal:0@1,surface:0@2,fs:1@3			ext:muster
+fbd89f344e111e58905b40302d9dc524	92	0	0				ext:doctor
+```
+
+The first line names the server, its version, and its platform. Each row is one other client:
+
+- `ID`: the session ID. Pass it to `yas client disconnect`.
+- `AGE_S`: seconds since it connected.
+- `OUT_BYTES_S`, `IN_BYTES_S`: measured bandwidth to and from it.
+- `SUBSCRIPTIONS`: what it watches.
+- `TERMINALS`, `SURFACES`: the views it has open, with their sizes.
+- `ORIGIN`: where it came from. `ext:NAME` is an extension.
+
+A browser tab that holds an old connection shows up here. Disconnect it with
+`yas client disconnect ID --reason "stale tab"`.
+
+## Read the server log
+
+The server writes its log to standard error: the terminal you started it from, the systemd journal
+for a service, or `/tmp/yas-server.log` under the nix-darwin agent. Pass `-v`, or set
+`YAS_VERBOSE=1`, for detail about audio, encoders, and connections. A server that the CLI starts on
+demand discards its output, so start it yourself to see the log:
+
+```bash
+yas server -v
+```
+
+## Common failures
+
+### Audio is silent
+
+yas disables audio when the PipeWire programs or library are missing. A verbose server says which:
+
+```text
+[audio] audio disabled: missing binaries on $PATH: pipewire, pipewire-pulse, pw-loopback, pw-dump, wpctl
+```
+
+or, when `libpipewire-0.3.so.0` cannot be loaded:
+
+```text
+[audio] audio disabled: dlopen libpipewire-0.3.so.0 failed (check LD_LIBRARY_PATH): ...
+```
+
+Install PipeWire, or add the library's directory to `LD_LIBRARY_PATH` in the server's environment.
+`YAS_AUDIO=0` disables audio on purpose. See [Audio, camera, and microphone](/gui/audio-camera-microphone).
+
+### Video uses the CPU
+
+Without GPU libraries, yas renders and encodes in software and says nothing unless you run it with
+`-v`. A verbose server logs what it found:
+
+```text
+[vulkan-render] Vulkan Video encode not available (queue=false enc_queue=false h264=false enc_qf=None)
+[vulkan-render] initialized: llvmpipe (LLVM 21.1.8, 256 bits) (requested /dev/dri/renderD128)
+```
+
+`llvmpipe` means software rendering. NVENC lines read `[nvenc] CODEC: unavailable — REASON` when the
+driver libraries are missing. See [Video encoding](/gui/video-encoding) for the libraries each
+encoder needs.
+
+An unknown name in `--surface-encoders` stops the server:
+
+```text
+yas server: unknown encoder: h264-nvidia
+```
+
+The same typo in `YAS_SURFACE_ENCODERS` is ignored, and the server uses the default list.
+
+### A second server will not start
+
+Each instance keeps its state under a lock. Starting another server with the same `--name` fails
+even with a different socket:
+
+```text
+yas-server: server instance 'docs' is already running (held by pid 115540); cannot acquire /home/you/.local/state/yas/instances/docs/kv.redb.server.lock: lock acquisition failed because the operation would block
+```
+
+Stop the running one with `yas quit` while `YAS_SOCK` or `--on` points at it, or pick another name.
+
+Starting a server on a socket path another server already uses does the opposite: the new server
+stops the old one and takes over the socket. It logs `yas-server: terminating previous server (pid
+N)`. The old server's terminals close.
+
+### An SSH remote does not connect
+
+On the first connection to an SSH remote, yas runs a script on the remote host that installs yas into
+`~/.local/bin` if it is missing and starts a server. The remote host needs:
+
+- A POSIX `sh`.
+- `curl` or `wget`, and HTTPS access to `yas.run` and GitHub release downloads.
+- An SSH server that allows Unix socket forwarding (`AllowStreamLocalForwarding` in `sshd_config`,
+  on by default).
+
+When the server still cannot be reached after the install attempt, the CLI reports
+`failed to connect to SOCKET after install: ...`. Install yas on the remote yourself with
+`yas install HOST` to see the installer's output. See [Remotes](/remote/remotes).
+
+### The browser says "home server unavailable"
+
+The edge could not reach the server, or the server runs as a different user than the edge. The edge
+log has the reason. See [Cross-user deployments](/operating/edge#cross-user-deployments).
+
+### A persistent extension breaks the server
+
+Start the server with persistence off, then disable and remove the extension:
+
+```bash
+yas server --no-persistent-extensions
+yas ext disable NAME
+yas ext remove NAME
+```
+
+<Aside type="note">
+
+The edge does not refuse a public address. A browser that connects to an edge over plain HTTP from
+another machine works, and sends the passphrase unencrypted. Put TLS in front of any edge that is
+reachable beyond loopback. See [Security model](/operating/security).
+
+</Aside>

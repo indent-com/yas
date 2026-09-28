@@ -1,0 +1,43 @@
+---
+title: "yas client"
+description: "List and disconnect clients connected to the server."
+sidebar:
+  order: 3
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+List and disconnect clients connected to the server.
+
+```text
+Usage: yas client [OPTIONS] [COMMAND]
+```
+
+## yas client list
+
+List other connected clients and subscriptions as TSV.
+
+```text
+Usage: yas client list [OPTIONS]
+```
+
+## yas client disconnect
+
+Disconnect another client.
+
+```text
+Usage: yas client disconnect [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Opaque session ID from `yas client list`
+
+Options:
+
+- `-r, --reason <REASON>`
+
+  Reason shown to the disconnected client
+

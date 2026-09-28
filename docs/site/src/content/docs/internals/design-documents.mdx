@@ -1,0 +1,60 @@
+---
+title: "Design documents"
+description: "The design documents, RFCs, and contributor references in the yas repository, and what each one covers."
+sidebar:
+  order: 117
+---
+
+The yas repository keeps its design documents in [`docs/design/`](https://github.com/yas-run/yas/tree/main/docs/design). Each one records the reasoning behind a protocol family or subsystem: the problem, the options considered, and the rules the implementation follows. Read them when you change a subsystem or implement a client. For how to use a feature, read the user pages on this site.
+
+[`docs/design/yas.md`](https://github.com/yas-run/yas/blob/main/docs/design/yas.md) is the normative contract for the yas wire protocol. When another document, this site, or the code disagrees with it on wire behavior, `yas.md` is the specification the others are checked against. The byte layouts it references are generated into the [wire registry](/reference/wire-registry).
+
+## Protocol
+
+- [yas.md](https://github.com/yas-run/yas/blob/main/docs/design/yas.md): the yas wire protocol, version 1. Framing, handshake, families, resource handles, flow control, and error rules.
+- [events.md](https://github.com/yas-run/yas/blob/main/docs/design/events.md): the Events family and the server's binary event journal, including the dump and recording formats. See [Event journal](/reference/events).
+- [env.md](https://github.com/yas-run/yas/blob/main/docs/design/env.md): the Environment family, which returns the server's environment variables in one reply.
+
+## Terminals and processes
+
+- [term-journal.md](https://github.com/yas-run/yas/blob/main/docs/design/term-journal.md): the per-command terminal journal that gives shell PTYs command boundaries, exit codes, and captured output.
+- [processes.md](https://github.com/yas-run/yas/blob/main/docs/design/processes.md): the Process family for non-PTY children with binary stdin, stdout, and stderr, including `yas run`.
+- [muster.md](https://github.com/yas-run/yas/blob/main/docs/design/muster.md): the reasoning behind the muster supervisor extension. Its [README](https://github.com/yas-run/yas/blob/main/extensions/muster/README.md) is the operating manual and wins where the two differ.
+
+## Files, Git, and code intelligence
+
+- [fs-watch.md](https://github.com/yas-run/yas/blob/main/docs/design/fs-watch.md): filesystem state sync, which mirrors a directory tree to clients as revisioned state.
+- [fs-read.md](https://github.com/yas-run/yas/blob/main/docs/design/fs-read.md): one-shot file reads.
+- [fs-write.md](https://github.com/yas-run/yas/blob/main/docs/design/fs-write.md): filesystem writes, used by the browser editor and language-server edits.
+- [fs-search.md](https://github.com/yas-run/yas/blob/main/docs/design/fs-search.md): file-name search and the client-side index behind the switcher.
+- [fs-grep.md](https://github.com/yas-run/yas/blob/main/docs/design/fs-grep.md): project-wide content search.
+- [git.md](https://github.com/yas-run/yas/blob/main/docs/design/git.md): the Git family for refs, logs, diffs, status, and blame.
+- [lsp.md](https://github.com/yas-run/yas/blob/main/docs/design/lsp.md): the LSP family, which runs language servers on the server and serves diagnostics and positional queries.
+- [kv.md](https://github.com/yas-run/yas/blob/main/docs/design/kv.md): the server's key-value store with compare-and-swap writes and prefix watches.
+
+## Networking and extensions
+
+- [net.md](https://github.com/yas-run/yas/blob/main/docs/design/net.md): the Net family, a TCP and UDP socket relay used by port forwarding.
+- [extensions.md](https://github.com/yas-run/yas/blob/main/docs/design/extensions.md): WebAssembly and JavaScript extensions running inside the server, and native channels.
+
+## Desktop integration
+
+- [media-devices-portals.md](https://github.com/yas-run/yas/blob/main/docs/design/media-devices-portals.md): application audio, viewer cameras and microphones, MPRIS, and the compositor's desktop portals on Linux.
+- [tray-notifications.md](https://github.com/yas-run/yas/blob/main/docs/design/tray-notifications.md): tray icons and desktop notifications from applications on the compositor.
+
+## Browser UI
+
+- [workspace-sessions.md](https://github.com/yas-run/yas/blob/main/docs/design/workspace-sessions.md): browser workspaces stored in the home server's KV store, and the `#workspace=` URL.
+- [docs/ide.md](https://github.com/yas-run/yas/blob/main/docs/ide.md): the design exploration and decisions behind the IDE panels. Its status is historical. The panels it describes are implemented.
+- [docs/ide-plan.md](https://github.com/yas-run/yas/blob/main/docs/ide-plan.md): the build plan for the IDE panels.
+
+## Contributor references
+
+- [UNSAFE.md](https://github.com/yas-run/yas/blob/main/UNSAFE.md): the unsafe code audit. Unsafe code is confined to the `server`, `browser`, and `compositor` crates. The file lists each unsafe area, such as `waitpid`, PTY draining, ConPTY, fd passing, GPU encoders, and Vulkan compositing, with the invariant it relies on, and ends with an audit checklist.
+- [CONTRIBUTING.md](https://github.com/yas-run/yas/blob/main/CONTRIBUTING.md): building, testing, packaging, the development environment, project structure, code conventions, versioning, and releases.
+
+<Aside type="note">
+
+Each design document starts with a status line and a date. The status says whether the design is implemented and, where it is not, what remains open. Where a design document and the code disagree on behavior outside the wire protocol, the code is what runs.
+
+</Aside>

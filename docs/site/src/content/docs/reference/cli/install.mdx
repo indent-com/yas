@@ -1,0 +1,23 @@
+---
+title: "yas install"
+description: "Install yas on a remote host via SSH, or print install commands."
+sidebar:
+  order: 26
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Install yas on a remote host via SSH, or print install commands.
+
+With a host argument, connects via SSH and runs the installer remotely. Without a host argument, prints the one-liner install commands for each platform so you can copy and run them by hand.
+
+```text
+Usage: yas install [OPTIONS] [HOST]
+```
+
+Arguments:
+
+- `[HOST]`
+
+  SSH target ([user@]host). Omit to print install commands for each platform
+

@@ -1,0 +1,121 @@
+---
+title: "Code panels in the browser"
+description: "Browse files, branches, and history, search a project, and edit code with language server help in the yas browser UI."
+sidebar:
+  order: 65
+---
+
+The browser UI has panels for working on code that lives on the server: a file tree, git branches
+and history, a problems list, project search, and an editor with language server support. They use
+the same server features as [`yas fs`](/code/files), [`yas git`](/code/git), and
+[`yas lsp`](/code/language-servers), so they work on any connected server, including remotes.
+
+![The IDE dock with the file tree, branches, and commit log, next to a terminal and an editor](/images/browser/code-panels.png)
+
+## Open the dock
+
+Press Ctrl+B e, or click **IDE dock** in the status bar. The dock opens on the left of the layout.
+
+The dropdown at the top picks the **root**, the directory the panels show, written as
+`connection:/path`. By default it follows the working directory of the focused terminal, so the
+panels switch projects when you switch terminals. The gear button opens **Workspace roots**, where
+you add named roots on any remote. The browser keeps the list on the home server.
+
+The dock has four sections. Click a heading to fold it, or drag the border between sections to
+resize them.
+
+## Files
+
+**Files** shows the current branch, a **Changes** list, and the tree.
+
+- **Changes** lists modified and untracked files with git status markers, such as `??` for
+  untracked. Click an entry to open its diff.
+- The tree shows file sizes and a status marker on changed files. Click a file to open it in the
+  editor.
+- Right-click a file or folder for **New file**, **New folder**, **Copy path**, **Rename or move**,
+  and **Delete**. **Delete** asks you to click **Confirm delete**.
+- A changed file in the tree has an **Open diff** button.
+
+The panel shows when a merge, rebase, cherry-pick, revert, or bisect is in progress.
+
+## Branches and commit log
+
+**Branches** lists **Worktrees**, **Local branches**, **Remote branches**, and **Tags**.
+
+- Click a branch or tag to show its history in the commit log.
+- Click a worktree to make it the root. The terminal button on the row opens a terminal in that
+  worktree.
+
+**Commit log** shows history newest first, with relative times, author initials, and ref labels on
+commits that branches or tags point to. Type a revision or range, such as `main..feature`, in the
+**revision range** box. **Load older commits** fetches the next page. Click a commit to open it in a
+tile that shows its message, its parents, and its patch.
+
+Ctrl+B y shows the branches section and Ctrl+B l shows the commit log. Ctrl+B l cycles the container
+layout instead when a layout is on screen.
+
+## Problems
+
+**Problems** (Ctrl+B p) lists the language server's errors and warnings for the root. While the
+language server starts, the section shows its state, such as **Indexing…**.
+
+## Project search
+
+Ctrl+B f opens project search in a pane at the top. Type in **Search file contents…**.
+
+- Buttons turn on **Match case**, **Regular expression**, and **Whole words only**.
+- **Include ignored files** also searches files that `.gitignore` excludes.
+- The summary line reads `{matches} matches in {files} files`. **Results were clipped** appears when
+  the server stopped at its result limit.
+
+Click a result to open the file at that line.
+
+## Edit files
+
+Clicking a file opens it in an editor pane beside the focused one. While an editor has focus, the
+status bar shows the file path and editor controls.
+
+- **Edit** shows the file. **Staged**, **Unstaged**, and **All** show its diff between `HEAD` and
+  the index, the index and the working tree, and `HEAD` and the working tree.
+- **Preview** appears for images, SVG, Markdown, and HTML files, and renders the file.
+- **Definition**, **References**, **Outline**, and **Rename** ask the language server. F12 or
+  Ctrl+Click goes to a definition, Shift+F12 finds references, and F2 renames.
+- **Save** writes the file. Ctrl+S (⌘S on macOS) does the same.
+
+Completions appear as you type, and Tab or Enter accepts one. Typing `(` or `,` in a call shows the
+signature. F8 and Shift+F8 move between problems in the file. Ctrl+B ? lists the rest of the editor
+keys.
+
+**Rename** asks for the new name, applies the edits to every file, and reports how many edits it
+made in how many files.
+
+## Unsaved changes and conflicts
+
+The editor keeps unsaved changes on the home server, in the
+[key-value store](/code/key-value-store) under `editor/buf/`. Reloading the page, or opening the
+workspace in another browser, brings them back.
+
+When the file changes on disk while you edit, saving shows
+**The file changed on disk. Reload or overwrite it.** Choose to reload the disk version or to
+overwrite it with yours. The editor also marks a file that was deleted or renamed on disk.
+
+## Commit and diff tiles
+
+A diff opened from **Changes** or **Open diff** starts in the unified view. A toggle in its header
+switches to side-by-side. The header names the two sides, such as `index ↔ working tree`.
+
+A commit tile shows the patch for every changed file. Click a line number to open the file in the
+editor at that line. Click a parent commit to open it in the same tile.
+
+<Aside type="note" title="Limits">
+
+- The panels do not stage, commit, or check out. Use a terminal for those.
+- Hover information does not appear in this release, because the language server hover query
+  fails.
+- **Preview** needs a secure context: HTTPS, or HTTP on `localhost` or `127.0.0.1`. It also needs
+  service worker support. Otherwise it shows
+  **Previews need a secure context (HTTPS, or HTTP on localhost)**.
+- Language features need a language server on the server's `PATH`. See
+  [Supported language servers](/code/language-servers#supported-language-servers).
+
+</Aside>

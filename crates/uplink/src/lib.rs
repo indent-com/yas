@@ -2,7 +2,7 @@
 //!
 //! Both endpoints pin raw X25519 public keys out of band. A fresh-session
 //! confirmation precedes local IPC; no bearer token or allocation response
-//! grants authority. See docs/uplink.md for the versioned wire protocol.
+//! grants authority. See docs/design/uplink.md for the versioned wire protocol.
 
 mod datagram;
 mod stream;

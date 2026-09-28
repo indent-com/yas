@@ -1,0 +1,103 @@
+---
+title: "Choosing a transport"
+description: "Which connection each yas command and URI uses, from local Unix sockets to SSH, WebSocket, WebTransport, and WebRTC, and what the proxy daemon adds."
+sidebar:
+  order: 55
+---
+
+Every way of reaching a yas server carries the same yas protocol, so every command works over every transport. The transport decides what you need to reach the server: a local socket, an SSH login, a passphrase, or a key. This page lists which transport each command and URI uses. [Transports](/internals/transports) describes how each one works on the wire.
+
+## Transports at a glance
+
+| Transport          | Used by                                                            | Authentication                                     | Reach                                              |
+| ------------------ | ------------------------------------------------------------------ | -------------------------------------------------- | -------------------------------------------------- |
+| Unix socket        | The CLI with no target, `local`, `local:NAME`, `socket:/path`      | Owner-only socket directory and peer user ID       | This machine                                       |
+| SSH                | `ssh:[user@]host[:socket-path]`, home-server routes to SSH remotes | Your SSH keys or ssh-agent, and a pinned host key  | Any SSH host                                       |
+| TCP                | `tcp:host:port`                                                    | None                                               | A listener you expose yourself                     |
+| WebSocket          | Browsers to `yas edge`, `ws://` and `wss://` URIs                  | Edge passphrase, and TLS for `wss://`              | An edge at a fixed address                         |
+| WebTransport       | Browsers to an edge with `YAS_WEBTRANSPORT=1`, `wt://` URIs        | Edge passphrase and TLS                            | An edge at a fixed address, over UDP               |
+| WebRTC DataChannel | `yas share` visitors, `share:` URIs                                | Share passphrase or read-only token                | Anywhere, through the hub, with no open ports      |
+| Uplink             | `yas uplink`, `uplink:` URIs                                       | Pinned X25519 keys on both ends, plus relay tokens | Anywhere, through a relay you do not have to trust |
+
+## Unix socket
+
+A local server listens on a Unix socket, or a named pipe on Windows. The CLI finds it through `YAS_SOCK`, or by server name in an owner-only runtime directory. When nothing is listening there, the CLI starts `yas server` in the background. `local:NAME` does the same for a named instance. See [Named instances](/terminals/named-instances).
+
+## SSH
+
+yas connects over SSH with its own client and opens a channel to the remote server's socket. It installs yas on the remote and starts the server when they are missing. See [SSH remotes](/remote/remotes#ssh-remotes).
+
+## TCP
+
+`tcp:host:port` sends the yas protocol over a plain TCP connection with no authentication and no encryption. `yas server` has no TCP listener of its own. Use it for a listener you set up and protect yourself, for example a `socat` bridge on loopback:
+
+```bash
+socat TCP-LISTEN:38140,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:"$YAS_SOCK" &
+yas --on tcp:127.0.0.1:38140 terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+4	agent		bash -i	/home/you	running
+```
+
+Anyone who can connect to that port controls the server.
+
+## WebSocket and WebTransport
+
+An edge, `yas edge` or `yas server --edge`, serves the web app and accepts browsers behind a passphrase. The CLI can use an edge too. Put the passphrase in the URI fragment:
+
+```bash
+yas --on 'ws://127.0.0.1:38150/edge#docs-edge-pw' terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+```
+
+A wrong passphrase fails:
+
+```text
+yas: yas-proxy: ws://127.0.0.1:38150/edge: auth rejected: auth
+```
+
+WebSocket is always available. WebTransport runs over QUIC and adds an unreliable datagram path beside the reliable stream. Events that can tolerate loss use it, and each such event also has a reliable fallback. `wt://host[:port]/?certHash=HEX#PASSPHRASE` connects to it. Port 443 is the default, and `certHash` pins the server certificate's SHA-256 hash instead of checking it against system roots. See [yas edge](/operating/edge).
+
+## WebRTC DataChannel
+
+`yas share` publishes a server through a signaling hub. Browsers and `share:` URIs connect to it peer to peer, or through a TURN relay when neither side can reach the other. A second, unreliable DataChannel carries datagrams beside the reliable one. See [Sharing over WebRTC](/remote/sharing).
+
+## Uplink
+
+`yas uplink` holds a connection out to a relay, and clients reach the server through it with end-to-end encryption between pinned keys. See [Uplink](/remote/uplink).
+
+## The proxy daemon
+
+The first command to a remote target starts `yas proxy-daemon` in the background. Later commands connect to the daemon over a local socket and reuse what it keeps open, so a script of short commands does not repeat the connection setup each time:
+
+- `share:` keeps one WebRTC session per passphrase and hub. Each command opens fresh channels on it. In testing the first `yas --on share:… terminal list` took about 7 seconds and the second took half a second.
+- `ssh:` keeps one SSH connection per host. Each command opens a fresh channel on it.
+- `tcp:`, `ws://`, `wss://`, and `uplink:` go through the daemon but open a new upstream connection for each command.
+- `wt://`, `socket:`, `local`, and `local:NAME` connect directly and never use the daemon.
+
+There is one daemon per user. An auto-started daemon exits after 300 seconds with no clients. It checks the user ID of every process that connects to it, because the target URIs it receives carry credentials.
+
+Set `YAS_PROXY=0` to connect directly from each command instead. You never need to run `yas proxy-daemon` yourself.
+
+## What each command uses
+
+| Command or setting                  | Transport                                                    |
+| ----------------------------------- | ------------------------------------------------------------ |
+| Any CLI command with no target      | Unix socket to the local server, started if needed           |
+| `--on local` or `--on local:NAME`   | Unix socket, started if needed                               |
+| `--on ssh:…`                        | SSH, through the proxy daemon                                |
+| `--on share:…`                      | WebRTC, through the proxy daemon                             |
+| `--on tcp:…`, `ws://…`, `wss://…`   | TCP or WebSocket, through the proxy daemon                   |
+| `--on wt://…`                       | WebTransport, directly                                       |
+| `--on uplink:…`                     | Uplink relay, through the proxy daemon                       |
+| `YAS_PROXY=0` with any of the above | The same transport, directly from the command                |
+| `yas open`                          | Browser to a built-in edge over WebSocket, then Unix socket  |
+| `yas edge`, `yas server --edge`     | WebSocket, plus WebTransport with `YAS_WEBTRANSPORT=1`       |
+| `yas share`, `yas server --share`   | WebRTC DataChannel through the hub                           |
+| `yas uplink`                        | WebTransport out to the relay                                |
+| Routes in the browser               | The home server dials each route with the matching connector |

@@ -1,0 +1,194 @@
+---
+title: "Solid"
+description: "Render yas terminals and surfaces inside a Solid app with the @yas-run/solid components and primitives."
+sidebar:
+  order: 92
+---
+
+`@yas-run/solid` puts yas terminals and graphical surfaces inside your own Solid app. It wraps the
+same `@yas-run/core` pieces as the [React package](/embedding/react): a `YasWorkspace` owns the
+connections, and a `YasTerminal` component draws one terminal by ID on a WebGL canvas. The bundled
+yas browser UI is built on this package.
+
+## Install
+
+```bash
+npm install --legacy-peer-deps @yas-run/solid @yas-run/core @yas-run/browser solid-js
+```
+
+Solid 1.8 or later is a peer dependency. You also need a Solid JSX compiler, such as
+`vite-plugin-solid`.
+
+<Aside type="caution" title="Peer dependency range in 0.3.0">
+
+`@yas-run/core` 0.3.0 declares `@yas-run/browser >=0.9.0` as a peer, but the matching browser
+package is 0.3.0. npm refuses the install with `ERESOLVE` unless you pass `--legacy-peer-deps`.
+
+</Aside>
+
+## Render a terminal
+
+Start a private server with an edge for testing:
+
+```bash
+D=$(mktemp -d)
+YAS_PASSPHRASE=docs-test-pass YAS_ADDR=127.0.0.1:3399 \
+  yas server --socket "$D/yas.sock" --name docs --edge &
+```
+
+```text
+yas edge: listening on 127.0.0.1:3399 (WebSocket)
+```
+
+This component connects to the edge, opens a shell when the server has no terminals, and renders
+the focused one. It ran against yas 0.3.0 with Solid 1.9 and the Vite 8 dev server.
+
+```tsx
+import { createEffect, createMemo, onCleanup } from "solid-js";
+import { YasWorkspace } from "@yas-run/core";
+import {
+  YasTerminal,
+  YasWorkspaceProvider,
+  createYasSessions,
+  createYasWorkspace,
+  createYasWorkspaceState,
+} from "@yas-run/solid";
+
+const wasm = import("@yas-run/browser").then(async (mod) => {
+  await mod.default();
+  return mod;
+});
+
+export function App(props: { url: string; passphrase: string }) {
+  const workspace = new YasWorkspace({
+    wasm,
+    connections: [
+      {
+        id: "default",
+        transport: {
+          type: "websocket",
+          url: props.url,
+          passphrase: props.passphrase,
+        },
+      },
+    ],
+  });
+  onCleanup(() => workspace.dispose());
+
+  return (
+    <YasWorkspaceProvider workspace={workspace} fontSize={14}>
+      <TerminalScreen />
+    </YasWorkspaceProvider>
+  );
+}
+
+function TerminalScreen() {
+  const workspace = createYasWorkspace();
+  const state = createYasWorkspaceState();
+  const sessions = createYasSessions();
+  const ready = createMemo(
+    () => state().connections.find((c) => c.id === "default")?.ready ?? false,
+  );
+
+  createEffect(() => {
+    if (!ready() || sessions().length > 0) return;
+    void workspace
+      .createSession({ connectionId: "default", rows: 24, cols: 80 })
+      .then((session) => workspace.focusSession(session.id));
+  });
+
+  const sessionId = () => state().focusedSessionId ?? sessions()[0]?.id ?? null;
+  createEffect(() => {
+    const id = sessionId();
+    workspace.setVisibleSessions(id ? [id] : []);
+  });
+
+  return (
+    <YasTerminal
+      sessionId={sessionId()}
+      style={{ width: "100vw", height: "100vh" }}
+    />
+  );
+}
+```
+
+Render it with `url="ws://127.0.0.1:3399/edge"` and `passphrase="docs-test-pass"`.
+
+- Wait for the connection's `ready` flag before `createSession`. Earlier calls reject with
+  `Terminal family is not ready or was not negotiated`.
+- Call `setVisibleSessions` with the terminals on screen. A terminal that already existed on the
+  server draws nothing until it is listed as visible.
+
+Stop the server when you are done:
+
+```bash
+YAS_SOCK="$D/yas.sock" yas quit
+```
+
+## Components
+
+### `YasWorkspaceProvider`
+
+Takes the same props as the React provider: `workspace`, `palette`, `fontFamily`, `fontSize`,
+`advanceRatio`, `textGamma`, and `children`. The context reads props through getters, so changing a
+provider prop updates every terminal under it. Components throw
+`YAS components require a YasWorkspaceProvider ancestor` without one.
+
+### `YasTerminal`
+
+| Prop             | Type                                            | Default                                                   |
+| ---------------- | ----------------------------------------------- | --------------------------------------------------------- |
+| `sessionId`      | `SessionId \| null`                             | required; `null` draws nothing                            |
+| `fontFamily`     | `string`                                        | provider, then `ui-monospace, monospace`                  |
+| `fontSize`       | `number`                                        | provider, then `13`                                       |
+| `palette`        | `TerminalPalette`                               | provider                                                  |
+| `readOnly`       | `boolean`                                       | `false`                                                   |
+| `resizable`      | `boolean`                                       | `true`                                                    |
+| `fitWidth`       | `boolean`                                       | `false`                                                   |
+| `showCursor`     | `boolean`                                       | `true`                                                    |
+| `onRender`       | `(renderMs: number) => void`                    | none                                                      |
+| `scrollbarColor` | `string`                                        | `rgba(255,255,255,0.3)`                                   |
+| `scrollbarWidth` | `number`                                        | `4`                                                       |
+| `advanceRatio`   | `number`                                        | provider                                                  |
+| `textGamma`      | `number`                                        | provider, then `1.4` on Apple platforms and `1` elsewhere |
+| `class`          | `string`                                        | none                                                      |
+| `style`          | `JSX.CSSProperties`                             | none                                                      |
+| `surfaceRef`     | `(surface: YasTerminalSurface \| null) => void` | none                                                      |
+
+The props behave as in React. `resizable={false}` keeps the host's size for a passive preview,
+`readOnly` stops input, and `fitWidth` scales a passive preview to the container's width. Use
+`surfaceRef` to reach the core `YasTerminalSurface`, which has `focus()`, `rows`, and `cols`. The
+Solid component has no ref handle.
+
+### `YasSurfaceView`
+
+Renders one graphical window from a terminal's compositor. It adds three props that the React
+view lacks: `focus` moves keyboard focus to the canvas while true, `resizeKey` re-measures the pane
+after layout whenever its value changes, and a **Surface video unavailable** overlay appears when
+the server cannot encode video. See [Rendering surfaces in your app](/embedding/surfaces).
+
+## Primitives
+
+Names starting with `create` return signals and clean up with the owning component. Names starting
+with `use` are plain lookups that read the current snapshot once; call them inside `createMemo` or
+`createEffect` when you need them to track changes.
+
+| Primitive                                                | Returns                                                                                             |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `createYasWorkspace()`                                   | The `YasWorkspace` from context.                                                                    |
+| `createYasWorkspaceState(workspace?)`                    | A signal of the whole `YasWorkspaceSnapshot`.                                                       |
+| `createYasSessions(workspace?)`                          | A signal of every terminal.                                                                         |
+| `createYasWorkspaceConnection(workspace, id, transport)` | Nothing. Adds the connection now and removes it on cleanup.                                         |
+| `useYasSession(workspace, sessionId)`                    | One terminal, or `null`.                                                                            |
+| `useYasFocusedSession(workspace)`                        | The focused terminal, or `null`.                                                                    |
+| `useYasConnection(workspace, sessionId)`                 | The connection snapshot that owns the terminal, or the first connection when `sessionId` is `null`. |
+
+The React `useYasConnection` takes a connection ID. The Solid one takes a terminal ID.
+
+The primitives are also exported from `@yas-run/solid/hooks`.
+
+## Workspace operations and transports
+
+The workspace object and transports come from `@yas-run/core` and are the same in every framework.
+See [Workspace operations](/embedding/react#workspace-operations) and
+[Transports from TypeScript](/embedding/react#transports-from-typescript) on the React page.

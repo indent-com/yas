@@ -33,8 +33,8 @@ pub fn license_text() -> String {
 #[command(
     name = "yas",
     version,
-    about = "Terminal streaming for browsers and AI agents",
-    long_about = "Terminal streaming for browsers and AI agents.\n\n\
+    about = "Terminal multiplexer and experimental Wayland compositor for browsers and AI agents",
+    long_about = "Terminal multiplexer and experimental Wayland compositor for browsers and AI agents.\n\n\
         yas hosts PTYs and streams them to browsers over WebSocket or WebRTC.\n\
         It also exposes every terminal operation as a CLI subcommand for scripts and LLM agents.\n\n\
         Quick start:\n  \
@@ -355,19 +355,19 @@ pub enum Command {
         command: Option<ClipboardCommand>,
     },
 
-    /// Mirror server filesystem state (docs/fs-watch.md)
+    /// Mirror server filesystem state (https://docs.yas.run/code/files)
     Fs {
         #[command(subcommand)]
         command: FsCommand,
     },
 
-    /// Inspect git repositories on the server (docs/git.md)
+    /// Inspect git repositories on the server (https://docs.yas.run/code/git)
     Git {
         #[command(subcommand)]
         command: GitCommand,
     },
 
-    /// Read and write the server's key/value store (docs/design/kv.md)
+    /// Read and write the server's key/value store (https://docs.yas.run/code/key-value-store)
     ///
     /// A prefix-watchable store the server already keeps for the web app's
     /// settings; it doubles as host-local scratch space for scripts.
@@ -376,7 +376,7 @@ pub enum Command {
         command: KvCommand,
     },
 
-    /// Query language servers on the server (docs/design/lsp.md)
+    /// Query language servers on the server (https://docs.yas.run/code/language-servers)
     ///
     /// Language servers are discovered by project markers (Cargo.toml,
     /// go.mod, tsconfig.json, …), spawned lazily, and stay warm across
@@ -401,12 +401,14 @@ pub enum Command {
     /// Manage the server's named remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
-    /// name instead of a full URI. They are stored in a server's KV store (the
-    /// `remotes` key), which is also the catalogue its Relay publishes to the
-    /// browser. These verbs edit the home server (YAS_SOCK, else the default
-    /// local instance) unless --on names another; YAS_TARGET and `yas.target`
-    /// do not redirect them. `--on NAME`, YAS_TARGET, and `yas.target` look
-    /// names up on the home server. A legacy ~/.config/yas/yas.remotes file is
+    /// name instead of a full URI. They are stored in a server's `remotes`
+    /// key/value entry, readable by every client of that server, which is also
+    /// the catalogue its Relay publishes to the browser. These verbs edit the
+    /// home server (YAS_SOCK, else the default local instance) unless --on
+    /// names another; YAS_TARGET and `yas.target` do not redirect them.
+    /// `--on NAME`, YAS_TARGET, and `yas.target` look names up on the home
+    /// server, and one can be set as the CLI default target with
+    /// `yas remote set-default`. A legacy ~/.config/yas/yas.remotes file is
     /// imported once into a server that has no catalogue yet.
     ///
     /// Examples:
@@ -427,9 +429,9 @@ pub enum Command {
     #[command(
         about = "Open the terminal UI in the browser",
         long_about = "Open the terminal UI in the browser\n\n\
-            Opens the browser on the local yas server, with that server's named\n\
-            remotes reachable through its Relay. Manage remotes with\n\
-            `yas remote add/remove` or through the Remotes dialog in the browser.\n\
+            Opens the browser with the local yas server and every named remote\n\
+            it publishes. Manage remotes with `yas remote add/remove`\n\
+            or through the Remotes dialog in the browser.\n\
             `--on` and `--hub` are refused: the UI always starts from the local server.\n\n\
             Examples:\n\
               yas open                        # local + all configured remotes\n\
@@ -455,7 +457,7 @@ pub enum Command {
         verbose: bool,
     },
 
-    /// Expose the local YAS server through an end-to-end encrypted relay
+    /// Expose the local yas server through an end-to-end encrypted relay
     ///
     /// Requires YAS_UPLINK_TOKEN for the control endpoint.
     Uplink {
@@ -618,8 +620,8 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_ptys: Option<usize>,
 
-        /// Surface video encoders to try, best first: h264-nvenc, av1-nvenc,
-        /// h264-vaapi, av1-vaapi, h264-vulkan, av1-vulkan, h264-software,
+        /// Surface video encoders to try, best first: av1-nvenc, h264-nvenc,
+        /// av1-vaapi, h264-vaapi, av1-vulkan, h264-vulkan, h264-software,
         /// av1-software (or set YAS_SURFACE_ENCODERS). The first entry a
         /// viewer can decode and this host can build wins.
         #[arg(long, value_name = "LIST")]
@@ -701,7 +703,7 @@ pub enum Command {
     /// Upgrade yas to the latest version
     Upgrade,
 
-    /// Hash a YAS edge passphrase for YAS_PASSPHRASE
+    /// Hash a yas edge passphrase for YAS_PASSPHRASE
     ///
     /// Prints an argon2id PHC string suitable for YAS_PASSPHRASE. If VALUE is
     /// omitted or "-", reads from stdin. The stored hash is salted; browser
@@ -711,7 +713,7 @@ pub enum Command {
         value: Option<String>,
     },
 
-    /// Run the YAS edge
+    /// Run the yas edge
     ///
     /// All configuration is via environment variables:
     ///
@@ -719,7 +721,7 @@ pub enum Command {
     ///
     ///   YAS_ADDR         Listen address (default: 127.0.0.1:3264)
     ///
-    ///   YAS_SOCK          Fixed home YAS server socket
+    ///   YAS_SOCK          Fixed home yas server socket
     ///
     ///   YAS_SERVER_UID    Required numeric home-server peer UID (default: edge euid)
     ///
@@ -732,7 +734,7 @@ pub enum Command {
     ///   YAS_WEBTRANSPORT_PUBLIC_PORT  UDP port advertised to browsers
     ///
     ///   YAS_WEBTRANSPORT_CERT / YAS_WEBTRANSPORT_KEY  Optional stable PEM identity
-    #[command(about = "Run the YAS edge")]
+    #[command(about = "Run the yas edge")]
     Edge,
 
     /// Generate man pages and shell completions
@@ -742,6 +744,10 @@ pub enum Command {
     Generate {
         /// Output directory (e.g. /usr/share)
         output: String,
+
+        /// Write the docs site's MDX CLI reference into the directory instead
+        #[arg(long)]
+        markdown: bool,
     },
 
     /// Run the connection-pool proxy daemon (internal; not for direct use)
@@ -1007,7 +1013,7 @@ pub enum TerminalCommand {
     /// so one can be fed back to `yas terminal output`.
     ///
     /// Nothing is recorded unless the shell emits OSC 133 semantic prompts —
-    /// see docs/shell-integration.md for the one-line hook.
+    /// see https://docs.yas.run/terminals/shell-integration for the one-line hook.
     Journal {
         /// Terminal ID
         id: u64,
@@ -2407,8 +2413,8 @@ pub enum KvCommand {
 
     /// Set one value, from an argument or stdin
     ///
-    /// Compare-and-swap by default: pass --if-hash to require the current
-    /// value, or --force to overwrite unconditionally. Exit 1 on conflict.
+    /// Overwrites by default; pass --if-hash to write only while the current
+    /// value's hash matches. Exit 1 on conflict.
     Put {
         /// Key
         key: String,

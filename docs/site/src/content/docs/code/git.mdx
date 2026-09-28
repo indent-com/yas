@@ -1,0 +1,224 @@
+---
+title: "Git"
+description: "Read status, history, diffs, file contents, and blame from repositories on a server with yas git, and fetch from their remotes."
+sidebar:
+  order: 62
+---
+
+`yas git` reads git repositories on the machine that runs the server. The server reads the
+repository itself, so reads work on a machine without a `git` binary. You get status, history,
+diffs, file contents at any revision, blame, reflogs, and fetch. Every command is read-only except
+`fetch`, and every command works against a remote with `--on`.
+
+## Point at a repository
+
+Pass the repository's path with `--repo`:
+
+```bash
+yas git log --repo "$PWD"
+```
+
+```text
+6e4c2577 Dev <dev@example.com> Document cargo run
+2c6c0f1a Dev <dev@example.com> Rename greet module file
+6ec29347 Dev <dev@example.com> Shorten greeting
+97a4ea9b Dev <dev@example.com> Initial commit
+```
+
+`--repo` defaults to `.`, which the server resolves against its own working directory. Pass an
+absolute path, as with `"$PWD"` above. `yas fs` and `yas lsp` resolve relative paths against your
+shell's directory.
+
+To find repositories under a directory, use `discover`:
+
+```bash
+yas git discover "$PWD"
+```
+
+```text
+/home/you/demo	/home/you/demo/.git
+```
+
+Each line is the worktree and its git directory, separated by a tab. `--depth` sets how deep to
+search (4 by default), `--nested` looks inside repositories it finds, and `--bare` reports bare
+repositories.
+
+## History
+
+`log` prints the abbreviated commit id, the author, and the subject, newest first. It takes a
+revision or range and an optional path after `--`:
+
+```bash
+yas git log --repo "$PWD" main..feature
+yas git log --repo "$PWD" --follow -- src/greeting.rs
+```
+
+```text
+d4ab700e Dev <dev@example.com> Add bye
+2c6c0f1a Dev <dev@example.com> Rename greet module file
+6ec29347 Dev <dev@example.com> Shorten greeting
+97a4ea9b Dev <dev@example.com> Initial commit
+```
+
+The first line is the output of the first command: the one commit on `feature` that `main` lacks. The other lines come from the second command, which follows `src/greeting.rs` back through the
+commit that renamed it from `src/greet.rs`.
+
+- `-n` sets the number of commits, 20 by default.
+- `--first-parent`, `--topo`, and `--full-message` work as in git.
+- `--watch` reprints the page whenever the refs at its ends move.
+- `--json` prints one commit per line, with `oid`, `parents`, `tree`, `author`, `committer`, and
+  `message`. Each person has `name`, `email`, `time` in Unix seconds, and `tz`.
+
+`reflog` prints a ref's history. `merge-base` prints the best common ancestor of two or more
+revisions:
+
+```bash
+yas git merge-base --repo "$PWD" main feature
+```
+
+```text
+6ec2934724691a21a8e10b8a104928b7541182bd
+```
+
+## Diffs
+
+With no revision, `diff` compares the worktree to the index:
+
+```bash
+yas git diff --repo "$PWD"
+yas git diff --repo "$PWD" --staged
+```
+
+```text
+A	Cargo.lock
+M	src/main.rs
+M	README.md
+```
+
+Each line is a status letter and a path. `A` is added, `M` modified, `D` deleted, and `R` renamed,
+shown as `old -> new`. Untracked files appear as `A`. The first two lines come from the worktree.
+The last line is the staged change that `--staged` reports.
+
+- One revision compares it with the worktree, or with the index when you add `--staged`.
+- Two revisions, or `A..B`, compare two commits. `A...B` compares `B` with the point where it forked
+  from `A`.
+- `--merge-base REV` compares the worktree with the point where `REV` forked.
+- A path after `--` limits the diff to that path.
+- `-p` prints unified hunks. `--binary` adds binary patches that `git apply --binary` accepts.
+- `--json` prints one object per file.
+
+```bash
+yas git diff --repo "$PWD" main...feature -p
+```
+
+```text
+diff --git a/src/greet.rs b/src/greet.rs
+index 06958d979f91fa2ba47c079c1735be08f437bb09..79392ec15308501aa14d6be44ad4e0a41c729f0d 100644
+--- a/src/greet.rs
++++ b/src/greet.rs
+@@ -2,3 +2,6 @@
+ pub fn hello(name: &str) -> String {
+     format!("Hi, {name}!")
+ }
++pub fn bye(name: &str) -> String {
++    format!("Bye, {name}!")
++}
+```
+
+## Status
+
+`status --watch` prints the branch and the working-tree state, then reprints when either changes:
+
+```bash
+yas git status --repo "$PWD" --watch
+```
+
+```text
+clean
+on main
+M  README.md
+?? Cargo.lock
+ M src/main.rs
+!! target/CACHEDIR.TAG
+```
+
+The output above is trimmed after the first ignored file. The two columns before each path are the staged and unstaged state, as in `git status --short`.
+`??` marks an untracked file and `!!` an ignored one. The first `clean` line is printed before the
+first scan finishes. `--json` prints each snapshot as an object with `head`, `oid`, `ahead`,
+`behind`, `stashes`, and a `status` list.
+
+## Files, trees, and blame
+
+`show REV:PATH` prints a file's bytes at a revision. `:PATH` reads from `HEAD`:
+
+```bash
+yas git show --repo "$PWD" v0.1:src/greet.rs
+```
+
+```text
+/// Build a greeting for `name`.
+pub fn hello(name: &str) -> String {
+    format!("Hi, {name}!")
+}
+```
+
+`ls-tree` lists one tree level, and `ls-files` lists the index:
+
+```bash
+yas git ls-tree --repo "$PWD" HEAD
+```
+
+```text
+100644 blob 2f7896d1d1365eafb0da03d9fe456fac81408487	.gitignore
+100644 blob cd86e21f9bab369d39886d5c18d48fa5336a9cc5	Cargo.toml
+100644 blob 1dd17cadfc7d6cd2c80f330e054d0f5ba8a6a322	README.md
+040000 tree 0bec2fddf074f78930df0912c033724fa804802d	src
+```
+
+The columns are the mode, the object type, the object id, and the name.
+
+`blame` prints each commit and the line range it last touched:
+
+```bash
+yas git blame --repo "$PWD" src/greeting.rs
+```
+
+```text
+2c6c0f1a605c876e130ac0d3db520bc3c5b4828b 1-4
+```
+
+`--rev` blames from another revision, `-M` follows renames, and `--start` with `--lines` limits the
+range.
+
+## Fetch
+
+`fetch` downloads from a remote named in the repository's config, `origin` by default. It runs the
+server machine's `git` binary with prompts turned off, so the remote must not need an interactive
+password. It prints each updated ref and the result:
+
+```bash
+yas git fetch --repo "$PWD"
+```
+
+```text
+refs/remotes/origin/main	Ok
+refs/remotes/origin/topic	Ok
+```
+
+A fetch with nothing new prints nothing. `--prune` deletes remote-tracking refs the remote no longer
+has, and `--timeout` gives up after that many seconds, 120 by default.
+
+<Aside type="note" title="Limits in this release">
+
+- `status` without `--watch` always prints `clean`. Use `--watch`, or `--watch --json` and read the
+  second snapshot.
+- `show` accepts only `REV:PATH` or `:PATH`. `show HEAD` for a commit object fails with `Invalid`.
+- `diff -p` between the worktree and the index fails with `Unsupported`. Patches work between
+  commits, and between `HEAD` and the index with `--staged`.
+- The server disables `yas git` with `YAS_GIT=0` and `fetch` alone with `YAS_GIT_FETCH=0`. Size
+  limits such as `YAS_GIT_BLOB_MAX` are listed in
+  [Environment variables](/reference/environment-variables).
+
+</Aside>
+
+Full flags are in the [`yas git` reference](/reference/cli/git).

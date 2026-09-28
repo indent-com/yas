@@ -1,0 +1,181 @@
+---
+title: "Architecture"
+description: "How the yas server, its connection layer, the browser client, and the Rust crates and JS packages fit together."
+sidebar:
+  order: 111
+---
+
+yas is one server process per user and instance, plus clients that speak one versioned protocol to
+it. The server owns every resource: terminals and their scrollback, parsed terminal state,
+compositor surfaces, files, Git and language-server state, processes, network flows, media, and
+extensions. Edges, the CLI, and the proxy daemon only carry bytes between clients and the server,
+so you can restart them without losing terminals.
+
+## System overview
+
+```text
+                         yas server
+  ┌─────────────────────────────────────────────────────────┐
+  │ PTY ──► terminal driver ──► Terminal family view encoder │
+  │ compositor (Wayland) ──► video encoder                   │
+  │ Relay catalogue + upstream connectors                    │
+  │ Font catalogue, FS, Git, LSP, KV, Process, Net, ...      │
+  │                    native listener (Unix socket)         │
+  └───────────────┬───────────────┬──────────────┬───────────┘
+                  │ Unix socket   │              │
+            yas edge      yas CLI / yas open   yas proxy-daemon
+                  │ WebSocket or WebTransport /edge
+                  ▼
+   browser: @yas-run/core session ──► yas-browser WASM ──► WebGL
+```
+
+- The terminal path parses PTY output with the vendored Alacritty engine into a structured grid.
+  The server sends each client bounded view frames paced for that client, and the browser draws
+  them with WebGL.
+- The compositor path encodes each surface as video. The browser decodes it with WebCodecs.
+- Other servers are reached through the home server's Relay family. The home server dials them over
+  Unix, SSH, TCP, WebSocket, WebTransport, WebRTC, or an uplink, and carries each one as a nested
+  protocol session. The browser never dials them.
+
+For how requests, results, and events are framed, see [The yas protocol](/internals/protocol). For
+the server's own internals, see [Server internals](/internals/server).
+
+## Crates
+
+Every crate lives in `crates/` and is a member of the root Cargo workspace. The vendored Alacritty
+terminal, `wayland-backend`, and `cros-codecs` under `vendor/` are excluded from it.
+
+| Crate                     | Directory                     | Kind          | Purpose                                                                                                                 |
+| ------------------------- | ----------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `yas-wire`                | `crates/yas/`                 | lib, `no_std` | Protocol frame header, family, operation, and payload codecs, generated from `protocol/yas/`.                           |
+| `yas-terminal-model`      | `crates/terminal-model/`      | lib           | Protocol-neutral terminal cells, styles, grids, and snapshots.                                                          |
+| `yas-terminal-driver`     | `crates/alacritty-driver/`    | lib           | Drives the vendored Alacritty engine: parsing, snapshots, scrollback, titles, modes, and search.                        |
+| `yas-browser`             | `crates/browser/`             | cdylib (WASM) | Published as `@yas-run/browser`. Turns renderer snapshots into WebGL vertex data and manages the glyph atlas.           |
+| `yas-server`              | `crates/server/`              | lib           | The server: PTYs, frame scheduling, every protocol family, Relay routes, and the native listener.                       |
+| `yas-compositor`          | `crates/compositor/`          | lib           | Experimental headless Wayland compositor with surface multiplexing, rendering, and input injection.                     |
+| `yas-desktop`             | `crates/desktop/`             | lib           | Private D-Bus session services for tray items, notifications, MPRIS, and portals.                                       |
+| `yas-fonts`               | `crates/fonts/`               | lib           | Font discovery, metadata, TTC extraction, and serving.                                                                  |
+| `yas-fssync`              | `crates/fssync/`              | lib           | Filesystem state sync: tree index, per-client diffs, and native watch backends.                                         |
+| `yas-git`                 | `crates/git/`                 | lib           | Git introspection: repository state streaming, object reads, diffs, and patches.                                        |
+| `yas-lsp`                 | `crates/lsp/`                 | lib           | Shared warm language servers projected into protocol records.                                                           |
+| `yas-guest`               | `crates/guest/`               | lib, `no_std` | Guest SDK for Wasmi extensions.                                                                                         |
+| `yas-edge`                | `crates/edge/`                | lib           | The browser edge: passphrase auth, `/edge` over WebSocket and WebTransport, and the bundled web app.                    |
+| `yas-webserver`           | `crates/webserver/`           | lib           | Shared web-serving helpers: passphrase handling, auth throttling, and hardened local IPC.                               |
+| `yas-proxy`               | `crates/proxy/`               | lib           | `yas proxy-daemon` and the connection pool for socket, TCP, SSH, WebSocket, WebTransport, WebRTC, and uplink upstreams. |
+| `yas-ssh`                 | `crates/ssh/`                 | lib           | Embedded SSH client (russh): ssh-agent and key auth, `~/.ssh/config`, `direct-streamlocal` channels.                    |
+| `yas-webrtc-forwarder`    | `crates/webrtc-forwarder/`    | lib           | `yas share`: hub signaling, STUN and TURN, and WebRTC DataChannels (str0m).                                             |
+| `yas-uplink`              | `crates/uplink/`              | lib           | Uplink security: Noise IK with pinned X25519 keys, record framing, and encrypted datagrams.                             |
+| `yas-composite-transport` | `crates/composite-transport/` | lib           | Pairs a reliable local stream with its optional datagram lane, with bounds.                                             |
+| `yas-runtime-dir`         | `crates/runtime-dir/`         | lib           | Picks the owner-only runtime directory for IPC sockets and the compositor.                                              |
+| `yas-sd-notify`           | `crates/sd-notify/`           | lib           | Minimal `sd_notify(3)` readiness without `libsystemd`.                                                                  |
+| `yas-cli`                 | `crates/cli/`                 | bin `yas`     | The `yas` command: every subcommand, the embedded edge for `yas open`, and the uplink producer.                         |
+| `yas-website`             | `crates/website/`             | bin           | The `yas.run` site, installer redirects, and the WebRTC signaling hub.                                                  |
+| `xtask`                   | `crates/xtask/`               | bin           | `cargo xtask protocol`: regenerates and checks the protocol artifacts.                                                  |
+
+## JavaScript packages
+
+The packages live in `js/`, a pnpm workspace.
+
+| Package          | Directory   | Published | Purpose                                                                                          |
+| ---------------- | ----------- | --------- | ------------------------------------------------------------------------------------------------ |
+| `@yas-run/core`  | `js/core/`  | yes       | Framework-free client: transports, protocol families, workspace, terminal and surface renderers. |
+| `@yas-run/react` | `js/react/` | yes       | React provider, hooks, `YasTerminal`, and `YasSurfaceView`. See [React](/embedding/react).       |
+| `@yas-run/solid` | `js/solid/` | yes       | Solid provider, primitives, `YasTerminal`, and `YasSurfaceView`. See [Solid](/embedding/solid).  |
+| `@yas-run/ui`    | `js/ui/`    | no        | The full browser app, built on Solid. Its build is compiled into the edge binary.                |
+| `yas-web`        | `js/web/`   | no        | The `yas.run` pages, including the share viewer, which mounts `@yas-run/ui`.                     |
+
+`@yas-run/browser` is built from `crates/browser/` with wasm-bindgen and published beside them.
+
+## Dependency graph
+
+Arrows point from a dependency to the crate or package that uses it. The graph shows the main
+in-repository edges; `yas-wire` and `yas-composite-transport` are used by most network crates.
+
+```text
+Rust
+  yas-terminal-model ─► yas-terminal-driver ─► yas-server
+  yas-runtime-dir ─► yas-compositor ─► yas-server
+  yas-runtime-dir ─► yas-webserver
+  yas-fssync ─► yas-git, yas-lsp ─► yas-server
+  yas-wire ─► yas-guest ─► yas-server
+  yas-fonts, yas-desktop, yas-sd-notify ─► yas-server
+  yas-wire ─► yas-composite-transport
+  yas-wire, yas-composite-transport, yas-webserver, yas-sd-notify ─► yas-webrtc-forwarder
+  yas-ssh, yas-uplink, yas-webrtc-forwarder, yas-webserver ─► yas-proxy ─► yas-server
+  yas-proxy, yas-ssh, yas-webrtc-forwarder, yas-webserver ─► yas-edge
+  yas-server, yas-edge, yas-proxy, yas-uplink ─► yas-cli
+
+JavaScript
+  @yas-run/browser ─► @yas-run/core ─► @yas-run/react
+                                    ─► @yas-run/solid ─► @yas-run/ui ─► yas-web
+```
+
+`yas-server` also depends directly on `yas-wire`, `yas-terminal-model`, `yas-webserver`, and
+`yas-composite-transport`. `yas-cli` also depends on `yas-ssh`, `yas-webrtc-forwarder`, and
+`yas-webserver`. The uplink producer lives in `yas-cli` and the consumer in `yas-proxy`;
+both use `yas-uplink`.
+
+## Deployment topologies
+
+These are the four common ways to put a server in front of a browser. Each connection option is
+described in [Transports](/remote/transports).
+
+### Local: `yas open`
+
+```text
+yas server ──Unix──► yas (embedded edge) ──WebSocket or WebTransport──► browser
+```
+
+`yas open` starts the server if it is not running, runs a temporary edge inside the CLI, and opens
+the browser. Everything runs as your user on one machine.
+
+### Remote through the home server: `yas remote add`
+
+```text
+browser ──/edge──► edge ──Unix──► home yas server ──Relay over SSH──► remote yas server
+```
+
+The home server reads its remote catalogue and publishes each remote to clients as an opaque route.
+It keeps each route's URI and credentials, opens the SSH connection when a browser connects the
+route, and carries the remote server as a nested protocol session. The edge never sees the route.
+The CLI uses the same catalogue. It resolves a bare target name (`--on NAME`, `YAS_TARGET`, or
+`yas.target`) by reading the `remotes` key from the home server (`YAS_SOCK`, else the default local
+instance) and dialing the stored URI itself. `yas remote add`, `remove`, `toggle`, and `list` edit
+the home server's catalogue, or the `--on` server's. See [Remotes](/remote/remotes).
+
+### Persistent edge: `yas edge` or `yas server --edge`
+
+```text
+yas server ──Unix──► yas edge ──WebSocket or WebTransport /edge──► browser
+```
+
+The edge authenticates the browser with a passphrase, then maps each WebSocket message to one
+length-prefixed frame on the home socket. With WebTransport enabled it also carries datagrams. It
+never parses frames or chooses a destination. `yas server --edge` (or `YAS_EDGE=1`) runs the same
+edge inside the server and hands it in-process sessions instead of socket connections. Serve any
+non-loopback edge over TLS, because the passphrase grants full control. See
+[Serving the browser with yas edge](/operating/edge).
+
+### WebRTC share: `yas share` or `yas server --share`
+
+```text
+yas server ──Unix──► yas share ◄──signaling──► yas.run hub ◄──signaling──► browser
+                         └───────────── WebRTC DataChannels ─────────────────┘
+```
+
+The forwarder and the browser derive the same channel key from the passphrase and meet on the hub.
+The hub gives each browser its own session ID, so several can connect at once. The full passphrase
+grants read-write access. The separate read-only secret makes the forwarder add a read-only session
+extension to the first HELLO, and the server then advertises and enforces a restricted catalogue.
+`yas server --share`
+(or `YAS_SHARE=1`) publishes from inside the server, with no socket hop and no proxy daemon. See
+[Sharing over WebRTC](/remote/sharing).
+
+## Related reference
+
+- [URI schemes](/reference/uris) lists every target form (`local`, `socket:`, `ssh:`, `tcp:`,
+  `ws://`, `wt://`, `share:`, `uplink:`, `proxy:`) and where each is accepted.
+- [Configuration files](/reference/configuration-files) covers `yas.conf` and the `remotes`
+  catalogue key.
+- [Transports internals](/internals/transports) covers each transport, the proxy daemon, and the
+  uplink protocol.

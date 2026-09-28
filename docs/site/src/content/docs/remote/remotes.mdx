@@ -1,0 +1,209 @@
+---
+title: "Remotes"
+description: "Point the CLI at another server with --on, save named remotes, and choose which servers the browser shows next to your own."
+sidebar:
+  order: 51
+---
+
+A remote is a server on another machine, or another named server on this one, that you reach from here. The CLI reaches one with `--on` on any command. The browser reaches remotes through your home server, which keeps a list of saved remotes and publishes each one to its clients as a route.
+
+## Run a command on another server
+
+Pass `--on` with a URI before or after the subcommand:
+
+```bash
+yas --on local:work terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+```
+
+`--on` accepts these forms:
+
+| URI                                         | Reaches                                                                                         |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `local`                                     | This machine's default server (`YAS_SOCK`, or the server named `default`).                      |
+| `local:NAME`                                | The server named `NAME` on this machine. yas starts it with `yas server --name NAME` if needed. |
+| `ssh:[user@]host[:socket-path]`             | A server on an SSH host. yas installs and starts it there if needed.                            |
+| `share:PASSPHRASE[?hub=URL]`                | A server published with `yas share`. See [Sharing over WebRTC](/remote/sharing).                |
+| `uplink:https://…#token=…&server=…`         | A server behind an uplink relay. See [Uplink](/remote/uplink).                                  |
+| `ws://host:port/edge#PASSPHRASE`            | A `yas edge` or `yas server --edge` over WebSocket. Use `wss://` for TLS.                       |
+| `wt://host[:port]/?certHash=HEX#PASSPHRASE` | An edge over WebTransport.                                                                      |
+| `tcp:host:port`                             | A raw yas byte stream that you expose yourself, with no authentication.                         |
+| `socket:/path`                              | A server's Unix socket at an explicit path.                                                     |
+
+Any other word is looked up as a remote name. See [Named targets in the CLI](#named-targets-in-the-cli). [Choosing a transport](/remote/transports) compares the forms.
+
+## Save a remote
+
+<Steps titleSize="h3">
+  <Step title="Add it">
+
+    Give the remote a name and a URI:
+
+    ```bash
+    yas remote add rabbit ssh:rabbit
+    yas remote add work local:work
+    yas remote add lab share:hunter2
+    ```
+
+    ```text
+    yas: remote 'rabbit' set to 'ssh:rabbit'
+    yas: remote 'work' set to 'local:work'
+    yas: remote 'lab' set to 'share:****'
+    ```
+
+    Adding a name that exists replaces its URI and enables it. Omit the URI to be prompted for one. A name cannot be empty, contain whitespace or `=`, or start with `#`.
+
+  </Step>
+  <Step title="Check the list">
+
+    ```bash
+    yas remote list
+    ```
+
+    ```text
+    work	local:work
+    rabbit	ssh:rabbit
+    lab	share:****
+    ```
+
+    Each line is the name, a tab, and the URI. A disabled remote has a third field, `(disabled)`. The list masks the passphrase in `share:` URIs and the fragment of `uplink:` URIs. Add `--reveal` to print them in full. `yas remote` with no subcommand also lists.
+
+  </Step>
+</Steps>
+
+Manage saved remotes with these subcommands:
+
+- `yas remote toggle NAME` disables a remote without deleting it, or enables it again. A disabled remote stays in the list and the home server does not connect to it.
+- `yas remote remove NAME` deletes it. Removing a name that does not exist exits with status 1.
+- `yas remote set-default TARGET` sets the CLI's default target. See [Set a default target](#set-a-default-target).
+
+You can also add, remove, disable, and reorder remotes in the browser's **Remotes** panel.
+
+## Where saved remotes live
+
+`yas remote add`, `list`, `toggle`, and `remove` edit the list on the server the command connects to. The list is the `remotes` key in that server's [key-value store](/code/key-value-store), so each named instance has its own. Add `--on` to edit another server's list:
+
+```bash
+yas --on local:work remote add build ssh:build.example
+```
+
+The value is plain text, one `name = uri` per line. A line that starts with `# name = uri` is a disabled remote:
+
+```bash
+yas kv get remotes
+```
+
+```text
+work = local:work
+# rabbit = ssh:rabbit
+lab = share:hunter2
+```
+
+The server watches this key. When it changes, the server connects to the new routes and publishes them to its clients without a restart.
+
+<Aside type="caution" title="Every client can read stored credentials">
+
+The stored URIs include `share:` passphrases and `uplink:` routing tokens. Any client connected to the server can read them with `yas kv get remotes` or in the **Remotes** panel. Any client that can do that already has full control of the server.
+
+</Aside>
+
+A server that finds no `remotes` key when it starts copies the entries from `~/.config/yas/yas.remotes` into it, once. `YAS_REMOTES` names a different file. The server leaves the file in place and does not read it again while the key exists, even when the key holds an empty list.
+
+```text
+yas: imported 3 remotes from /home/you/.config/yas/yas.remotes into this instance's KV store
+```
+
+## Named targets in the CLI
+
+When `--on`, `YAS_TARGET`, or `yas.target` holds a word that is not a URI, the CLI looks it up in `~/.config/yas/yas.remotes` on the machine running the command (or the file `YAS_REMOTES` names). It does not read the server's `remotes` key. A remote you add with `yas remote add` is available to `--on` by name only after you add the same line to that file:
+
+```text
+local = local
+work = local:work
+```
+
+```bash
+yas --on work terminal list
+```
+
+The first name lookup creates the file with the single entry `local = local` if it does not exist. Disabled lines do not resolve. An unknown name fails:
+
+```text
+yas: unknown target 'off' (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], or a name from yas.remotes)
+```
+
+## Set a default target
+
+Commands without `--on` go to a default target. The CLI picks the first of these that is set:
+
+1. `--on TARGET` on the command line.
+2. The `YAS_TARGET` environment variable. An empty value counts as unset.
+3. The `yas.target` key in `~/.config/yas/yas.conf` (or `$XDG_CONFIG_HOME/yas/yas.conf`).
+4. The local server, which the CLI starts if it is not running.
+
+`yas remote set-default` writes the third one:
+
+```bash
+yas remote set-default work
+```
+
+```text
+yas: default target set to 'work'
+```
+
+It adds `yas.target = work` to `yas.conf`. Pass `local` or an empty string to remove the key:
+
+```bash
+yas remote set-default local
+```
+
+```text
+yas: default target cleared (using local)
+```
+
+The default applies to the CLI only. `yas open` and the browser are not affected.
+
+## SSH remotes
+
+An `ssh:` target runs on the SSH host itself, and yas uses its own SSH client, so no `ssh` binary is needed locally.
+
+- On first connection yas checks for `yas` on the remote. If it is missing, yas installs it to `~/.local/bin` with `curl` or `wget` from `https://yas.run`, then starts `yas server` in the background. The remote needs `curl` or `wget`, CA certificates, and a supported OS and architecture.
+- yas authenticates with ssh-agent through `SSH_AUTH_SOCK`, then with `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, and `~/.ssh/id_rsa`.
+- From `~/.ssh/config`, yas honors `Hostname`, `User`, `Port`, and `IdentityFile`.
+- Host keys are trusted on first use and recorded in `~/.ssh/known_hosts`. A host with a recorded key must match it. `YAS_SSH_KNOWN_HOSTS` names a different file.
+- Commands to the same host share one SSH connection through the [proxy daemon](/remote/transports#the-proxy-daemon).
+
+The part after a second `:` is an explicit socket path on the remote: `ssh:alice@prod:/run/yas/yas.sock`.
+
+## Local named servers
+
+`local:NAME` reaches the server named `NAME` on this machine and starts it if it is not running. It works with `--on`, in `YAS_TARGET`, and as the URI of a saved remote, so a home server can publish another instance on the same machine as a route. See [Named instances](/terminals/named-instances).
+
+## The home server and its routes
+
+`yas open` starts this machine's server if needed and opens the web app in your browser:
+
+```bash
+yas open
+```
+
+```text
+yas: serving browser UI at http://127.0.0.1:34451/#psk=…
+```
+
+That server is the home server. It always uses `YAS_SOCK` or the `default` instance, and ignores `--on` and the default target. The home server connects to every enabled entry in its `remotes` key and publishes each as a route. The browser shows the home server and the routes in the **Remotes** panel with their connection status:
+
+- **Add to workspace** and **Remove from workspace** choose which routes the current workspace shows. The home server is always in the workspace.
+- **Manage** opens a connected remote's panels in a pane.
+- **Disable**, **Enable**, and **Remove** edit the `remotes` key.
+
+The home server dials every route itself with the credentials it stores. Route snapshots sent to the browser carry opaque handles and no URIs or credentials. The workspace keeps its route selection with its layout, so the browser URL names only the workspace.
+
+<Aside type="note">
+
+`YAS_RELAY=0` on the home server turns off route publication and connections to remotes.
+
+</Aside>

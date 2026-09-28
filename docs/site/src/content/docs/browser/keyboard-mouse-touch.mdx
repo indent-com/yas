@@ -1,0 +1,119 @@
+---
+title: "Keyboard, mouse, and touch"
+description: "Every browser UI binding behind the Ctrl+B prefix, plus the keys, mouse gestures, and touch gestures that work without it."
+sidebar:
+  order: 22
+---
+
+The browser UI sends every key to the focused terminal or surface, except the keys on this page.
+Most UI actions sit behind the **Ctrl+B prefix**. Scrollback, mouse, and touch gestures work without
+the prefix.
+
+## Use the prefix
+
+Press Ctrl+B, release it, then press one key.
+
+- While the prefix is armed, the status bar shows `^B` and a map titled **Keys behind Ctrl+B** lists
+  the keys that do something now.
+- Escape cancels the prefix.
+- A key with no binding is consumed and does nothing.
+- Ctrl+B Ctrl+B sends one literal Ctrl+B to the focused pane, for programs such as tmux that use it
+  themselves.
+- On macOS and iOS, ⌘B also arms the prefix.
+
+![The Keys behind Ctrl+B map, shown after pressing Ctrl+B](/images/browser/prefix-map.png)
+
+Ctrl+B ? opens **Keyboard & mouse shortcuts**, a full reference that includes the editor keys.
+
+## Keys that work anywhere
+
+| Keys after Ctrl+B | Action                                                     |
+| ----------------- | ---------------------------------------------------------- |
+| `k`, `/`, or `w`  | Open the menu                                              |
+| `>`               | Open the menu to run a command in a new terminal           |
+| `@`               | Open the menu to open a file by name                       |
+| `#`               | Open the menu to jump to a symbol from the language server |
+| `Enter`           | New terminal                                               |
+| `Shift+Enter`     | New terminal beside the focused pane                       |
+| `e`               | Toggle the files panel                                     |
+| `f`               | Open project search in the top pane                        |
+| `y`               | Show the branches panel                                    |
+| `p`               | Show the problems panel                                    |
+| `r`               | Toggle the preview panel on the right                      |
+| `q`               | Park the focused pane                                      |
+| `x`               | Close the focused terminal or surface                      |
+| `[` and `]`       | Previous and next workspace                                |
+| `n`               | Create a workspace                                         |
+| `a`               | Open the workspace manager                                 |
+| `d`               | Detach the current workspace                               |
+| `←` and `→`       | Back and forward through navigation history                |
+
+The menu modes behind `>`, `@`, and `#` are described in
+[Command menu and overlays](/browser/command-menu). The panels behind `e`, `f`, `y`, and `p` are
+described in [Code panels in the browser](/code/code-panels).
+
+## Keys for the layout
+
+These bindings exist while a layout is on screen. When a key appears in both tables, the layout
+binding wins.
+
+| Keys after Ctrl+B     | Action                                                       |
+| --------------------- | ------------------------------------------------------------ |
+| `Tab` and `Shift+Tab` | Next and previous pane                                       |
+| `1` to `9`            | Focus a container by number                                  |
+| `←` `↑` `↓` `→`       | Move focus in that direction                                 |
+| `Shift` + arrow       | Move the focused container                                   |
+| `Alt` + arrow         | Resize the focused container                                 |
+| `z`                   | Zoom the focused pane, or restore all panes                  |
+| `h` and `v`           | Split the next container horizontally or vertically          |
+| `b`                   | Toggle the focused container between horizontal and vertical |
+| `t`                   | Tabbed container layout                                      |
+| `s`                   | Stacking container layout                                    |
+| `l`                   | Cycle horizontal, vertical, tabbed, and stacking             |
+| `=`                   | Give every pane equal space                                  |
+| `Space`               | Move focus between tiled and floating panes                  |
+| `Shift+Space`         | Float the focused pane, or return it to the tiling tree      |
+| `q`                   | Park                                                         |
+| `x`                   | Close                                                        |
+
+Ctrl+B l cycles the container layout while a layout is on screen. It opens the commit log panel only
+when no layout is mounted.
+
+## Keys without the prefix
+
+- Escape closes the top overlay, such as the menu or the help.
+- Enter restarts a terminal whose process has exited.
+- Ctrl+Shift+V pastes the browser clipboard into the focused pane.
+- Shift+Wheel scrolls the scrollback, even when the program in the terminal has turned on mouse
+  reporting.
+- Shift+PageUp and Shift+PageDown page through scrollback. Shift+Home and Shift+End jump to the top
+  and bottom.
+- Any other key leaves scrollback and goes to the program.
+
+## Mouse
+
+- Click and drag selects text. Double-click selects a word and triple-click selects a line.
+- Alt+Click on a URL opens it after a confirmation dialog that shows the destination.
+- Drag the scrollbar, or click in its track, to scroll.
+- Alt+drag moves a floating window. Alt+right-drag resizes it.
+- Drag a pane by its **Drag to move** handle to place it elsewhere in the layout, or drop it on the
+  preview panel to park it.
+
+## Touch
+
+- Swipe to scroll.
+- Long-press, then drag, to select text and copy it.
+- Long-press and release to send a right-click.
+- The on-screen toolbar has **Paste**, one-shot **Ctrl** and **Alt** modifiers, **Esc**, **Tab**,
+  **⇧Enter**, and **Show keyboard**.
+
+The **Media** panel in the status bar sets how touches reach a surface. **Send touches to the app**
+forwards them as touch events. **YAS gestures** uses the scroll, selection, and right-click gestures above.
+
+<Aside type="note" title="Limits">
+
+- The browser keeps some shortcuts for itself, and those never reach the page or the terminal.
+- The help overlay labels Ctrl+B r as "Preview, Debug, Web pane". The key toggles only the preview
+  panel.
+
+</Aside>

@@ -1,0 +1,759 @@
+---
+title: "yas terminal"
+description: "Manage terminals (PTYs)"
+sidebar:
+  order: 1
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Manage terminals (PTYs)
+
+```text
+Usage: yas terminal [OPTIONS] [COMMAND]
+```
+
+## yas terminal list
+
+List all terminals (TSV: ID, TAG, TITLE, COMMAND, CWD, STATUS)
+
+```text
+Usage: yas terminal list [OPTIONS]
+```
+
+## yas terminal start
+
+Start a new terminal and print its ID
+
+The command is executed directly, the way a process is started anywhere else — no login shell, so no rc files and no shell syntax. Pass `--shell` to run one string through `$SHELL` instead. With no command at all, the terminal gets the default interactive shell.
+
+Options come before the command; everything after the first bare word belongs to it. Use `--` when the command's own flags would be ambiguous.
+
+Examples:
+
+```text
+yas terminal start htop
+yas terminal start -- cargo test --release
+yas terminal start --cwd /src --env RUST_LOG=debug -- cargo run
+yas terminal start --shell 'ls | wc -l'
+```
+
+```text
+Usage: yas terminal start [OPTIONS] [COMMAND]...
+```
+
+Arguments:
+
+- `[COMMAND]...`
+
+  Command to run (defaults to `$SHELL` or /bin/sh)
+
+Options:
+
+- `-c, --shell`
+
+  Run the command through the server's login shell (`$SHELL` -lic) instead of executing it directly. Needed for pipes, redirections, globs, and anything else that is shell syntax rather than a program
+
+- `--cwd <DIR>`
+
+  Working directory for the new terminal
+
+- `--env <KEY=VALUE>`
+
+  Set an environment variable, repeatable (`--env` KEY=VALUE). Overrides whatever the server would otherwise pass down
+
+- `-t, --tag <TAG>`
+
+  Terminal tag / label
+
+- `--rows <ROWS>`
+
+  Terminal rows
+
+  Default: `24`.
+
+- `--cols <COLS>`
+
+  Terminal columns
+
+  Default: `80`.
+
+- `--wait`
+
+  Block until the process exits (requires `--timeout`)
+
+- `--timeout <TIMEOUT>`
+
+  Maximum seconds to wait (only with `--wait`)
+
+- `--deadline <SECONDS>`
+
+  Seconds after which the server stops this terminal on its own, armed at creation. Unlike `--timeout`, which only bounds how long this command waits, the deadline outlives the client: the terminal dies even if this process is killed. Re-send it with `yas terminal deadline` to use it as a dead-man switch
+
+## yas terminal show
+
+Print the current visible text of a terminal.
+
+```text
+Usage: yas terminal show [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+Options:
+
+- `--ansi`
+
+  Include ANSI color/style escape sequences in output
+
+- `--rows <ROWS>`
+
+  Resize to this many rows before capturing
+
+- `--cols <COLS>`
+
+  Resize to this many columns before capturing
+
+## yas terminal cwd
+
+Print a terminal's live working directory.
+
+```text
+Usage: yas terminal cwd [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+## yas terminal history
+
+Print scrollback + viewport text.
+
+Without position flags, prints everything. Use `--from-beginning` or `--from-end` to set a starting offset, and `--limit` to cap the output.
+
+`--since` CURSOR instead reads only what was appended since a cursor and prints the next cursor on stderr, so a loop pulls each byte once: c=$(yas terminal history 3 `--since` now 2&gt;&1 &gt;/dev/null | cut `-d`' ' -f2) yas terminal history 3 `--since` "$c" CURSOR is SEQ, SEQ:COL, `now` (no text, current cursor) or `start`.
+
+```text
+Usage: yas terminal history [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+Options:
+
+- `--from-start <FROM_START>`
+
+  Start N lines from the top (oldest = 0)
+
+- `--from-end <FROM_END>`
+
+  Start N lines from the bottom (newest = 0)
+
+- `--limit <LIMIT>`
+
+  Maximum number of lines to return
+
+- `--since <CURSOR>`
+
+  Read only what is new since this cursor (SEQ[:COL], now, start)
+
+- `--max-bytes <BYTES>`
+
+  Cap a `--since` read; the reply says where to continue from
+
+- `--json`
+
+  JSON output (with `--since`: text plus the next cursor)
+
+- `--ansi`
+
+  Include ANSI color/style escape sequences in output
+
+- `--rows <ROWS>`
+
+  Resize to this many rows before capturing
+
+- `--cols <COLS>`
+
+  Resize to this many columns before capturing
+
+## yas terminal journal
+
+List the commands a terminal has run (needs OSC 133 shell integration).
+
+TSV: INDEX, STATUS, EXIT, MS, START_SEQ, END_SEQ, COMMAND. Prints the most recent commands by default. Indices are stable and never reused, so one can be fed back to `yas terminal output`.
+
+Nothing is recorded unless the shell emits OSC 133 semantic prompts — see https://docs.yas.run/terminals/shell-integration for the one-line hook.
+
+```text
+Usage: yas terminal journal [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+Options:
+
+- `--from <INDEX>`
+
+  Start at this command index instead of the newest ones
+
+- `--limit <LIMIT>`
+
+  Maximum number of records
+
+  Default: `20`.
+
+- `--json`
+
+  One JSON object per record
+
+## yas terminal output
+
+Print one command's output (needs OSC 133 shell integration).
+
+Defaults to the newest command. With `--wait` and no INDEX, it picks the command that is running, or if none is, the next one to start (so a command sent just before still counts), blocks server-side until that command finishes, and exits with its status (124 if the wait timed out). This is how to run something in a live shell and collect the result: yas terminal send 3 'cargo test\n' yas terminal output 3 `--wait` 600
+
+```text
+Usage: yas terminal output [OPTIONS] <ID> [INDEX]
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `[INDEX]`
+
+  Command index from `yas terminal journal` (default: newest)
+
+Options:
+
+- `--wait <SECONDS>`
+
+  Block up to SECONDS for the command to finish first
+
+- `--max-bytes <BYTES>`
+
+  Cap the output; the reply says where to continue from
+
+  Default: `262144`.
+
+- `--json`
+
+  JSON: the record plus its output text
+
+## yas terminal grep
+
+Ripgrep-compatible search over terminals' backlog + viewport.
+
+Each terminal is treated as a "file". Trailing IDs pick specific terminals (same numbers `yas terminal list` prints); with no IDs and no filters, every terminal is searched. Logical lines that soft-wrap across multiple physical rows are stitched back into one line before matching — a regex like 'Error: .\* refused' matches even if the message wrapped at column 80.
+
+Target selection: yas terminal grep PATTERN            # all terminals yas terminal grep PATTERN 3 5        # just PTYs 3 and 5 yas terminal grep PATTERN `--tag` build yas terminal grep PATTERN `--title` vim `--running` yas terminal grep PATTERN `--all`
+
+Uses the Rust `regex` crate (RE2-style — same default engine as ripgrep). Lookaround and backreferences are not supported; pipe through external ripgrep if you need them: `yas terminal history 3 | rg -P '(?<=...)'`.
+
+```text
+Usage: yas terminal grep [OPTIONS] [PATTERN] [IDS]...
+```
+
+Arguments:
+
+- `[PATTERN]`
+
+  Regex pattern (or literal string with `-F`). May be omitted if -e/-f is used
+
+- `[IDS]...`
+
+  Terminal IDs to search (empty = all terminals, subject to filters)
+
+Options:
+
+- `-e, --regexp <REGEXPS>`
+
+  Additional regex pattern (may be given multiple times)
+
+- `-f, --file <PATTERN_FILES>`
+
+  Read one pattern per line from FILE (may be given multiple times)
+
+- `-F, --fixed-strings`
+
+  Treat pattern as a literal string, not a regex
+
+- `-w, --word-regexp`
+
+  Only match whole words (wrap pattern in \b…\b)
+
+- `-x, --line-regexp`
+
+  Only match whole lines (anchor pattern with \A…\z)
+
+- `-i, --ignore-case`
+
+  Case-insensitive match
+
+- `-s, --case-sensitive`
+
+  Force case-sensitive match (overrides `-i`, `-S`)
+
+- `-S, --smart-case`
+
+  Case-insensitive if pattern is all-lowercase, else sensitive
+
+- `-v, --invert-match`
+
+  Invert: print lines that do NOT match
+
+- `-U, --multiline`
+
+  Allow patterns to span multiple lines
+
+- `--multiline-dotall`
+
+  In multiline mode, let `.` match newline as well
+
+- `-A, --after-context <AFTER_CONTEXT>`
+
+  Show N lines of context after each match
+
+  Default: `0`.
+
+- `-B, --before-context <BEFORE_CONTEXT>`
+
+  Show N lines of context before each match
+
+  Default: `0`.
+
+- `-C, --context <CONTEXT>`
+
+  Show N lines of context before and after each match
+
+- `--context-separator <CONTEXT_SEPARATOR>`
+
+  Separator printed between non-contiguous context groups
+
+  Default: `--`.
+
+- `--no-context-separator`
+
+  Suppress the context separator line
+
+- `-n, --line-number`
+
+  Show 1-based line numbers (default on)
+
+- `-N, --no-line-number`
+
+  Suppress line numbers
+
+- `-H, --with-filename`
+
+  Always print the terminal "filename" (pty:N) with each match
+
+- `-I, --no-filename`
+
+  Never print the terminal "filename"
+
+- `--heading`
+
+  Group matches per terminal under a heading (default on TTY, multi-PTY)
+
+- `--no-heading`
+
+  Do not group matches under a per-terminal heading
+
+- `--column`
+
+  Show 1-based column of the first match on each line
+
+- `-c, --count`
+
+  Print only "pty:N:&lt;count&gt;" per terminal (no match lines)
+
+- `--count-matches`
+
+  Like `-c` but count every match, not every matching line
+
+- `-l, --files-with-matches`
+
+  Print only the IDs of terminals with at least one match
+
+- `--files-without-match`
+
+  Print only the IDs of terminals with no matches
+
+- `-o, --only-matching`
+
+  Print only the matched text, one per line
+
+- `-m, --max-count <MAX_COUNT>`
+
+  Stop after N matches per terminal
+
+- `--passthru`
+
+  Print every line; matching lines use the match separator
+
+- `--vimgrep`
+
+  Emit one line per match as pty:N:line:col:text
+
+- `--json`
+
+  Emit ripgrep's JSON event stream (begin/match/context/end/summary)
+
+- `-p, --pretty`
+
+  Alias for `--color=always` `--heading` `-n`
+
+- `-0, --null`
+
+  Separate filename from the rest with a NUL byte
+
+- `--color <COLOR>`
+
+  When to colorize output: auto, always, never, ansi
+
+  Default: `auto`. Values: `auto`, `always`, `never`, `ansi`.
+
+- `--field-context-separator <FIELD_CONTEXT_SEPARATOR>`
+
+  String between filename and line number for context lines
+
+  Default: `-`.
+
+- `--field-match-separator <FIELD_MATCH_SEPARATOR>`
+
+  String between filename and line number for match lines
+
+  Default: `:`.
+
+- `-q, --quiet`
+
+  Do not print anything; exit 0 on any match, 1 otherwise
+
+- `--no-messages`
+
+  Suppress warnings about unreadable files / missing IDs
+
+- `--stats`
+
+  Print match-count statistics after searching
+
+- `--stop-on-nonmatch`
+
+  In a terminal, stop searching after the first non-matching line that follows a match (useful for tailing recent events)
+
+- `--sort <SORT>`
+
+  Sort results: "path" (by numeric terminal ID) or "none"
+
+  Values: `path`, `none`.
+
+- `--sortr <SORTR>`
+
+  Like `--sort` but reversed
+
+  Values: `path`, `none`.
+
+- `--tag <TAG>`
+
+  Keep terminals whose tag contains this substring
+
+- `--title <TITLE>`
+
+  Keep terminals whose title contains this substring
+
+- `--running`
+
+  Keep only running terminals
+
+- `--exited`
+
+  Keep only exited terminals
+
+- `--all`
+
+  Explicitly opt in to "no filter, no positional IDs"
+
+## yas terminal send
+
+Send input to a terminal.
+
+Fails if the terminal has exited. Supports C-style escapes: \n \r \t \\ \0 \xHH. \n sends CR (Enter), matching real terminal behavior. Use \x0a for literal LF. To control interactive programs like vim: yas terminal send 3 '\x1b:wq\n' printf '\x1b:wq\n' | yas terminal send 3 -
+
+```text
+Usage: yas terminal send [OPTIONS] <ID> <TEXT>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `<TEXT>`
+
+  Text to send (use - to read from stdin)
+
+## yas terminal mouse
+
+Send a mouse event to a terminal.
+
+Coordinates are zero-based cell positions, matching browser terminal mouse reporting. The server translates the event using the terminal's active mouse mode/encoding (X10, normal, button-motion, any-motion, SGR). Examples:
+
+```text
+yas terminal mouse 3 click 10 5
+yas terminal mouse 3 down 10 5 --button right
+yas terminal mouse 3 move 12 5 --button left
+yas terminal mouse 3 wheel-up 10 5
+```
+
+```text
+Usage: yas terminal mouse [OPTIONS] <ID> <EVENT> <COL> <ROW>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `<EVENT>`
+
+  Mouse event: down, up, move, click, hover, wheel-up, or wheel-down
+
+- `<COL>`
+
+  Zero-based terminal column
+
+- `<ROW>`
+
+  Zero-based terminal row
+
+Options:
+
+- `-b, --button <BUTTON>`
+
+  Mouse button for down/up/click/move
+
+  Default: `left`.
+
+## yas terminal click
+
+Click at terminal cell coordinates.
+
+Shorthand for terminal mouse ID click COL ROW. Coordinates are zero-based cells, not pixels.
+
+```text
+Usage: yas terminal click [OPTIONS] <ID> <COL> <ROW>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `<COL>`
+
+  Zero-based terminal column
+
+- `<ROW>`
+
+  Zero-based terminal row
+
+Options:
+
+- `-b, --button <BUTTON>`
+
+  Mouse button: left, middle, or right
+
+  Default: `left`.
+
+## yas terminal wait
+
+Wait for a terminal to exit or match a pattern.
+
+Without `--pattern`, blocks until the PTY process exits and returns its exit code. With `--pattern`, subscribes to output and exits when the regex matches a line produced after the wait began.
+
+```text
+Usage: yas terminal wait [OPTIONS] --timeout <TIMEOUT> <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+Options:
+
+- `--timeout <TIMEOUT>`
+
+  Maximum seconds to wait before giving up (exit code 124)
+
+  Required.
+
+- `--pattern <PATTERN>`
+
+  Regex pattern to match against new output lines
+
+## yas terminal restart
+
+Restart an exited terminal (re-runs the original command)
+
+```text
+Usage: yas terminal restart [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+## yas terminal deadline
+
+Arm, refresh, or clear a terminal's server-enforced deadline
+
+The countdown restarts from now on every call, so repeating it on an interval makes it a dead-man switch: the terminal outlives the client by at most one period. 0 clears it.
+
+```text
+Usage: yas terminal deadline [OPTIONS] <ID> <SECONDS>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `<SECONDS>`
+
+  Seconds from now, or 0 to clear
+
+## yas terminal kill
+
+Send a signal to a terminal's process group.
+
+```text
+Usage: yas terminal kill [OPTIONS] <ID> [SIGNAL]
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `[SIGNAL]`
+
+  Signal name or number (e.g. TERM, KILL, INT, 9)
+
+  Default: `TERM`.
+
+## yas terminal close
+
+Close a terminal.
+
+```text
+Usage: yas terminal close [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+## yas terminal attach
+
+Attach this terminal to a remote one (Ctrl-] detaches)
+
+Puts the local tty in raw mode, forwards keystrokes, and repaints the remote grid. Needs a real terminal on stdin. Exits with the remote program's status if it finishes while attached.
+
+```text
+Usage: yas terminal attach [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+## yas terminal resize
+
+Set a terminal's viewport size
+
+The size is a client \*request\*: the server reconciles the desired sizes of every attached viewer, so another connected client can hold the grid larger than this.
+
+```text
+Usage: yas terminal resize [OPTIONS] <ID> <COLS> <ROWS>
+```
+
+Arguments:
+
+- `<ID>`
+
+  Terminal ID
+
+- `<COLS>`
+
+  Columns
+
+- `<ROWS>`
+
+  Rows
+
+## yas terminal record
+
+Record timestamped terminal output
+
+Writes native TerminalFrame records in YASREC1 with microsecond timestamps. Records until `--frames` or `--duration` is reached, or Ctrl+C.
+
+```text
+Usage: yas terminal record [OPTIONS] <ID>
+```
+
+Arguments:
+
+- `<ID>`
+
+  PTY terminal ID
+
+Options:
+
+- `-o, --output <OUTPUT>`
+
+  Output file path (default: pty-&lt;id&gt;.yasrec)
+
+- `-f, --frames <FRAMES>`
+
+  Maximum number of frames to record (0 = unlimited)
+
+  Default: `0`.
+
+- `-d, --duration <DURATION>`
+
+  Maximum duration in seconds (0 = unlimited)
+
+  Default: `0`.
+

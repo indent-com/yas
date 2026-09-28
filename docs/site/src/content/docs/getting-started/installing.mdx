@@ -1,0 +1,212 @@
+---
+title: "Installing yas"
+description: "Install the yas binary on Linux, macOS, or Windows, keep it up to date, and add shell completions and man pages."
+sidebar:
+  order: 11
+---
+
+yas ships as one binary with no required dependencies. The installer downloads the latest release from GitHub, puts `yas` in a `bin` directory on your machine, and writes man pages and shell completions beside it. Linux gets every feature. macOS and Windows get terminal multiplexing without the graphical compositor.
+
+## Install on Linux or macOS
+
+Run the installer:
+
+```bash
+curl -sf https://yas.run | sh
+```
+
+```text
+downloading the latest yas for linux/x86_64 from GitHub...
+installing to /home/you/.local/bin...
+installed yas 0.3.0 to /home/you/.local/bin/yas
+generated man pages and completions in /home/you/.local/share
+```
+
+Check the installed version:
+
+```bash
+yas --version
+```
+
+```text
+yas 0.3.0
+```
+
+The installer picks an install prefix and puts the binary in its `bin` directory:
+
+- `~/.local`, when `~/.local/bin` is on your `PATH`.
+- `~`, when `~/bin` is on your `PATH`.
+- `/usr/local` otherwise.
+
+It first tries to write without elevated rights. When that fails and you are not root, it retries with `sudo`, or with `doas` when `sudo` is missing.
+
+On Linux the installer checks for glibc and downloads the musl build only on systems without it, such as Alpine. On macOS it signs the binary ad hoc so Gatekeeper lets it run. Running the installer again when the same version and build are already present prints `yas 0.3.0 already installed.` and changes nothing.
+
+The installer reads these environment variables:
+
+- `YAS_PREFIX` sets the install prefix. The binary goes to `$YAS_PREFIX/bin/yas` and the man pages and completions to `$YAS_PREFIX/share`.
+- `YAS_INSTALL_DIR` is an older form that names the `bin` directory. The installer strips a trailing `/bin` and uses the rest as the prefix. `YAS_PREFIX` wins when both are set.
+- `YAS_GPL=1` selects the GPL build described below.
+
+```bash
+curl -sf https://yas.run | YAS_PREFIX="$HOME/opt/yas" sh
+```
+
+## Install the GPL build with x264
+
+The default binary is MIT-licensed and encodes software H.264 with OpenH264. On Linux you can install a build that uses x264 instead, which gives better software H.264. x264 is GPL-2.0-or-later, so that binary as a whole is distributed under the GPL.
+
+```bash
+curl -sf https://yas.run | YAS_GPL=1 sh
+```
+
+`YAS_GPL=1` has no effect on macOS. The installer prints a note and installs the standard binary.
+
+Every binary prints its exact license terms:
+
+```bash
+yas --license
+```
+
+```text
+yas — MIT License, copyright (c) 2026 Indent Team
+Full text: https://github.com/yas-run/yas/blob/main/LICENSE
+
+This binary includes OpenH264, copyright (c) Cisco Systems,
+licensed under the BSD-2-Clause license.
+```
+
+The GPL build prints the x264 notice in place of the OpenH264 one.
+
+## Install on Windows
+
+Run the installer in PowerShell:
+
+```powershell
+irm https://yas.run/install.ps1 | iex
+```
+
+It downloads `yas.exe` to `%LOCALAPPDATA%\yas\bin` and adds that directory to your user `PATH`. Set `YAS_INSTALL_DIR` to install somewhere else:
+
+```powershell
+$env:YAS_INSTALL_DIR = "C:\tools\yas"
+irm https://yas.run/install.ps1 | iex
+```
+
+The installer can replace a `yas.exe` that is still running. It renames the old file and deletes it on a later install.
+
+## Upgrade
+
+```bash
+yas upgrade
+```
+
+```text
+downloading the latest yas for linux/x86_64 from GitHub...
+yas 0.3.0 already installed.
+```
+
+`yas upgrade` downloads the installer for your platform and runs it against the directory the running binary lives in. A GPL binary upgrades to the GPL build and a standard binary to the standard build. Set `YAS_GPL=1` or `YAS_GPL=0` to switch builds during an upgrade. After a successful upgrade, yas stops its background connection proxy so the next command starts the new one.
+
+## Install on another machine
+
+Give `yas install` an SSH target to run the installer there:
+
+```bash
+yas install alice@build-box
+```
+
+It uses your `ssh` command, detects the remote operating system, and runs the Linux and macOS installer with `curl` or `wget`, or the PowerShell installer on Windows.
+
+Without a target, `yas install` prints the install commands so you can run them by hand:
+
+```bash
+yas install
+```
+
+```text
+# Linux / macOS
+curl -sf https://yas.run | sh
+
+# Windows (PowerShell)
+irm https://yas.run/install.ps1 | iex
+```
+
+You usually do not need `yas install`. The first time you connect to an SSH remote, yas installs itself there if `yas` is missing. That automatic install needs these on the remote host:
+
+- A POSIX `sh`.
+- `curl` or `wget`, and CA certificates for HTTPS.
+- Linux on x86_64 or arm64, or macOS on arm64.
+
+It installs to `~/.local/bin` on the remote and starts `yas server` there. See [Remotes](/remote/remotes) for connecting.
+
+## Add shell completions and man pages
+
+The installer runs this step for you. To write the files somewhere else, pass a directory to `yas generate`:
+
+```bash
+yas generate ~/.local/share
+```
+
+It writes man pages for every command and completions for bash, zsh, and fish:
+
+```text
+bash-completion/completions/yas.bash
+fish/vendor_completions.d/yas.fish
+man/man1/yas.1
+man/man1/yas-terminal.1
+man/man1/yas-terminal-start.1
+...
+zsh/site-functions/_yas
+```
+
+Pass `/usr/share` or `/usr/local/share` to install system-wide. Your shell finds the completions when the directory is on its completion path.
+
+## Supported platforms
+
+| Platform | Architecture  | Wayland compositor | Features                                 |
+| -------- | ------------- | ------------------ | ---------------------------------------- |
+| Linux    | x86_64, arm64 | Yes                | Full features                            |
+| macOS    | arm64         | No                 | Terminal multiplexing, no graphical apps |
+| Windows  | x86_64        | No                 | Terminal multiplexing, no graphical apps |
+
+Linux builds exist for glibc and for musl. There is no macOS build for Intel Macs.
+
+## Optional runtime dependencies
+
+yas runs without any of the libraries below. Software H.264 and AV1 encoders are built in, and the compositor falls back to CPU rendering. When a library or program is present, yas finds it at startup and uses it. GPU libraries are loaded with `dlopen`, and missing ones are skipped without an error.
+
+These apply on Linux only.
+
+### GPU compositing and hardware encoding
+
+| Library                                 | Used for                                         |
+| --------------------------------------- | ------------------------------------------------ |
+| `libvulkan.so.1`                        | GPU compositing and Vulkan Video encoding        |
+| `libva.so.2`, `libva-drm.so.2`          | VA-API hardware encoding on Intel and AMD GPUs   |
+| `libgbm.so.1`                           | DMA-BUF allocation for zero-copy VA-API encoding |
+| `libcuda.so.1`, `libnvidia-encode.so.1` | NVENC hardware encoding on NVIDIA GPUs           |
+
+See [Video encoding](/gui/video-encoding) for choosing encoders.
+
+### Desktop services and audio
+
+| Dependency             | Used for                                                |
+| ---------------------- | ------------------------------------------------------- |
+| `pipewire`             | Audio, run as a private instance for each server        |
+| `pipewire-pulse`       | PulseAudio compatibility for applications               |
+| `libpipewire-0.3.so.0` | Capturing audio in the server process, through `dlopen` |
+| `dbus-daemon`          | Private desktop and PipeWire D-Bus sessions             |
+| `wireplumber`          | PipeWire session manager, started when installed        |
+| `xwayland-satellite`   | X11 applications, started when installed                |
+
+- Audio stays off when PipeWire is not installed or `libpipewire-0.3.so.0` cannot be found by the dynamic linker. Set `LD_LIBRARY_PATH` if the library lives in a non-default location.
+- The same private PipeWire instance also carries camera, microphone, and screen-cast portals. To keep it from starting at all, set `YAS_AUDIO=0`, `YAS_MEDIA_INPUT=0`, and `YAS_PORTALS=0` on the server. `YAS_AUDIO=0` alone leaves it running while the other two are on.
+- yas starts `xwayland-satellite` when it is on `PATH` and exports the resulting `DISPLAY` to every terminal. Applications that speak Wayland still use Wayland. Without the binary, only Wayland applications can show windows. Set `YAS_XWAYLAND=0` to skip it.
+
+See [Audio, camera, and microphone](/gui/audio-camera-microphone) for what audio does in the browser.
+
+<Aside type="note">
+  `yas install` and `yas upgrade` fetch the installer from `yas.run` and the
+  binary from GitHub releases, so both need network access to those hosts.
+</Aside>

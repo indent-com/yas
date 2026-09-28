@@ -1,0 +1,155 @@
+---
+title: "Shell integration"
+description: "Make your shell report its working directory and mark each command so yas can track the directory and record a per-command journal."
+sidebar:
+  order: 33
+---
+
+Shells can send two kinds of escape sequences that yas reads from every terminal. **OSC 7** reports the shell's working directory. **OSC 133** marks where each prompt, command, and command output starts, and how the command exited. With both in place, `yas terminal cwd` and the **CWD** column follow every `cd`, and `yas terminal journal` and `yas terminal output` can list commands and return one command's output and exit code. yas does not add these hooks to your shell itself. This page shows the hooks for fish, zsh, and bash.
+
+## What each sequence gives you
+
+- **OSC 7**: the server stores the reported directory and answers `yas terminal cwd` and the **CWD** column from it. Without it, yas asks the operating system for the directory of the terminal's process on each poll.
+- **OSC 133**: the server records each command's text, exit code, duration, and output range. `yas terminal journal`, `yas terminal output`, and `output --wait` depend on it. Without it the journal stays empty. See [Reading terminal output](/terminals/reading-output).
+
+Some prompts and terminal integrations already emit OSC 133. Before you add a hook, start a terminal with your usual shell, run a command, and check `yas terminal journal`. Adding a second set of markers on top of existing ones records commands incorrectly.
+
+## fish
+
+Recent fish releases emit both sequences on their own. With fish 4.9 there is nothing to add: the journal and working directory work in a terminal running plain fish.
+
+For an older fish that does not mark prompts, add this to `~/.config/fish/config.fish`:
+
+```fish
+function __yas_prompt_start --on-event fish_prompt
+    printf '\e]133;A\a'
+end
+functions -c fish_prompt __yas_fish_prompt
+function fish_prompt
+    __yas_fish_prompt
+    printf '\e]133;B\a'
+end
+function __yas_preexec --on-event fish_preexec
+    printf '\e]133;C\a'
+end
+function __yas_postexec --on-event fish_postexec
+    printf '\e]133;D;%s\a' $status
+end
+```
+
+The wrapper around `fish_prompt` sends the end-of-prompt marker after your prompt is drawn, so the recorded command does not include the prompt text. Put it after anything that defines `fish_prompt`.
+
+## zsh
+
+Add both blocks to the end of `~/.zshrc`, after any theme or framework that sets `PS1`.
+
+Report the working directory:
+
+```zsh
+_yas_osc7() {
+  local url="file://${HOST}"
+  local c ch
+  for ((i = 1; i <= ${#PWD}; i++)); do
+    ch="${PWD[i]}"
+    case "$ch" in
+      [-A-Za-z0-9_./~]) url+="$ch" ;;
+      *) printf -v c '%%%02X' "'$ch"; url+="$c" ;;
+    esac
+  done
+  printf '\e]7;%s\a' "$url"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook chpwd _yas_osc7
+_yas_osc7
+```
+
+Mark commands:
+
+```zsh
+_yas_precmd() {
+  printf '\e]133;D;%s\a' $?
+  printf '\e]133;A\a'
+}
+_yas_preexec() {
+  printf '\e]133;C\a'
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _yas_precmd
+add-zsh-hook preexec _yas_preexec
+PS1=$PS1$'%{\e]133;B\a%}'
+```
+
+The last line appends the end-of-prompt marker to your prompt, so the text between it and the command start is the command line.
+
+## bash
+
+Add this to `~/.bashrc`. It needs bash 4.4 or later for `PS0`.
+
+```bash
+_yas_osc7() {
+  local url="file://${HOSTNAME}" i ch
+  for ((i = 0; i < ${#PWD}; i++)); do
+    ch="${PWD:i:1}"
+    case "$ch" in
+      [-A-Za-z0-9_./~]) url+="$ch" ;;
+      *) printf -v ch '%%%02X' "'$ch"; url+="$ch" ;;
+    esac
+  done
+  printf '\e]7;%s\a' "$url"
+}
+_yas_prompt() {
+  local status=$?
+  printf '\e]133;D;%s\a' "$status"
+  _yas_osc7
+  printf '\e]133;A\a'
+}
+PROMPT_COMMAND="_yas_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PS0='\e]133;C\a'
+PS1=$PS1'\[\e]133;B\a\]'
+```
+
+- `_yas_prompt` runs first in `PROMPT_COMMAND`, so it reads the exit code of your command before anything else changes `$?`.
+- bash prints `PS0` after you press Enter on a command and before it runs, which marks the start of the command's output. An empty line does not start a command record.
+- Set `PS1` before this block, or append the marker again if something later replaces `PS1`.
+
+The default shell in a yas terminal is a login shell (`$SHELL -li`). A login bash reads `~/.bash_profile`, `~/.bash_login`, or `~/.profile`, not `~/.bashrc`. Make sure one of those sources `~/.bashrc`.
+
+## Check that it works
+
+Start a terminal with your shell, run a few commands, and read the journal and directory:
+
+```bash
+ID=$(yas terminal start -t zsh --cols 150 -- zsh -i)
+yas terminal send "$ID" 'cd /usr/share\n'
+yas terminal send "$ID" 'ls | wc -l\n'
+yas terminal send "$ID" 'false\n'
+sleep 1
+yas terminal journal "$ID"
+yas terminal cwd "$ID"
+```
+
+```text
+INDEX	STATUS	EXIT	MS	START_SEQ	END_SEQ	COMMAND
+0	exited	0	0	1	1	cd /usr/share
+1	exited	0	5	2	3	ls | wc -l
+2	exited	1	0	4	4	false
+/usr/share
+```
+
+Signs of a problem:
+
+- The prompt appears in the **COMMAND** column: the end-of-prompt marker (`133;B`) comes before the prompt text instead of after it.
+- Every command shows `incomplete` with no exit code, or extra empty records appear: the shell sends the command-start marker (`133;C`) more than once per command.
+- `journal` prints `no commands recorded`: the shell sends no OSC 133 markers.
+
+## Sequence reference
+
+- OSC 7 is `ESC ] 7 ; file://HOSTNAME/PATH BEL`, with the path percent-encoded. yas ignores a report whose hostname is not this machine's, because a shell reached over SSH reports a path on the other machine.
+- OSC 133 markers are `A` (prompt starts), `B` (prompt ends, command line follows), `C` (command output starts), and `D;STATUS` (command finished with that exit code). A bare `D` closes the command without an exit code.
+- yas also reads VS Code's OSC 633 variant. `633;E;COMMAND` supplies the command line directly, and yas prefers it over the text drawn between `B` and `C`.
+
+<Aside type="note">
+  The `D` sent before the very first prompt is ignored, because no command was
+  running. Command text is kept up to 4096 bytes per record
+  (`YAS_TERM_JOURNAL_CMD_MAX`).
+</Aside>

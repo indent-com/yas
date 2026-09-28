@@ -1,0 +1,37 @@
+---
+title: "yas uplink"
+description: "Expose the local yas server through an end-to-end encrypted relay."
+sidebar:
+  order: 17
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Expose the local yas server through an end-to-end encrypted relay
+
+Requires `YAS_UPLINK_TOKEN` for the control endpoint.
+
+```text
+Usage: yas uplink [OPTIONS] --identity <IDENTITY> --allow-client <ALLOW_CLIENT> <URL>
+```
+
+Arguments:
+
+- `<URL>`
+
+  Control endpoint URL (e.g. https://relay.example)
+
+Options:
+
+- `--identity <IDENTITY>`
+
+  X25519 private key as unpadded base64url (43 characters)
+
+  Required. Environment: `YAS_UPLINK_IDENTITY`.
+
+- `--allow-client <ALLOW_CLIENT>`
+
+  Authorized client public key as unpadded base64url (43 characters; repeatable)
+
+  Required. Environment: `YAS_UPLINK_CLIENT_KEYS`.
+

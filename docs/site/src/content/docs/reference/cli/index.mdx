@@ -1,0 +1,70 @@
+---
+title: "CLI reference"
+description: "Every yas subcommand, argument, and option, generated from the CLI's own definitions."
+sidebar:
+  order: 121
+  group:
+    label: "CLI reference"
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+This reference is generated from the same definitions that produce `yas --help`, so it matches the release built from this commit. Run `yas <command> --help` for the same text in a terminal, or `yas learn` for a task-oriented guide.
+
+```text
+Usage: yas [OPTIONS] <COMMAND>
+```
+
+## Global options
+
+These options apply to every subcommand.
+
+- `--on <ON>`
+
+  Remote to connect to: a URI (ssh:host, tcp:h:p, socket:/p, share:pass, local[:name]) or the name of a remote on the home server (see `yas remote`). Overrides `YAS_TARGET` and yas.conf `yas.target`
+
+- `--hub <HUB>`
+
+  Signaling hub URL
+
+  Default: `yas.run`. Environment: `YAS_HUB`.
+
+- `--json`
+
+  Emit NDJSON for an extension-provided `@name` command
+
+  This root option must precede `@name`. A `--json` after the namespace is passed verbatim to the extension command.
+
+
+## Commands
+
+- [`yas terminal`](/reference/cli/terminal): Manage terminals (PTYs)
+- [`yas mustard`](/reference/cli/mustard): Interactively manage Muster stacks, units, and terminals.
+- [`yas client`](/reference/cli/client): List and disconnect clients connected to the server.
+- [`yas events`](/reference/cli/events): Inspect and configure the server's binary event journal.
+- [`yas surface`](/reference/cli/surface): Manage compositor surfaces.
+- [`yas media`](/reference/cli/media): Inspect and control desktop media players (MPRIS)
+- [`yas clipboard`](/reference/cli/clipboard): Manage the clipboard.
+- [`yas fs`](/reference/cli/fs): Mirror server filesystem state (https://docs.yas.run/code/files)
+- [`yas git`](/reference/cli/git): Inspect git repositories on the server (https://docs.yas.run/code/git)
+- [`yas kv`](/reference/cli/kv): Read and write the server's key/value store (https://docs.yas.run/code/key-value-store)
+- [`yas lsp`](/reference/cli/lsp): Query language servers on the server (https://docs.yas.run/code/language-servers)
+- [`yas ext`](/reference/cli/ext): Run and manage extensions.
+- [`yas run`](/reference/cli/run): Execute a process and connect its standard streams.
+- [`yas remote`](/reference/cli/remote): Manage the server's named remotes.
+- [`yas open`](/reference/cli/open): Open the terminal UI in the browser.
+- [`yas share`](/reference/cli/share): Share via WebRTC.
+- [`yas uplink`](/reference/cli/uplink): Expose the local yas server through an end-to-end encrypted relay.
+- [`yas uplink-keygen`](/reference/cli/uplink-keygen): Print an X25519 key pair as JSON (private_key and public_key, base64url)
+- [`yas uplink-public-key`](/reference/cli/uplink-public-key): Print the public key derived from `YAS_UPLINK_IDENTITY`.
+- [`yas uplink-url`](/reference/cli/uplink-url): Print a consumer URL using the producer's `YAS_UPLINK_IDENTITY`.
+- [`yas forward`](/reference/cli/forward): Forward local ports to the server's network (TCP and UDP)
+- [`yas socks`](/reference/cli/socks): Proxy TCP connections into the server's network over SOCKS5.
+- [`yas learn`](/reference/cli/learn): Print the full CLI reference (usage guide for scripts and LLM agents)
+- [`yas server`](/reference/cli/server): Run the yas terminal multiplexer server.
+- [`yas quit`](/reference/cli/quit): Shut down the yas server.
+- [`yas install`](/reference/cli/install): Install yas on a remote host via SSH, or print install commands.
+- [`yas upgrade`](/reference/cli/upgrade): Upgrade yas to the latest version.
+- [`yas hash-passphrase`](/reference/cli/hash-passphrase): Hash a yas edge passphrase for `YAS_PASSPHRASE`.
+- [`yas edge`](/reference/cli/edge): Run the yas edge.
+- [`yas generate`](/reference/cli/generate): Generate man pages and shell completions.

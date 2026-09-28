@@ -1,0 +1,236 @@
+---
+title: "Rendering surfaces in your app"
+description: "Show a graphical window from the yas compositor in your own page with YasSurfaceView or YasSurfaceCanvas."
+sidebar:
+  order: 93
+---
+
+A surface is a graphical window that a program opened on a terminal's Wayland compositor. The
+server encodes each surface as H.264 or AV1 video, and your page decodes it with WebCodecs and
+draws it on a canvas. `YasSurfaceView` in [`@yas-run/react`](/embedding/react) and
+[`@yas-run/solid`](/embedding/solid) does this for you, and `YasSurfaceCanvas` in `@yas-run/core`
+is the framework-free class underneath.
+
+<Aside type="caution" title="Experimental">
+
+The compositor and surface streaming are experimental. The compositor runs on Linux servers only.
+The browser needs WebCodecs.
+
+</Aside>
+
+## Show a surface
+
+<Steps titleSize="h3">
+  <Step title="Start a program that opens a window">
+    Any command started in a terminal on a Linux server can open Wayland surfaces. This example uses
+    Chrome as the Wayland client:
+
+    ```bash
+    yas terminal start -- google-chrome --ozone-platform=wayland \
+      --user-data-dir="$(mktemp -d)" --no-first-run \
+      "data:text/html,<h1 style='font-size:80px'>yas surface</h1>"
+    yas surface list
+    ```
+
+    ```text
+    ID	TITLE	SIZE	APP_ID
+    1	data:text/html,<h1 style='font-size:80px'>yas surface</h1> - Google Chrome	1920x1080	google-chrome
+    ```
+
+  </Step>
+  <Step title="List surfaces in your page">
+    Each connection has a `surfaceStore`. `getSurfaces()` returns a map from surface ID to
+    `YasSurface`, and `onChange(listener)` returns an unsubscribe function. A surface with
+    `parentId` equal to `0n` is a top-level window; others are popups or child windows.
+
+    ```tsx
+    import { useEffect, useState } from "react";
+    import type { YasSurface } from "@yas-run/core";
+    import { YasSurfaceView, useYasConnection, useYasWorkspace } from "@yas-run/react";
+
+    function useTopLevelSurfaces(connectionId: string): YasSurface[] {
+      const workspace = useYasWorkspace();
+      const ready = useYasConnection(connectionId)?.ready ?? false;
+      const [surfaces, setSurfaces] = useState<YasSurface[]>([]);
+
+      useEffect(() => {
+        const store = workspace.getConnection(connectionId)?.surfaceStore;
+        if (!ready || !store) return;
+        const update = () =>
+          setSurfaces([...store.getSurfaces().values()].filter((s) => s.parentId === 0n));
+        update();
+        return store.onChange(update);
+      }, [workspace, connectionId, ready]);
+
+      return surfaces;
+    }
+    ```
+
+  </Step>
+  <Step title="Render it">
+    ```tsx
+    export function FirstSurface() {
+      const first = useTopLevelSurfaces("default")[0];
+      if (!first) return <p>No surfaces</p>;
+      return (
+        <YasSurfaceView
+          connectionId="default"
+          surfaceId={first.surfaceId}
+          style={{ width: 800, height: 500 }}
+        />
+      );
+    }
+    ```
+
+    The view resizes the window to its own box. With this 800 by 500 pane on a 1x display, the
+    surface list changes to:
+
+    ```text
+    ID	TITLE	SIZE	APP_ID
+    1	data:text/html,<h1 style='font-size:80px'>yas surface</h1> - Google Chrome	800x500	google-chrome
+    ```
+
+  </Step>
+</Steps>
+
+`YasSurface` carries `connectionId`, `surfaceId`, `parentId`, `title`, `appId`, `origin`, `width`
+and `height` in physical pixels, `logicalWidth` and `logicalHeight` in Wayland logical pixels, and
+`minimumSize` when the application sets one.
+
+## `YasSurfaceView` props
+
+- `connectionId` and `surfaceId`: which surface to show. Required.
+- `resizable`: whether this view owns the surface's size. Default `true`. Set `false` only for a
+  passive preview, such as a thumbnail, that shares another view's stream. A passive view gets a
+  fixed downscale at thumbnail frame rate (15 fps) and accepts no input.
+- `live`: set `false` to paint only frames another live view already decoded, without asking the
+  server for a stream. Default `true`.
+- `touchMode`: `"direct"` sends every touchscreen contact to the application's `wl_touch`, so it
+  handles pinch and multi-finger gestures. `"pointer"` turns a tap into a click, a one-finger drag
+  into scrolling, and a long press into a right-click. Default `"direct"`. Changing it does not
+  restart the stream.
+- `zoom` and `zoomMode`: `zoomMode="relative"` (default) multiplies the display's pixel ratio by
+  `zoom`; `"exact"` uses `zoom` as the surface scale. `zoom` is clamped to 0.25 through 4 and only
+  affects resizable views.
+- `className`/`class` and `style`: applied to the container `<div>`.
+- Solid only: `focus` and `resizeKey`. See [Solid](/embedding/solid#yassurfaceview).
+
+The React view also takes a `ref` whose handle exposes `canvas` (the `<canvas>` element) and
+`surface` (the current `YasSurface`).
+
+## Wire a surface yourself
+
+The React view's mount sequence in
+[`js/react/src/YasSurfaceView.tsx`](https://github.com/yas-run/yas/blob/main/js/react/src/YasSurfaceView.tsx)
+is the reference wiring. Follow the same order in any other framework.
+
+<Steps titleSize="h3">
+  <Step title="Probe codecs">
+    Call `detectCodecSupport()` when the view mounts, before it subscribes. The probe asks
+    WebCodecs which of H.264, AV1, and their 4:4:4 variants the browser decodes, and how large a
+    frame it can decode. The result is cached for the page. Until it finishes, subscriptions carry
+    `codec_support=0`, which the server reads as "accept anything", so a page that skips the probe
+    can be sent a codec it cannot decode. Call it even on pages that show only passive previews.
+  </Step>
+  <Step title="Create and attach the canvas">
+    ```ts
+    import { YasSurfaceCanvas, detectCodecSupport, driveSurfaceResize } from "@yas-run/core";
+
+    detectCodecSupport();
+    const view = new YasSurfaceCanvas({
+      workspace,
+      connectionId,
+      surfaceId,
+      live: true,
+      resizable: true,
+      touchMode: "direct",
+    });
+    view.attach(container);
+    ```
+
+    `resizable` here tells the canvas whether a resize driver will follow. A passive view uses it
+    to request its scaled size on the first subscribe.
+
+  </Step>
+  <Step title="Drive the size">
+    For a resizable view, hand the canvas and its container to `driveSurfaceResize`:
+
+    ```ts
+    const driver = driveSurfaceResize(view, container, () => ({ zoom: 1, mode: "relative" }));
+    ```
+
+    The zoom callback runs on every measurement. When only the zoom changes, call
+    `driver.reapply()`. After a layout change that a `ResizeObserver` may miss, such as leaving
+    fullscreen, call `driver.remeasure()`.
+
+  </Step>
+  <Step title="Clean up in reverse">
+    Call `driver.dispose()`, then `view.dispose()`. Disposing the driver withdraws the view's size
+    claim with `setDisplaySize(null)`.
+  </Step>
+</Steps>
+
+## How sizing works
+
+`driveSurfaceResize` in
+[`js/core/src/surfaceResize.ts`](https://github.com/yas-run/yas/blob/main/js/core/src/surfaceResize.ts)
+turns the container's box into a display size and a resize request:
+
+- It watches the container's CSS box with a `ResizeObserver`, plus `window` resize, page
+  visibility, and device pixel ratio changes.
+- It multiplies the CSS width and height by `devicePixelRatio`, rounds, and then rounds each extent
+  down to an even number, with a minimum of 2. Video encoders round odd extents down, so an odd
+  request would come back one pixel short and letterbox.
+- It calls `setDisplaySize(width, height, scale120, cssScale120)` on every measurement, so the
+  canvas resolution changes at once. Scales are in 120ths: `120` is 1x.
+- It sends `requestResize(width, height, scale120)` to the server. The first change after 250 ms
+  of quiet goes out immediately. Later changes in the same drag go out at most every 30 ms, always
+  with the newest box. Identical boxes are not re-sent.
+- When the page is hidden or the box has zero area, it calls `setDisplaySize(null)` and forgets the
+  last box, so a hidden pane stops constraining the window. Showing the pane again reclaims it.
+
+The server fits one surface to every resizable viewer at once. It asks the application for the
+largest logical size that fits all of them, within the application's minimum and maximum size
+hints, and encodes at the highest pixel ratio any viewer requested.
+
+## Presentation smoothing
+
+Smoothing holds decoded frames for a short, adaptive delay to even out network jitter. It engages
+after 8 steady frames and never adds more than 96 ms. It is bypassed when the server is on the same
+host (a protocol round trip under 2 ms).
+
+- The SDK default is on. `SurfaceStore` in `@yas-run/core` starts with smoothing enabled, so an
+  embedded view smooths unless you turn it off.
+- The standalone yas browser UI defaults to off and favors input latency. It turns smoothing on
+  only when the browser's local storage has `yas.surfaceSmoothing` set to `"1"`.
+
+Change it per connection:
+
+```ts
+workspace
+  .getConnection("default")
+  ?.surfaceStore.setPresentationSmoothingEnabled(false);
+```
+
+Turning it off discards queued frames and paints the newest one immediately.
+
+## Input
+
+A resizable view forwards input to the application. A view without a display size, including every
+passive view, forwards nothing.
+
+- The canvas is focusable (`tabIndex = 0`). Click it or focus it to send keys.
+- Keys are sent as Linux evdev scancodes mapped from `KeyboardEvent.code`, which names the physical
+  key.
+- A hidden `<textarea>` receives IME composition and text input. When the application reports its
+  text cursor, the textarea moves over it so the IME's candidate window opens there.
+- Mouse buttons, pointer motion, and wheel events go to the application's pointer. Touch follows
+  `touchMode`.
+- Paste events and files dropped on the canvas are forwarded to the application.
+
+<Aside type="note">
+
+The Solid view shows **Surface video unavailable** when the server has no usable encoder. The React
+view has no overlay for this case. The connection's `surfaceStore.videoUnavailableReason` holds the server's reason.
+
+</Aside>

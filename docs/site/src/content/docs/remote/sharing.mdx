@@ -1,0 +1,141 @@
+---
+title: "Sharing over WebRTC"
+description: "Publish a server through the yas.run hub so anyone with the passphrase can open it in a browser or reach it from the CLI."
+sidebar:
+  order: 52
+---
+
+`yas share` publishes a server over WebRTC. It prints a link that opens the server in any browser, and a second link that opens it read-only. The server needs no open ports and no public address: both ends connect out to a signaling hub, `yas.run` by default, and then talk to each other directly or through a TURN relay.
+
+## Share a server
+
+<Steps titleSize="h3">
+  <Step title="Start the share">
+
+    ```bash
+    yas share
+    ```
+
+    ```text
+    YAS at https://yas.run/s#psk=docs-throwaway-7f3k
+    Read-only: https://yas.run/s#psk=szEeNtzrbBMQX_jo8b02eNX6QAGjug-1JyPPvp2SZp0.ro
+    ```
+
+    The first line is the full-control link. The value after `#psk=` is the passphrase. The second line is the read-only link. Its value is a token derived from the passphrase, followed by `.ro`. Both lines go to stdout.
+
+    `yas share` starts the local server if it is not running. It shares the server at `YAS_SOCK`, or the `default` instance.
+
+  </Step>
+  <Step title="Send a link">
+
+    Send the full-control link to someone who may use the server as you. Send the read-only link to someone who may only watch. Anyone with a link can connect while the share runs.
+
+  </Step>
+  <Step title="Stop sharing">
+
+    Press **Ctrl+C**. Connected browsers lose the server. The server itself keeps running.
+
+  </Step>
+</Steps>
+
+Options:
+
+- `--quiet` prints nothing to stdout.
+- `--verbose` prints connection diagnostics to stderr, such as `fetched ICE config (2 servers)` and `registered with signaling server (session …)`. `YAS_WEBRTC_VERBOSE=1` does the same.
+- `--hub URL` or `YAS_HUB` uses another signaling hub. The default is `yas.run`, which yas reaches as `wss://yas.run`.
+
+## Choose the passphrase
+
+Without configuration, each `yas share` generates a new random 26-character passphrase, so old links stop working when the share restarts. Set a passphrase to keep the same links across restarts:
+
+```bash
+YAS_PASSPHRASE=correct-horse-battery yas share
+```
+
+yas reads `YAS_SHARE_PASSPHRASE` first and `YAS_PASSPHRASE` second. Use `YAS_SHARE_PASSPHRASE` when one server hosts both an edge and a share and each needs its own secret. An empty or whitespace-only value is an error. The read-only token depends only on the passphrase, so a fixed passphrase also gives a fixed read-only link.
+
+The passphrase travels in the URL fragment, which browsers do not send to the web server. The hub relays signed, encrypted connection offers and never receives the passphrase.
+
+## Share from the server process
+
+`yas server --share`, or `YAS_SHARE=1`, runs the share inside the server instead of as a second process:
+
+```bash
+YAS_PASSPHRASE=correct-horse-battery yas server --share
+```
+
+A hosted share prints nothing, because a service log is the wrong place for a URL that carries the passphrase. Set `YAS_SHARE_QUIET=0` to print the two links, and `YAS_SHARE_VERBOSE=1` for diagnostics:
+
+```bash
+YAS_SHARE_QUIET=0 YAS_PASSPHRASE=correct-horse-battery yas server --share
+```
+
+```text
+YAS at https://yas.run/s#psk=correct-horse-battery
+Read-only: https://yas.run/s#psk=….ro
+```
+
+Set a passphrase for a hosted share. Without one the server generates a random passphrase and, being quiet, never shows it, so nobody can connect.
+
+## What each link allows
+
+The full-control passphrase grants everything the server can do, as the user it runs as: create terminals, type into them, read and write files, run Git and language servers, open network connections, and stop the server. Treat it like a password to that account.
+
+A read-only visitor gets a restricted set of operations that the server enforces. The share marks the session read-only when it connects, and the server rejects anything outside that set. A read-only visitor can:
+
+- Watch terminals, scroll them, and read and search their text, journal, and command output.
+- Watch graphical surfaces and capture screenshots of them.
+- Receive audio and media output.
+- Load the server's exportable fonts.
+
+A read-only visitor cannot:
+
+- Create, close, resize, or type into terminals.
+- Click, type, resize, or focus surfaces.
+- Send camera or microphone input.
+- Use files, Git, language servers, the key-value store, port forwarding, or extensions.
+- List or disconnect other clients, or shut down the server.
+
+## Connect from the CLI
+
+A `share:` URI reaches a shared server from any machine with yas:
+
+```bash
+yas --on share:docs-throwaway-9q2m terminal list
+```
+
+```text
+ID	TAG	TITLE	COMMAND	CWD	STATUS
+```
+
+Use the full-control passphrase. The CLI does not accept the read-only token. Add `?hub=URL` to name a hub for this URI; otherwise the CLI uses `--hub` or `YAS_HUB`.
+
+The first command sets up the WebRTC connection, which took about 7 seconds in testing. The [proxy daemon](/remote/transports#the-proxy-daemon) keeps that connection open, so the next command took half a second. Save the URI as a remote to reach it by name. See [Remotes](/remote/remotes).
+
+## Connection status
+
+The status bar's connection indicator, at its right end, shows each connection's state. Select it to open the connection status popover.
+
+![Connection status popover showing a shared terminal that is connected, with a Manage server button](/images/remote/share-status-popover-connected.jpg)
+
+The popover lists each connection with:
+
+- Its name and a colored dot.
+- Its state, such as **Connected** or **Connecting…**, and the round-trip time in milliseconds when connected.
+- The last connection error and the number of retries, when there are any.
+- **Manage server** when connected, which opens the server's panels.
+- **Reconnect** when not connected, which retries at once.
+
+![Connection status popover showing a shared terminal that is connecting, with a Reconnect button](/images/remote/share-status-popover-desktop.jpg)
+
+## NAT traversal
+
+The share fetches STUN and TURN server settings from the hub's `/ice` endpoint. Peers first try a direct connection between their own addresses and their public addresses. When neither side can reach the other directly, traffic goes through a TURN relay over UDP, or TCP or TLS where UDP is blocked. WebRTC encrypts the connection end to end in every case, so the TURN relay forwards ciphertext.
+
+<Aside type="caution">
+
+- Anyone who learns a link can connect until you stop the share or change the passphrase.
+- A share needs the hub to set up each new connection. Established connections survive a hub outage.
+- A `share:` URI saved as a remote is readable by every client of the server that stores it. See [Where saved remotes live](/remote/remotes#where-saved-remotes-live).
+
+</Aside>

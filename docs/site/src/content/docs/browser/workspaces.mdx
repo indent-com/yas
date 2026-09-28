@@ -1,0 +1,141 @@
+---
+title: "Workspaces and layout"
+description: "Open the yas browser UI, arrange terminals and surfaces in tiled, tabbed, stacked, and floating panes, and keep named workspaces on the home server."
+sidebar:
+  order: 21
+---
+
+The browser UI shows the terminals and surfaces of a server as panes. You arrange panes in a
+tiling layout, and you keep several layouts as named **workspaces**. yas stores each workspace on
+the home server, so a layout survives a page reload and follows you to another browser.
+
+## Open the browser UI
+
+Run `yas open` on the machine where you want the browser to run:
+
+```bash
+yas open --port 47811
+```
+
+```text
+yas: serving browser UI at http://127.0.0.1:47811/#psk=…
+```
+
+`yas open` starts the local server if it is not running. It then listens on `127.0.0.1`, opens the
+printed URL in your default browser, and serves the UI until you press Ctrl+C.
+
+- `--port` picks the port. Without it, yas picks a free port.
+- The `#psk=` fragment carries a random token that `yas open` generates for this run. It authenticates the tab. The UI removes it
+  from the address bar after it connects.
+- yas connects to the server named by `YAS_SOCK`, or to the instance named by `YAS_SERVER_NAME`.
+  See [Named instances](/terminals/named-instances).
+
+To reach a server on another machine, add it as a [remote](/remote/remotes), or serve the UI with
+[`yas edge`](/operating/edge) or [`yas share`](/remote/sharing).
+
+## Parts of the screen
+
+- The **workspace tabs** run along the top. The icon at the left opens the workspace manager. The
+  pane controls sit at the right.
+- The panes fill the middle. Each pane shows one terminal, surface, editor, or panel.
+- The status bar runs along the bottom. It shows the menu button with counts, the focused pane's
+  working directory, panel toggles, the font and palette, and the connection state. See
+  [Command menu and overlays](/browser/command-menu).
+
+The counts next to the menu button use one letter per kind: **T** terminals, **S** surfaces, **E**
+editors and other tiles, **W** web panes, and **x** exited terminals. `3T ·2E` means three terminals
+and two tiles.
+
+## Add and arrange panes
+
+All layout keys start with the Ctrl+B prefix. Press Ctrl+B, release it, then press the key.
+[Keyboard, mouse, and touch](/browser/keyboard-mouse-touch) lists every binding.
+
+<Steps titleSize="h3">
+  <Step title="Open a terminal">
+
+Press Ctrl+B Enter to start a terminal in a new pane. When the workspace has more than one
+connection, yas asks which server to start it on. Ctrl+B Shift+Enter opens it beside the
+focused pane.
+
+  </Step>
+  <Step title="Choose the split direction">
+
+Press Ctrl+B h so the next pane splits horizontally, or Ctrl+B v for vertical. Ctrl+B b toggles
+the direction of the focused container.
+
+  </Step>
+  <Step title="Change the container layout">
+
+Press Ctrl+B t for tabbed, Ctrl+B s for stacking, or Ctrl+B l to cycle through horizontal,
+vertical, tabbed, and stacking.
+
+  </Step>
+  <Step title="Move, resize, and balance">
+
+Ctrl+B with an arrow key moves focus. Add Shift to move the focused container, or Alt to resize
+it. Ctrl+B = gives every pane in the workspace equal space.
+
+  </Step>
+</Steps>
+
+Each pane also has buttons in the top bar:
+
+- **Zoom this pane** (Ctrl+B z) shows only the focused pane. **Restore all panes** brings the rest
+  back.
+- **Make floating** (Ctrl+B Shift+Space) lifts the pane out of the tiling tree into a window.
+  Alt+drag moves a floating window and Alt+right-drag resizes it. Ctrl+B Space moves focus between
+  tiled and floating panes.
+- **Park** (Ctrl+B q) takes the pane off screen and keeps it running. Parked panes appear in the
+  **Preview panel** (Ctrl+B r) and under **Background** in the menu.
+- **Close** (Ctrl+B x) closes the pane's terminal or surface.
+
+The menu action **Exit layout** returns to a single focused terminal.
+
+## Work with several workspaces
+
+A workspace holds a layout, the item shown in each pane, the open side panels, and the remotes
+active in it. Terminals belong to the server, so two workspaces can show the same terminal.
+
+- Ctrl+B n creates a workspace and switches to it.
+- Ctrl+B [ and Ctrl+B ] switch to the previous and next workspace tab.
+- Ctrl+B d detaches the current workspace from this browser. The **×** on a tab does the same.
+- Ctrl+B a opens the **Workspaces** manager.
+
+The manager lists **All workspaces** on the home server. Each row shows the name, the last change,
+and a state: **Selected** for the one on screen and **Attached** for the others in your tab strip.
+Use **Select**, **Detach**, **Rename**, and **Delete** on a row, or **Create workspace** at the
+bottom. Detaching removes the tab from this browser and keeps the workspace on the server.
+
+The **Share URL** action in the menu copies a link with `#workspace=<id>` in the fragment. Opening
+it in another browser connected to the same home server opens that workspace.
+
+## Where workspaces are stored
+
+The UI writes workspaces to the home server's [key-value store](/code/key-value-store) under the
+`ui/` prefix. List them from a terminal:
+
+```bash
+yas kv ls ui/
+```
+
+```text
+workspace-session-devices/v1/3a89dc06-730a-4e0e-8e11-fe8276cfe443	      267
+workspace-sessions/v1/4e18f90a-c5cf-4256-82af-8fe50662a19d	     355
+workspace-sessions/v1/b18d66bc-29ea-4f17-9da3-ff616a17c623	     648
+workspace-sessions/v1/c9b8075b-659c-41a9-9f60-883fc601fb9a	     635
+```
+
+The first column is the key and the second is the value size in bytes. Each
+`workspace-sessions/v1/<id>` value is one workspace as JSON. Each
+`workspace-session-devices/v1/<id>` value records which workspaces one browser has attached.
+
+<Aside type="note" title="Limits">
+
+- Every client of the home server can read and change these records. Anyone with access to the
+  server sees your workspace names and layouts.
+- Font, palette, and other display settings stay in the browser's local storage. The menu action
+  **Clear local storage** resets them and reloads the page.
+- `yas open` accepts `--on` and `--hub`, and ignores both. It always serves the local server.
+
+</Aside>

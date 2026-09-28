@@ -1,0 +1,51 @@
+---
+title: "yas forward"
+description: "Forward local ports to the server's network (TCP and UDP)"
+sidebar:
+  order: 21
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Forward local ports to the server's network (TCP and UDP)
+
+Specs are `[kind/][bind:]port:host:hostport`, where kind is tcp (default) or udp, bind defaults to 127.0.0.1, and a local port of 0 picks a free one. Every spec rides one connection; all listeners bind before any serves, so a bind failure leaves nothing running.
+
+Forwards end with the process — the listening socket is local, so there is nothing to reattach to.
+
+Examples:
+
+```text
+yas forward 8080:localhost:3000
+yas forward 8080:localhost:3000 5432:db.internal:5432
+yas forward udp/5353:resolver.internal:53
+yas forward tls/8443:api.internal:443   # server terminates TLS
+yas forward --all                    # every enabled yas.forwards entry
+yas forward add web 8080:localhost:3000
+yas forward list
+```
+
+```text
+Usage: yas forward [OPTIONS] [SPEC]...
+```
+
+Arguments:
+
+- `[SPEC]...`
+
+  Forward specs, or a named entry's management subcommand
+
+Options:
+
+- `--all`
+
+  Start every enabled entry in ~/.config/yas/yas.forwards
+
+- `--alpn <ALPN>`
+
+  ALPN protocols to offer on tls/ forwards, in preference order (e.g. `--alpn` h2,http/1.1). Omitted offers no ALPN, which is not the same as offering http/1.1
+
+- `--insecure`
+
+  Skip certificate verification on tls/ forwards. The server must also permit it (yas server `--allow-forward-insecure`)
+

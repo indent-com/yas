@@ -1,0 +1,153 @@
+---
+title: "Video encoding and GPUs"
+description: "Choose which video encoders the server uses for surfaces, how it picks one per viewer, and how GPU compositing and hardware encoding are detected."
+sidebar:
+  order: 42
+---
+
+The server sends every surface to each viewer as a compressed video stream, in H.264 or AV1. It picks
+an encoder separately for each viewer, from an ordered list you can change. On Linux the compositor
+renders with Vulkan when a Vulkan driver is present and encodes on a GPU when a hardware encoder is
+present. Without either, it renders and encodes on the CPU. No configuration is needed for either
+case.
+
+<Aside type="caution" title="Experimental">
+  Surface streaming and the compositor are experimental and run on Linux servers
+  only.
+</Aside>
+
+## Encoders
+
+| Value           | Codec | Backend          | Max resolution | Notes                                                                                    |
+| --------------- | ----- | ---------------- | -------------- | ---------------------------------------------------------------------------------------- |
+| `av1-nvenc`     | AV1   | NVIDIA NVENC     | 8192×4352      | Needs an NVIDIA GPU with AV1 encode (RTX 40 series and later) and the proprietary driver |
+| `h264-nvenc`    | H.264 | NVIDIA NVENC     | 3840×2160      | Needs the proprietary NVIDIA driver                                                      |
+| `av1-vaapi`     | AV1   | VA-API           | 8192×4352      | Intel or AMD GPU with AV1 encode                                                         |
+| `h264-vaapi`    | H.264 | VA-API           | 3840×2160      | Intel or AMD GPU                                                                         |
+| `av1-vulkan`    | AV1   | Vulkan Video     | 8192×4352      | Encodes on the compositor's GPU; 4:4:4 where the driver supports it                      |
+| `h264-vulkan`   | H.264 | Vulkan Video     | 3840×2160      | Encodes on the compositor's GPU; 4:4:4 where the driver supports it                      |
+| `h264-software` | H.264 | openh264 or x264 | 3840×2160      | Backend chosen at build time; x264 only in the GPL build                                 |
+| `av1-software`  | AV1   | rav1e            | 3840×2160      | CPU-bound; limited to a 4K pixel area so it stays interactive                            |
+
+`software` is accepted as a name for `h264-software`, and `vaapi` for `h264-vaapi`. Run
+`yas --license` to see which software H.264 backend your binary carries.
+
+## Set the encoder order
+
+The server tries encoders in this order by default:
+
+```text
+av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, av1-vulkan, h264-vulkan, h264-software, av1-software
+```
+
+Pass `--surface-encoders` with a comma-separated list to change the order or remove entries:
+
+```bash
+yas server --surface-encoders av1-nvenc,h264-nvenc,h264-software
+```
+
+- `YAS_SURFACE_ENCODERS` sets the same list from the environment. The flag wins when both are set.
+- An unknown name in the flag stops the server:
+
+  ```text
+  yas server: unknown encoder: bogus
+  ```
+
+- An unknown name in `YAS_SURFACE_ENCODERS` is ignored, and the server uses the default order.
+
+## How the server picks an encoder for each viewer
+
+Each client tells the server which codecs it decodes (H.264, AV1, and whether each handles 4:4:4
+chroma) and the largest frame its decoder accepts. For each surface a client views, the server walks
+the list and uses the first encoder that:
+
+1. produces a codec the client decodes,
+2. this host can build at the requested size.
+
+Encoders that fail to start are skipped, and the next one is tried. If a Vulkan Video session asks
+for 4:4:4 and the driver refuses it, the server retries the same Vulkan encoder at 4:2:0 before
+moving down the list.
+
+The browser detects the codec from each frame and configures its WebCodecs decoder to match. In the
+browser's media panel (**Media settings** in the status bar) you can narrow which formats the
+browser offers. The server then chooses within that narrower set.
+
+## The resolution ceiling is per viewer
+
+Two limits cap the size of a viewer's stream: the chosen encoder's maximum from the table, and the
+client's declared decoder maximum. A client that declares no maximum is held at 3840×2160.
+
+The compositor renders a surface at the size its most capable viewer can receive. An AV1 viewer on a
+5K display gets a native 5120×2880 stream. A viewer whose encoder or decoder stops lower gets a
+scaled copy of the same surface with the same aspect ratio. One limited viewer does not lower the
+resolution for the others.
+
+Performance pressure does not reduce resolution. A slow encoder delivers fewer frames per second.
+Network pressure lowers quality through the bandwidth controls.
+
+## Tune bandwidth and encoder speed
+
+- `YAS_SURFACE_BANDWIDTH`: `low`, `medium`, `high`, or `ultra` (the default), or a raw AV1 quantizer
+  from `10` to `255`. This is a ceiling. The server spends less while the link is congested and
+  returns to the ceiling when it recovers. A surface that stops changing is re-sent at better
+  quality until it reaches the ceiling.
+- `YAS_SURFACE_SPEED`: `slow`, `medium`, `fast`, or `realtime` (the default), or a raw value from
+  `10` (slowest) to `255` (fastest). It sets the encoder preset for rav1e, x264, openh264, NVENC, and
+  VA-API. Vulkan Video has no speed control.
+- `YAS_CHROMA`: `444` (the default) asks for full-resolution chroma, which keeps text sharp. The
+  server falls back to 4:2:0 when the encoder or the viewer cannot do 4:4:4. Set `420` to always use
+  4:2:0.
+
+## GPU compositing
+
+The compositor loads Vulkan at runtime. When a Vulkan driver is available, it composites windows on
+the GPU. The server log names the device at startup:
+
+```text
+[compositor] trying Vulkan renderer for /dev/dri/renderD128
+[vulkan-render] initialized: llvmpipe (LLVM 21.1.8, 256 bits) (requested /dev/dri/renderD128)
+[compositor] Vulkan renderer: true (dmabuf=false)
+```
+
+This log comes from a host with no GPU, where the Vulkan driver is Mesa's CPU implementation
+(llvmpipe). The compositor accepts both shared-memory and DMA-BUF client buffers when the driver
+supports DMA-BUF import.
+
+The output path depends on the hardware:
+
+- **Vulkan Video.** The compositor renders, converts, and encodes on one GPU. No pixels return to the
+  CPU, and the server does no encoding work. Each viewer gets its own encode session, sized and paced
+  for that viewer.
+- **Vulkan with VA-API.** The compositor writes frames into VA-API surfaces on the GPU, and the VA-API
+  encoder reads them directly.
+- **CPU readback.** When neither of the above is available, the compositor copies the rendered frame
+  to memory and the server encodes it there.
+
+Choose devices with these variables:
+
+- `YAS_VAAPI_DEVICE`: the VA-API render node. Default `/dev/dri/renderD128`.
+- `YAS_COMPOSITOR_DEVICE`: the render node for Vulkan compositing. Defaults to the CUDA GPU when NVENC
+  is enabled, otherwise `YAS_VAAPI_DEVICE`.
+- `YAS_CUDA_DEVICE`: the CUDA device ordinal for NVENC. Default `0`.
+
+## Runtime-loaded libraries
+
+yas has no required GPU dependencies. The software H.264 and AV1 encoders are linked into the binary.
+GPU libraries are loaded with `dlopen` when the server starts, and a missing library disables only
+the feature that needs it:
+
+| Library                                 | Used for                                         |
+| --------------------------------------- | ------------------------------------------------ |
+| `libvulkan.so.1`                        | GPU compositing, Vulkan Video encode             |
+| `libva.so.2`, `libva-drm.so.2`          | VA-API hardware encode (Intel and AMD)           |
+| `libgbm.so.1`                           | DMA-BUF allocation for zero-copy VA-API encoding |
+| `libcuda.so.1`, `libnvidia-encode.so.1` | NVENC hardware encode                            |
+
+<Aside type="note">
+  The server's user needs permission to open the GPU device nodes. VA-API and
+  Vulkan usually need `/dev/dri/renderD*` and membership in the distribution's
+  `render` or `video` group. NVENC needs the NVIDIA device nodes. A container
+  must expose those nodes and the driver libraries. When a device is missing or
+  not readable, the server moves to the next encoder in the list and ends at
+  software.
+</Aside>

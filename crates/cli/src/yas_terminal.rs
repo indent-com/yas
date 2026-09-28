@@ -507,7 +507,7 @@ pub(crate) async fn cmd_journal(
     }
     if printed == 0 && !json {
         eprintln!(
-            "yas: no commands recorded — does the shell emit OSC 133? See docs/shell-integration.md"
+            "yas: no commands recorded — does the shell emit OSC 133? See https://docs.yas.run/terminals/shell-integration"
         );
     }
     Ok(0)

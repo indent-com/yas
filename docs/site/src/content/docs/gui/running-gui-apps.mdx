@@ -1,0 +1,219 @@
+---
+title: "Running GUI apps"
+description: "Launch Linux GUI applications from a terminal onto the server's headless Wayland compositor, then list, capture, and drive their windows from the CLI."
+sidebar:
+  order: 41
+---
+
+On Linux, every yas server runs a headless Wayland compositor. A GUI application you start from a
+yas terminal opens its windows on that compositor instead of on a physical display. Each window is a
+**surface**. The browser shows surfaces in panes next to terminals, and `yas surface` lists,
+captures, and sends input to them from a shell or a script.
+
+<Aside type="caution" title="Experimental">
+  The compositor and everything on this page are experimental. They run on Linux
+  servers only. A server on macOS or Windows has terminals and no surfaces.
+</Aside>
+
+## Launch an app
+
+The compositor starts with the server, before the first terminal. Every terminal inherits the
+variables that point applications at it:
+
+```bash
+ID=$(yas terminal start bash)
+yas terminal send "$ID" 'env | grep -E "WAYLAND|XDG_SESSION|GDK|QT_QPA|SDL" | sort\n'
+yas terminal show "$ID"
+```
+
+```text
+GDK_BACKEND=wayland
+MOZ_ENABLE_WAYLAND=1
+QT_QPA_PLATFORM=wayland
+SDL_VIDEODRIVER=wayland
+WAYLAND_DISPLAY=wayland-1
+XDG_SESSION_TYPE=wayland
+```
+
+yas also sets `ELECTRON_OZONE_PLATFORM_HINT=wayland` and
+`NIXOS_OZONE_WL=1`, so Electron apps and Nix-wrapped Chromium builds pick Wayland.
+`XDG_RUNTIME_DIR` points at the directory that holds the compositor socket.
+
+Start the application from a terminal, either inside an interactive shell or directly:
+
+```bash
+yas terminal start google-chrome about:blank
+```
+
+The command prints the terminal ID. The application's windows appear as surfaces once they map.
+
+Older Chromium and Electron builds that do not detect Wayland on their own need
+`--ozone-platform=wayland`:
+
+```bash
+yas terminal start brave --ozone-platform=wayland https://example.com
+```
+
+## View surfaces in the browser
+
+Surfaces appear in the [command menu](/browser/command-menu) with your terminals. Select one to open
+it in the focused pane. It then behaves like any other pane in a
+[workspace](/browser/workspaces): you can split, move, park, and close it. Closing a surface pane
+sends the application a close request, and the pane stays until the application actually closes the
+window.
+
+An application you start from the command menu opens its first window in the active pane.
+
+The browser receives each surface as a video stream. See
+[Video encoding and GPUs](/gui/video-encoding) for how the server encodes it.
+
+## List surfaces
+
+```bash
+yas surface list
+```
+
+```text
+ID	TITLE	SIZE	APP_ID
+1	yas demo - Google Chrome	1280x720	google-chrome
+2	about:blank - Google Chrome	1920x1080	google-chrome
+```
+
+The output is tab-separated, one surface per line:
+
+- `ID`: the surface ID that every other `yas surface` command takes.
+- `TITLE`: the window title the application set.
+- `SIZE`: the surface size in pixels, as `WIDTHxHEIGHT`.
+- `APP_ID`: the application ID the application set.
+
+`yas surface` with no subcommand, `yas surface ls`, and `yas s ls` print the same table.
+
+## Capture a screenshot
+
+```bash
+yas surface capture 1
+```
+
+```text
+surface-1.png
+```
+
+The command writes the file and prints its path. Options:
+
+- `--output PATH` (`-o`): write to this path. The extension picks the format: `.png` or `.avif`.
+- `--format png|avif` (`-f`): set the format explicitly.
+- `--width N` and `--height N`: resize the surface to this size before capturing. The resize
+  stays in effect after the capture, and `yas surface list` shows the new size.
+
+```bash
+yas surface capture 1 --output resized.png --width 800 --height 600
+yas surface capture 1 --output small.avif
+```
+
+## Send input
+
+Coordinates are pixels from the top-left corner of the surface.
+
+```bash
+yas surface focus 1                         # give the surface keyboard and pointer focus
+yas surface click 1 300 111                 # left-click
+yas surface click 1 300 111 --button right  # also middle, back, forward
+yas surface type 1 "hello from yas{Return}"
+yas surface text 1 " café naïve"
+yas surface key 1 ctrl+a
+yas surface scroll 1 3                      # three wheel notches down
+yas surface scroll 1 --horizontal -- -2     # two notches left
+```
+
+Keyboard input goes to the surface that has focus. Run `yas surface focus` before `type`, `text`, or
+`key` when another window, such as a closed popup menu, may still hold it.
+
+A middle click pastes the primary selection, as it does on a desktop. `scroll` takes wheel notches,
+and fractions are allowed. Put `--` before a negative amount so it is not read as an option. Add `--smooth` to scroll the way a trackpad does, with pixel deltas and no
+notch count. Applications and Xwayland handle the two differently.
+
+### Key names and typing syntax
+
+`yas surface key` takes one key, optionally with modifiers joined by `+`:
+
+- Modifiers: `ctrl` (or `control`), `shift`, `alt`, `super` (or `meta`). Each may appear once.
+- Named keys: `Return` (or `Enter`), `Escape` (or `Esc`), `Tab`, `BackSpace` (or `bs`), `Space`,
+  `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete` (or
+  `del`), `F1` to `F12`, `minus`, `equal`.
+- Single characters: letters, digits, and US-keyboard punctuation.
+
+Key names are case-insensitive. `ctrl+shift+c` and `shift+Tab` are valid keys.
+
+`yas surface type` sends US-QWERTY keystrokes for each character. Text inside `{braces}` is a key in
+the same syntax as `key`, so `"{ctrl+a}{BackSpace}new text{Return}"` selects all, deletes, types,
+and presses Enter. `type` accepts only characters that exist on a US keyboard, and `{` always starts
+a key name. For anything else, use `yas surface text`, which commits the literal UTF-8 string to the
+focused text field:
+
+```bash
+yas surface type 1 "héllo"
+```
+
+```text
+yas: unsupported character: é
+```
+
+## Record video
+
+```bash
+yas surface record 1 --frames 30 --output v.h264
+```
+
+```text
+recording surface 1 (h264, 1280x720) → v.h264 (30 frames)
+```
+
+`record` writes the encoded stream as the server sends it: Annex B for H.264 and OBU for AV1. `ffplay`
+plays both files directly. It stops at `--frames N`, `--duration SECONDS`, or Ctrl+C. Options:
+
+- `--codec h264|av1` (`-c`): the codecs to accept. The server picks one. The default file
+  extension is `.h264` or `.obu`.
+- `--size WIDTHxHEIGHT[@DPR]` (`-s`): ask for the surface at this physical size, optionally at a
+  device pixel ratio.
+- `--fps N`: the display refresh rate to advertise. Default `60`.
+- `--timing PATH`: also write per-frame timing as CSV (`pts_ms,arrival_ms,bytes,key`).
+
+The server sends a frame when the surface changes. A window that does not repaint produces few
+frames, so a `--frames` limit can take a long time to reach.
+
+## Close a surface
+
+```bash
+yas surface close 2
+```
+
+The compositor sends the window an `xdg_toplevel` close request. The application decides whether to
+close. The surface leaves `yas surface list` when it does.
+
+## X11 applications
+
+The compositor speaks Wayland only. X11 applications run through
+[`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite). When that binary is on the
+server's `PATH`, yas starts it once per session and exports `DISPLAY` to every terminal. yas claims a
+free display number from `:20` upward.
+
+With the bridge running, the toolkit variables become ordered preferences: `GDK_BACKEND=wayland,x11`,
+`QT_QPA_PLATFORM=wayland;xcb`, and `SDL_VIDEODRIVER=wayland,x11`. Applications that speak Wayland
+keep using it, and X11-only applications get a display.
+
+Without `xwayland-satellite`, the session is Wayland-only and no `DISPLAY` is exported. Set
+`YAS_XWAYLAND=0` on the server to turn the bridge off when the binary is installed.
+
+## Run a server without the compositor
+
+Set `YAS_SKIP_COMPOSITOR=1` when you start `yas server` to skip the compositor entirely. The server
+then has terminals and no surfaces. The servers the CLI starts on its own for one-shot commands run
+this way.
+
+<Aside type="note">
+  `yas surface capture --quality` and `--scale` are defined in the CLI, and the
+  current release rejects both with an error. `record --codec h264-444` and
+  `av1-444` are rejected the same way. The compositor's clipboard is covered in
+  [Clipboard, media players, and
+  notifications](/gui/clipboard-media-notifications).
+</Aside>

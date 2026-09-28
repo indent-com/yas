@@ -1,0 +1,216 @@
+---
+title: "Using yas from an agent"
+description: "Give an AI agent terminals, files, Git, language servers, and GUI windows through yas CLI commands, locally or on a remote."
+sidebar:
+  order: 71
+---
+
+An AI agent drives yas the same way a script does: through CLI commands that print plain text on stdout and report results in their exit status. The agent starts terminals, types into them, and reads what the programs printed. It also reads and searches files, inspects Git repositories, queries language servers, and clicks and types into graphical windows. Add `--on` to any command and the same work happens on another machine. A person can watch every terminal and window in a browser while the agent works.
+
+## Install the skill
+
+yas publishes an agent skill at [https://yas.run/SKILL.md](https://yas.run/SKILL.md). It contains:
+
+- Frontmatter with the name `yas` and a description of when to use it, which skill-loading agents read to decide when to load the rest.
+- A summary of what the CLI does: terminals, surfaces, files, Git, language servers, the key-value store, and the command journal, locally or through `--on`.
+- The install commands for yas.
+- An instruction to run `yas learn` for the full reference.
+
+For an agent that loads skills from a directory, save the file there under a `yas` folder. For Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills/yas
+curl -sf https://yas.run/SKILL.md -o ~/.claude/skills/yas/SKILL.md
+```
+
+For other agents, add the file's contents to the agent's instructions, or tell it to read the URL.
+
+## Read the full guide
+
+`yas learn` prints the complete CLI guide written for scripts and agents, about 530 lines of Markdown. It covers every command group with examples. The same text is on [yas learn](/agents/learn).
+
+```bash
+yas learn | head -3
+```
+
+```text
+# yas CLI
+
+yas is a terminal multiplexer and headless Wayland compositor. Terminals run CLI programs (PTYs) and GUI applications (compositor). Surfaces are video-encoded and streamed to browsers; the CLI gives programmatic control over both.
+```
+
+## Run a command and collect its result
+
+For a single command, start a terminal that runs it and wait for it to finish:
+
+```bash
+yas terminal start --wait --timeout 10 -- sh -c 'echo hi; exit 5'
+```
+
+```text
+2
+exited(5)
+```
+
+The first line is the terminal ID and the second is how it ended. The command exits with the program's exit status, here 5, or 124 when the timeout passes first. Read the output afterwards with `yas terminal show 2`. Use `--cols 200` or wider on `start` so long lines do not wrap.
+
+For a pipe-oriented program that needs no terminal, `yas run` connects its stdin, stdout, and stderr to yours and exits with its status:
+
+```bash
+yas run -- sh -c 'echo out; echo err >&2; exit 3'
+```
+
+## Work in a live shell
+
+A long-lived shell keeps state between commands, such as the working directory, environment, and activated tools. yas records each command the shell runs when the shell emits OSC 133 markers. Set that up first; see [Shell integration](/terminals/shell-integration). Without it the journal stays empty and the commands below find nothing.
+
+<Steps titleSize="h3">
+  <Step title="Start the shell">
+
+    ```bash
+    ID=$(yas terminal start --cols 200 -t agent)
+    ```
+
+    `start` prints only the new terminal's ID on stdout, so it can be captured. `-t` tags the terminal so you and the agent can tell it apart in `yas terminal list`.
+
+  </Step>
+  <Step title="Note the next command index">
+
+    ```bash
+    N=$(yas terminal journal "$ID" --json | wc -l)
+    ```
+
+    The journal has one JSON line per recorded command, so its line count is the index of the next command.
+
+  </Step>
+  <Step title="Type the command">
+
+    ```bash
+    yas terminal send "$ID" "ls /nonexistent\n"
+    ```
+
+    `\n` presses Enter. `send` also understands `\t`, `\r`, `\\`, `\0`, and `\xHH`, so `"\x03"` sends Ctrl+C.
+
+  </Step>
+  <Step title="Wait for it and read its output">
+
+    ```bash
+    yas terminal output "$ID" "$N" --wait 60
+    ```
+
+    ```text
+    ls: cannot access '/nonexistent': No such file or directory
+    ```
+
+    The server waits until command `N` finishes, then yas prints only that command's output and exits with its exit status, here 2.
+
+  </Step>
+</Steps>
+
+`yas terminal journal` lists the commands with their status, exit code, duration in milliseconds, output range, and command line:
+
+```bash
+yas terminal journal "$ID"
+```
+
+```text
+INDEX	STATUS	EXIT	MS	START_SEQ	END_SEQ	COMMAND
+0	exited	2	6	1	2	ls /nonexistent
+1	exited	0	2004	3	4	sleep 2; echo done
+```
+
+`yas terminal output "$ID" 1` prints an earlier command's output. `--json` on `journal` and `output` prints one JSON object per record, with fields such as `index`, `status`, `exit`, `command`, `text`, and `next_cursor`.
+
+Without an index, `yas terminal output "$ID" --wait` waits for the command running now, or for the next one to start if none is running. A fast command can finish before the wait begins. The wait then waits for a later command, so pass the index as shown above.
+
+## Read the screen
+
+- `yas terminal show ID` prints what is on screen now. Use it for full-screen programs such as `htop` or an editor.
+- `yas terminal history ID --from-end 0 --limit N` prints the last `N` lines of scrollback.
+- `yas terminal history ID --since CURSOR` prints only what arrived after `CURSOR`, and writes the next cursor to stderr as `cursor: 8:2`. Pass `start` to read from the beginning.
+- `yas terminal wait ID --timeout N` waits for the terminal's program to exit and exits with its status, or 124 on timeout.
+
+Always pass `--limit` or `--since` to `history`. Without them it prints the whole scrollback.
+
+<Aside type="caution">
+
+In yas 0.3.0, `yas terminal wait --pattern` and `yas terminal history --since now` fail with `collection limit is 1`. Use `output --wait` with a command index, or poll `history --since` with a cursor.
+
+</Aside>
+
+## Drive graphical windows
+
+On Linux, a graphical program started in any terminal opens its window in yas's compositor. The agent can see and operate it:
+
+```bash
+yas terminal start -t gui -- google-chrome --ozone-platform=wayland --app=file:///tmp/page.html
+yas surface list
+```
+
+```text
+ID	TITLE	SIZE	APP_ID
+1	page.html	1920x1080	chrome-__tmp_page.html-Default
+```
+
+```bash
+yas surface capture 1 --output s1.png
+yas surface click 1 100 18
+yas surface type 1 "hello"
+yas surface key 1 ctrl+a
+```
+
+- `capture` writes a PNG and prints its path. Coordinates for `click` are pixels in that image.
+- `type` sends US-QWERTY keystrokes and understands names in braces, such as `{Return}`. `text` commits literal UTF-8, which reaches non-ASCII characters.
+- `key` presses one key or chord. `scroll` sends wheel notches. `focus` gives the window keyboard and pointer focus.
+- The window title in `surface list` updates as the program changes it, which is a cheap way to check a result.
+
+Chromium-based browsers and Electron apps need `--ozone-platform=wayland`. See [Running graphical applications](/gui/running-gui-apps).
+
+## Work on a remote
+
+Every command takes `--on`. The agent can use a remote without a shell login there:
+
+```bash
+yas --on ssh:dev terminal start --cols 200 --wait --timeout 600 -- make -j8
+yas --on local:work fs grep -l TODO --root /src
+```
+
+See [Remotes](/remote/remotes) for the target forms and how to set a default target with `YAS_TARGET`.
+
+## Files, Git, and code intelligence
+
+These commands run on the server, next to the code, and suit agent tool calls:
+
+- `yas fs cat`, `find`, `grep`, and `write` read, locate, search, and write files. `fs grep` exits 1 when nothing matches, like `grep`. `fs write --if-hash H` writes only if the file is unchanged. See [Files](/code/files).
+- `yas git status`, `log`, `diff`, `show`, and `blame` read repositories without running `git`. See [Git](/code/git).
+- `yas lsp def`, `refs`, `hover`, `diag`, and `rename` ask a language server that stays warm between calls. `yas lsp diag --wait` after an edit shows the resulting errors. A first call in a new workspace can exit 2 while the server is warming up; run `yas lsp wait` once. See [Language servers](/code/language-servers).
+- `yas kv get` and `put` give scripts scratch storage on the server. See [Key-value store](/code/key-value-store).
+
+```bash
+yas fs grep -l REMOTES_KEY --root ~/src/yas/crates
+```
+
+```text
+cli/src/yas_remotes.rs
+server/src/relay.rs
+```
+
+## Machine-readable output
+
+- `--json` on `fs`, `git`, `lsp`, `terminal journal`, and `terminal output` prints NDJSON: one JSON object per line.
+- Extension commands, `yas @name …`, take `--json` before the `@name` to print NDJSON: `yas --json @builder build`. A `--json` after `@name` goes to the extension unchanged. `yas ext commands` lists the extension commands a server offers.
+- List commands such as `yas terminal list` and `yas surface list` print tab-separated columns with a header row.
+
+## Output and exit status
+
+- Commands that create something, such as `yas terminal start`, print its ID alone on stdout.
+- Diagnostics go to stderr, prefixed `yas:`.
+- Exit status 0 means success, and 1 means an error, no match, or a failed compare-and-swap. A usage error exits 2.
+- A timeout exits 124.
+- `yas run`, `yas terminal start --wait`, `yas terminal wait`, and `yas terminal output --wait` exit with the program's or command's own status.
+
+<Aside type="tip">
+
+Terminals keep running after the agent's command returns. Close them with `yas terminal close ID` when the work is done.
+
+</Aside>

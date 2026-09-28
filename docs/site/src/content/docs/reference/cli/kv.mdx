@@ -1,0 +1,131 @@
+---
+title: "yas kv"
+description: "Read and write the server's key/value store (https://docs.yas.run/code/key-value-store)"
+sidebar:
+  order: 10
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Read and write the server's key/value store (https://docs.yas.run/code/key-value-store)
+
+A prefix-watchable store the server already keeps for the web app's settings; it doubles as host-local scratch space for scripts.
+
+```text
+Usage: yas kv [OPTIONS] <COMMAND>
+```
+
+## yas kv get
+
+Print one value's bytes to stdout
+
+Exits 1 when the key is absent — that is an empty answer, not an error, so `if yas kv get k >/dev/null; then` reads naturally.
+
+```text
+Usage: yas kv get [OPTIONS] <KEY>
+```
+
+Arguments:
+
+- `<KEY>`
+
+  Key
+
+## yas kv put
+
+Set one value, from an argument or stdin
+
+Overwrites by default; pass `--if-hash` to write only while the current value's hash matches. Exit 1 on conflict.
+
+```text
+Usage: yas kv put [OPTIONS] <KEY> [VALUE]
+```
+
+Arguments:
+
+- `<KEY>`
+
+  Key
+
+- `[VALUE]`
+
+  Value; omit to read it from stdin
+
+Options:
+
+- `--if-hash <IF_HASH>`
+
+  Write only if the current value's hash equals this hex value
+
+- `--force`
+
+  Overwrite unconditionally
+
+- `--durable`
+
+  Wait for the write to reach disk before answering
+
+- `--json`
+
+  JSON result output
+
+## yas kv rm
+
+Delete one key.
+
+```text
+Usage: yas kv rm [OPTIONS] <KEY>
+```
+
+Arguments:
+
+- `<KEY>`
+
+  Key
+
+Options:
+
+- `--if-hash <IF_HASH>`
+
+  Delete only if the current value's hash equals this hex value
+
+- `--force`
+
+  Delete unconditionally
+
+- `--durable`
+
+  Wait for the delete to reach disk before answering
+
+- `--json`
+
+  JSON result output
+
+## yas kv ls
+
+List the keys under a prefix (TSV: KEY, SIZE)
+
+```text
+Usage: yas kv ls [OPTIONS] [PREFIX]
+```
+
+Arguments:
+
+- `[PREFIX]`
+
+  Key prefix; omit for the whole store
+
+Options:
+
+- `--watch`
+
+  Keep streaming changes after the first snapshot
+
+- `--values`
+
+  Include values (TSV gains a third column)
+
+- `--json`
+
+  NDJSON output
+

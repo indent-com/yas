@@ -1,0 +1,332 @@
+---
+title: "Environment variables"
+description: "Every YAS_* environment variable the yas code reads, with its default and effect."
+sidebar:
+  order: 122
+---
+
+This page lists every `YAS_*` variable that yas reads, grouped by the subsystem that reads it. Set a variable in the environment of the process that reads it. Server settings go in the environment of `yas server` (or the service unit that starts it). Client settings go in the environment of the CLI command.
+
+Unless a row says otherwise:
+
+- The server samples a setting once at startup. Restart it to apply a change.
+- A switch documented as "`0` disables" is on for any other value, including unset.
+- A size or count that fails to parse falls back to the default.
+- Sizes are bytes and durations are the unit in the name (`_MS` for milliseconds, `_SECS` for seconds).
+
+## Client, target, and paths
+
+| Variable              | Default                                            | Purpose                                                                                                                                                                                         |
+| --------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `YAS_SOCK`            | automatic per-instance path                        | Unix socket (or Windows named pipe) of the local server. Overrides the packaged and automatic paths. See [Configuration files](/reference/configuration-files#sockets-and-runtime-directories). |
+| `YAS_TARGET`          | unset                                              | Default target for CLI commands. `--on` overrides it; it overrides `yas.target` in `yas.conf`.                                                                                                  |
+| `YAS_SERVER_NAME`     | `default`                                          | Instance name for `yas server --name` and for extensions that derive per-instance paths.                                                                                                        |
+| `YAS_HUB`             | `yas.run`                                          | Signaling hub URL for `share:` targets and `yas share` (same as `--hub`).                                                                                                                       |
+| `YAS_CONFIG`          | `<config dir>/yas.conf`                            | Path of `yas.conf`.                                                                                                                                                                             |
+| `YAS_REMOTES`         | `<config dir>/yas.remotes`                         | Path of `yas.remotes`.                                                                                                                                                                          |
+| `YAS_FORWARDS`        | `<config dir>/yas.forwards`                        | Path of `yas.forwards`.                                                                                                                                                                         |
+| `YAS_KV_PATH`         | `<state dir>/yas/instances/<name>/kv.redb`         | Path of the KV database.                                                                                                                                                                        |
+| `YAS_EXTENSION_PATH`  | `<state dir>/yas/instances/<name>/extensions.redb` | Path of the extension catalogue database.                                                                                                                                                       |
+| `YAS_EXT_DB`          | unset                                              | Alternate name for `YAS_EXTENSION_PATH`, read when that is unset.                                                                                                                               |
+| `YAS_WASM_CACHE`      | `<cache dir>/yas/instances/<name>/wasm`            | Directory of the extension object cache.                                                                                                                                                        |
+| `YAS_PROXY`           | enabled                                            | `0` makes the CLI connect to `ssh:` targets in-process instead of through the per-user proxy.                                                                                                   |
+| `YAS_PROXY_SOCK`      | per-user automatic path                            | Socket of the per-user connection proxy.                                                                                                                                                        |
+| `YAS_PROXY_UID`       | unset                                              | Numeric UID the proxy socket must belong to. Requires an explicit `YAS_PROXY_SOCK`.                                                                                                             |
+| `YAS_PROXY_IDLE`      | `300` when yas spawns the proxy                    | Seconds the proxy stays up with no clients.                                                                                                                                                     |
+| `YAS_SSH_KNOWN_HOSTS` | `~/.ssh/known_hosts`                               | Known-hosts file for `ssh:` targets.                                                                                                                                                            |
+| `YAS_VERBOSE`         | unset                                              | `1` turns on verbose server logging, as `--verbose` does.                                                                                                                                       |
+
+## Server core and terminals
+
+| Variable                     | Default                   | Purpose                                                                                                                 |
+| ---------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `YAS_SHELL_FLAGS`            | `li`                      | Flags passed to the default shell (login, interactive).                                                                 |
+| `YAS_SCROLLBACK`             | `10000`                   | Scrollback lines per terminal.                                                                                          |
+| `YAS_MAX_CONNECTIONS`        | `0` (unlimited)           | Maximum concurrent client connections.                                                                                  |
+| `YAS_MAX_PTYS`               | `0` (unlimited)           | Maximum live PTYs. A refused create gets `RESOURCE_EXHAUSTED`.                                                          |
+| `YAS_MAX_EXITED`             | `1024`                    | Exited terminals retained before the oldest is removed. `0` removes the bound.                                          |
+| `YAS_EXITED_LINGER`          | `0` (retain until closed) | Seconds an exited terminal is retained before removal.                                                                  |
+| `YAS_TERM_JOURNAL`           | enabled                   | `0` disables the per-command terminal journal.                                                                          |
+| `YAS_TERM_JOURNAL_MAX`       | `256`                     | Journal entries kept per terminal. Minimum 1.                                                                           |
+| `YAS_TERM_JOURNAL_CMD_MAX`   | `4096`                    | Bytes of command text kept per journal entry.                                                                           |
+| `YAS_TERM_OUTPUT_MAX`        | `1048576`                 | Bytes of output kept per journal entry, clamped to 4096 through 8388608.                                                |
+| `YAS_TICK_FLOOR_US`          | unset                     | Experimental minimum spacing between delivery ticks, in microseconds.                                                   |
+| `YAS_FD_CHANNEL`             | unset                     | File descriptor number of an inherited socket to serve as a client connection. See [FD channel](/embedding/fd-channel). |
+| `YAS_EXPORT_SOCK`            | unset                     | `1` exports the server socket path as `YAS_SOCK` in terminals the server starts, as `--export-sock`.                    |
+| `YAS_INJECT_PATH`            | unset                     | `1` appends the server binary's directory to `PATH` in terminals the server starts, so `yas` runs inside them.          |
+| `YAS_ENV`                    | enabled                   | `0` disables the environment family.                                                                                    |
+| `YAS_KV`                     | enabled                   | `0` disables the KV store.                                                                                              |
+| `YAS_KV_VALUE_MAX`           | `4194304`                 | Largest KV value.                                                                                                       |
+| `YAS_KV_TOTAL_MAX`           | `268435456`               | Total bytes stored in KV.                                                                                               |
+| `YAS_KV_MAX_ENTRIES`         | `16384`                   | Maximum KV keys.                                                                                                        |
+| `YAS_NET`                    | enabled                   | `0` disables the network family.                                                                                        |
+| `YAS_RELAY`                  | enabled                   | `0` disables relaying to remotes.                                                                                       |
+| `YAS_ALLOW_FORWARD`          | unrestricted              | Comma-separated `host[:ports]` patterns the TCP/UDP relay may reach. Loopback is always allowed.                        |
+| `YAS_ALLOW_FORWARD_INSECURE` | unset                     | `1` lets relayed TLS streams skip certificate verification.                                                             |
+| `YAS_FONTS`                  | enabled                   | `0` disables the font family.                                                                                           |
+| `YAS_FONT_EXPORT`            | enabled                   | `0` stops fonts being exported to clients and empties the catalogue.                                                    |
+| `YAS_FONT_DIRS`              | unset                     | Extra font directories, separated by `:` (`;` on Windows).                                                              |
+
+## Processes
+
+| Variable                             | Default                             | Purpose                                                                       |
+| ------------------------------------ | ----------------------------------- | ----------------------------------------------------------------------------- |
+| `YAS_PROCESS`                        | enabled                             | `0` disables native non-PTY processes, as `--no-processes` does.              |
+| `YAS_PROCESS_MAX_PER_CLIENT`         | `16`                                | Live processes per client.                                                    |
+| `YAS_PROCESS_MAX`                    | `64`                                | Live processes per server.                                                    |
+| `YAS_PROCESS_MAX_SPAWNING`           | `8`                                 | Concurrent process spawns.                                                    |
+| `YAS_PROCESS_MAX_WATCHERS`           | per-client limit times server limit | Total process watches.                                                        |
+| `YAS_PROCESS_MAX_WATCHERS_PER_CHILD` | `64`                                | Watches on one process.                                                       |
+| `YAS_PROCESS_REQUEST_MAX_PER_CLIENT` | `16777216`                          | Buffered request bytes per client.                                            |
+| `YAS_PROCESS_REQUEST_MAX`            | `67108864`                          | Buffered request bytes per server.                                            |
+| `YAS_PROCESS_BUFFER_MAX`             | `201326592`                         | Buffered output bytes per server.                                             |
+| `YAS_PROCESS_KILL_GRACE`             | `2`                                 | Seconds between the terminate and kill signals. Accepts fractions.            |
+| `YAS_PROCESS_DETACHED_RESULT_TTL`    | `300`                               | Seconds a detached process's final result stays watchable. Accepts fractions. |
+
+## Files, Git, and language servers
+
+| Variable                        | Default             | Purpose                                                   |
+| ------------------------------- | ------------------- | --------------------------------------------------------- |
+| `YAS_FS`                        | enabled             | `0` disables the filesystem family.                       |
+| `YAS_FS_WRITE`                  | enabled             | `0` makes the filesystem family read-only.                |
+| `YAS_FS_LATENCY_MS`             | `20`                | Watch event coalescing delay.                             |
+| `YAS_FS_INLINE_MAX`             | `16777216`          | Largest file sent inline in a read.                       |
+| `YAS_FS_WINDOW`                 | `1048576`           | Flow-control window for file transfers.                   |
+| `YAS_FS_MAX_ENTRIES`            | `1000000`           | Entries tracked per filesystem watch.                     |
+| `YAS_GIT`                       | enabled             | `0` disables the Git family.                              |
+| `YAS_GIT_FETCH`                 | enabled             | `0` disables `git fetch` requests.                        |
+| `YAS_GIT_FETCH_TIMEOUT_MS`      | `120000`            | Fetch timeout.                                            |
+| `YAS_GIT_BLOB_MAX`              | `16777216`          | Largest blob returned.                                    |
+| `YAS_GIT_BYTES_MAX`             | `8388608`           | Largest response.                                         |
+| `YAS_GIT_LOG_MAX`               | `4096`              | Commits per log request.                                  |
+| `YAS_GIT_ENTRIES_MAX`           | `10000`             | Entries per tree or status response.                      |
+| `YAS_GIT_WALK_MAX`              | `100000`            | Commits walked per request.                               |
+| `YAS_GIT_UNTRACKED_SCAN_MAX`    | `1000000`           | Paths scanned for untracked files.                        |
+| `YAS_GIT_RENAME_LIMIT`          | `1000`              | Rename detection limit for diffs.                         |
+| `YAS_GIT_BLAME_LINES_MAX`       | `50000`             | Lines per blame.                                          |
+| `YAS_GIT_MAX_LOG_SUBS`          | `64`                | Log subscriptions per client.                             |
+| `YAS_GIT_WORKTREES_MAX`         | `256`               | Worktrees listed per repository.                          |
+| `YAS_GIT_DISCOVER_DEPTH_MAX`    | `16`                | Directory depth for repository discovery.                 |
+| `YAS_GIT_DISCOVER_MAX`          | `256`               | Repositories returned by discovery.                       |
+| `YAS_GIT_DISCOVER_SCAN_MAX`     | `100000`            | Directories scanned by discovery.                         |
+| `YAS_GIT_REFS_LATENCY_MS`       | `50` (max `1000`)   | Ref-change coalescing delay.                              |
+| `YAS_GIT_STATUS_LATENCY_MS`     | `500` (max `10000`) | Status-change coalescing delay.                           |
+| `YAS_LSP`                       | enabled             | `0` disables the language server family.                  |
+| `YAS_LSP_MAX_SERVERS`           | `64`                | Running language servers.                                 |
+| `YAS_LSP_MAX_DOCS`              | `128`               | Open documents.                                           |
+| `YAS_LSP_DOCS_BYTES_MAX`        | `67108864`          | Bytes of open documents.                                  |
+| `YAS_LSP_MAX_OVERLAYS`          | `64`                | Unsaved-buffer overlays.                                  |
+| `YAS_LSP_BUFFER_MAX`            | `8388608`           | Bytes per overlay.                                        |
+| `YAS_LSP_TIMEOUT_MS`            | `30000`             | Request timeout.                                          |
+| `YAS_LSP_INIT_TIMEOUT`          | `60`                | Seconds allowed for server initialization.                |
+| `YAS_LSP_READY_GRACE_MS`        | `1000`              | Wait after initialization before queries count as ready.  |
+| `YAS_LSP_IDLE_SECS`             | `900`               | Idle time before a server is stopped.                     |
+| `YAS_LSP_MAX_RESTARTS`          | `3`                 | Restarts after crashes.                                   |
+| `YAS_LSP_SPAWN_RATE`            | `30`                | Server spawns per minute.                                 |
+| `YAS_LSP_ENTRIES_MAX`           | `200000`            | Entries per response.                                     |
+| `YAS_LSP_BYTES_MAX`             | `50331648`          | Bytes per response.                                       |
+| `YAS_LSP_ENGINE_QUEUE_MAX`      | `256`               | Engine queue depth.                                       |
+| `YAS_LSP_PENDING_QUERIES_MAX`   | `256`               | Pending queries.                                          |
+| `YAS_LSP_INGRESS_PATHS_MAX`     | `4096`              | Changed paths queued for servers.                         |
+| `YAS_LSP_PROJECTION_QUEUE_MAX`  | `8`                 | Projection queue depth.                                   |
+| `YAS_LSP_WRITER_QUEUE_MAX`      | `32`                | Writer queue depth.                                       |
+| `YAS_LSP_DIAG_FILES_MAX`        | `4096`              | Files with retained diagnostics.                          |
+| `YAS_LSP_DIAG_ENTRIES_MAX`      | `16384`             | Retained diagnostics.                                     |
+| `YAS_LSP_DIAG_ENTRIES_PER_FILE` | `4096`              | Retained diagnostics per file.                            |
+| `YAS_LSP_DIAG_BYTES_MAX`        | `16777216`          | Bytes of retained diagnostics.                            |
+| `YAS_LSP_DIAGS_COLD_SECS`       | `600`               | Age after which diagnostics for closed files are dropped. |
+
+## Extensions and channels
+
+These are deployment settings. `yas server --ext-*` and `--channel-*` flags override them, and the server resolves them once at startup.
+
+| Variable                             | Default                                    | Purpose                                                                                               |
+| ------------------------------------ | ------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `YAS_EXT`                            | enabled                                    | `0` disables extensions.                                                                              |
+| `YAS_CHANNEL`                        | enabled                                    | `0` disables native channels.                                                                         |
+| `YAS_ALLOW_EXT_PERSIST`              | enabled                                    | `0` refuses durable extensions and skips restoring their definitions. Transient extensions still run. |
+| `YAS_EXT_MAX_RUNNING`                | CPUs minus one, clamped to 1 through 4     | Extensions executing at once.                                                                         |
+| `YAS_EXT_MAX_PERSISTENT`             | `128`                                      | Installed persistent extensions.                                                                      |
+| `YAS_EXT_MAX_TRANSIENT`              | `128`                                      | Loaded transient extensions.                                                                          |
+| `YAS_EXT_MAX_VALIDATING`             | `2`                                        | Modules validated at once.                                                                            |
+| `YAS_EXT_FOLLOW_MAX_PER_CLIENT`      | `128`                                      | Extension output follows per client.                                                                  |
+| `YAS_EXT_FOLLOW_MAX`                 | `4096`                                     | Extension output follows per server.                                                                  |
+| `YAS_EXT_ARGUMENT_STORE_MAX`         | `268435456`                                | Bytes of stored invocation arguments.                                                                 |
+| `YAS_EXT_MODULE_MAX`                 | `67108864` (also the maximum)              | Largest module.                                                                                       |
+| `YAS_EXT_OBJECT_CACHE_MAX`           | `2147483648`                               | Bytes in the object cache.                                                                            |
+| `YAS_EXT_OBJECT_CACHE_MAX_ENTRIES`   | `4096`                                     | Objects in the object cache.                                                                          |
+| `YAS_EXT_UPLOAD_MAX_PER_CLIENT`      | `4`                                        | Concurrent uploads per client.                                                                        |
+| `YAS_EXT_UPLOAD_MAX_ACTIVE`          | `32`                                       | Concurrent uploads per server.                                                                        |
+| `YAS_EXT_UPLOAD_TIMEOUT`             | `300`                                      | Seconds an upload may take.                                                                           |
+| `YAS_EXT_PENDING_TIMEOUT`            | `300`                                      | Seconds a pending install waits.                                                                      |
+| `YAS_EXT_MEMORY_MAX`                 | `134217728`                                | Linear memory per extension.                                                                          |
+| `YAS_EXT_OUTBOX_MAX`                 | `67108864`                                 | Queued outbound bytes. Must equal the default.                                                        |
+| `YAS_EXT_OUTPUT_RETAIN_MAX`          | `67108864`                                 | Retained output bytes.                                                                                |
+| `YAS_EXT_TERMINAL_RETAIN`            | `30`                                       | Seconds output is retained after an extension exits.                                                  |
+| `YAS_EXT_COMMAND_STORE_MAX`          | `67108864`                                 | Bytes of registered commands.                                                                         |
+| `YAS_EXT_COMMAND_SNAPSHOT_MAX`       | `256`                                      | Commands per snapshot.                                                                                |
+| `YAS_EXT_TABLE_ELEMENTS_MAX`         | `65536`                                    | WebAssembly table elements.                                                                           |
+| `YAS_EXT_VALUE_STACK_MAX`            | `131072`                                   | Interpreter value stack.                                                                              |
+| `YAS_EXT_CALL_DEPTH_MAX`             | `1024`                                     | Call depth.                                                                                           |
+| `YAS_EXT_STACK_SIZE`                 | `2097152`                                  | Native stack per extension thread.                                                                    |
+| `YAS_EXT_FUEL_SLICE`                 | `1000000`                                  | Fuel per scheduling slice.                                                                            |
+| `YAS_EXT_JOB_BYTES_MAX`              | `67108864`                                 | Job bytes used in the server's capacity plan.                                                         |
+| `YAS_EXT_OUTBOX_MESSAGES_MAX`        | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_OUTBOX_TIMEOUT`             | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_JOB_MAX_PER_CLIENT`         | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_JOB_MAX`                    | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_JOB_PENDING_MAX_PER_CLIENT` | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_JOB_PENDING_MAX`            | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_JOB_BYTES_MAX_PER_CLIENT`   | validated only                             | Parsed and range-checked. No runtime limit reads it.                                                  |
+| `YAS_EXT_THREAD_DEBUG`               | unset                                      | Any value logs extension thread preparation.                                                          |
+| `YAS_CHANNEL_MAX_LISTEN_PER_CLIENT`  | `64`                                       | Channel listeners per client.                                                                         |
+| `YAS_CHANNEL_MAX_LISTENERS`          | `1024`                                     | Channel listeners per server.                                                                         |
+| `YAS_CHANNEL_MAX_PER_CLIENT`         | `64`                                       | Connected channels per client.                                                                        |
+| `YAS_CHANNEL_MAX_CONNECTED`          | `128`                                      | Connected channels per server.                                                                        |
+| `YAS_CHANNEL_BUFFER_MAX`             | `268435456`                                | Buffered channel bytes.                                                                               |
+| `YAS_MUSTER_DIR`                     | `<config dir>/yas/instances/<name>/muster` | Unit directory of the [muster](/extensions/muster) extension.                                         |
+| `YAS_SOCKET_TEMPLATE`                | unset                                      | Socket path template muster uses for units.                                                           |
+
+## Compositor and surface video
+
+| Variable                           | Default                                                                                       | Purpose                                                                                                  |
+| ---------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `YAS_SKIP_COMPOSITOR`              | unset                                                                                         | `1` starts the server without the Wayland compositor.                                                    |
+| `YAS_COMPOSITOR_DEVICE`            | the NVIDIA render node when NVENC is preferred, else `YAS_VAAPI_DEVICE`                       | DRM render node the compositor renders on.                                                               |
+| `YAS_XWAYLAND`                     | enabled                                                                                       | `0` stops the server starting `xwayland-satellite`.                                                      |
+| `YAS_SURFACE_ENCODERS`             | `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,av1-vulkan,h264-vulkan,h264-software,av1-software` | Encoder preference list, as `--surface-encoders`.                                                        |
+| `YAS_SURFACE_BANDWIDTH`            | `ultra`                                                                                       | Quality ceiling: `low`, `medium`, `high`, `ultra`, or a raw quantizer `10` through `255`.                |
+| `YAS_SURFACE_SPEED`                | `realtime`                                                                                    | Encoder speed: `slow`, `medium`, `fast`, `realtime`, or `10` through `255`.                              |
+| `YAS_CHROMA`                       | `444`                                                                                         | `420` forces 4:2:0 chroma.                                                                               |
+| `YAS_H264_SOFTWARE`                | x264 when built in                                                                            | Pins `h264-software` to `x264` or `openh264`.                                                            |
+| `YAS_VAAPI_DEVICE`                 | `/dev/dri/renderD128`                                                                         | VA-API render node.                                                                                      |
+| `YAS_CUDA_DEVICE`                  | `0`                                                                                           | CUDA device ordinal for NVENC and NVDEC.                                                                 |
+| `YAS_ENCODE_FENCE_TIMEOUT_MS`      | `10000`                                                                                       | Wait for a GPU encode fence. `0` waits forever.                                                          |
+| `YAS_ENABLE_EXTERNAL_MEMORY_HOST`  | unset                                                                                         | Set to use `VK_EXT_external_memory_host` for SHM uploads on drivers where it is off by default (NVIDIA). |
+| `YAS_DISABLE_EXTERNAL_MEMORY_HOST` | unset                                                                                         | Set to never use `VK_EXT_external_memory_host`.                                                          |
+| `YAS_SCREENCAST_MAX_STREAMS`       | `4`                                                                                           | Concurrent portal screencast streams.                                                                    |
+
+## Media, audio, and desktop integration
+
+| Variable                           | Default                          | Purpose                                                                                             |
+| ---------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `YAS_AUDIO`                        | enabled                          | `0` disables audio capture.                                                                         |
+| `YAS_AUDIO_BITRATE`                | `64000`                          | Opus bitrate in bits per second.                                                                    |
+| `YAS_MEDIA_INPUT`                  | enabled                          | `0` disables viewer camera and microphone input.                                                    |
+| `YAS_MEDIA_CAMERA`                 | enabled                          | `0` disables viewer cameras.                                                                        |
+| `YAS_MEDIA_MICROPHONE`             | enabled                          | `0` disables viewer microphones.                                                                    |
+| `YAS_MEDIA_CAMERA_CODECS`          | all                              | Camera formats accepted: `mjpeg`, `h264`, `av1`, `h264-444`, `av1-444`. `mjpeg` is always accepted. |
+| `YAS_MEDIA_MICROPHONE_CODECS`      | all                              | Microphone formats accepted: `pcm`, `opus`. `pcm` is always accepted.                               |
+| `YAS_MEDIA_CAMERA_DECODERS`        | `nvdec,vaapi,vulkan,software`    | Camera decoder preference list.                                                                     |
+| `YAS_MEDIA_CAMERA_VULKAN_DEVICE`   | first device                     | Vulkan device for camera decode, by index or name substring.                                        |
+| `YAS_MEDIA_CAMERA_MAX_WIDTH`       | `1920` (also the maximum)        | Largest camera width.                                                                               |
+| `YAS_MEDIA_CAMERA_MAX_HEIGHT`      | `1080` (also the maximum)        | Largest camera height.                                                                              |
+| `YAS_MEDIA_CAMERA_MAX_FPS`         | codec default                    | Highest camera frame rate.                                                                          |
+| `YAS_DECODE_FENCE_TIMEOUT_MS`      | `10000`                          | Wait for a Vulkan Video decode fence.                                                               |
+| `YAS_DESKTOP`                      | enabled                          | `0` disables tray icons and notifications.                                                          |
+| `YAS_ICON_THEME`                   | `hicolor`                        | Icon theme for tray icons.                                                                          |
+| `YAS_NOTIFICATION_TIMEOUT_MS`      | `10000`                          | Default notification lifetime.                                                                      |
+| `YAS_NOTIFICATION_TIMEOUT_MIN_MS`  | `1000`                           | Shortest notification lifetime.                                                                     |
+| `YAS_NOTIFICATION_TIMEOUT_MAX_MS`  | `86400000`                       | Longest notification lifetime.                                                                      |
+| `YAS_MPRIS`                        | enabled                          | `0` disables the MPRIS media-player bridge.                                                         |
+| `YAS_MPRIS_ARTWORK_BYTES`          | `8388608` (also the maximum)     | Artwork bytes per player.                                                                           |
+| `YAS_MPRIS_MAX_PLAYERS`            | `32` (also the maximum)          | Players tracked.                                                                                    |
+| `YAS_PORTALS`                      | enabled                          | `0` disables the compositor's desktop portals.                                                      |
+| `YAS_PORTAL_BIN`                   | `xdg-desktop-portal` from `PATH` | Path of the portal frontend binary.                                                                 |
+| `YAS_PORTAL_FALLBACK`              | `gtk;*`                          | Backends for portal interfaces yas does not implement.                                              |
+| `YAS_PORTAL_ACCESS_TIMEOUT_MS`     | `60000` (also the maximum)       | Wait for a viewer to answer an access request.                                                      |
+| `YAS_PORTAL_SCREENCAST_TIMEOUT_MS` | `120000` (also the maximum)      | Wait for a viewer to answer a screencast request.                                                   |
+
+## Event journal
+
+| Variable                  | Default   | Purpose                                                                               |
+| ------------------------- | --------- | ------------------------------------------------------------------------------------- |
+| `YAS_EVENTS`              | `default` | Startup event selector. See [Event journal](/reference/events).                       |
+| `YAS_EVENTS_SIZE`         | `1048576` | Ring size, from 4096 to 67104768 bytes.                                               |
+| `YAS_EVENTS_FILE`         | unset     | Record events to this file from startup.                                              |
+| `YAS_EVENTS_FILE_HISTORY` | `1`       | `0` starts the startup recording at the live edge instead of with the ring's history. |
+| `YAS_EVENTS_FILE_APPEND`  | `0`       | `1` appends to an existing recording file.                                            |
+
+## Edge, share, and uplink
+
+| Variable                       | Default                  | Purpose                                                                                                                   |
+| ------------------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `YAS_ADDR`                     | `127.0.0.1:3264`         | Listen address of `yas edge`.                                                                                             |
+| `YAS_EDGE`                     | unset                    | `1` serves the browser UI from the server process, as `--edge`.                                                           |
+| `YAS_SHARE`                    | unset                    | `1` publishes the server over WebRTC from the server process, as `--share`.                                               |
+| `YAS_PASSPHRASE`               | unset                    | Passphrase for the edge and share when their own variables are unset.                                                     |
+| `YAS_EDGE_PASSPHRASE`          | `YAS_PASSPHRASE`         | Edge passphrase.                                                                                                          |
+| `YAS_SHARE_PASSPHRASE`         | `YAS_PASSPHRASE`         | Share passphrase.                                                                                                         |
+| `YAS_SHARE_QUIET`              | quiet                    | `0` prints the share URL when the server hosts the share.                                                                 |
+| `YAS_SHARE_VERBOSE`            | unset                    | `1` logs share connection details.                                                                                        |
+| `YAS_WEBRTC_VERBOSE`           | unset                    | `1` logs WebRTC forwarder details.                                                                                        |
+| `YAS_TRUSTED_PROXY_IPS`        | none                     | Comma-separated exact IP addresses of reverse proxies whose forwarding headers the edge trusts.                           |
+| `YAS_SERVER_UID`               | the edge's effective UID | UID the home server socket must belong to.                                                                                |
+| `YAS_WEBTRANSPORT`             | unset                    | `1` enables WebTransport on the edge.                                                                                     |
+| `YAS_WEBTRANSPORT_ADDR`        | `YAS_ADDR`               | UDP listen address for WebTransport.                                                                                      |
+| `YAS_WEBTRANSPORT_PUBLIC_PORT` | the bind port            | Port advertised to browsers. Must not be `0`.                                                                             |
+| `YAS_WEBTRANSPORT_CERT`        | unset                    | Certificate chain. Set with `YAS_WEBTRANSPORT_KEY`. Leaving both unset uses a short-lived pinned development certificate. |
+| `YAS_WEBTRANSPORT_KEY`         | unset                    | Private key for `YAS_WEBTRANSPORT_CERT`.                                                                                  |
+| `YAS_WEBTRANSPORT_PIN_CERT`    | unset                    | `1` pins the configured certificate by hash.                                                                              |
+| `YAS_WEBTRANSPORT_STATS`       | unset                    | `1` logs QUIC RTT, congestion window, send rate, and loss every five seconds.                                             |
+| `YAS_UPLINK_IDENTITY`          | unset                    | Server X25519 private key for `yas uplink`, unpadded base64url.                                                           |
+| `YAS_UPLINK_CLIENT_KEYS`       | unset                    | Authorized client public keys for `yas uplink`.                                                                           |
+| `YAS_UPLINK_TOKEN`             | required                 | Relay control token for `yas uplink`.                                                                                     |
+| `YAS_UPLINK_CLIENT_TOKEN`      | unset                    | Consumer routing token for connecting to an uplink.                                                                       |
+
+## Install and update
+
+| Variable          | Default                             | Purpose                                                                                                                                                                        |
+| ----------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `YAS_PREFIX`      | chosen by `install.sh`              | Install prefix. SSH auto-install sets `$HOME/.local`.                                                                                                                          |
+| `YAS_INSTALL_DIR` | `%LOCALAPPDATA%\yas\bin` on Windows | Install directory for `install.ps1`. `install.sh` treats it as a legacy bin directory: it strips a trailing `/bin` and uses the rest as the prefix when `YAS_PREFIX` is unset. |
+| `YAS_GPL`         | unset                               | `1` installs the GPL build with x264. `yas update` passes it through.                                                                                                          |
+
+## Development and testing
+
+These variables are read by build scripts, tests, and development tools. Release servers do not read them.
+
+| Variable                                       | Default        | Purpose                                                      |
+| ---------------------------------------------- | -------------- | ------------------------------------------------------------ |
+| `YAS_UPDATE_SCHEMA`                            | unset          | `1` makes the build regenerate protocol schema outputs.      |
+| `YAS_UPDATE_CLI_DOCS`                          | unset          | `1` makes the CLI docs test rewrite the generated reference. |
+| `YAS_WEB_DIST`                                 | built-in       | Directory of browser assets for the website build.           |
+| `YAS_WEBSITE_ADDR`                             | `0.0.0.0:8000` | Listen address of the website server.                        |
+| `YAS_DEV_UI_PORT`                              | `3265`         | Vite dev server port.                                        |
+| `YAS_DEV_EDGE_PORT`                            | `3266`         | Development edge port.                                       |
+| `YAS_DEV_EDGE_HOST`                            | `127.0.0.1`    | Development edge host.                                       |
+| `YAS_DEV_EXT_PORT`                             | `3268`         | Development extension registry port.                         |
+| `YAS_DEV_SOCK`                                 | unset          | Socket example in muster configuration tests.                |
+| `YAS_E2E_TMPDIR`                               | `mktemp -d`    | Working directory for end-to-end servers.                    |
+| `YAS_MODAL_PASSPHRASE`                         | unset          | Passphrase for the Modal sandbox script.                     |
+| `YAS_FUZZ_SECONDS`                             | `60`           | Fuzz run length.                                             |
+| `YAS_FUZZ_TARGET`                              | all            | Fuzz target: `frame`, `families`, or `packed`.               |
+| `YAS_DEBUG_GPU_LAYERS`                         | unset          | A value other than `0` enables Vulkan validation layers.     |
+| `YAS_PIPEWIRE_VIDEO_CONSUMER`                  | unset          | PipeWire video consumer for tests.                           |
+| `YAS_WRITE_COLOR_CAPTURES`                     | unset          | Writes color test captures to disk.                          |
+| `YAS_WRITE_HDR_PROBE`                          | unset          | Writes the HDR probe image.                                  |
+| `YAS_WRITE_P3_H264_PROBE`                      | unset          | Writes the P3 H.264 probe stream.                            |
+| `YAS_COLOR_GPU`                                | unset          | Runs GPU color tests.                                        |
+| `YAS_COLOR_DIRECT_BACKEND`                     | unset          | Backend for direct color tests.                              |
+| `YAS_COLOR_PROBE_DIRECTORY`                    | unset          | Output directory for color probes.                           |
+| `YAS_COLOR_VULKAN_H264_444`                    | unset          | Runs the Vulkan H.264 4:4:4 color test.                      |
+| `YAS_VAAPI_REAL_TEST`                          | unset          | Runs VA-API tests on real hardware.                          |
+| `YAS_VAAPI_TEST_AV1`                           | unset          | Runs the VA-API AV1 test.                                    |
+| `YAS_VAAPI_TEST_H264`                          | unset          | Runs the VA-API H.264 test.                                  |
+| `YAS_TEST_DIRECT_NVDEC_AV1_420`                | unset          | Runs the NVDEC AV1 4:2:0 test.                               |
+| `YAS_TEST_DIRECT_NVDEC_AV1_444`                | unset          | Runs the NVDEC AV1 4:4:4 test.                               |
+| `YAS_TEST_DIRECT_NVDEC_H264_420`               | unset          | Runs the NVDEC H.264 4:2:0 test.                             |
+| `YAS_TEST_DIRECT_NVDEC_H264_444`               | unset          | Runs the NVDEC H.264 4:4:4 test.                             |
+| `YAS_TEST_DIRECT_NVDEC_EXPECT_444_UNAVAILABLE` | unset          | Expects the NVDEC 4:4:4 tests to find no support.            |
+| `YAS_TEST_ALACRITTY`                           | unset          | Path of an Alacritty binary for tests.                       |
+| `YAS_TEST_CHROMIUM`                            | unset          | Path of a Chromium binary for tests.                         |
+| `YAS_TEST_WESTON`                              | unset          | Path of a Weston binary for tests.                           |
+| `YAS_TEST_WAYLAND_SOCKET`                      | unset          | Wayland socket for tests.                                    |
+| `YAS_TEST_DBUS_SESSION_CONF`                   | unset          | D-Bus session configuration for tests.                       |
+| `YAS_TEST_REDIS_URL`                           | unset          | Redis URL for hub tests.                                     |
+| `YAS_UPLINK_TEST_CLIENT`                       | unset          | Uplink test client mode.                                     |
+| `YAS_UPLINK_E2E_FIXTURE`                       | unset          | Uplink end-to-end fixture.                                   |
+| `YAS_UPLINK_INTEROP_BIN`                       | unset          | Binary for uplink interoperability tests.                    |
+| `YAS_PASTE_BASE`                               | unset          | Paste test input.                                            |
+| `YAS_PASTE_PROBE`                              | unset          | Paste test probe.                                            |
+| `YAS_PASTE_WAYLAND`                            | unset          | Paste test Wayland mode.                                     |

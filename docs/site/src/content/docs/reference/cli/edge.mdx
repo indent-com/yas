@@ -1,0 +1,35 @@
+---
+title: "yas edge"
+description: "Run the yas edge."
+sidebar:
+  order: 29
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Run the yas edge
+
+All configuration is via environment variables:
+
+`YAS_PASSPHRASE`   Browser passphrase (required)
+
+`YAS_ADDR`         Listen address (default: 127.0.0.1:3264)
+
+`YAS_SOCK`          Fixed home yas server socket
+
+`YAS_SERVER_UID`    Required numeric home-server peer UID (default: edge euid)
+
+`YAS_TRUSTED_PROXY_IPS`  Exact reverse-proxy IPs allowed to supply X-Forwarded-For
+
+`YAS_WEBTRANSPORT`  Set to 1 for a native QUIC datagram listener
+
+`YAS_WEBTRANSPORT_ADDR`  UDP bind (defaults to `YAS_ADDR`)
+
+`YAS_WEBTRANSPORT_PUBLIC_PORT`  UDP port advertised to browsers
+
+`YAS_WEBTRANSPORT_CERT` / `YAS_WEBTRANSPORT_KEY`  Optional stable PEM identity
+
+```text
+Usage: yas edge [OPTIONS]
+```
+

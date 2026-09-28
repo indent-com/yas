@@ -1,0 +1,194 @@
+---
+title: "Files"
+description: "Read, search, write, and watch files on a server with yas fs, with content hashes that stop two writers from overwriting each other."
+sidebar:
+  order: 61
+---
+
+`yas fs` works with files on the machine that runs the server. It prints files, searches their
+contents and names, writes with conflict detection, moves and links entries, and streams changes to
+a directory tree. Every command also works against a remote with `--on`, so a script on your laptop
+can edit files on a build machine.
+
+The examples run in a small Rust repository. Paths are relative to `--root`, which defaults to your
+current directory.
+
+## Read and search
+
+`cat` prints a file's bytes unchanged:
+
+```bash
+yas fs cat src/greeting.rs
+```
+
+```text
+/// Build a greeting for `name`.
+pub fn hello(name: &str) -> String {
+    format!("Hi, {name}!")
+}
+```
+
+`grep` searches file contents. The match is case-insensitive and literal by default:
+
+```bash
+yas fs grep hello
+```
+
+```text
+src/greeting.rs:2:pub fn hello(name: &str) -> String {
+src/main.rs:6:    println!("{}", greet::hello(name));
+```
+
+Each line is the path, the 1-based line number, and the matching line. `grep` exits 1 when nothing
+matches.
+
+- `-s` matches case exactly.
+- `-e` treats the pattern as a regular expression, as in `yas fs grep -e 'fn\s+\w+'`.
+- `-w` matches whole words only.
+- `-l` prints only the paths that contain a match.
+- `--no-ignore` also searches files that `.gitignore` excludes, such as `target/`.
+- `--json` prints one object per match.
+
+```bash
+yas fs grep hello --json
+```
+
+```text
+{"col":7,"endCol":12,"endLine":2,"ignored":false,"line":2,"path":"src/greeting.rs","text":"pub fn hello(name: &str) -> String {"}
+```
+
+`line` and `endLine` are 1-based. `col` and `endCol` are 0-based byte offsets into the line.
+`ignored` is `true` for a match in a gitignored file.
+
+`find` fuzzy-matches file paths and prints the best matches first:
+
+```bash
+yas fs find grt
+```
+
+```text
+src/greeting.rs
+.git/refs/tags
+.git/refs/tags/v0.1
+.git/description
+.git/refs/heads/feature
+```
+
+`-n` sets the number of results, 50 by default.
+
+## Write files
+
+`write` reads the new content from stdin. It prints `ok` and the BLAKE3 hash of what it wrote:
+
+```bash
+echo "first draft" | yas fs write --parents notes/todo.txt
+```
+
+```text
+ok 50952f7500e9a08ddc121c5b6a547158fd2543ed04857f1fb0582d4961a12c67
+```
+
+Without `--parents`, a missing directory fails with `yas: filesystem entry not found`.
+
+Pass the hash you last read to `--if-hash`. The write succeeds only when the file still has that
+content. `--create` succeeds only when the path does not exist yet:
+
+```bash
+echo again | yas fs write --create notes/todo.txt
+```
+
+```text
+conflict: on-disk hash is 50952f7500e9a08ddc121c5b6a547158fd2543ed04857f1fb0582d4961a12c67 (rebase and retry, or --force)
+```
+
+A conflict exits 1 and prints the hash that is on disk now. Read the file again, merge your change,
+and retry with that hash. `--force` overwrites unconditionally. A write with no precondition flag
+overwrites the file.
+
+- `--durable` waits until the file and its directory are synced to disk.
+- `--mode 644` sets the file mode. By default yas keeps the existing mode or applies the umask.
+- `--json` prints the result as an object:
+
+```bash
+echo "second" | yas fs write --json notes/todo.txt
+```
+
+```text
+{"hash":"a74e619132c4c530d0d738f3cceddefaf06a79aad18b5be1a3bcbc054c1f3f84","mtimeNs":1790573557848884798,"revision":2,"status":"ok"}
+```
+
+`hash` is the new content hash. `mtimeNs` is the modification time in nanoseconds. `revision`
+is the server's revision number for the entry. `status` is `ok`, or `conflict` when a precondition
+failed.
+
+## Move, link, and remove
+
+```bash
+yas fs mkdir --parents docs/guide
+yas fs mv notes/todo.txt notes/done.txt
+yas fs ln -s ../notes/done.txt docs/done
+yas fs rm notes
+```
+
+- `mkdir` prints `ok`. `--mode` sets the directory mode.
+- `mv` prints `ok` and the content hash. `--parents` creates the destination's directories.
+- `ln` makes a hard link, or a symlink with `-s`. `--force` or `--if-hash` replaces an existing
+  entry.
+- `rm` removes a file, or a directory and everything under it. `--if-hash` removes a file only when
+  its content matches.
+
+## Watch a tree
+
+`sync` prints a snapshot of a directory tree and then streams every change:
+
+```bash
+yas fs sync . --ignore
+```
+
+```text
+syncing /home/you/demo
+d            0 .
+f            8 .gitignore
+f          148 Cargo.lock
+f           59 Cargo.toml
+f           56 README.md
+d            0 src
+f           99 src/greeting.rs
+f          114 src/main.rs
+watching for changes (ctrl-c to stop)…
+~ d .
++ f new.txt
+> new.txt -> renamed.txt
+~ d .
+- renamed.txt
+~ d .
+```
+
+This output came from creating `new.txt`, renaming it, and deleting it in another shell.
+
+The snapshot lines give the type (`d` directory, `f` file), the size in bytes, and the path. After
+the snapshot, `+` marks a new entry, `~` a changed entry, `>` a rename, and `-` a removal. The
+directory `.` shows as changed each time its list of children changes.
+
+- `--once` exits after the snapshot.
+- `--ignore` skips gitignored files, `.ignore` patterns, and `.git`. `--gitignore`, `--dot-ignore`,
+  and `--exclude-git` turn on each part alone.
+- `--exclude PATTERN` skips paths that match a gitignore-style pattern. Repeat it for more patterns.
+- `--no-recursive` watches only the directory and its direct children.
+- `--content` sends file contents as well as hashes.
+- `--json` prints one event object per line.
+
+<Aside type="note" title="Limits">
+
+- `grep` and `find` include files inside `.git` in their results. `yas fs grep -l name` in a fresh
+  repository lists every sample hook. Filter the output or narrow `--root`.
+- `grep -m` sets the size of each page of results, and `grep` keeps fetching pages. `-m 1` fails
+  with an `Invalid` error.
+- The server refuses writes when it runs with `YAS_FS_WRITE=0`, and disables `yas fs` entirely with
+  `YAS_FS=0`. See [Environment variables](/reference/environment-variables).
+- `sync` stops with an error when the tree holds more than `YAS_FS_MAX_ENTRIES` entries, one
+  million by default.
+
+</Aside>
+
+Full flags are in the [`yas fs` reference](/reference/cli/fs).

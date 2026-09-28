@@ -1,0 +1,44 @@
+---
+title: "Internals"
+description: "How yas is built: its crates, protocol, transports, server, compositor, and browser renderer."
+sidebar:
+  order: 11
+  group:
+    label: "Internals"
+    icon: "ph:cpu"
+---
+
+These pages describe how yas works inside, for contributors and for anyone implementing the protocol or debugging a deployment.
+
+<CardGrid>
+  <Card title="Architecture" href="/internals/architecture">
+    How the yas server, its connection layer, the browser client, and the Rust
+    crates and JS packages fit together.
+  </Card>
+  <Card title="The yas protocol" href="/internals/protocol">
+    How a yas session starts, how frames are laid out, and how families,
+    statuses, and datagrams fit together.
+  </Card>
+  <Card title="Transports internals" href="/internals/transports">
+    How each yas transport carries the native protocol, from Unix sockets and
+    WebSockets to WebRTC, SSH, the proxy daemon, and the uplink Noise layer.
+  </Card>
+  <Card title="Server internals" href="/internals/server">
+    How the yas server configures itself, runs PTYs and processes, parses
+    terminal output, paces frames per client, and handles camera input and
+    audio.
+  </Card>
+  <Card title="Compositor internals" href="/internals/compositor">
+    How the yas headless Wayland compositor starts, tracks surfaces, manages
+    color, renders with Vulkan, and hands frames to video encoders.
+  </Card>
+  <Card title="Frontend internals" href="/internals/frontend">
+    How the yas browser client decodes terminal frames, renders them with WASM
+    and WebGPU or WebGL2, handles input, manages connections, and plays surface
+    video.
+  </Card>
+  <Card title="Design documents" href="/internals/design-documents">
+    The design documents, RFCs, and contributor references in the yas
+    repository, and what each one covers.
+  </Card>
+</CardGrid>

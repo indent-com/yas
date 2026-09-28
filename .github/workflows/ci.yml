@@ -24,6 +24,14 @@ jobs:
       - name: Check crates.io publication plan
         run: ./bin/publish-crates --plan
 
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/check-docs
+
   test:
     runs-on: ubuntu-24.04
     steps:

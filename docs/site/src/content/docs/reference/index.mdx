@@ -1,0 +1,42 @@
+---
+title: "Reference"
+description: "The CLI, environment variables, configuration files, URI schemes, events, and wire registry."
+sidebar:
+  order: 12
+  group:
+    label: "Reference"
+    icon: "ph:book-open"
+---
+
+Lookup material for yas.
+
+<CardGrid>
+  <Card title="CLI reference" href="/reference/cli">
+    Every yas subcommand, argument, and option, generated from the CLI's own
+    definitions.
+  </Card>
+  <Card title="Environment variables" href="/reference/environment-variables">
+    Every YAS_* environment variable the yas code reads, with its default and
+    effect.
+  </Card>
+  <Card title="Configuration files" href="/reference/configuration-files">
+    The files yas reads and writes on disk: yas.conf, yas.forwards, yas.remotes,
+    per-instance state and cache, and sockets.
+  </Card>
+  <Card title="URI schemes" href="/reference/uris">
+    The grammar of every target URI yas accepts in --on, YAS_TARGET, yas.target,
+    and saved remotes.
+  </Card>
+  <Card title="Event journal" href="/reference/events">
+    Configure, read, follow, and record the server's binary event journal with
+    yas events.
+  </Card>
+  <Card title="Wire registry" href="/reference/wire-registry">
+    Every family, message, and record layout in the yas protocol, generated from
+    the canonical schema.
+  </Card>
+  <Card title="How yas compares" href="/reference/comparison">
+    How yas differs from ttyd, gotty, Eternal Terminal, Mosh, and xterm.js with
+    node-pty, and when another tool fits better.
+  </Card>
+</CardGrid>

@@ -1,0 +1,23 @@
+---
+title: "yas hash-passphrase"
+description: "Hash a yas edge passphrase for YAS_PASSPHRASE."
+sidebar:
+  order: 28
+---
+
+{/* Generated from crates/cli/src/cli.rs by `bin/generate-cli-docs`. Do not edit. */}
+
+Hash a yas edge passphrase for `YAS_PASSPHRASE`
+
+Prints an argon2id PHC string suitable for `YAS_PASSPHRASE`. If VALUE is omitted or "-", reads from stdin. The stored hash is salted; browser clients still enter the original plaintext passphrase.
+
+```text
+Usage: yas hash-passphrase [OPTIONS] [VALUE]
+```
+
+Arguments:
+
+- `[VALUE]`
+
+  Plaintext passphrase to hash (or -/omitted to read from stdin)
+

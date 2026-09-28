@@ -1,4 +1,5 @@
 mod cli;
+mod cli_docs;
 mod completion;
 mod events_human;
 mod forward;
@@ -1084,8 +1085,12 @@ async fn async_main() {
         Command::Learn => {
             print!("{}", include_str!("learn.md"));
         }
-        Command::Generate { output } => {
-            generate::run(&output);
+        Command::Generate { output, markdown } => {
+            if markdown {
+                cli_docs::write(&output);
+            } else {
+                generate::run(&output);
+            }
         }
         Command::ProxyDaemon => {
             yas_proxy::run(false);

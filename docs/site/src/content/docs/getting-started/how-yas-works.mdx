@@ -1,0 +1,74 @@
+---
+title: "How yas works"
+description: "The mental model behind yas: a server that keeps terminals and windows alive, the clients that attach to it, and the ways to reach it."
+sidebar:
+  order: 12
+---
+
+yas keeps your terminals running on a machine so you can close the browser, lose the network, or switch computers and come back to the same shells with their scrollback intact. The same terminals are open to scripts and AI agents through CLI commands, so an agent can start a build, type into a shell, and read the result while you watch it in a browser tab.
+
+## The server
+
+Everything lives in one process, `yas server`, on the machine where your programs run. It owns the terminals, their scrollback, and on Linux the graphical windows. Clients come and go. The server and what it runs stay until you close them or stop the server.
+
+You rarely start the server yourself. The first command that needs it, such as `yas open` or `yas terminal start`, starts one in the background:
+
+```bash
+yas terminal start htop
+```
+
+```text
+1
+```
+
+`yas quit` stops the server and every terminal in it.
+
+A machine can run more than one server. Each has a name, `default` unless you pick another, and its own socket, settings, and state. Address one with `--on local:NAME` and yas starts it on first use. See [Named instances](/terminals/named-instances).
+
+## Terminals and surfaces
+
+A **terminal** is a program running in a pseudo-terminal on the server: a shell, `htop`, a build. The server parses its output as it arrives and keeps the resulting screen and scrollback, so any client can read what is on screen without replaying raw bytes. A terminal keeps its output after its program exits until you close it. See [Controlling terminals](/terminals/controlling-terminals) and [Reading terminal output](/terminals/reading-output).
+
+On Linux the server also runs an experimental headless Wayland compositor. A graphical program started from any terminal, such as `foot`, Firefox, or an editor, opens its window there. Each window is a **surface**. The server encodes surfaces as H.264 or AV1 video and streams them to browsers, and the CLI can capture, click, and type into them. See [Running graphical applications](/gui/running-gui-apps).
+
+## Clients
+
+A **client** is anything connected to a server:
+
+- A browser tab running the yas web app.
+- A CLI command such as `yas terminal list`, which connects, does one thing, and disconnects.
+- A component embedded in your own web app with [`@yas-run/react`](/embedding/react) or [`@yas-run/solid`](/embedding/solid).
+
+Many clients can watch the same terminal at once. Each client reports how fast it draws: its display rate, how long it takes to apply a frame, and how many frames are waiting. The server paces each client from its own reports, so a phone on a slow link does not hold back a workstation on the same terminal. The focused terminal gets full frame rate and background terminals slow down. Keystrokes go straight to the terminal, so typing latency is bounded by the round trip to the server.
+
+`yas client list` shows who is connected.
+
+## Reaching a server
+
+The browser and CLI connect first to one server, the **home server**. Other servers are reached through it or directly by address.
+
+| Way in     | Command                                      | What it does                                                                                                   | Page                                   |
+| ---------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| Local      | `yas open`                                   | Starts the server if needed and opens the web app in your browser on this machine.                             | [Workspaces](/browser/workspaces)      |
+| SSH remote | `yas remote add dev ssh:dev` then `yas open` | The home server connects over SSH, installs yas on the remote if missing, and shows it beside your local one.  | [Remotes](/remote/remotes)             |
+| Edge       | `yas edge`                                   | Serves the web app from a long-running process behind a passphrase, for a server you reach at a fixed address. | [yas edge](/operating/edge)            |
+| Share      | `yas share`                                  | Publishes the server through the `yas.run` hub over WebRTC and prints a full-control URL and a read-only URL.  | [Sharing over WebRTC](/remote/sharing) |
+| Uplink     | `yas uplink URL`                             | Connects out to a relay you do not trust, with end-to-end encryption between pinned keys.                      | [Uplink](/remote/uplink)               |
+
+The CLI reaches the same targets with `--on`: `yas --on ssh:dev terminal list`, `yas --on share:PASSPHRASE terminal list`, or the name of a saved remote.
+
+## One protocol everywhere
+
+Every client speaks the yas protocol, whether it arrives over a local socket, SSH, a WebSocket, WebTransport, or a WebRTC data channel. The transport only carries the bytes. A browser tab and a CLI command use the same operations, so anything you can do from one you can script from the other. See [Transports](/remote/transports) for the options and [Protocol](/internals/protocol) for the details.
+
+## The CLI does what the browser does
+
+Starting terminals, typing into them, reading their screens, clicking and typing into surfaces, reading files, querying Git and language servers, and managing remotes are all `yas` subcommands. They print plain text or tab-separated columns so scripts and agents can parse them. Run `yas learn` for the full guide, or see [Using yas from an agent](/agents/using-yas-from-an-agent).
+
+For how the pieces fit inside the server, see [Architecture](/internals/architecture).
+
+<Aside type="caution" title="A connection is a login">
+  Any client that reaches a server has the same authority as a shell running as
+  the server's user. A full-control passphrase, an SSH remote, and an uplink key
+  all grant it. See [Security](/operating/security).
+</Aside>

@@ -1,0 +1,169 @@
+---
+title: "GPU sandboxes on Tensorlake"
+description: "Build a yas image from a checkout and start it in a Tensorlake GPU sandbox with a public HTTPS edge and a WebRTC share."
+sidebar:
+  order: 85
+---
+
+The repository includes two scripts that run yas in a [Tensorlake](https://tensorlake.ai) sandbox with
+an NVIDIA GPU. `bin/tensorlake-import.ts` builds yas and the bundled extensions from your checkout and
+registers them as a private Tensorlake image. `bin/tensorlake-start.ts` starts a sandbox from that
+image, runs one yas server that serves both the browser edge and a WebRTC share, and prints the URLs.
+
+## Requirements
+
+- A yas checkout with [direnv](https://direnv.net), Nix, and Node 24.
+- An x86_64 Linux Nix builder. On macOS or ARM, configure a remote builder. A native binary for your
+  own machine cannot run in the sandbox.
+- A Tensorlake project API key.
+
+## Start a sandbox
+
+<Steps titleSize="h3">
+  <Step title="Install the pinned SDK">
+    From the checkout root:
+
+    ```bash
+    direnv allow
+    direnv exec . npm ci --prefix bin
+    export TENSORLAKE_API_KEY=...
+    ```
+
+  </Step>
+  <Step title="Build and register the image">
+
+    ```bash
+    direnv exec . bin/tensorlake-import.ts
+    ```
+
+    The script builds `packages.x86_64-linux.yas-release`, checks that the result is an x86_64 Linux
+    binary, builds every bundled extension, and uploads them with the image's Dockerfile. It registers
+    the image as `yas-ubuntu-26-04` and prints JSON with its `cas-v1:...` reference.
+
+    Nix builds from Git, so add new source files to Git before you import. Tracked changes that are
+    not committed are included.
+
+  </Step>
+  <Step title="Start the sandbox">
+
+    ```bash
+    direnv exec . bin/tensorlake-start.ts
+    ```
+
+    The script prints JSON with these fields:
+
+    - `sandboxId`: the Tensorlake sandbox ID.
+    - `image`: the image it started from.
+    - `timeoutSecs`: the effective idle timeout.
+    - `edgeUrl`: the HTTPS edge, with the passphrase in the URL fragment.
+    - `shareUrl`: the `https://yas.run/s#psk=...` share link.
+
+    The script exits and leaves the sandbox running.
+
+  </Step>
+</Steps>
+
+Reimport after changing yas or its extensions. Existing sandboxes keep the image they started with.
+
+## What the sandbox runs
+
+- **Resources:** 8 CPUs, 16 GiB of memory, one `RTX-PRO-6000` GPU, and the image's disk size.
+- **Image:** Ubuntu 26.04 with PipeWire, Vulkan and EGL libraries, Blender, htop, Mesa utilities,
+  Xwayland, `xwayland-satellite` 0.8.2, and Brave and Firefox from their vendors' APT repositories.
+  Tensorlake supplies the NVIDIA driver libraries at runtime.
+- **Server:** `yas server --share --edge --export-sock --inject-path`, as the `yas` user, supervised by
+  Tensorlake as the process `yas-server` with an always-restart policy. Its socket is
+  `/run/yas/yas-default.sock`.
+- **Edge:** listens on `0.0.0.0:3264`. The script exposes port 3264 through Tensorlake's HTTPS proxy
+  without Tensorlake authentication, so yas's passphrase is the only check.
+- **Extensions:** `doctor`, `muster`, `systemd`, and `xdg-desktop` are installed from files in the
+  image, with no download. Later starts keep existing definitions, including ones you updated or
+  disabled. The sandbox has no systemd manager, so the `systemd` extension has nothing to show.
+
+Before it prints the URLs, the script checks that the server is running, that `nvidia-smi` sees the
+GPU, and that `yas terminal list` and `yas ext list` succeed.
+
+## Options
+
+`bin/tensorlake-import.ts`:
+
+- `--name IMAGE`: register under another name. Default `yas-ubuntu-26-04`.
+
+`bin/tensorlake-start.ts`:
+
+- `--image NAME_OR_REF`: start from another registered name, or pin a `cas-v1:...` reference.
+- `--name NAME`: create a named sandbox. A named sandbox suspends at its idle timeout instead of
+  terminating.
+- `--timeout SECONDS`: idle timeout. Default `0`, which requests your plan's maximum: unlimited on
+  Pro and Enterprise.
+- `--passphrase TEXT`: the passphrase for both the edge and the share. Overrides
+  `YAS_SHARE_PASSPHRASE`.
+- `--sandbox ID`: rerun setup in an existing sandbox without creating one. It cannot be combined with
+  `--image`, `--name`, or `--timeout`.
+
+Without a passphrase, the script reuses the one saved in the sandbox's root-only
+`/etc/yas/share.env`, or generates a random one. Blank passphrases are rejected before anything is
+created. Rerunning with the same passphrase keeps the running server. A new passphrase replaces the
+server, which closes its terminals and GUI applications.
+
+```bash
+direnv exec . bin/tensorlake-start.ts --image yas-dev --name my-yas --timeout 3600
+direnv exec . bin/tensorlake-start.ts --sandbox SANDBOX_ID
+```
+
+## Run commands in the sandbox
+
+With the Tensorlake SDK, run `yas` as the `yas` user with the server's socket:
+
+```ts
+await sandbox.run("runuser", {
+  args: [
+    "-u",
+    "yas",
+    "--",
+    "env",
+    "XDG_RUNTIME_DIR=/run/yas",
+    "YAS_SOCK=/run/yas/yas-default.sock",
+    "yas",
+    "terminal",
+    "start",
+    "brave-browser",
+    "--ozone-platform=wayland",
+  ],
+});
+```
+
+Read the server, edge, and share logs with `sandbox.getOutput("yas-server")` or in Tensorlake's
+console. The server runs with `YAS_WEBRTC_VERBOSE=1`, so the log includes ICE and DataChannel
+diagnostics.
+
+Terminate the sandbox when you are done with `Sandbox.connect({ sandboxId })` and
+`sandbox.terminate()`. The scripts never terminate a sandbox, even when a startup check fails.
+
+## Check GPU rendering
+
+Look for a line that starts like this in the `yas-server` log:
+
+```text
+[vulkan-render] initialized: NVIDIA
+```
+
+`nvidia-smi` succeeding does not prove the compositor uses the GPU. If the line names `llvmpipe`, yas
+is rendering in software and uses several CPU cores to do it.
+
+<Aside type="caution" title="Known limits">
+
+- GPU compositing does not give Wayland clients GPU rendering. The sandbox has no `/dev/dri` device,
+  so yas does not offer `zwp_linux_dmabuf_v1`, and clients such as `es2gears_wayland` fall back to
+  Mesa software rendering.
+- Firefox does not start in the tested Tensorlake runtime. It fails in gVisor on
+  `arch_prctl(ARCH_SET_GS)` ([gVisor issue #11567](https://github.com/google/gvisor/issues/11567)).
+  Use Brave.
+- CPU percentages inside gVisor are sampled estimates and can read high for processes that wake
+  often. Compare against host-side measurements.
+- Tensorlake's proxy authentication setting applies to every exposed port. If the sandbox already
+  exposes other ports that require Tensorlake authentication, the script refuses to start the edge.
+- If startup fails, the script reports the sandbox's state and termination details. A proxy
+  `SANDBOX_NOT_FOUND` right after creation can mean the sandbox stopped after reaching `Running`.
+
+</Aside>
