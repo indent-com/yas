@@ -1,0 +1,45 @@
+---
+/**
+ * TOC — on-this-page nav with scroll-spy.
+ */
+import { cn } from "@/lib/cn";
+import type { HTMLAttributes } from "astro/types";
+import type { TOCItem } from "@cloudflare/nimbus-docs/types";
+
+interface Props extends HTMLAttributes<"div"> {
+  headings: TOCItem[];
+}
+
+const { headings, class: className, ...attrs } = Astro.props;
+---
+
+{headings.length > 0 && (
+  <div data-nb-toc class={cn("toc-container", className)} {...attrs}>
+    <h2 class="mb-2 text-sm font-semibold text-foreground">On this page</h2>
+    <nav aria-label="Table of contents">
+      <ul class="m-0 flex list-none flex-col border-l-2 border-border p-0">
+        {headings.map((h) => {
+          const indent = h.depth - 2;
+
+          return (
+            <li>
+              <a
+                href={`#${h.slug}`}
+                data-nb-toc-link
+                data-nb-slug={h.slug}
+                class="relative -ml-0.5 block py-1.5 pr-2 text-[0.8125rem] leading-snug text-muted-foreground no-underline before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-transparent before:content-[''] hover:text-foreground aria-[current=true]:font-medium aria-[current=true]:text-link aria-[current=true]:before:bg-brand"
+                style={`padding-left: calc(1.25rem + ${indent}rem);`}
+              >
+                {h.text}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
+  </div>
+)}
+
+<script>
+  import "./toc.client";
+</script>

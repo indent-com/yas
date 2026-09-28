@@ -1,0 +1,24 @@
+---
+/**
+ * yas mark (`logo.svg` at the repository root) with the lowercase name set in
+ * monospace, as on yas.run. Inherits `currentColor`; size it with a height
+ * class.
+ */
+import type { HTMLAttributes } from "astro/types";
+
+type Props = HTMLAttributes<"span">;
+
+const { class: className, ...attrs } = Astro.props;
+---
+
+<span class:list={["inline-flex items-center gap-[0.45em]", className]} {...attrs}>
+  <svg viewBox="0 0 256 256" class="h-full w-auto" aria-hidden="true">
+    <circle cx="128" cy="128" r="120" fill="none" stroke="currentColor" stroke-width="16"></circle>
+    <g fill="currentColor">
+      <rect x="120" y="128" width="16" height="120"></rect>
+      <rect x="120" y="128" width="16" height="120" transform="rotate(120 128 128)"></rect>
+      <rect x="120" y="128" width="16" height="120" transform="rotate(240 128 128)"></rect>
+    </g>
+  </svg>
+  <span class="font-mono font-semibold leading-none tracking-[0.2em]" style="font-size: 1.05em">yas</span>
+</span>

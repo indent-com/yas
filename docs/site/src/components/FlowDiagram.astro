@@ -1,0 +1,62 @@
+---
+interface Props {
+  label: string;
+  steps: string[];
+}
+
+const { label, steps } = Astro.props;
+---
+
+<figure class="flow-diagram" aria-label={label}>
+  <ol>
+    {steps.map((step) => <li>{step}</li>)}
+  </ol>
+</figure>
+
+<style>
+  .flow-diagram {
+    margin: 1.5rem 0;
+    padding: 1rem;
+    overflow-x: auto;
+    border: 1px solid var(--nb-border);
+    border-radius: var(--nb-radius);
+    background: var(--nb-muted);
+  }
+
+  .flow-diagram ol {
+    display: flex;
+    align-items: stretch;
+    min-width: max-content;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .flow-diagram li {
+    display: flex;
+    align-items: center;
+    min-width: 8.5rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--nb-border-strong);
+    border-radius: calc(var(--nb-radius) - 0.125rem);
+    background: var(--nb-card);
+    color: var(--nb-card-foreground);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    line-height: 1.35;
+    box-shadow: var(--nb-shadow-sm);
+  }
+
+  .flow-diagram li:not(:last-child)::after {
+    content: "→";
+    align-self: center;
+    margin: 0 -2rem 0 1rem;
+    transform: translateX(2rem);
+    color: var(--nb-muted-foreground);
+    font-size: 1rem;
+  }
+
+  .flow-diagram li:not(:last-child) {
+    margin-right: 3rem;
+  }
+</style>

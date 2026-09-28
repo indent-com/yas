@@ -1,0 +1,88 @@
+---
+import { Button } from "./ui/button";
+import { LinkButton } from "./ui/link-button";
+import { ThemeToggle } from "./ui/theme-toggle";
+import { SearchTrigger } from "./ui/search";
+import Wordmark from "./Wordmark.astro";
+import { config } from "virtual:nimbus/config";
+import { getSidebarSections } from "@cloudflare/nimbus-docs";
+
+interface Props {
+  /** Astro collection id for the current page, forwarded from DocsLayout. */
+  collection?: string;
+  /** Astro entry id for the current page, forwarded from DocsLayout. */
+  entryId?: string;
+  /**
+   * Whether the page has a sidebar to open. When `false`, the mobile
+   * menu button is hidden — pages that opted out via `sidebar: false`
+   * shouldn't show a button that opens an empty dialog. Default `true`.
+   */
+  showSidebar?: boolean;
+}
+
+// `entryId` is part of Props as a forward-compat hook (the version-switcher
+// recipe reads it) but the base Header doesn't use it — leave it off the
+// destructure to avoid an unused-var warning.
+const { collection, showSidebar = true } = Astro.props;
+
+// Normalize trailing slash so isActive matches sidebar hrefs.
+const currentSlug = Astro.url.pathname.replace(/\/$/, "") || "/";
+const sections = await getSidebarSections(currentSlug, { collection });
+const showSections = sections.length >= 2;
+---
+
+<header class="sticky top-0 z-30 border-b border-border bg-card/80 backdrop-blur-lg">
+  <div class="mx-auto flex items-center justify-between h-14 px-4 lg:px-6">
+    <div class="flex items-center gap-3">
+      {showSidebar && (
+        <Button
+          variant="ghost"
+          shape="square"
+          size="sm"
+          icon="ph:list"
+          aria-label="Open navigation"
+          data-menu-btn
+          class="lg:hidden text-muted-foreground"
+        />
+      )}
+
+      <a href="/" class="group flex items-center gap-2.5 no-underline" aria-label={`${config.title} docs home`}>
+        <Wordmark class="h-[1.125rem] w-auto text-foreground transition-opacity group-hover:opacity-70" />
+        <span class="text-sm font-normal text-muted-foreground">Docs</span>
+      </a>
+
+      {showSections && (
+        <nav aria-label="Sections" class="hidden md:flex items-center gap-1 ml-4 pl-4 border-l border-border h-6">
+          {sections.map((section) => (
+            <a
+              href={section.href}
+              aria-current={section.isActive ? "page" : undefined}
+              class:list={[
+                "px-2 py-1 rounded-md text-[0.8125rem] font-medium no-underline transition-colors",
+                section.isActive
+                  ? "text-link bg-brand/8"
+                  : "text-muted-foreground hover:text-foreground hover:bg-accent/60",
+              ]}
+            >
+              {section.label}
+            </a>
+          ))}
+        </nav>
+      )}
+    </div>
+
+    <div class="flex items-center gap-2">
+      {config.search !== false && <SearchTrigger />}
+      <ThemeToggle />
+      <a
+        href="https://github.com/yas-run/yas"
+        class="hidden sm:block px-2 py-1 rounded-md text-[0.8125rem] font-medium text-muted-foreground no-underline transition-colors hover:text-foreground hover:bg-accent"
+      >
+        GitHub
+      </a>
+      <LinkButton href="/getting-started/installing" size="sm" class="hidden sm:inline-flex">
+        Install
+      </LinkButton>
+    </div>
+  </div>
+</header>

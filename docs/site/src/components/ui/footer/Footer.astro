@@ -1,0 +1,58 @@
+---
+const sections: { title: string; links: { label: string; href: string }[] }[] = [
+  {
+    title: "yas",
+    links: [
+      { label: "yas.run", href: "https://yas.run" },
+      { label: "GitHub", href: "https://github.com/yas-run/yas" },
+      { label: "Releases", href: "https://github.com/yas-run/yas/releases" },
+    ],
+  },
+  {
+    title: "Docs",
+    links: [
+      { label: "Getting started", href: "/getting-started" },
+      { label: "CLI reference", href: "/reference/cli" },
+      { label: "Changelog", href: "/changelog" },
+    ],
+  },
+];
+
+const year = new Date().getFullYear();
+import Wordmark from "@/components/Wordmark.astro";
+---
+
+<footer class="border-t border-border bg-card" data-pagefind-ignore>
+  <div class="mx-auto w-full max-w-[80rem] px-6 py-12 lg:px-10">
+    <div class="flex flex-col gap-10 md:flex-row md:items-start md:justify-between">
+      <div class="flex flex-col gap-3">
+        <a href="https://yas.run" class="no-underline" aria-label="yas.run">
+          <Wordmark class="h-5 w-auto text-foreground" />
+        </a>
+        <p class="text-xs text-muted-foreground">© {year} Indent. MIT licensed.</p>
+      </div>
+
+      <div class="grid grid-cols-2 gap-8 sm:grid-cols-2 sm:gap-16">
+        {
+          sections.map((section) => (
+            <div class="flex flex-col gap-3">
+              <h2 class="text-xs font-semibold tracking-normal text-foreground">{section.title}</h2>
+              <ul class="flex list-none flex-col gap-2 p-0">
+                {section.links.map((link) => (
+                  <li>
+                    <a
+                      href={link.href}
+                      class="text-[0.8125rem] text-muted-foreground no-underline transition-colors hover:text-link"
+                    >
+                      {link.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </div>
+</footer>
