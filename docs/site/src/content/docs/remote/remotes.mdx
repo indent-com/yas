@@ -76,7 +76,7 @@ Any other word is looked up as a remote name. See [Named targets in the CLI](#na
 
 Manage saved remotes with these subcommands:
 
-- `yas remote toggle NAME` disables a remote without deleting it, or enables it again. A disabled remote stays in the list and the home server does not connect to it.
+- `yas remote toggle NAME` disables a remote without deleting it, or enables it again. A disabled remote stays in the list, the home server does not connect to it, and `--on NAME` refuses it.
 - `yas remote remove NAME` deletes it. Removing a name that does not exist exits with status 1.
 - `yas remote set-default TARGET` sets the CLI's default target. See [Set a default target](#set-a-default-target).
 
@@ -84,7 +84,7 @@ You can also add, remove, disable, and reorder remotes in the browser's **Remote
 
 ## Where saved remotes live
 
-`yas remote add`, `list`, `toggle`, and `remove` edit the list on the server the command connects to. The list is the `remotes` key in that server's [key-value store](/code/key-value-store), so each named instance has its own. Add `--on` to edit another server's list:
+`yas remote add`, `list`, `toggle`, and `remove` edit the list on the home server: the server at `YAS_SOCK`, or the `default` instance when it is unset. A default target set with `YAS_TARGET` or `yas.target` does not change which list they edit. The list is the `remotes` key in that server's [key-value store](/code/key-value-store), so each named instance has its own. Add `--on` to edit another server's list:
 
 ```bash
 yas --on local:work remote add build ssh:build.example
@@ -118,21 +118,26 @@ yas: imported 3 remotes from /home/you/.config/yas/yas.remotes into this instanc
 
 ## Named targets in the CLI
 
-When `--on`, `YAS_TARGET`, or `yas.target` holds a word that is not a URI, the CLI looks it up in `~/.config/yas/yas.remotes` on the machine running the command (or the file `YAS_REMOTES` names). It does not read the server's `remotes` key. A remote you add with `yas remote add` is available to `--on` by name only after you add the same line to that file:
-
-```text
-local = local
-work = local:work
-```
+When `--on`, `YAS_TARGET`, or `yas.target` holds a word that is not a URI, the CLI looks it up in the home server's `remotes` key, the list `yas remote add` edits. The CLI then connects to the stored URI itself. A remote can name another remote:
 
 ```bash
-yas --on work terminal list
+yas remote add work local:work
+yas remote add build work
+yas --on build terminal list
 ```
 
-The first name lookup creates the file with the single entry `local = local` if it does not exist. Disabled lines do not resolve. An unknown name fails:
+```text
+yas: remote 'work' set to 'local:work'
+yas: remote 'build' set to 'work'
+ID	     TAG	    TITLE	  COMMAND	CWD	    STATUS
+```
+
+A disabled remote, an unknown name, and a loop of names each fail with status 1. The messages never print a stored URI:
 
 ```text
-yas: unknown target 'off' (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], or a name from yas.remotes)
+yas: remote 'work' is disabled; enable it with `yas remote toggle work`
+yas: unknown target 'nosuch' (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, uplink:, proxy:, local[:NAME], or a remote name from `yas remote list` on the home server)
+yas: remotes: cycle detected resolving 'a'
 ```
 
 ## Set a default target
@@ -194,7 +199,7 @@ yas open
 yas: serving browser UI at http://127.0.0.1:34451/#psk=…
 ```
 
-That server is the home server. It always uses `YAS_SOCK` or the `default` instance, and ignores `--on` and the default target. The home server connects to every enabled entry in its `remotes` key and publishes each as a route. The browser shows the home server and the routes in the **Remotes** panel with their connection status:
+That server is the home server. It always uses `YAS_SOCK` or the `default` instance, and the default target does not change it. `yas open --on TARGET` exits with status 2 and suggests `yas remote add NAME TARGET` instead. The home server connects to every enabled entry in its `remotes` key and publishes each as a route. The browser shows the home server and the routes in the **Remotes** panel with their connection status:
 
 - **Add to workspace** and **Remove from workspace** choose which routes the current workspace shows. The home server is always in the workspace.
 - **Manage** opens a connected remote's panels in a pane.

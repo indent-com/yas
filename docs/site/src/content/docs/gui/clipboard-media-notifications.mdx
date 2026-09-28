@@ -37,7 +37,7 @@ text/plain;charset=utf-8
 `list` prints one MIME type per line: the formats the current clipboard owner offers. This example
 follows a copy in Chrome. `yas clipboard` with no subcommand runs `list`.
 
-Read the clipboard with `get`. It asks for `text/plain` unless you pass `--mime`:
+Read the clipboard with `get`. Without `--mime` it reads plain text:
 
 ```bash
 yas clipboard get
@@ -56,19 +56,20 @@ yas clipboard set --mime image/png < shot.png
 - `--primary` sets the primary selection, which a middle click pastes, instead of the clipboard.
 - Setting the clipboard takes ownership from whichever application held it.
 
-After `yas clipboard set`, read the value back with the same MIME type you set. A plain `get` asks
-for `text/plain`, which the offer does not include:
+A plain-text `get` (no `--mime`, `text/plain` with or without a charset, or `UTF8_STRING`) reads
+whichever plain-text type the owner offers, so a value you set reads back:
 
 ```bash
 yas clipboard set "pasted by yas"
 yas clipboard get
-yas clipboard get --mime "text/plain;charset=utf-8"
 ```
 
 ```text
-yas: YAS request 0x0021/0x0005 failed with NotFound: no detail
 pasted by yas
 ```
+
+Any other MIME type must match a type in `list` exactly. A type the owner does not offer fails with
+`NotFound`.
 
 ## Media players
 

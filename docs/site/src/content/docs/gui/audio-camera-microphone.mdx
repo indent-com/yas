@@ -60,9 +60,8 @@ browser:
 - **Sound quality** and **Bitrate**: the Opus bitrate, from 32 to 256 kbps, or **Desktop default**.
 
 All viewers of a compositor share one Opus encoder. The server encodes at the highest bitrate any
-connected viewer asks for, and at 64 kbps when every viewer leaves it at **Desktop default**.
-`YAS_AUDIO_BITRATE` sets the bitrate, in bits per second, that the encoder starts at before a viewer
-connects.
+connected viewer asks for. When every viewer leaves it at **Desktop default**, the server encodes at
+`YAS_AUDIO_BITRATE`, in bits per second, 64000 by default.
 
 Audio and video carry timestamps from the same clock. The browser measures how far audio lags the
 focused window's video and reports it. yas publishes that delay to applications as PipeWire sink
@@ -146,15 +145,19 @@ and `software` alone turns off hardware decoding.
 - `YAS_MEDIA_INPUT=0`: turn off microphone and camera input. `YAS_MEDIA_MICROPHONE=0` and
   `YAS_MEDIA_CAMERA=0` turn off one kind.
 - `YAS_PORTALS=0`: turn off the desktop portals, including window sharing through ScreenCast.
-- `YAS_AUDIO=0`: do not start PipeWire for audio output.
+- `YAS_AUDIO=0`: turn off desktop sound. Viewers are not offered it, even while PipeWire runs for
+  the microphone, the camera, or the portals.
 
-<Aside type="caution" title="YAS_AUDIO=0 alone keeps audio on">
-  yas starts the private PipeWire instance when any of audio output, media
-  input, or ScreenCast needs it. Once it runs, desktop sound is offered to
-  viewers. To stop PipeWire entirely, set `YAS_AUDIO=0`, `YAS_MEDIA_INPUT=0`,
-  and `YAS_PORTALS=0` together.
-</Aside>
+yas starts the private PipeWire instance when any of audio output, media input, or ScreenCast needs
+it. To keep PipeWire from starting at all, set `YAS_AUDIO=0`, `YAS_MEDIA_INPUT=0`, and
+`YAS_PORTALS=0` together.
 
 Without the programs or library listed under [Requirements](#requirements), the server runs with no
-audio, microphone, camera, or window sharing. Start the server with `--verbose` to log which
-program or library is missing.
+audio, microphone, camera, or window sharing. Unless `YAS_AUDIO=0` is set, it prints one line with
+the reason when it starts:
+
+```text
+[audio] desktop audio unavailable: missing on $PATH: pipewire, pipewire-pulse, pw-loopback, pw-dump, wpctl; -v for details, YAS_AUDIO=0 to silence
+```
+
+Start the server with `--verbose` for more detail.

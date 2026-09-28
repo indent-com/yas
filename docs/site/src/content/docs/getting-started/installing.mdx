@@ -201,7 +201,7 @@ See [Video encoding](/gui/video-encoding) for choosing encoders.
 | `xwayland-satellite`   | X11 applications, started when installed                |
 
 - Audio stays off when PipeWire is not installed or `libpipewire-0.3.so.0` cannot be found by the dynamic linker. Set `LD_LIBRARY_PATH` if the library lives in a non-default location.
-- The same private PipeWire instance also carries camera, microphone, and screen-cast portals. To keep it from starting at all, set `YAS_AUDIO=0`, `YAS_MEDIA_INPUT=0`, and `YAS_PORTALS=0` on the server. `YAS_AUDIO=0` alone leaves it running while the other two are on.
+- The same private PipeWire instance also carries camera, microphone, and screen-cast portals. To keep it from starting at all, set `YAS_AUDIO=0`, `YAS_MEDIA_INPUT=0`, and `YAS_PORTALS=0` on the server. `YAS_AUDIO=0` alone turns off desktop sound, and PipeWire keeps running for the microphone, the camera, and the portals.
 - yas starts `xwayland-satellite` when it is on `PATH` and exports the resulting `DISPLAY` to every terminal. Applications that speak Wayland still use Wayland. Without the binary, only Wayland applications can show windows. Set `YAS_XWAYLAND=0` to skip it.
 
 See [Audio, camera, and microphone](/gui/audio-camera-microphone) for what audio does in the browser.

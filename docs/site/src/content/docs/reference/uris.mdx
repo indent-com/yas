@@ -57,7 +57,7 @@ The CLI checks prefixes in this order: `proxy:`, `ssh:`, `tcp:`, `wt://`, `ws://
 | `uplink:https://relay/#token=T&server=K`      | [Uplink](/remote/uplink) through a relay   | `token` is the routing token and `server` is the server's public key. The client private key comes from `identity=` or `YAS_UPLINK_IDENTITY`.                                                                                                |
 | `share:SECRET`                                | WebRTC through the hub                     | `SECRET` is the share passphrase, which grants full access, or a read-only token ending in `.ro`. `?hub=URL` overrides `--hub` and `YAS_HUB`. See [Sharing](/remote/sharing).                                                                |
 | `proxy:TARGET`                                | Per-user proxy                             | Routes `TARGET` through the proxy even where the CLI would connect directly.                                                                                                                                                                 |
-| `NAME`                                        | Whatever `NAME` points to                  | A remote name, resolved recursively. A cycle is an error.                                                                                                                                                                                    |
+| `NAME`                                        | Whatever `NAME` points to                  | A remote name from the home server's `remotes` key, resolved recursively. A cycle is an error.                                                                                                                                               |
 
 Passphrases go in the URI fragment because a fragment is never sent in an HTTP request line, so it stays out of access logs and `Referer` headers.
 
@@ -86,7 +86,7 @@ yas --on bogus terminal list
 ```
 
 ```text
-yas: unknown target 'bogus' (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], or a name from yas.remotes)
+yas: unknown target 'bogus' (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, uplink:, proxy:, local[:NAME], or a remote name from `yas remote list` on the home server)
 ```
 
 An invalid instance name fails before any connection:
@@ -98,9 +98,3 @@ yas --on 'local:bad/name' terminal list
 ```text
 yas: invalid local server name: server name may contain only ASCII letters, digits, '-', '_', and '.'
 ```
-
-<Aside type="caution">
-
-The CLI resolves a bare remote name from the local `yas.remotes` file. Remotes added with `yas remote add` live in the home server's `remotes` KV key, so the CLI does not find them and prints the `unknown target` error above. Pass the full URI instead. See [Configuration files](/reference/configuration-files#yasremotes).
-
-</Aside>

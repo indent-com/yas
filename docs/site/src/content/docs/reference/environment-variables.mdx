@@ -23,7 +23,7 @@ Unless a row says otherwise:
 | `YAS_SERVER_NAME`     | `default`                                          | Instance name for `yas server --name` and for extensions that derive per-instance paths.                                                                                                        |
 | `YAS_HUB`             | `yas.run`                                          | Signaling hub URL for `share:` targets and `yas share` (same as `--hub`).                                                                                                                       |
 | `YAS_CONFIG`          | `<config dir>/yas.conf`                            | Path of `yas.conf`.                                                                                                                                                                             |
-| `YAS_REMOTES`         | `<config dir>/yas.remotes`                         | Path of `yas.remotes`.                                                                                                                                                                          |
+| `YAS_REMOTES`         | `<config dir>/yas.remotes`                         | Path of `yas.remotes`, which a server imports once when it has no `remotes` key.                                                                                                                |
 | `YAS_FORWARDS`        | `<config dir>/yas.forwards`                        | Path of `yas.forwards`.                                                                                                                                                                         |
 | `YAS_KV_PATH`         | `<state dir>/yas/instances/<name>/kv.redb`         | Path of the KV database.                                                                                                                                                                        |
 | `YAS_EXTENSION_PATH`  | `<state dir>/yas/instances/<name>/extensions.redb` | Path of the extension catalogue database.                                                                                                                                                       |
@@ -210,8 +210,8 @@ These are deployment settings. `yas server --ext-*` and `--channel-*` flags over
 
 | Variable                           | Default                          | Purpose                                                                                             |
 | ---------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `YAS_AUDIO`                        | enabled                          | `0` disables audio capture.                                                                         |
-| `YAS_AUDIO_BITRATE`                | `64000`                          | Opus bitrate in bits per second.                                                                    |
+| `YAS_AUDIO`                        | enabled                          | `0` turns off desktop audio, even when PipeWire runs for media input or portals.                    |
+| `YAS_AUDIO_BITRATE`                | `64000`                          | Opus bitrate in bits per second for viewers at **Desktop default**.                                 |
 | `YAS_MEDIA_INPUT`                  | enabled                          | `0` disables viewer camera and microphone input.                                                    |
 | `YAS_MEDIA_CAMERA`                 | enabled                          | `0` disables viewer cameras.                                                                        |
 | `YAS_MEDIA_MICROPHONE`             | enabled                          | `0` disables viewer microphones.                                                                    |

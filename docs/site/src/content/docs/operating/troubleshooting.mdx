@@ -135,7 +135,14 @@ yas server -v
 
 ### Audio is silent
 
-yas disables audio when the PipeWire programs or library are missing. A verbose server says which:
+yas disables audio when the PipeWire programs or library are missing. The server prints one line
+with the reason when it starts:
+
+```text
+[audio] desktop audio unavailable: missing on $PATH: pipewire, pipewire-pulse, pw-loopback, pw-dump, wpctl; -v for details, YAS_AUDIO=0 to silence
+```
+
+A verbose server prints each missing piece on its own line:
 
 ```text
 [audio] audio disabled: missing binaries on $PATH: pipewire, pipewire-pulse, pw-loopback, pw-dump, wpctl

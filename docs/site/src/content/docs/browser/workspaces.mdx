@@ -29,6 +29,8 @@ printed URL in your default browser, and serves the UI until you press Ctrl+C.
   from the address bar after it connects.
 - yas connects to the server named by `YAS_SOCK`, or to the instance named by `YAS_SERVER_NAME`.
   See [Named instances](/terminals/named-instances).
+- `yas open` always opens the local server's UI. It refuses `--on` with status 2 and suggests
+  `yas remote add NAME TARGET`, and refuses `--hub` the same way.
 
 To reach a server on another machine, add it as a [remote](/remote/remotes), or serve the UI with
 [`yas edge`](/operating/edge) or [`yas share`](/remote/sharing).
@@ -136,6 +138,5 @@ The first column is the key and the second is the value size in bytes. Each
   server sees your workspace names and layouts.
 - Font, palette, and other display settings stay in the browser's local storage. The menu action
   **Clear local storage** resets them and reloads the page.
-- `yas open` accepts `--on` and `--hub`, and ignores both. It always serves the local server.
 
 </Aside>

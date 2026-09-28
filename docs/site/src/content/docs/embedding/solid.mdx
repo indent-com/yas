@@ -13,18 +13,11 @@ yas browser UI is built on this package.
 ## Install
 
 ```bash
-npm install --legacy-peer-deps @yas-run/solid @yas-run/core @yas-run/browser solid-js
+npm install @yas-run/solid @yas-run/core @yas-run/browser solid-js
 ```
 
 Solid 1.8 or later is a peer dependency. You also need a Solid JSX compiler, such as
 `vite-plugin-solid`.
-
-<Aside type="caution" title="Peer dependency range in 0.3.0">
-
-`@yas-run/core` 0.3.0 declares `@yas-run/browser >=0.9.0` as a peer, but the matching browser
-package is 0.3.0. npm refuses the install with `ERESOLVE` unless you pass `--legacy-peer-deps`.
-
-</Aside>
 
 ## Render a terminal
 

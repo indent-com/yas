@@ -151,7 +151,7 @@ The server's user needs access to the GPU device nodes, such as `/dev/dri/render
 
 ## Audio
 
-Audio runs through a private PipeWire graph per compositor, encoded as Opus and played by the browser. Disable it with `YAS_AUDIO=0`. It is also off when the PipeWire binaries or `libpipewire-0.3.so.0` are missing.
+Audio runs through a private PipeWire graph per compositor, encoded as Opus and played by the browser. `YAS_AUDIO=0` refuses the desktop audio output even when PipeWire runs for media input or portals. Audio is also off when the PipeWire binaries or `libpipewire-0.3.so.0` are missing, and the server then prints one `[audio] desktop audio unavailable` line with the reason.
 
 ```mermaid
 graph LR

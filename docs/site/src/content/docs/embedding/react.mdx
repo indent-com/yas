@@ -13,20 +13,12 @@ browser connects to a yas edge, a WebRTC share, an uplink, or any transport you 
 ## Install
 
 ```bash
-npm install --legacy-peer-deps @yas-run/react @yas-run/core @yas-run/browser react react-dom
+npm install @yas-run/react @yas-run/core @yas-run/browser react react-dom
 ```
 
 - `@yas-run/core` holds the workspace, transports, and renderers.
 - `@yas-run/browser` is the WebAssembly module that turns terminal state into vertex data.
 - React 18 or later is a peer dependency.
-
-<Aside type="caution" title="Peer dependency range in 0.3.0">
-
-`@yas-run/core` 0.3.0 declares `@yas-run/browser >=0.9.0` as a peer, but the matching browser
-package is 0.3.0. npm refuses the install with `ERESOLVE` unless you pass `--legacy-peer-deps`.
-pnpm and Yarn print a warning and continue.
-
-</Aside>
 
 ## Render a terminal
 

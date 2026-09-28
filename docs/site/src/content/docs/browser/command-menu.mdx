@@ -96,8 +96,13 @@ The **Clients** tab lists every client connected to the server:
 - **Other subscriptions** lists what it watches, such as a key-value prefix.
 
 To disconnect another client, click **Kick**, edit the reason if you want, and click **Confirm
-kick**. A kicked `yas` command exits with status 1 and prints
-`yas: YAS server is closing with Ok: no detail`.
+kick**. A kicked `yas` command exits with status 1 and prints the reason:
+
+```text
+yas: disconnected by the YAS server: Removed by an administrator
+```
+
+A kicked browser tab does not show the reason.
 
 ## Status bar overlays
 
@@ -111,7 +116,6 @@ kick**. A kicked `yas` command exits with status 1 and prints
 <Aside type="caution" title="Remote URIs are shared">
 
 The remote list lives on the home server. Every connected client can read the stored URIs,
-including `share:` passphrases, which the list masks until you click reveal. The reason you type
-for a kick is not shown by the `yas` CLI.
+including `share:` passphrases, which the list masks until you click reveal.
 
 </Aside>

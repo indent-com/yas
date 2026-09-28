@@ -14,25 +14,14 @@ import `node:net`.
 ## Install
 
 ```bash
-npm install --legacy-peer-deps @yas-run/core @yas-run/browser
+npm install @yas-run/core @yas-run/browser
 ```
 
 `@yas-run/browser` is the WebAssembly module the workspace uses for terminal state. `loadYasWasm()`
 from `@yas-run/core/node` reads its `.wasm` file from disk and initializes it, so you never handle
 the bytes yourself. Pass a path to `loadYasWasm(path)` to load the file from somewhere else.
 
-<Aside type="caution" title="Limits in 0.3.0">
-
-- Run these programs with Bun. The published `@yas-run/core` 0.3.0 uses extensionless relative
-  imports, and Node's ES module loader fails with `ERR_MODULE_NOT_FOUND` on the first one.
-- `NodeUnixSocketTransport`, `BunUnixSocketTransport`, and `DenoUnixSocketTransport` add a length
-  prefix to the protocol preface, which the server expects raw. The server closes the connection
-  after HELLO and the transport retries forever. The example below uses a small transport that
-  writes the byte stream unchanged.
-- npm needs `--legacy-peer-deps` because `@yas-run/core` 0.3.0 declares
-  `@yas-run/browser >=0.9.0` as a peer while the matching package is 0.3.0.
-
-</Aside>
+The packages are plain ES modules and load in Node without a bundler.
 
 ## Run a command and read its exit status
 
@@ -40,67 +29,13 @@ Save this as `run-command.mjs`. It starts one command in a new terminal on the s
 `YAS_SOCK`, waits for it to exit, and exits with the same status.
 
 ```js
-import net from "node:net";
 import {
   YasWorkspace,
   exitCodeFromStatus,
   formatExitStatus,
   nullLogger,
 } from "@yas-run/core";
-import { loadYasWasm } from "@yas-run/core/node";
-
-// Carries the native byte stream unchanged: preface, then length-prefixed frames.
-class UnixStreamTransport {
-  yasFraming = "stream";
-  status = "disconnected";
-  authRejected = false;
-  lastError = null;
-  #socket = null;
-  #listeners = {
-    message: new Set(),
-    statuschange: new Set(),
-    datagram: new Set(),
-  };
-
-  constructor(path) {
-    this.path = path;
-  }
-  #setStatus(status) {
-    this.status = status;
-    for (const listener of this.#listeners.statuschange) listener(status);
-  }
-  connect() {
-    if (this.#socket) return;
-    this.#setStatus("connecting");
-    const socket = net.createConnection(this.path);
-    this.#socket = socket;
-    socket.on("connect", () => this.#setStatus("connected"));
-    socket.on("data", (chunk) => {
-      const copy = new Uint8Array(chunk.byteLength);
-      copy.set(chunk);
-      for (const listener of this.#listeners.message) listener(copy.buffer);
-    });
-    socket.on("error", (error) => (this.lastError = error.message));
-    socket.on("close", () => {
-      this.#socket = null;
-      if (this.status !== "closed") this.#setStatus("disconnected");
-    });
-  }
-  send(data) {
-    this.#socket?.write(data);
-  }
-  close() {
-    this.#setStatus("closed");
-    this.#socket?.destroy();
-    this.#socket = null;
-  }
-  addEventListener(type, listener) {
-    this.#listeners[type]?.add(listener);
-  }
-  removeEventListener(type, listener) {
-    this.#listeners[type]?.delete(listener);
-  }
-}
+import { NodeUnixSocketTransport, loadYasWasm } from "@yas-run/core/node";
 
 const socketPath = process.env.YAS_SOCK;
 if (!socketPath) throw new Error("set YAS_SOCK to the server's Unix socket");
@@ -109,19 +44,19 @@ const workspace = new YasWorkspace({
   wasm: await loadYasWasm(),
   logger: nullLogger,
   connections: [
-    {
-      id: "default",
-      transport: {
-        type: "custom",
-        transport: new UnixStreamTransport(socketPath),
-      },
-    },
+    { id: "default", transport: new NodeUnixSocketTransport(socketPath) },
   ],
 });
 
-await new Promise((resolve) =>
-  workspace.getConnection("default").onReady(resolve),
-);
+await new Promise((resolve) => {
+  const check = () => {
+    if (!workspace.getSnapshot().ready) return;
+    unsubscribe();
+    resolve();
+  };
+  const unsubscribe = workspace.subscribe(check);
+  check();
+});
 
 const session = await workspace.createSession({
   connectionId: "default",
@@ -141,9 +76,14 @@ workspace.dispose();
 process.exit(exitCodeFromStatus(exited.exitStatus));
 ```
 
+- `NodeUnixSocketTransport` connects to the server's socket. `BunUnixSocketTransport` and
+  `DenoUnixSocketTransport` take the same path and use the runtime's own socket API. Deno needs
+  `--allow-read --allow-write` for the socket path.
 - `nullLogger` silences the workspace. Leave `logger` out to print lifecycle events to the console.
-- `onReady` fires once the server's HELLO has arrived. `createSession` rejects with
-  `Terminal family is not ready or was not negotiated` before that.
+- `workspace.getSnapshot().ready` turns true once the server's HELLO has arrived. `createSession`
+  rejects with `Terminal family is not ready or was not negotiated` before that.
+- `createSession` returns a snapshot of the session at creation. Read later state with
+  `workspace.getSession(id)`, `awaitSessionExit`, or `subscribe`.
 - `command` runs through the server's login shell. Pass `argv: ["prog", "arg"]` instead to start a
   program directly.
 
@@ -152,8 +92,8 @@ Run it against a private server:
 ```bash
 D=$(mktemp -d); yas server --socket "$D/yas.sock" --name docs &
 export YAS_SOCK="$D/yas.sock"
-bun run-command.mjs; echo "shell exit: $?"
-bun run-command.mjs 'kill -9 $$'; echo "shell exit: $?"
+node run-command.mjs; echo "shell exit: $?"
+node run-command.mjs 'kill -9 $$'; echo "shell exit: $?"
 yas terminal list
 yas quit
 ```

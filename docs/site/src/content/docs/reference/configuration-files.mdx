@@ -56,15 +56,9 @@ See [Port forwarding](/remote/port-forwarding).
 
 ### yas.remotes
 
-`yas.remotes` is an import file. The saved remotes that clients see live in the home server's `remotes` KV key, which `yas remote add` and `yas remote remove` edit. When a server starts and the `remotes` key does not exist, the server reads `yas.remotes` once and stores its entries in that key. After that the server ignores the file.
+`yas.remotes` is an import file. The saved remotes that clients see live in the home server's `remotes` KV key, which `yas remote add` and `yas remote remove` edit, and the CLI resolves remote names from that key. When a server starts and the `remotes` key does not exist, the server reads `yas.remotes` once and stores its entries in that key. After that the server ignores the file. Nothing else reads it, and yas never creates it.
 
 Each line is `name = uri`. A line that starts with `# ` is a disabled remote. `YAS_REMOTES` replaces the path of this file.
-
-<Aside type="caution">
-
-In the current release, `yas --on NAME` resolves `NAME` from the local `yas.remotes` file and ignores the server's `remotes` key. A remote added with `yas remote add` works in the browser but fails on the CLI with `unknown target`. The same applies to `yas.target` when it names such a remote, which makes every command without `--on` fail. Use a full URI with `--on`, or set `yas remote set-default` to a URI. If the file is missing when the CLI looks up a name, the CLI creates it with the single entry `local = local`.
-
-</Aside>
 
 ## Instance state and cache
 

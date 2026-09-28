@@ -46,7 +46,19 @@ Options go before the command. Everything after the first bare word belongs to t
 - `--wait --timeout SECONDS` blocks until the program exits. See [Wait for a terminal to exit](#wait-for-a-terminal-to-exit).
 - `--deadline SECONDS` makes the server stop the terminal after that many seconds, even if the client that started it is gone.
 
+A program that cannot be found fails the start with status 1:
+
+```bash
+yas terminal start no-such-program
+```
+
+```text
+yas: no-such-program: command not found
+```
+
 Terminals inherit the server's environment. The server sets `TERM=xterm-256color` and `COLORTERM=truecolor`, and on Linux it adds the variables graphical programs need to reach the compositor.
+
+A `YAS_SOCK` inherited from the server that names a different server is dropped. See [Run yas commands inside an instance's terminals](/terminals/named-instances#run-yas-commands-inside-an-instances-terminals).
 
 ## List terminals
 
@@ -126,7 +138,17 @@ Pass `-` to read the text from standard input:
 printf 'echo from stdin\n' | yas terminal send 2 -
 ```
 
-Sending to a terminal whose program has exited does nothing and still exits with status 0.
+Sending to a terminal whose program has exited fails with status 1:
+
+```bash
+yas terminal send 3 'ls\n'
+```
+
+```text
+yas: cannot send to pty 3: it has exited(3) (`yas terminal restart 3` re-runs it)
+```
+
+An unknown ID fails the same way with `yas: pty N not found`.
 
 ## Click and scroll
 
@@ -180,6 +202,12 @@ Remove a terminal with `close`. This ends its program if it is still running and
 yas terminal close 1
 ```
 
+Run a terminal's program again with `restart`. It re-runs the command the terminal was started with, in the same terminal ID, from any client. A running program is stopped first.
+
+```bash
+yas terminal restart 3
+```
+
 Exited terminals the server keeps are bounded. When more than 1024 have exited, the oldest are removed first. `YAS_MAX_EXITED` on the server changes the limit, and `0` removes it. Stopping the server with `yas quit` ends every terminal.
 
 ## Wait for a terminal to exit
@@ -218,12 +246,5 @@ exit=3
 `--timeout` only bounds how long the command waits. The terminal keeps running after a timeout. Use `--deadline` to stop the terminal itself.
 
 To wait for a line of output instead of an exit, see [Reading terminal output](/terminals/reading-output).
-
-<Aside type="caution" title="Limits in yas 0.3.0">
-
-- `yas terminal restart ID` fails with `failed with Unsupported` for any terminal started by another connection. Every CLI command opens its own connection, so restarting from the CLI does not work. Start a new terminal with the same command instead.
-- Starting a program that cannot be found fails with `failed with ResourceExhausted` rather than a not-found message.
-
-</Aside>
 
 `yas terminal record ID` writes timestamped output frames to a file. For every subcommand and flag, see the [`yas terminal` reference](/reference/cli/terminal).

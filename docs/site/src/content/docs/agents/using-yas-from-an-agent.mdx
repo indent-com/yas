@@ -128,15 +128,11 @@ Without an index, `yas terminal output "$ID" --wait` waits for the command runni
 - `yas terminal show ID` prints what is on screen now. Use it for full-screen programs such as `htop` or an editor.
 - `yas terminal history ID --from-end 0 --limit N` prints the last `N` lines of scrollback.
 - `yas terminal history ID --since CURSOR` prints only what arrived after `CURSOR`, and writes the next cursor to stderr as `cursor: 8:2`. Pass `start` to read from the beginning.
+- `yas terminal history ID --since now` prints only the cursor for the current end. Save it before you send input, then read from it.
 - `yas terminal wait ID --timeout N` waits for the terminal's program to exit and exits with its status, or 124 on timeout.
+- `yas terminal wait ID --pattern REGEX --timeout N` prints the first line written after the wait began that matches `REGEX`, and exits with 0, or 124 on timeout.
 
 Always pass `--limit` or `--since` to `history`. Without them it prints the whole scrollback.
-
-<Aside type="caution">
-
-In yas 0.3.0, `yas terminal wait --pattern` and `yas terminal history --since now` fail with `collection limit is 1`. Use `output --wait` with a command index, or poll `history --since` with a cursor.
-
-</Aside>
 
 ## Drive graphical windows
 

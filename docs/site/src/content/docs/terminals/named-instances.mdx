@@ -111,26 +111,22 @@ Pointing two instances at the same file with these variables makes them share it
 
 ## Run yas commands inside an instance's terminals
 
-Terminals inherit the server's environment, including `YAS_SOCK`. A `yas` command typed in a terminal therefore targets the server named by the inherited `YAS_SOCK`, or the `default` instance when it is unset.
+A `yas` command typed in a terminal targets the server named by `YAS_SOCK` in that terminal, or the `default` instance when it is unset. Terminals inherit the server's environment, with one exception: a `YAS_SOCK` that names a different server is removed. A `YAS_SOCK` that names the server's own socket is kept.
 
-To make commands inside an instance's terminals target that instance, start the server with `YAS_SOCK` set to its own socket:
+To make commands inside an instance's terminals target that instance, start the server with `--export-sock` (`YAS_EXPORT_SOCK=1`). It sets `YAS_SOCK` in each new terminal to the server's socket. `--inject-path` (`YAS_INJECT_PATH=1`) appends the directory of the server's `yas` binary to `PATH` once, so `yas` runs inside terminals even when it is not on the server's `PATH`.
 
 ```bash
-W=$(mktemp -d)
-YAS_SOCK="$W/yas.sock" yas server --name work &
-YAS_SOCK="$W/yas.sock" yas terminal start --cols 200 --wait --timeout 5 -- sh -c 'echo YAS_SOCK=$YAS_SOCK; yas terminal list'
-YAS_SOCK="$W/yas.sock" yas terminal show 1
+yas server --name work --export-sock --inject-path &
+yas --on local:work terminal start --cols 200 --wait --timeout 5 -- sh -c 'echo YAS_SOCK=$YAS_SOCK; yas terminal list'
+yas --on local:work terminal show 1
 ```
 
 ```text
-YAS_SOCK=/tmp/tmp.iXT5Xm44ra/yas.sock
-ID	TAG	TITLE	COMMAND	CWD	STATUS
-1		sh -c 'echo YAS_SOCK=$YAS_SOCK; yas terminal list'	/tmp	running
+1
+exited(0)
+YAS_SOCK=/run/user/1000/yas/yas-work.sock
+ID	     TAG	    TITLE	  COMMAND	CWD	    STATUS
+1	      	       sh -c 'echo YAS_SOCK=$YAS_SOCK; yas terminal list'	     /tmp	  running
 ```
 
-<Aside type="caution">
-
-- A server started from a shell whose `YAS_SOCK` names another server passes that value to all its terminals. `yas` commands inside them then act on the other server. This includes instances started automatically by `--on local:NAME`, which inherit the environment of the command that started them.
-- `yas server --export-sock` (`YAS_EXPORT_SOCK=1`) and `--inject-path` (`YAS_INJECT_PATH=1`) are meant to set `YAS_SOCK` and append the `yas` binary's directory to `PATH` in new terminals. In yas 0.3.0 they have no effect on terminals. Use the `YAS_SOCK` approach above, and make sure `yas` is on the server's `PATH`.
-
-</Aside>
+A `--env YAS_SOCK=...` on `yas terminal start` still wins over both.

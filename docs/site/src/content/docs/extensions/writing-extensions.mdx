@@ -36,13 +36,24 @@ yas ext run args args.js; echo "exit=$?"
 ```
 
 ```text
+server docs passed 2 argument(s)
 exit=0
+server docs passed 0 argument(s)
 exit=2
 ```
 
-`yas ext run` waits for the attempt to finish and exits with its code. `console.log` lines are log
-output, and the CLI prints them on stderr. An uncaught exception ends the attempt as `trapped` and
-the CLI exits 1. `--json` prints NDJSON instead: one `status` record per lifecycle change, one record
+`yas ext run` waits for the attempt to finish, prints its output, and exits with its code. It prints
+the output even when the attempt finishes before the CLI starts following it. `console.log` lines
+are log output, and the CLI prints them on stderr. An uncaught exception ends the attempt as
+`trapped`. The CLI prints the exception on stderr and exits 1:
+
+```text
+yas: extension boom trapped: QuickJS exception: Error: boom
+    at main (extension.js:2:13)
+```
+
+A cancelled attempt prints `was cancelled` in place of `trapped`, and one that hit a resource limit
+prints `exceeded a resource limit`. `--json` prints NDJSON instead: one `status` record per lifecycle change, one record
 per output chunk (`stdout`, `stderr`, `log`, or `gap`, with `data` as a byte array), and a final
 `status` record whose `last_exit` holds `kind`, `code`, and `detail`. For a trapped attempt,
 `detail` carries the exception and its stack.
@@ -151,7 +162,10 @@ Only a named persistent extension can register commands. The namespace is the ex
 - `yas ext attach NAME` follows retained and future output.
 - `yas ext stop`, `start`, and `restart` control the running attempt. `yas ext disable` stops it
   durably. `yas ext remove` deletes a disabled extension.
-- `yas ext run --detach` returns once a transient extension is running.
+- `yas ext run --detach` returns once a transient extension is running. After it stops, the server
+  keeps its name and output for 30 seconds (`YAS_EXT_TERMINAL_RETAIN`) so `yas ext attach` can
+  replay the output. `yas ext run` with the same name fails with a message saying so until then. An
+  attached transient extension releases its name as soon as it stops.
 
 Persistent definitions live in `extensions.redb` under the instance's state directory, and module
 objects live under the instance's cache directory. The server restores them on start.
@@ -207,11 +221,10 @@ headers. Publish the digest next to each URL so users can pin it with `#blake3`,
 [Bundled extensions](/extensions/bundled).
 
 <Aside type="caution" title="Limits">
-  - An extension runs with the server's full authority over the machine. See
-  [Security model](/operating/security). - `yas ext manage` needs an interactive
-  terminal. It accepts `https://` URLs and plain `http://` only on loopback. -
-  When a transient extension finishes within about 200 ms, `yas ext run` can
-  miss its output, with or without `--json`. Run it with `--persist` and read
-  the output with `yas ext attach NAME`. - A trapped attempt prints no message
-  in human output. Run with `--json` to read the exception.
+
+- An extension runs with the server's full authority over the machine. See
+  [Security model](/operating/security).
+- `yas ext manage` needs an interactive terminal. `--from` takes a registry base URL. It accepts
+  `https://` URLs and plain `http://` only on loopback.
+
 </Aside>

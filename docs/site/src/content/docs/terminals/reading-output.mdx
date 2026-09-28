@@ -62,6 +62,18 @@ cursor: 14:2
 
 A cursor is a line sequence number and an optional column, `SEQ` or `SEQ:COL`. Sequence numbers count every line since the terminal started, so they keep naming the same text while it scrolls. `start` means the oldest retained text.
 
+`now` means the current end of the output. `history --since now` prints no text, only the cursor to resume from:
+
+```bash
+yas terminal history 6 --since now
+```
+
+```text
+cursor: 2:15
+```
+
+A cursor past the end of the output also prints no text. The command exits with 0 and reports the current end as the next cursor.
+
 - `--json` prints one object with the text and the cursors:
 
   ```text
@@ -134,6 +146,9 @@ exit=4
 exit=124
 ```
 
+On timeout it also prints `yas: timed out waiting for a command in pty 6` on standard error. With an
+index, `--wait` waits for that command, and returns at once when it has already finished.
+
 Pass an index to read an older command:
 
 ```bash
@@ -153,7 +168,7 @@ alsa
 
 `yas terminal wait ID --timeout SECONDS` blocks until the terminal's program exits and exits with its code. See [Controlling terminals](/terminals/controlling-terminals#wait-for-a-terminal-to-exit).
 
-`--pattern REGEX` returns as soon as a line of output matches, printing the line and exiting with 0. It matches only output produced after the wait began, so text already on screen does not satisfy it. On a terminal that has already exited, `wait` returns the exit status immediately.
+`--pattern REGEX` returns as soon as a line of output matches, printing the line and exiting with 0. It matches only output produced after the wait began, so text already on screen does not satisfy it. On a terminal that has already exited, `wait` returns the exit status immediately. With `--timeout`, a wait that sees no match exits with 124.
 
 ```bash
 yas terminal wait "$ID" --timeout 120 --pattern 'BUILD (SUCCESS|FAILURE)'
@@ -190,10 +205,3 @@ yas events tail --from-now
 ```
 
 `yas events dump` prints the retained history and `yas events config` shows which event types are on. See [Events](/reference/events).
-
-<Aside type="caution" title="Limits in yas 0.3.0">
-
-- `yas terminal wait --pattern` on a running terminal fails with `YAS Terminal query returned 36 bytes; collection limit is 1`. `yas terminal history --since now` fails with the same error. Use `output --wait` with shell integration, or poll `history --since` from a cursor.
-- A `--since` cursor past the end of the output fails with `failed with Internal`.
-
-</Aside>
