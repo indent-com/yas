@@ -108,7 +108,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@yas-run/browser": ">=0.9.0"
+    "@yas-run/browser": "^0.3.0"
   },
   "dependencies": {
     "tweetnacl": "^1.0.3"
