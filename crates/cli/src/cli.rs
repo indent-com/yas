@@ -2602,7 +2602,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2620,7 +2620,7 @@ pub enum LspCommand {
         #[arg(long)]
         declaration: bool,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2634,7 +2634,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2651,7 +2651,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2668,7 +2668,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2687,7 +2687,7 @@ pub enum LspCommand {
         #[arg(long)]
         file: Option<String>,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2708,11 +2708,12 @@ pub enum LspCommand {
         #[arg(long)]
         watch: bool,
 
-        /// Wait for language servers to finish indexing first
+        /// Wait for language servers to finish indexing, then for the next
+        /// published diagnostics (or 5 seconds without any server update)
         #[arg(long)]
         wait: bool,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2730,7 +2731,7 @@ pub enum LspCommand {
         /// The new name
         new_name: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2741,7 +2742,7 @@ pub enum LspCommand {
 
     /// Block until the workspace's language servers are ready
     Wait {
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
