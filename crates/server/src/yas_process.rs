@@ -24,7 +24,6 @@ use super::app_env::SessionEnv;
 use super::process::{self, NativeRecord, Server};
 
 const ROUTE_EVENTS: usize = 80;
-pub(crate) const MAX_EXIT_REPLAYS_PER_SESSION: usize = schema::process::MAX_PROCESSES as usize;
 
 #[derive(Clone)]
 pub(crate) struct Runtime {
@@ -210,13 +209,21 @@ struct SessionInner {
     operation_gate: Option<Arc<TestOperationGate>>,
 }
 
-#[derive(Default)]
 struct ExitReplays {
     values: HashMap<u64, ExitInfo>,
     order: VecDeque<u64>,
+    capacity: usize,
 }
 
 impl ExitReplays {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
     fn get(&self, process_handle: u64) -> Option<&ExitInfo> {
         self.values.get(&process_handle)
     }
@@ -225,7 +232,7 @@ impl ExitReplays {
         if self.values.insert(process_handle, exit).is_none() {
             self.order.push_back(process_handle);
         }
-        while self.order.len() > MAX_EXIT_REPLAYS_PER_SESSION {
+        while self.order.len() > self.capacity {
             if let Some(retired) = self.order.pop_front() {
                 self.values.remove(&retired);
             }
@@ -286,10 +293,13 @@ impl Runtime {
             schema::process::SPAWN_STDIN_NULL as u32
         };
         wire::Limits {
-            max_mutation_replays: super::yas::MAX_PROCESS_OPERATION_REPLAYS as u32,
             launcher_flags,
-            ..wire::Limits::HARD
+            ..self.server.maxima().limits()
         }
+    }
+
+    pub(crate) fn maxima(&self) -> process::ProcessMaxima {
+        self.server.maxima()
     }
 
     pub(crate) fn session(
@@ -313,7 +323,7 @@ impl Runtime {
             session_env: StdMutex::new(session_env),
             next_process_id: AtomicU32::new(1),
             routes: StdMutex::new(HashMap::new()),
-            exits: StdMutex::new(ExitReplays::default()),
+            exits: StdMutex::new(ExitReplays::new(self.server.maxima().exit_replays())),
             closed,
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
@@ -1067,7 +1077,12 @@ mod tests {
 
     #[test]
     fn exit_replays_are_bounded_retryable_and_fifo_evicted() {
-        let mut exits = ExitReplays::default();
+        const MAX_EXIT_REPLAYS_PER_SESSION: usize = schema::process::MAX_PROCESSES as usize;
+        assert_eq!(
+            process::ProcessMaxima::DEFAULT.exit_replays(),
+            MAX_EXIT_REPLAYS_PER_SESSION
+        );
+        let mut exits = ExitReplays::new(MAX_EXIT_REPLAYS_PER_SESSION);
         for process_handle in 1..=MAX_EXIT_REPLAYS_PER_SESSION as u64 + 1 {
             exits.insert(
                 process_handle,

@@ -30,6 +30,10 @@ async fn start() -> HostedServer {
         .expect("hosted server starts")
 }
 
+fn server_log(server: &HostedServer) -> String {
+    std::fs::read_to_string(server.log_path()).unwrap_or_default()
+}
+
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only probes for existence.
     unsafe { libc::kill(pid, 0) == 0 }
@@ -217,6 +221,123 @@ async fn processes_run_concurrently_on_one_session() {
         "8 one-second commands ran concurrently: {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_configured_for_more_processes_runs_them_on_one_session() {
+    const PROCESSES: usize = 200;
+    let server = tokio::time::timeout(
+        TIMEOUT,
+        HostedServer::start(
+            options()
+                .args(["--process-max-per-session", "256"])
+                .args(["--process-max-pending-spawns", "64"])
+                .args(["--process-max-waits", "512"])
+                .env("YAS_PROCESS_MAX", "1024")
+                .env("YAS_PROCESS_MAX_ENV", "1024"),
+        ),
+    )
+    .await
+    .expect("hosted server start timed out")
+    .expect("hosted server starts");
+    let client = server.connect().await.unwrap();
+    let limits = client.process_limits().expect("Process limits");
+    assert_eq!(limits.max_processes_per_session, 256);
+    assert_eq!(limits.max_processes, 1024);
+    assert_eq!(limits.max_pending_spawns, 64);
+    assert_eq!(limits.max_pending_waits, 512);
+    assert_eq!(limits.max_envc, 1024);
+    // 12 MiB of the 16 MiB receive budget over 256 processes' two streams.
+    assert_eq!(client.default_process_window(), 24 * 1024);
+
+    // All of them alive at once: each blocks until its stdin closes.
+    let mut processes = Vec::new();
+    for index in 0..PROCESSES {
+        let process = client
+            .spawn(
+                Command::new("sh")
+                    .args([
+                        "-c",
+                        &format!("read _; echo {index}; head -c 65536 /dev/zero"),
+                    ])
+                    .stdin(Stdin::Piped),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("spawn {index}: {error}\n{}", server_log(&server)));
+        processes.push(process);
+    }
+    assert!(client.processes().await.unwrap().len() >= PROCESSES);
+    let runs = processes
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut process)| {
+            tokio::spawn(async move {
+                let mut stdin = process.take_stdin().unwrap();
+                stdin.write_all(b"go\n").await.unwrap();
+                stdin.finish().await.unwrap();
+                let output = process.output().await.unwrap();
+                assert!(output.status.success(), "{index}: {:?}", output.status);
+                let expected = format!("{index}\n");
+                assert!(output.stdout.starts_with(expected.as_bytes()), "{index}");
+                assert_eq!(output.stdout.len(), expected.len() + 65536, "{index}");
+            })
+        });
+    for run in runs.collect::<Vec<_>>() {
+        tokio::time::timeout(TIMEOUT, run).await.unwrap().unwrap();
+    }
+
+    // More environment entries than the original 256.
+    let mut command = Command::new("sh");
+    command.args(["-c", "echo $V999"]);
+    for index in 0..1000 {
+        command.env(format!("V{index}"), index.to_string());
+    }
+    let output = client
+        .spawn(&command)
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"999\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_server_refuses_a_seventeenth_process_and_extra_environment() {
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let limits = client.process_limits().expect("Process limits");
+    assert_eq!(
+        limits,
+        yas_client::wire::process::Limits {
+            max_mutation_replays: limits.max_mutation_replays,
+            launcher_flags: limits.launcher_flags,
+            ..yas_client::wire::process::Limits::DEFAULT
+        }
+    );
+    let mut processes = Vec::new();
+    for _ in 0..16 {
+        processes.push(client.spawn(Command::new("sleep").arg("30")).await.unwrap());
+    }
+    let error = client
+        .spawn(Command::new("sleep").arg("30"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.status(),
+        Some(yas_client::wire::core::Status::ResourceExhausted),
+        "{error}\n{}",
+        server_log(&server)
+    );
+    for process in &processes {
+        process.kill().await.unwrap();
+    }
+    let mut command = Command::new("true");
+    for index in 0..300 {
+        command.env(format!("V{index}"), "x");
+    }
+    let error = client.spawn(&command).await.unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -57,6 +57,24 @@
 //! [`Command::operation_id`]) on the same [`Client`] returns the original
 //! process instead of starting a second one. A new session does not see the
 //! old session's operation IDs (and its ordinary processes are gone anyway).
+//!
+//! # Capacity
+//!
+//! A server admits a bounded number of live processes per session (16 by
+//! default), in total (64), and in flight (8 spawns), plus pending
+//! [`Client::wait_process`] calls (32) and attach/control operations (16).
+//! Beyond those a call fails with `RESOURCE_EXHAUSTED`. Operators raise them
+//! with `yas server --process-max-per-session N` and its siblings (see
+//! `docs/design/processes.md`). [`Client::process_limits`] reports what this
+//! session's server enforces, including values above the original maxima.
+//! [`host::HostOptions::arg`](crate::host::HostOptions::arg) passes the same
+//! flags to a hosted server.
+//!
+//! Every stdout/stderr stream holds its [`Command::window`] of the
+//! session's receive budget (16 MiB) while it is open. Unless a command sets
+//! one, [`Client::default_process_window`] sizes it so that the server's
+//! per-session maximum of processes fits: 384 KiB at the default of 16,
+//! never more than 1 MiB nor less than 16 KiB.
 
 use std::ffi::OsStr;
 use std::time::Duration;
@@ -78,6 +96,9 @@ use crate::client::{Client, DEFAULT_REQUEST_TIMEOUT, Hook, Reply, Route};
 use crate::error::{Error, Result};
 use crate::state::{STATE_CREDIT, Subscription};
 use crate::transfer::{ByteSink, ByteStream, DEFAULT_WINDOW};
+
+/// The smallest output window [`Client::default_process_window`] picks.
+const MIN_AUTO_WINDOW: u64 = 16 * 1024;
 
 pub use yas_wire::process::ExitKind;
 
@@ -114,7 +135,7 @@ pub struct Command {
     merge_stderr: bool,
     detachable: bool,
     stdin: Stdin,
-    window: u64,
+    window: Option<u64>,
     operation_id: [u8; 16],
     leave_residue: Option<Option<Duration>>,
 }
@@ -130,7 +151,7 @@ impl Command {
             merge_stderr: false,
             detachable: false,
             stdin: Stdin::Null,
-            window: DEFAULT_WINDOW,
+            window: None,
             operation_id: nonzero_id(),
             leave_residue: None,
         }
@@ -154,7 +175,8 @@ impl Command {
         self
     }
 
-    /// Set one environment variable. Explicit entries replace inherited ones.
+    /// Set one environment variable. Explicit entries replace inherited ones,
+    /// and setting a key again replaces its earlier value.
     pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.env
             .push((os_bytes(key.as_ref()), os_bytes(value.as_ref())));
@@ -222,10 +244,14 @@ impl Command {
         self
     }
 
-    /// Receive window per output stream in bytes (default 1 MiB): how much
-    /// output the server may send ahead of the reader.
+    /// Receive window per output stream in bytes: how much output the server
+    /// may send ahead of the reader. By default it is 1 MiB, or a fair share
+    /// of the session's receive budget when the server admits many processes
+    /// per session ([`Client::default_process_window`]). Servers that predate
+    /// configurable maxima send output only in whole 64 KiB chunks, so there a
+    /// smaller window is raised to one chunk.
     pub fn window(&mut self, bytes: u64) -> &mut Self {
-        self.window = bytes.max(1);
+        self.window = Some(bytes.max(1));
         self
     }
 
@@ -244,7 +270,7 @@ impl Command {
     }
 
     /// The SPAWN request; `stdin_null`: the server gives [`Stdin::Null`] the null device.
-    fn to_wire(&self, stdin_null: bool) -> Result<Spawn> {
+    fn to_wire(&self, stdin_null: bool, window: u64) -> Result<Spawn> {
         let mut flags = 0u16;
         let mut extensions = Extensions::default();
         if let Some(grace) = self.leave_residue {
@@ -284,16 +310,17 @@ impl Command {
                 WorkingDirectory::Terminal(id) => Cwd::Terminal(*id),
             },
             argv: self.argv.clone(),
+            // The wire wants unique keys in byte order; a later env() wins.
             env: self
                 .env
                 .iter()
-                .map(|(key, value)| EnvEntry {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
+                .cloned()
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(key, value)| EnvEntry { key, value })
                 .collect(),
-            stdout_receive_credit: self.window,
-            stderr_receive_credit: if self.merge_stderr { 0 } else { self.window },
+            stdout_receive_credit: window,
+            stderr_receive_credit: if self.merge_stderr { 0 } else { window },
             extensions,
         })
     }
@@ -743,7 +770,21 @@ impl Client {
     /// happens to it and its children.
     pub async fn spawn(&self, command: &Command) -> Result<Process> {
         let stdin_null = self.launcher_flags() & schema::SPAWN_STDIN_NULL as u32 != 0;
-        let spawn = command.to_wire(stdin_null)?;
+        let window = command
+            .window
+            .unwrap_or_else(|| self.default_process_window());
+        let spawn = command.to_wire(stdin_null, window)?;
+        // Servers from before the extended limits refuse more than 256
+        // entries as undecodable; say why instead.
+        if let Some(limits) = self.process_limits()
+            && spawn.env.len() > limits.max_envc as usize
+        {
+            return Err(Error::invalid(format!(
+                "{} environment entries; this server accepts at most {}",
+                spawn.env.len(),
+                limits.max_envc
+            )));
+        }
         let reply = self
             .call_ok(
                 family::PROCESS,
@@ -753,7 +794,7 @@ impl Client {
                 Some(bundle_hook()),
             )
             .await?;
-        let mut process = self.process_from_reply(reply, command.window)?;
+        let mut process = self.process_from_reply(reply, window)?;
         if command.stdin == Stdin::Null
             && let Some(stdin) = process.stdin.take()
         {
@@ -771,6 +812,7 @@ impl Client {
             .into_iter()
             .find(|info| info.handle == handle)
             .is_some_and(|info| info.merged_stderr);
+        let window = self.default_process_window();
         let attach = Attach {
             process_handle: handle,
             flags: if stdin {
@@ -778,8 +820,8 @@ impl Client {
             } else {
                 0
             },
-            stdout_receive_credit: DEFAULT_WINDOW,
-            stderr_receive_credit: if merged { 0 } else { DEFAULT_WINDOW },
+            stdout_receive_credit: window,
+            stderr_receive_credit: if merged { 0 } else { window },
             extensions: Extensions::default(),
         };
         let reply = self
@@ -791,7 +833,7 @@ impl Client {
                 Some(bundle_hook()),
             )
             .await?;
-        self.process_from_reply(reply, DEFAULT_WINDOW)
+        self.process_from_reply(reply, window)
     }
 
     fn process_from_reply(&self, mut reply: Reply, window: u64) -> Result<Process> {
@@ -802,11 +844,27 @@ impl Client {
                 .take(Route::Transfer(id))
                 .ok_or_else(|| Error::protocol("Process stream route missing"))
         };
+        // Servers that predate configurable maxima (so admit at most the
+        // original 16 processes per session) send output only in whole
+        // chunks: a window below the chunk size would never let one through.
+        // Raising it costs at most 16 × 2 chunks of the receive budget.
+        let whole_chunks = self.process_limits().is_none_or(|limits| {
+            u64::from(limits.max_processes_per_session) <= schema::MAX_PROCESSES_PER_SESSION
+        });
+        let window_for = |descriptor: &yas_wire::transfer::Descriptor| {
+            if whole_chunks {
+                window.max(u64::from(descriptor.max_chunk_bytes))
+            } else {
+                window
+            }
+        };
         let stdout_frames = route(&mut reply, bundle.stdout.transfer_id)?;
-        let stdout = ByteStream::new(self.clone(), bundle.stdout, stdout_frames, window)?;
+        let stdout_window = window_for(&bundle.stdout);
+        let stdout = ByteStream::new(self.clone(), bundle.stdout, stdout_frames, stdout_window)?;
         let stderr = match bundle.stderr {
             Some(descriptor) => {
                 let frames = route(&mut reply, descriptor.transfer_id)?;
+                let window = window_for(&descriptor);
                 Some(ByteStream::new(self.clone(), descriptor, frames, window)?)
             }
             None => None,
@@ -941,6 +999,19 @@ impl Client {
         })
     }
 
+    /// The output window a [`Command`] gets unless it sets one: 1 MiB, or
+    /// less when the server admits so many processes per session that their
+    /// stdout and stderr windows would not fit in three quarters of the
+    /// session's receive budget (16 MiB), leaving the rest for everything
+    /// else the session receives. Never below 16 KiB.
+    pub fn default_process_window(&self) -> u64 {
+        let per_session = self.process_limits().map_or(1, |limits| {
+            u64::from(limits.max_processes_per_session).max(1)
+        });
+        let budget = yas_wire::schema::transport::RECOMMENDED_BUFFERED / 4 * 3;
+        (budget / (2 * per_session)).clamp(MIN_AUTO_WINDOW, DEFAULT_WINDOW)
+    }
+
     /// The Process family limits this session negotiated.
     pub fn process_limits(&self) -> Option<wire::Limits> {
         self.family_limits(family::PROCESS)
@@ -981,5 +1052,33 @@ pub(crate) fn os_bytes(value: &OsStr) -> Vec<u8> {
     #[cfg(not(unix))]
     {
         value.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_goes_on_the_wire_sorted_with_the_last_value_of_each_key() {
+        let mut command = Command::new("sh");
+        for index in [10, 2, 1, 2] {
+            command.env(format!("V{index}"), format!("{index}"));
+        }
+        command.env("V2", "last");
+        let spawn = command.to_wire(false, 1024).unwrap();
+        let env: Vec<_> = spawn
+            .env
+            .iter()
+            .map(|entry| (entry.key.as_slice(), entry.value.as_slice()))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                (&b"V1"[..], &b"1"[..]),
+                (&b"V10"[..], &b"10"[..]),
+                (&b"V2"[..], &b"last"[..]),
+            ]
+        );
     }
 }

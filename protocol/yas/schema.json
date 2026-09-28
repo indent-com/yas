@@ -8745,6 +8745,62 @@
           "required": false,
           "hard_min": 0,
           "hard_max": 12
+        },
+        {
+          "name": "MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "tag": 12,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
+        },
+        {
+          "name": "MAX_PROCESSES_EXTENDED",
+          "tag": 13,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 65536
+        },
+        {
+          "name": "MAX_PENDING_SPAWNS_EXTENDED",
+          "tag": 14,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 4096
+        },
+        {
+          "name": "MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "tag": 15,
+          "type": "u64",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 1073741824
+        },
+        {
+          "name": "MAX_ENVC_EXTENDED",
+          "tag": 16,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
+        },
+        {
+          "name": "MAX_PENDING_WAITS",
+          "tag": 17,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 65536
+        },
+        {
+          "name": "MAX_PENDING_OPERATIONS",
+          "tag": 18,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
         }
       ],
       "requests": [
@@ -9117,6 +9173,70 @@
         {
           "name": "MAX_DETACHED_RETENTION_NS",
           "value": 300000000000
+        },
+        {
+          "name": "MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "value": 16384
+        },
+        {
+          "name": "MAX_PROCESSES_EXTENDED",
+          "value": 65536
+        },
+        {
+          "name": "MAX_PENDING_SPAWNS_EXTENDED",
+          "value": 4096
+        },
+        {
+          "name": "MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "value": 1073741824
+        },
+        {
+          "name": "MAX_ENVC_EXTENDED",
+          "value": 16384
+        },
+        {
+          "name": "MAX_PENDING_WAITS",
+          "value": 65536
+        },
+        {
+          "name": "MAX_PENDING_OPERATIONS",
+          "value": 16384
+        },
+        {
+          "name": "LEGACY_PENDING_WAITS",
+          "value": 32
+        },
+        {
+          "name": "LEGACY_PENDING_OPERATIONS",
+          "value": 16
+        },
+        {
+          "name": "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "value": 12
+        },
+        {
+          "name": "LIMIT_MAX_PROCESSES_EXTENDED",
+          "value": 13
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_SPAWNS_EXTENDED",
+          "value": 14
+        },
+        {
+          "name": "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "value": 15
+        },
+        {
+          "name": "LIMIT_MAX_ENVC_EXTENDED",
+          "value": 16
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_WAITS",
+          "value": 17
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_OPERATIONS",
+          "value": 18
         },
         {
           "name": "LIMIT_MAX_ARGC",

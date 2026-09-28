@@ -3291,6 +3291,33 @@ settlements enter the bounded table, whose size never exceeds the advertised
 limit. Outside that horizon the client must WATCH to reconcile the catalogue
 and use a fresh operation ID instead of retrying the expired SPAWN ID.
 
+The capacity limits are server policy. An unconfigured server advertises tags
+1–10 at their v1 hard maxima (16 processes per session, 64 server-wide, 8
+pending spawns, 8 MiB stream buffer, 256 environment entries). A server
+configured above them (`yas server --process-max*`, `YAS_PROCESS_MAX*`; see
+[processes.md](processes.md#capacity-and-backpressure)) keeps each v1 tag at
+its hard maximum, which v1 clients accept and stay within. It adds the optional
+tag that carries the real value:
+
+| Tag | Name                               | Type | Hard max | Replaces tag |
+| --- | ---------------------------------- | ---- | -------- | ------------ |
+| 12  | MAX_PROCESSES_PER_SESSION_EXTENDED | u32  | 16384    | 5            |
+| 13  | MAX_PROCESSES_EXTENDED             | u32  | 65536    | 6            |
+| 14  | MAX_PENDING_SPAWNS_EXTENDED        | u32  | 4096     | 7            |
+| 15  | MAX_STREAM_BUFFER_BYTES_EXTENDED   | u64  | 1 GiB    | 8            |
+| 16  | MAX_ENVC_EXTENDED                  | u32  | 16384    | 3            |
+
+A client that knows these tags uses them. An extended value below its v1 tag
+contradicts it and fails HELLO. SPAWN's environment count may therefore reach
+16384 on the wire, but a server refuses more entries than it advertised with
+INVALID, as v1 decoding did. Tags 17 `MAX_PENDING_WAITS` (u32, at most 65536)
+and 18 `MAX_PENDING_OPERATIONS` (u32, completion-held ATTACH/CONTROL, at
+most 16384) advertise per-session admissions that v1 servers enforced silently. A
+server sends them only when they differ from those fixed values, 32 and 16
+(`LEGACY_PENDING_WAITS`, `LEGACY_PENDING_OPERATIONS`), which a client assumes
+when a tag is absent. Tag 10 grows with the configuration so that every live
+process, pending spawn and pending operation can hold a replay.
+
 ## Network family
 
 Net is family `0x0041`, version 1. It relays TCP, UDP, Unix-domain sockets, and

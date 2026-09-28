@@ -1712,6 +1712,22 @@ export const YAS_PROCESS_MAX_PROCESSES = 64 as const;
 export const YAS_PROCESS_MAX_PENDING_SPAWNS = 8 as const;
 export const YAS_PROCESS_MAX_STREAM_BUFFER_BYTES = 8388608 as const;
 export const YAS_PROCESS_MAX_DETACHED_RETENTION_NS = 300000000000 as const;
+export const YAS_PROCESS_MAX_PROCESSES_PER_SESSION_EXTENDED = 16384 as const;
+export const YAS_PROCESS_MAX_PROCESSES_EXTENDED = 65536 as const;
+export const YAS_PROCESS_MAX_PENDING_SPAWNS_EXTENDED = 4096 as const;
+export const YAS_PROCESS_MAX_STREAM_BUFFER_BYTES_EXTENDED = 1073741824 as const;
+export const YAS_PROCESS_MAX_ENVC_EXTENDED = 16384 as const;
+export const YAS_PROCESS_MAX_PENDING_WAITS = 65536 as const;
+export const YAS_PROCESS_MAX_PENDING_OPERATIONS = 16384 as const;
+export const YAS_PROCESS_LEGACY_PENDING_WAITS = 32 as const;
+export const YAS_PROCESS_LEGACY_PENDING_OPERATIONS = 16 as const;
+export const YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED = 12 as const;
+export const YAS_PROCESS_LIMIT_MAX_PROCESSES_EXTENDED = 13 as const;
+export const YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS_EXTENDED = 14 as const;
+export const YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED = 15 as const;
+export const YAS_PROCESS_LIMIT_MAX_ENVC_EXTENDED = 16 as const;
+export const YAS_PROCESS_LIMIT_MAX_PENDING_WAITS = 17 as const;
+export const YAS_PROCESS_LIMIT_MAX_PENDING_OPERATIONS = 18 as const;
 export const YAS_PROCESS_LIMIT_MAX_ARGC = 1 as const;
 export const YAS_PROCESS_LIMIT_MAX_ARG_BYTES = 2 as const;
 export const YAS_PROCESS_LIMIT_MAX_ENVC = 3 as const;
@@ -2225,6 +2241,13 @@ export const YAS_FAMILY_LIMIT_POLICIES: Readonly<Record<number, readonly YasFami
     [9, 8, true, 1n, 300000000000n],
     [10, 4, true, 1n, 65536n],
     [11, 4, false, 0n, 12n],
+    [12, 4, false, 1n, 16384n],
+    [13, 4, false, 1n, 65536n],
+    [14, 4, false, 1n, 4096n],
+    [15, 8, false, 1n, 1073741824n],
+    [16, 4, false, 1n, 16384n],
+    [17, 4, false, 1n, 65536n],
+    [18, 4, false, 1n, 16384n],
   ],
   65: [
     [1, 4, true, 1n, 255n],
@@ -11635,6 +11658,62 @@ export const YAS_SCHEMA = {
           "required": false,
           "hard_min": 0,
           "hard_max": 12
+        },
+        {
+          "name": "MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "tag": 12,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
+        },
+        {
+          "name": "MAX_PROCESSES_EXTENDED",
+          "tag": 13,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 65536
+        },
+        {
+          "name": "MAX_PENDING_SPAWNS_EXTENDED",
+          "tag": 14,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 4096
+        },
+        {
+          "name": "MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "tag": 15,
+          "type": "u64",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 1073741824
+        },
+        {
+          "name": "MAX_ENVC_EXTENDED",
+          "tag": 16,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
+        },
+        {
+          "name": "MAX_PENDING_WAITS",
+          "tag": 17,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 65536
+        },
+        {
+          "name": "MAX_PENDING_OPERATIONS",
+          "tag": 18,
+          "type": "u32",
+          "required": false,
+          "hard_min": 1,
+          "hard_max": 16384
         }
       ],
       "requests": [
@@ -12007,6 +12086,70 @@ export const YAS_SCHEMA = {
         {
           "name": "MAX_DETACHED_RETENTION_NS",
           "value": 300000000000
+        },
+        {
+          "name": "MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "value": 16384
+        },
+        {
+          "name": "MAX_PROCESSES_EXTENDED",
+          "value": 65536
+        },
+        {
+          "name": "MAX_PENDING_SPAWNS_EXTENDED",
+          "value": 4096
+        },
+        {
+          "name": "MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "value": 1073741824
+        },
+        {
+          "name": "MAX_ENVC_EXTENDED",
+          "value": 16384
+        },
+        {
+          "name": "MAX_PENDING_WAITS",
+          "value": 65536
+        },
+        {
+          "name": "MAX_PENDING_OPERATIONS",
+          "value": 16384
+        },
+        {
+          "name": "LEGACY_PENDING_WAITS",
+          "value": 32
+        },
+        {
+          "name": "LEGACY_PENDING_OPERATIONS",
+          "value": 16
+        },
+        {
+          "name": "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED",
+          "value": 12
+        },
+        {
+          "name": "LIMIT_MAX_PROCESSES_EXTENDED",
+          "value": 13
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_SPAWNS_EXTENDED",
+          "value": 14
+        },
+        {
+          "name": "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED",
+          "value": 15
+        },
+        {
+          "name": "LIMIT_MAX_ENVC_EXTENDED",
+          "value": 16
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_WAITS",
+          "value": 17
+        },
+        {
+          "name": "LIMIT_MAX_PENDING_OPERATIONS",
+          "value": 18
         },
         {
           "name": "LIMIT_MAX_ARGC",

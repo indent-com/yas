@@ -48,13 +48,222 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
-const DEFAULT_MAX_PER_CLIENT: usize = 16;
-const DEFAULT_MAX_GLOBAL: usize = 64;
-const DEFAULT_MAX_SPAWNING: usize = 8;
 const DEFAULT_MAX_WATCHERS_PER_GENERATION: usize = 64;
 const DEFAULT_REQUEST_MAX_PER_CLIENT: usize = 16 * 1024 * 1024;
 const DEFAULT_REQUEST_MAX: usize = 64 * 1024 * 1024;
 const DEFAULT_BUFFER_MAX: usize = 192 * 1024 * 1024;
+/// Spawn-request bytes each process past the defaults adds to the retained
+/// request budgets, so raising the process maxima does not leave them
+/// binding first.
+const REQUEST_BYTES_PER_EXTRA_PROCESS: usize = 64 * 1024;
+/// Transfers a session may send besides its processes' stdout and stderr.
+const OUTBOUND_TRANSFERS_BASE: usize = 32;
+/// Operation replays a session retains at the default maxima.
+const OPERATION_REPLAYS_BASE: usize = 256;
+
+/// Process family maxima a server enforces and advertises in HELLO.
+///
+/// [`ProcessMaxima::DEFAULT`] is what YAS has always enforced. Values above
+/// the Process family's original hard maxima (16 processes per session, 64
+/// server-wide, 8 pending spawns, 8 MiB stream buffers, 256 environment
+/// entries) are advertised through the family's optional extended limit
+/// tags, so clients that predate them keep seeing, and staying within, the
+/// original values. Per-session transfer, operation-replay and exit-replay
+/// capacities, and the server-wide stream-window and spawn-request budgets,
+/// grow with these values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessMaxima {
+    /// Live processes one session may own: pending spawns, attachments,
+    /// and unwatched owned processes (`YAS_PROCESS_MAX_PER_SESSION`).
+    pub per_session: usize,
+    /// Process generations server-wide (`YAS_PROCESS_MAX`).
+    pub total: usize,
+    /// Spawns one session may have in flight
+    /// (`YAS_PROCESS_MAX_PENDING_SPAWNS`).
+    pub pending_spawns: usize,
+    /// Largest stdin window a process gets, and the stream buffer the
+    /// family advertises (`YAS_PROCESS_STREAM_BUFFER_MAX`).
+    pub stream_buffer_bytes: u64,
+    /// Environment entries one SPAWN may carry (`YAS_PROCESS_MAX_ENV`).
+    pub envc: usize,
+    /// Pending `WAIT`s per session (`YAS_PROCESS_MAX_WAITS`).
+    pub pending_waits: usize,
+    /// Completion-held `ATTACH`/`CONTROL` operations per session
+    /// (`YAS_PROCESS_MAX_OPERATIONS`).
+    pub pending_operations: usize,
+}
+
+impl Default for ProcessMaxima {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl ProcessMaxima {
+    /// What YAS enforces unless configured otherwise.
+    pub const DEFAULT: Self = Self::of(wire::Limits::DEFAULT);
+
+    /// The largest values a server may be configured with.
+    pub const HARD: Self = Self::of(wire::Limits::HARD);
+
+    const fn of(limits: wire::Limits) -> Self {
+        Self {
+            per_session: limits.max_processes_per_session as usize,
+            total: limits.max_processes as usize,
+            pending_spawns: limits.max_pending_spawns as usize,
+            stream_buffer_bytes: limits.max_stream_buffer_bytes,
+            envc: limits.max_envc as usize,
+            pending_waits: limits.max_pending_waits as usize,
+            pending_operations: limits.max_pending_operations as usize,
+        }
+    }
+
+    /// [`ProcessMaxima::DEFAULT`] overridden by the `YAS_PROCESS_*`
+    /// variables that are set (`YAS_PROCESS_MAX_PER_CLIENT` is the older
+    /// name of `YAS_PROCESS_MAX_PER_SESSION`). Like the server's other
+    /// environment fallbacks this is lenient, so a stale export cannot make
+    /// the server unbootable: a variable that is not a whole number within
+    /// [`ProcessMaxima::HARD`] keeps its default and yields a warning.
+    pub fn from_env() -> (Self, Vec<String>) {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
+        let hard = Self::HARD;
+        let mut maxima = Self::DEFAULT;
+        let mut warnings = Vec::new();
+        let mut read = |names: &[&str], maximum: u64| -> Option<u64> {
+            let (name, value) = names
+                .iter()
+                .find_map(|name| lookup(name).map(|value| (*name, value)))?;
+            match value.trim().parse::<u64>() {
+                Ok(parsed) if (1..=maximum).contains(&parsed) => Some(parsed),
+                _ => {
+                    warnings.push(format!(
+                        "ignoring {name}={value:?}: expected a whole number from 1 to {maximum}"
+                    ));
+                    None
+                }
+            }
+        };
+        let count = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        if let Some(value) = read(
+            &["YAS_PROCESS_MAX_PER_SESSION", "YAS_PROCESS_MAX_PER_CLIENT"],
+            hard.per_session as u64,
+        ) {
+            maxima.per_session = count(value);
+        }
+        if let Some(value) = read(&["YAS_PROCESS_MAX"], hard.total as u64) {
+            maxima.total = count(value);
+        }
+        if let Some(value) = read(
+            &["YAS_PROCESS_MAX_PENDING_SPAWNS"],
+            hard.pending_spawns as u64,
+        ) {
+            maxima.pending_spawns = count(value);
+        }
+        if let Some(value) = read(&["YAS_PROCESS_STREAM_BUFFER_MAX"], hard.stream_buffer_bytes) {
+            maxima.stream_buffer_bytes = value;
+        }
+        if let Some(value) = read(&["YAS_PROCESS_MAX_ENV"], hard.envc as u64) {
+            maxima.envc = count(value);
+        }
+        if let Some(value) = read(&["YAS_PROCESS_MAX_WAITS"], hard.pending_waits as u64) {
+            maxima.pending_waits = count(value);
+        }
+        if let Some(value) = read(
+            &["YAS_PROCESS_MAX_OPERATIONS"],
+            hard.pending_operations as u64,
+        ) {
+            maxima.pending_operations = count(value);
+        }
+        (maxima, warnings)
+    }
+
+    /// Check every value is at least 1 and at most [`ProcessMaxima::HARD`].
+    pub fn validate(&self) -> Result<(), String> {
+        let hard = Self::HARD;
+        let checks: [(&str, u64, u64); 7] = [
+            (
+                "processes per session",
+                self.per_session as u64,
+                hard.per_session as u64,
+            ),
+            ("processes", self.total as u64, hard.total as u64),
+            (
+                "pending spawns",
+                self.pending_spawns as u64,
+                hard.pending_spawns as u64,
+            ),
+            (
+                "stream buffer bytes",
+                self.stream_buffer_bytes,
+                hard.stream_buffer_bytes,
+            ),
+            ("environment entries", self.envc as u64, hard.envc as u64),
+            (
+                "pending waits",
+                self.pending_waits as u64,
+                hard.pending_waits as u64,
+            ),
+            (
+                "pending operations",
+                self.pending_operations as u64,
+                hard.pending_operations as u64,
+            ),
+        ];
+        for (name, value, maximum) in checks {
+            if value == 0 || value > maximum {
+                return Err(format!(
+                    "the Process maximum for {name} must be between 1 and {maximum}, not {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Operation replays each session retains: enough that every live
+    /// process, pending spawn and pending operation can hold one.
+    pub(crate) fn operation_replays(&self) -> usize {
+        self.per_session
+            .saturating_mul(2)
+            .saturating_add(self.pending_spawns)
+            .saturating_add(self.pending_operations)
+            .max(OPERATION_REPLAYS_BASE)
+            .min(yas_wire::schema::process::MAX_MUTATION_REPLAYS as usize)
+    }
+
+    /// Transfers a session may have outbound: the base allowance plus two
+    /// (stdout, stderr) per process above the default per-session maximum.
+    pub(crate) fn outbound_transfers(&self) -> usize {
+        OUTBOUND_TRANSFERS_BASE.saturating_add(
+            self.per_session
+                .saturating_sub(Self::DEFAULT.per_session)
+                .saturating_mul(2),
+        )
+    }
+
+    /// Exit records each session retains for WAIT replies.
+    pub(crate) fn exit_replays(&self) -> usize {
+        self.total.max(Self::DEFAULT.total)
+    }
+
+    /// The limits a server with these maxima selects in HELLO.
+    pub(crate) fn limits(&self) -> wire::Limits {
+        let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        wire::Limits {
+            max_envc: clamp(self.envc),
+            max_processes_per_session: clamp(self.per_session),
+            max_processes: clamp(self.total),
+            max_pending_spawns: clamp(self.pending_spawns),
+            max_stream_buffer_bytes: self.stream_buffer_bytes,
+            max_mutation_replays: clamp(self.operation_replays()),
+            max_pending_waits: clamp(self.pending_waits),
+            max_pending_operations: clamp(self.pending_operations),
+            ..wire::Limits::DEFAULT
+        }
+    }
+}
 /// Keep one process frame from occupying an entire ordinary bulk-writer turn.
 /// The protocol accepts larger packets, but the server emits at most this much
 /// stdout or stderr data before the fair scheduler can choose another queue.
@@ -164,9 +373,16 @@ struct Policy {
 }
 
 impl Policy {
-    fn from_env(enabled: bool) -> Self {
-        let max_per_endpoint = env_usize("YAS_PROCESS_MAX_PER_CLIENT", DEFAULT_MAX_PER_CLIENT);
-        let max_generations = env_usize("YAS_PROCESS_MAX", DEFAULT_MAX_GLOBAL);
+    fn new(enabled: bool, maxima: &ProcessMaxima) -> Self {
+        let max_per_endpoint = maxima.per_session;
+        let max_generations = maxima.total;
+        let defaults = ProcessMaxima::DEFAULT;
+        let extra_per_endpoint = max_per_endpoint.saturating_sub(defaults.per_session);
+        let extra_generations = max_generations.saturating_sub(defaults.total);
+        // Admission reserves one default window per stream for every
+        // generation; keep room for all of them.
+        let default_max_buffer = DEFAULT_BUFFER_MAX
+            .max(max_generations.saturating_mul(3 * PROCESS_DEFAULT_STREAM_WINDOW as usize));
         let default_max_watchers = max_per_endpoint.saturating_mul(max_generations).max(1);
         Self {
             enabled,
@@ -180,10 +396,17 @@ impl Policy {
             .max(1),
             max_request_per_endpoint: env_usize(
                 "YAS_PROCESS_REQUEST_MAX_PER_CLIENT",
-                DEFAULT_REQUEST_MAX_PER_CLIENT,
+                DEFAULT_REQUEST_MAX_PER_CLIENT.saturating_add(
+                    extra_per_endpoint.saturating_mul(REQUEST_BYTES_PER_EXTRA_PROCESS),
+                ),
             ),
-            max_request: env_usize("YAS_PROCESS_REQUEST_MAX", DEFAULT_REQUEST_MAX),
-            max_buffer: env_usize("YAS_PROCESS_BUFFER_MAX", DEFAULT_BUFFER_MAX),
+            max_request: env_usize(
+                "YAS_PROCESS_REQUEST_MAX",
+                DEFAULT_REQUEST_MAX.saturating_add(
+                    extra_generations.saturating_mul(REQUEST_BYTES_PER_EXTRA_PROCESS),
+                ),
+            ),
+            max_buffer: env_usize("YAS_PROCESS_BUFFER_MAX", default_max_buffer),
             kill_grace: env_duration("YAS_PROCESS_KILL_GRACE", DEFAULT_KILL_GRACE),
             final_ttl: env_duration("YAS_PROCESS_DETACHED_RESULT_TTL", DEFAULT_FINAL_TTL),
         }
@@ -431,6 +654,7 @@ impl EndpointOutput {
 
 struct ServerInner {
     policy: Policy,
+    maxima: ProcessMaxima,
     verbose: bool,
     next_generation: AtomicU64,
     next_endpoint: AtomicU64,
@@ -445,11 +669,18 @@ struct ServerInner {
 pub(crate) struct Server(Arc<ServerInner>);
 
 impl Server {
+    /// A server with the default maxima.
+    #[cfg(test)]
     pub(crate) fn new(verbose: bool, enabled: bool) -> Self {
-        let policy = Policy::from_env(enabled);
-        let max_spawning = env_usize("YAS_PROCESS_MAX_SPAWNING", DEFAULT_MAX_SPAWNING).max(1);
+        Self::with_maxima(verbose, enabled, ProcessMaxima::DEFAULT)
+    }
+
+    pub(crate) fn with_maxima(verbose: bool, enabled: bool, maxima: ProcessMaxima) -> Self {
+        let policy = Policy::new(enabled, &maxima);
+        let max_spawning = env_usize("YAS_PROCESS_MAX_SPAWNING", maxima.pending_spawns).max(1);
         Self(Arc::new(ServerInner {
             policy,
+            maxima,
             verbose,
             next_generation: AtomicU64::new(1),
             next_endpoint: AtomicU64::new(1),
@@ -469,6 +700,10 @@ impl Server {
 
     pub(crate) fn enabled(&self) -> bool {
         self.0.policy.enabled
+    }
+
+    pub(crate) fn maxima(&self) -> ProcessMaxima {
+        self.0.maxima
     }
 
     #[cfg(all(test, unix))]
@@ -3261,5 +3496,113 @@ fn os_error_detail(error: io::Error) -> &'static str {
         Some(libc::EPERM) => "permission denied signaling process group",
         Some(libc::EINVAL) => "invalid signal",
         _ => "process control failed",
+    }
+}
+
+#[cfg(test)]
+mod maxima_tests {
+    use super::ProcessMaxima;
+    use std::collections::HashMap;
+
+    fn from(vars: &[(&str, &str)]) -> (ProcessMaxima, Vec<String>) {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        ProcessMaxima::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn defaults_keep_every_historical_capacity() {
+        let defaults = ProcessMaxima::DEFAULT;
+        assert_eq!(
+            (
+                defaults.per_session,
+                defaults.total,
+                defaults.pending_spawns,
+                defaults.stream_buffer_bytes,
+                defaults.envc,
+                defaults.pending_waits,
+                defaults.pending_operations,
+            ),
+            (16, 64, 8, 8 * 1024 * 1024, 256, 32, 16)
+        );
+        assert_eq!(defaults.outbound_transfers(), 32);
+        assert_eq!(defaults.operation_replays(), 256);
+        assert_eq!(defaults.exit_replays(), 64);
+        assert_eq!(defaults.limits(), {
+            let mut limits = yas_wire::process::Limits::DEFAULT;
+            limits.max_mutation_replays = 256;
+            limits
+        });
+        assert_eq!(from(&[]), (defaults, Vec::new()));
+        defaults.validate().unwrap();
+        ProcessMaxima::HARD.validate().unwrap();
+    }
+
+    #[test]
+    fn environment_raises_maxima_and_the_capacities_that_follow_them() {
+        let (maxima, warnings) = from(&[
+            ("YAS_PROCESS_MAX_PER_SESSION", "1024"),
+            ("YAS_PROCESS_MAX", "4096"),
+            ("YAS_PROCESS_MAX_PENDING_SPAWNS", "64"),
+            ("YAS_PROCESS_STREAM_BUFFER_MAX", "67108864"),
+            ("YAS_PROCESS_MAX_ENV", "4096"),
+            ("YAS_PROCESS_MAX_WAITS", "1024"),
+            ("YAS_PROCESS_MAX_OPERATIONS", "256"),
+        ]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(maxima.per_session, 1024);
+        assert_eq!(maxima.total, 4096);
+        assert_eq!(maxima.stream_buffer_bytes, 64 * 1024 * 1024);
+        assert_eq!(maxima.outbound_transfers(), 32 + 2 * (1024 - 16));
+        assert_eq!(maxima.operation_replays(), 2 * 1024 + 64 + 256);
+        assert_eq!(maxima.exit_replays(), 4096);
+        let limits = maxima.limits();
+        assert_eq!(limits.max_processes_per_session, 1024);
+        assert_eq!(limits.max_pending_waits, 1024);
+        assert_eq!(
+            yas_wire::process::Limits::from_extensions(&limits.to_extensions().unwrap()).unwrap(),
+            limits
+        );
+    }
+
+    #[test]
+    fn environment_is_lenient_and_honours_the_older_per_client_name() {
+        let (maxima, warnings) = from(&[("YAS_PROCESS_MAX_PER_CLIENT", "4")]);
+        assert_eq!(maxima.per_session, 4);
+        assert!(warnings.is_empty());
+        let (maxima, _) = from(&[
+            ("YAS_PROCESS_MAX_PER_SESSION", "32"),
+            ("YAS_PROCESS_MAX_PER_CLIENT", "4"),
+        ]);
+        assert_eq!(maxima.per_session, 32);
+        let (maxima, warnings) = from(&[
+            ("YAS_PROCESS_MAX", "lots"),
+            ("YAS_PROCESS_MAX_WAITS", "0"),
+            ("YAS_PROCESS_MAX_PER_SESSION", "1000000"),
+        ]);
+        assert_eq!(maxima, ProcessMaxima::DEFAULT);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("YAS_PROCESS_MAX=\"lots\""))
+        );
+    }
+
+    #[test]
+    fn validation_bounds_every_field() {
+        let mut maxima = ProcessMaxima::DEFAULT;
+        maxima.pending_waits = 0;
+        assert!(maxima.validate().is_err());
+        let mut maxima = ProcessMaxima::DEFAULT;
+        maxima.per_session = ProcessMaxima::HARD.per_session + 1;
+        assert!(
+            maxima
+                .validate()
+                .unwrap_err()
+                .contains("processes per session")
+        );
     }
 }

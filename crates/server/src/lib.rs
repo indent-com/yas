@@ -104,6 +104,7 @@ pub use ipc::{
     IpcListener, IpcStream, default_ipc_path, default_ipc_path_for, default_ipc_path_template,
 };
 pub use media_policy::MediaCodecPolicy;
+pub use process::ProcessMaxima;
 use pty::{PtyHandle, PtyWriteTarget};
 pub use server_name::ServerName;
 pub use surface_encoder::ChromaSubsampling;
@@ -449,6 +450,8 @@ pub struct Config {
     pub verbose: bool,
     /// Advertise and accept the native non-PTY process family.
     pub processes: bool,
+    /// Process family maxima (`--process-max*`, `YAS_PROCESS_MAX*`).
+    pub process_maxima: ProcessMaxima,
     /// Maximum number of concurrent client connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum number of PTYs across all clients (0 = unlimited).  Counts
@@ -8564,7 +8567,8 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
         payload
     });
     #[cfg(any(unix, windows))]
-    let process_server = process::Server::new(config.verbose, config.processes);
+    let process_server =
+        process::Server::with_maxima(config.verbose, config.processes, config.process_maxima);
     let boot_generation = new_boot_generation();
     let logical_cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -13140,6 +13144,7 @@ mod tests {
                     fd_channel: None,
                     verbose: false,
                     processes: true,
+                    process_maxima: ProcessMaxima::DEFAULT,
                     max_connections: 0,
                     max_ptys: 0,
                     ping_interval: Duration::ZERO,

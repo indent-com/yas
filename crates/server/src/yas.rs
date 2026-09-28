@@ -101,7 +101,6 @@ const BASE_WATCH_LIMIT: usize = NATIVE_APP_BASELINE_WATCHES + DYNAMIC_WATCH_HEAD
 const MAX_WATCHES: usize = 64;
 const MAX_RELAYS: usize = 32;
 const MAX_PENDING_CONNECTS: usize = 8;
-const MAX_OUTBOUND_TRANSFERS: usize = 32;
 const TRANSFER_CHUNK: usize = 64 * 1024;
 const RELAY_INPUT_WINDOW: u64 = 256 * 1024;
 const RELAY_OUTPUT_WINDOW: u64 = 256 * 1024;
@@ -248,10 +247,18 @@ const MAX_GIT_QUERY_STATE_DETAIL_BYTES: usize = 4096;
 const NATIVE_CATALOGUE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const NATIVE_SURFACE_SCALE_120: u16 = 120;
 const PROCESS_STREAM_QUEUE: usize = 64;
-pub(super) const MAX_PROCESS_OPERATION_REPLAYS: usize = 256;
+/// A session's stdin windows leave 1/4 of its receive budget to other frames.
+const PROCESS_STDIN_RESERVE_DIVISOR: u64 = 4;
+/// The smallest stdin window a process gets while the budget allows.
+const PROCESS_STDIN_MIN_WINDOW: u64 = 4 * 1024;
+// Process admissions scale with the server's configured ProcessMaxima; these
+// are their values at the defaults, which the tests exercise.
+#[cfg(test)]
+const MAX_PROCESS_OPERATION_REPLAYS: usize = 256;
+#[cfg(test)]
 const MAX_PENDING_PROCESS_WAITS: usize = 32;
-const MAX_PENDING_PROCESS_SEMANTIC_OPERATIONS: usize =
-    yas_process_wire::Limits::HARD.max_processes_per_session as usize;
+#[cfg(test)]
+const MAX_PENDING_PROCESS_SEMANTIC_OPERATIONS: usize = 16;
 const MAX_PENDING_FS_SEMANTIC_OPERATIONS: usize =
     yas_fs_wire::Limits::HARD.max_query_concurrency as usize;
 
@@ -2766,6 +2773,9 @@ struct Session {
     inbound_credit: Arc<CreditBudget>,
     inbound_transfers: Arc<InboundTransferRegistry>,
     outbound: HashMap<u32, Arc<FlowControl>>,
+    /// Outbound Transfers this session may hold at once; grows with the
+    /// configured processes per session (two streams each).
+    max_outbound_transfers: usize,
     outbound_sensitive: BTreeSet<u32>,
     surface_capture_transfers: HashMap<u32, u64>,
     relay_transfers: HashMap<u32, RelayTransfer>,
@@ -2982,6 +2992,8 @@ struct ProcessRuntime {
     transfer_to_attachment: HashMap<u32, (u32, ProcessTransferKind)>,
     operations: HashMap<[u8; 16], ProcessReplay>,
     operation_order: VecDeque<[u8; 16]>,
+    /// Replay capacity from the server's ProcessMaxima.
+    operation_replays: usize,
 }
 
 struct ProcessAttachment {
@@ -3057,9 +3069,11 @@ impl ProcessRuntime {
         session_env: Option<super::app_env::SessionEnv>,
     ) -> Option<Self> {
         let session = service.session(session_id, session_env).ok()?;
+        let operation_replays = service.maxima().operation_replays();
         Some(Self {
             service,
             session,
+            operation_replays,
             attachments: HashMap::new(),
             transfer_to_attachment: HashMap::new(),
             operations: HashMap::new(),
@@ -3072,7 +3086,7 @@ impl ProcessRuntime {
         make_operation_replay_room(
             &mut self.operations,
             &mut self.operation_order,
-            MAX_PROCESS_OPERATION_REPLAYS,
+            self.operation_replays,
             reserved,
             |replay| {
                 replay.attachment_id.is_some_and(|attachment_id| {
@@ -6637,10 +6651,24 @@ impl CreditBudget {
         }
     }
 
+    /// Like [`Self::lease`], but never takes the budget below `keep`
+    /// unreserved bytes.
+    fn lease_keeping(self: &Arc<Self>, requested: u64, keep: u64) -> CreditLease {
+        let bytes = self.reserve_keeping(requested, keep);
+        CreditLease {
+            budget: Arc::clone(self),
+            bytes: AtomicU64::new(bytes),
+        }
+    }
+
     fn reserve(&self, requested: u64) -> u64 {
+        self.reserve_keeping(requested, 0)
+    }
+
+    fn reserve_keeping(&self, requested: u64, keep: u64) -> u64 {
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
-            let available = self.maximum.saturating_sub(current);
+            let available = self.maximum.saturating_sub(current).saturating_sub(keep);
             let allocated = requested.min(available);
             if allocated == 0 {
                 return 0;
@@ -7113,6 +7141,11 @@ impl Session {
             .flatten()
             .and_then(|service| ProcessRuntime::new(service, negotiated.session_id, None));
         spawn_upload_stage_gc(internal.clone(), cancellation.clone());
+        let process_maxima = services
+            .process
+            .as_ref()
+            .map(|service| service.maxima())
+            .unwrap_or_default();
         Self {
             services,
             negotiated,
@@ -7135,16 +7168,15 @@ impl Session {
             inbound_credit,
             inbound_transfers,
             outbound: HashMap::new(),
+            max_outbound_transfers: process_maxima.outbound_transfers(),
             outbound_sensitive: BTreeSet::new(),
             surface_capture_transfers: HashMap::new(),
             relay_transfers: HashMap::new(),
             relay_handles: HashMap::new(),
             pending_requests: HashMap::new(),
             next_process_semantic_id: 1,
-            process_semantic_slots: Arc::new(Semaphore::new(
-                MAX_PENDING_PROCESS_SEMANTIC_OPERATIONS,
-            )),
-            process_wait_slots: Arc::new(Semaphore::new(MAX_PENDING_PROCESS_WAITS)),
+            process_semantic_slots: Arc::new(Semaphore::new(process_maxima.pending_operations)),
+            process_wait_slots: Arc::new(Semaphore::new(process_maxima.pending_waits)),
             next_events_semantic_id: 1,
             events_dump_slots: Arc::new(Semaphore::new(
                 yas_wire::schema::events::MAX_PENDING_DUMPS as usize,
@@ -16920,7 +16952,7 @@ impl Session {
         content_kind: u16,
         sensitive: bool,
     ) -> Option<(Descriptor, Arc<FlowControl>)> {
-        if self.outbound.len() >= MAX_OUTBOUND_TRANSFERS {
+        if self.outbound.len() >= self.max_outbound_transfers {
             return None;
         }
         let transfer_id = self.alloc_transfer_id()?;
@@ -16969,7 +17001,7 @@ impl Session {
         max_item_bytes: u64,
         sensitive: bool,
     ) -> Option<(Descriptor, Arc<FlowControl>)> {
-        if self.outbound.len() >= MAX_OUTBOUND_TRANSFERS {
+        if self.outbound.len() >= self.max_outbound_transfers {
             return None;
         }
         let transfer_id = self.alloc_transfer_id()?;
@@ -18060,6 +18092,17 @@ impl Session {
                     .await;
             }
         };
+        // The wire admits up to the extended hard maximum; this server admits
+        // what it advertised, and more entries fail as decoding did before.
+        if self
+            .process
+            .as_ref()
+            .is_some_and(|process| request.env.len() > process.service.maxima().envc)
+        {
+            return self
+                .send_sensitive_result(&frame, Status::Invalid, Vec::new())
+                .await;
+        }
         let fingerprint = *blake3::hash(&frame.payload).as_bytes();
         if let Some((status, body)) = self.process_replay(
             yas_process_wire::request_kind::SPAWN,
@@ -18101,7 +18144,7 @@ impl Session {
             || self.process.as_ref().is_some_and(|process| {
                 process.attachments.len() >= limits.max_processes_per_session as usize
             })
-            || self.outbound.len().saturating_add(2) > MAX_OUTBOUND_TRANSFERS
+            || self.outbound.len().saturating_add(2) > self.max_outbound_transfers
             || self
                 .process
                 .as_mut()
@@ -18206,7 +18249,7 @@ impl Session {
         let limits = self.process.as_ref().ok_or(())?.service.limits();
         if self.process.as_ref().is_some_and(|process| {
             process.attachments.len() >= limits.max_processes_per_session as usize
-        }) || self.outbound.len().saturating_add(2) > MAX_OUTBOUND_TRANSFERS
+        }) || self.outbound.len().saturating_add(2) > self.max_outbound_transfers
         {
             return self
                 .send_sensitive_result(&frame, Status::ResourceExhausted, Vec::new())
@@ -23581,7 +23624,7 @@ impl Session {
                             .await;
                     }
                 };
-                if self.outbound.len() >= MAX_OUTBOUND_TRANSFERS {
+                if self.outbound.len() >= self.max_outbound_transfers {
                     return self
                         .send_result_parts(
                             family::RELAY,
@@ -25625,10 +25668,25 @@ impl Session {
         let stdin = if control.stdin_window == 0 {
             None
         } else {
+            let maxima = self
+                .process
+                .as_ref()
+                .map(|process| process.service.maxima())
+                .unwrap_or_default();
+            // Stdin windows share the session's receive budget with every
+            // other frame the peer sends. They never take the last quarter of
+            // it, so a session full of idle stdin pipes can still read
+            // requests, credit and PING results, and each gets a fair share
+            // of the rest at the configured processes per session.
+            let reserve = self.inbound_credit.maximum / PROCESS_STDIN_RESERVE_DIVISOR;
+            let fair_share = ((self.inbound_credit.maximum - reserve)
+                / maxima.per_session.max(1) as u64)
+                .max(PROCESS_STDIN_MIN_WINDOW);
             let target_window = control
                 .stdin_window
-                .min(yas_process_wire::MAX_STREAM_BUFFER_BYTES);
-            let receive_credit = self.inbound_credit.lease(target_window);
+                .min(maxima.stream_buffer_bytes)
+                .min(fair_share);
+            let receive_credit = self.inbound_credit.lease_keeping(target_window, reserve);
             let granted = receive_credit.bytes();
             let Some(transfer_id) = self.alloc_transfer_id() else {
                 self.abort_transfer(stdout.transfer_id);
@@ -31090,16 +31148,29 @@ async fn run_process_output(
                     "non-contiguous Process lifetime output offset".to_owned(),
                 ));
             }
-            for bytes in chunk.data.chunks(TRANSFER_CHUNK) {
+            // Send as much as the receiver's credit allows, not whole
+            // chunks: a window smaller than one chunk still makes progress.
+            let mut rest = &chunk.data[..];
+            while !rest.is_empty() {
+                let Some(room) = flow
+                    .available(
+                        offset,
+                        TRANSFER_CHUNK.min(rest.len()),
+                        &connection,
+                        &connection,
+                    )
+                    .await
+                else {
+                    return Err((Status::Cancelled, "Process output cancelled".to_owned()));
+                };
+                let (bytes, tail) = rest.split_at(room);
+                rest = tail;
                 let end = offset.checked_add(bytes.len() as u64).ok_or_else(|| {
                     (
                         Status::Internal,
                         "Process output offset overflow".to_owned(),
                     )
                 })?;
-                if !flow.wait_through(end, &connection).await {
-                    return Err((Status::Cancelled, "Process output cancelled".to_owned()));
-                }
                 send_event_with_sensitivity(
                     &out,
                     family::TRANSFER,
@@ -32618,15 +32689,28 @@ fn spawn_byte_transfer_with_sensitivity(
     tokio::spawn(async move {
         let _permit = permit;
         let mut offset = 0u64;
-        for chunk in bytes.chunks(TRANSFER_CHUNK) {
+        // Chunks follow the receiver's credit, so a window smaller than
+        // TRANSFER_CHUNK still makes progress.
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let Some(room) = control
+                .available(
+                    offset,
+                    TRANSFER_CHUNK.min(rest.len()),
+                    &cancellation,
+                    &cancellation,
+                )
+                .await
+            else {
+                let _ = internal.send(Internal::TransferFinished(transfer_id)).await;
+                return;
+            };
+            let (chunk, tail) = rest.split_at(room);
+            rest = tail;
             let end = match offset.checked_add(chunk.len() as u64) {
                 Some(end) => end,
                 None => break,
             };
-            if !control.wait_through(end, &cancellation).await {
-                let _ = internal.send(Internal::TransferFinished(transfer_id)).await;
-                return;
-            }
             let data = ByteData {
                 transfer_id,
                 offset,
@@ -37476,7 +37560,7 @@ mod tests {
     fn maximal_process_delta_falls_back_to_bounded_snapshot_records() {
         let records = vec![
             maximal_process_state_record();
-            yas_process_wire::Limits::HARD.max_processes_per_session as usize
+            yas_process_wire::Limits::DEFAULT.max_processes_per_session as usize
         ];
         assert_oversized_delta_has_bounded_reset_snapshot(BoundedStateFamily::Process, records);
     }
@@ -39040,7 +39124,14 @@ mod tests {
             (
                 "Process",
                 MAX_PROCESS_OPERATION_REPLAYS,
-                yas_process_wire::Limits::HARD.max_processes_per_session as usize,
+                yas_process_wire::Limits::DEFAULT.max_processes_per_session as usize,
+            ),
+            (
+                "Process at its hard maxima",
+                super::super::process::ProcessMaxima::HARD.operation_replays(),
+                super::super::process::ProcessMaxima::HARD.per_session
+                    + super::super::process::ProcessMaxima::HARD.pending_spawns
+                    + super::super::process::ProcessMaxima::HARD.pending_operations,
             ),
             (
                 "Selection",
@@ -50953,6 +51044,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn path_env() -> Vec<yas_process_wire::EnvEntry> {
+        vec![yas_process_wire::EnvEntry {
+            key: b"PATH".to_vec(),
+            value: std::env::var("PATH").unwrap_or_default().into_bytes(),
+        }]
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn process_attach_control_tasks_are_bounded_and_terminate_timer_is_idempotent() {
         let server = super::super::process::Server::new(false, true);
@@ -50982,7 +51081,9 @@ mod tests {
                     b"-c".to_vec(),
                     b"trap '' TERM; printf R; while :; do sleep 1; done".to_vec(),
                 ],
-                env: Vec::new(),
+                // An empty environment has no PATH: without it the loop
+                // spins on "sleep: command not found" and fills stderr.
+                env: path_env(),
                 stdout_receive_credit: 1,
                 stderr_receive_credit: 1,
                 extensions: Extensions::default(),
@@ -51029,7 +51130,9 @@ mod tests {
                     b"-c".to_vec(),
                     b"trap '' TERM; printf R; while :; do sleep 1; done".to_vec(),
                 ],
-                env: Vec::new(),
+                // An empty environment has no PATH: without it the loop
+                // spins on "sleep: command not found" and fills stderr.
+                env: path_env(),
                 stdout_receive_credit: 1,
                 stderr_receive_credit: 1,
                 extensions: Extensions::default(),
@@ -51285,6 +51388,85 @@ mod tests {
         timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
         drop(foreign);
         timeout(TEST_TIMEOUT, foreign_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_output_follows_credit_smaller_than_one_chunk() {
+        let server = super::super::process::Server::new(false, true);
+        let runtime = super::super::yas_process::Runtime::new(server.clone());
+        let mut services = test_services(None, unavailable_connector(), None);
+        services.process = Some(runtime);
+        let (mut client, codec, _, server_task) =
+            start_session(services, &[family::TRANSFER, family::PROCESS]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            900,
+            &yas_process_wire::Spawn {
+                operation_id: [0xd1; 16],
+                flags: 0,
+                environment_kind: yas_process_wire::EnvironmentKind::Empty,
+                cwd: yas_process_wire::Cwd::ServerDefault,
+                argv: vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"printf ABC".to_vec()],
+                env: Vec::new(),
+                stdout_receive_credit: 1,
+                stderr_receive_credit: 1,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let spawned = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            900,
+        )
+        .await;
+        assert_eq!(spawned.status, Status::Ok);
+        let stdout = yas_process_wire::StreamBundle::decode(&spawned.body)
+            .unwrap()
+            .stdout
+            .transfer_id;
+
+        // "ABC" is one read and one chunk. Each byte of credit lets one byte
+        // through; the server does not wait for credit through the chunk.
+        for (offset, byte) in b"ABC".iter().enumerate() {
+            let data = timeout(TEST_TIMEOUT, async {
+                loop {
+                    let frame = next_frame(&mut client, &codec).await;
+                    if frame.header.family == family::TRANSFER
+                        && frame.header.kind == yas_wire::schema::transfer::event::BYTE_DATA
+                    {
+                        let data = ByteData::decode(&frame.payload).unwrap();
+                        if data.transfer_id == stdout {
+                            break data;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("output within the credit granted");
+            assert_eq!(data.offset, offset as u64);
+            assert_eq!(data.data, [*byte]);
+            write_event(
+                &mut client,
+                &codec,
+                family::TRANSFER,
+                yas_wire::schema::transfer::event::CREDIT,
+                &Credit {
+                    transfer_id: stdout,
+                    cumulative_limit: offset as u64 + 2,
+                },
+            )
+            .await;
+        }
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -51588,7 +51770,12 @@ mod tests {
             yas_process_wire::Limits::from_extensions(&descriptor.limits).unwrap(),
             yas_process_wire::Limits {
                 max_mutation_replays: MAX_PROCESS_OPERATION_REPLAYS as u32,
-                ..yas_process_wire::Limits::HARD
+                launcher_flags: if cfg!(unix) {
+                    yas_wire::schema::process::SPAWN_LAUNCHER_FLAGS as u32
+                } else {
+                    yas_wire::schema::process::SPAWN_STDIN_NULL as u32
+                },
+                ..yas_process_wire::Limits::DEFAULT
             },
         );
         for kind in [

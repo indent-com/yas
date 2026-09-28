@@ -320,7 +320,11 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   terminates the group (`SIGTERM`, then `SIGKILL` after
   `YAS_PROCESS_KILL_GRACE`, 2 s), so background children die with it unless
   they `setsid`. Ordinary processes die with their session; detachable ones
-  survive it. The module docs spell this out.
+  survive it. The module docs spell this out. A server admits 16 live
+  processes per session and 64 in total by default;
+  `yas server --process-max-per-session N` (and the other `--process-max*`
+  flags) raises that, and `Client::process_limits()` reports what the server
+  enforces.
 - **Files** (`fs`): open a root, read (whole, limited, ranged) with BLAKE3
   hashes, stat (`lstat` semantics), list, write with preconditions (`Any`,
   `Absent`, `Hash`) through a staged commit, mkdir -p, rename, remove, symlink.

@@ -908,6 +908,13 @@ Every Request kind has a correlated Result with the same family and kind.
 | 9 | `MAX_DETACHED_RETENTION_NS` | 8 | true | 1 | 300000000000 |
 | 10 | `MAX_MUTATION_REPLAYS` | 4 | true | 1 | 65536 |
 | 11 | `LAUNCHER_FLAGS` | 4 | false | 0 | 12 |
+| 12 | `MAX_PROCESSES_PER_SESSION_EXTENDED` | 4 | false | 1 | 16384 |
+| 13 | `MAX_PROCESSES_EXTENDED` | 4 | false | 1 | 65536 |
+| 14 | `MAX_PENDING_SPAWNS_EXTENDED` | 4 | false | 1 | 4096 |
+| 15 | `MAX_STREAM_BUFFER_BYTES_EXTENDED` | 8 | false | 1 | 1073741824 |
+| 16 | `MAX_ENVC_EXTENDED` | 4 | false | 1 | 16384 |
+| 17 | `MAX_PENDING_WAITS` | 4 | false | 1 | 65536 |
+| 18 | `MAX_PENDING_OPERATIONS` | 4 | false | 1 | 16384 |
 
 ### Shared types
 

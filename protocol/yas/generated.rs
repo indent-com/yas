@@ -3851,6 +3851,22 @@ pub const MAX_PROCESSES: u64 = 64;
 pub const MAX_PENDING_SPAWNS: u64 = 8;
 pub const MAX_STREAM_BUFFER_BYTES: u64 = 8388608;
 pub const MAX_DETACHED_RETENTION_NS: u64 = 300000000000;
+pub const MAX_PROCESSES_PER_SESSION_EXTENDED: u64 = 16384;
+pub const MAX_PROCESSES_EXTENDED: u64 = 65536;
+pub const MAX_PENDING_SPAWNS_EXTENDED: u64 = 4096;
+pub const MAX_STREAM_BUFFER_BYTES_EXTENDED: u64 = 1073741824;
+pub const MAX_ENVC_EXTENDED: u64 = 16384;
+pub const MAX_PENDING_WAITS: u64 = 65536;
+pub const MAX_PENDING_OPERATIONS: u64 = 16384;
+pub const LEGACY_PENDING_WAITS: u64 = 32;
+pub const LEGACY_PENDING_OPERATIONS: u64 = 16;
+pub const LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED: u64 = 12;
+pub const LIMIT_MAX_PROCESSES_EXTENDED: u64 = 13;
+pub const LIMIT_MAX_PENDING_SPAWNS_EXTENDED: u64 = 14;
+pub const LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED: u64 = 15;
+pub const LIMIT_MAX_ENVC_EXTENDED: u64 = 16;
+pub const LIMIT_MAX_PENDING_WAITS: u64 = 17;
+pub const LIMIT_MAX_PENDING_OPERATIONS: u64 = 18;
 pub const LIMIT_MAX_ARGC: u64 = 1;
 pub const LIMIT_MAX_ARG_BYTES: u64 = 2;
 pub const LIMIT_MAX_ENVC: u64 = 3;
@@ -3894,6 +3910,13 @@ super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES", tag: 8, value_type: supe
 super::LimitMetadata { name: "MAX_DETACHED_RETENTION_NS", tag: 9, value_type: super::LimitValueType::U64, required: true, hard_min: 1, hard_max: 300000000000 },
 super::LimitMetadata { name: "MAX_MUTATION_REPLAYS", tag: 10, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 65536 },
 super::LimitMetadata { name: "LAUNCHER_FLAGS", tag: 11, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 12 },
+super::LimitMetadata { name: "MAX_PROCESSES_PER_SESSION_EXTENDED", tag: 12, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
+super::LimitMetadata { name: "MAX_PROCESSES_EXTENDED", tag: 13, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 65536 },
+super::LimitMetadata { name: "MAX_PENDING_SPAWNS_EXTENDED", tag: 14, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 4096 },
+super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES_EXTENDED", tag: 15, value_type: super::LimitValueType::U64, required: false, hard_min: 1, hard_max: 1073741824 },
+super::LimitMetadata { name: "MAX_ENVC_EXTENDED", tag: 16, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
+super::LimitMetadata { name: "MAX_PENDING_WAITS", tag: 17, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 65536 },
+super::LimitMetadata { name: "MAX_PENDING_OPERATIONS", tag: 18, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SPAWN_MERGE_STDERR", value: 1 },
@@ -3962,6 +3985,22 @@ super::ConstantMetadata { name: "MAX_PROCESSES", value: 64 },
 super::ConstantMetadata { name: "MAX_PENDING_SPAWNS", value: 8 },
 super::ConstantMetadata { name: "MAX_STREAM_BUFFER_BYTES", value: 8388608 },
 super::ConstantMetadata { name: "MAX_DETACHED_RETENTION_NS", value: 300000000000 },
+super::ConstantMetadata { name: "MAX_PROCESSES_PER_SESSION_EXTENDED", value: 16384 },
+super::ConstantMetadata { name: "MAX_PROCESSES_EXTENDED", value: 65536 },
+super::ConstantMetadata { name: "MAX_PENDING_SPAWNS_EXTENDED", value: 4096 },
+super::ConstantMetadata { name: "MAX_STREAM_BUFFER_BYTES_EXTENDED", value: 1073741824 },
+super::ConstantMetadata { name: "MAX_ENVC_EXTENDED", value: 16384 },
+super::ConstantMetadata { name: "MAX_PENDING_WAITS", value: 65536 },
+super::ConstantMetadata { name: "MAX_PENDING_OPERATIONS", value: 16384 },
+super::ConstantMetadata { name: "LEGACY_PENDING_WAITS", value: 32 },
+super::ConstantMetadata { name: "LEGACY_PENDING_OPERATIONS", value: 16 },
+super::ConstantMetadata { name: "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED", value: 12 },
+super::ConstantMetadata { name: "LIMIT_MAX_PROCESSES_EXTENDED", value: 13 },
+super::ConstantMetadata { name: "LIMIT_MAX_PENDING_SPAWNS_EXTENDED", value: 14 },
+super::ConstantMetadata { name: "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED", value: 15 },
+super::ConstantMetadata { name: "LIMIT_MAX_ENVC_EXTENDED", value: 16 },
+super::ConstantMetadata { name: "LIMIT_MAX_PENDING_WAITS", value: 17 },
+super::ConstantMetadata { name: "LIMIT_MAX_PENDING_OPERATIONS", value: 18 },
 super::ConstantMetadata { name: "LIMIT_MAX_ARGC", value: 1 },
 super::ConstantMetadata { name: "LIMIT_MAX_ARG_BYTES", value: 2 },
 super::ConstantMetadata { name: "LIMIT_MAX_ENVC", value: 3 },

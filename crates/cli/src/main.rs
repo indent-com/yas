@@ -763,7 +763,15 @@ async fn async_main() {
             deployment,
             verbose,
             no_processes,
+            process_maxima,
         } => {
+            let process_maxima = match process_maxima.resolve() {
+                Ok(maxima) => maxima,
+                Err(error) => {
+                    eprintln!("yas server: {error}");
+                    std::process::exit(2);
+                }
+            };
             let deployment = match deployment.into_overrides() {
                 Ok(deployment) => deployment,
                 Err(error) => {
@@ -867,6 +875,7 @@ async fn async_main() {
                         .unwrap_or(false),
                 processes: !no_processes
                     && !std::env::var("YAS_PROCESS").is_ok_and(|value| value == "0"),
+                process_maxima,
                 // Both default to 0 (unlimited), which is the right default:
                 // a client that can open a PTY can already spend the machine's
                 // resources from inside it, so these are an operator sanity
