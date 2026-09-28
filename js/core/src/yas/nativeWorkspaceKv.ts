@@ -4,7 +4,7 @@ import {
   YAS_FAMILY_KV,
   YAS_KV_MAX_INLINE_BYTES,
   YAS_KV_MAX_KEY_BYTES,
-} from "./generated";
+} from "./generated.js";
 import {
   YasKvClient,
   YasKvConflictError,
@@ -12,16 +12,16 @@ import {
   type YasKvPrecondition,
   type YasKvStateChange,
   type YasKvStateUpdate,
-} from "./kv";
-import type { YasConnection } from "./session";
+} from "./kv.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_DELTA,
   YAS_STATE_RESET,
   YAS_STATE_SNAPSHOT_BEGIN,
   YAS_STATE_SNAPSHOT_END,
   YAS_STATE_SNAPSHOT_RECORDS,
-} from "./state";
-import { YasProtocolError } from "./wire";
+} from "./state.js";
+import { YasProtocolError } from "./wire.js";
 import {
   WorkspaceSessionKvConflictError,
   copyWorkspaceSessionHash,
@@ -32,7 +32,7 @@ import {
   type WorkspaceSessionKvWatch,
   type WorkspaceSessionKvWatchOptions,
   type WorkspaceSessionOwnedKv,
-} from "../workspaceSessionKv";
+} from "../workspaceSessionKv.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });

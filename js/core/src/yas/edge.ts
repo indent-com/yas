@@ -3,13 +3,13 @@ import type {
   YasTransportMessage,
   YasTransportOptions,
   ConnectionStatus,
-} from "../types";
+} from "../types.js";
 import {
   YasConnection,
   type YasConnectionOptions,
   type YasTransport,
-} from "./session";
-import { YAS_WEBSOCKET_SUBPROTOCOL } from "./generated";
+} from "./session.js";
+import { YAS_WEBSOCKET_SUBPROTOCOL } from "./generated.js";
 
 /** Exact browser contract for `/edge`: authenticate, then one YAS frame/message. */
 export class YasEdgeWebSocketTransport implements YasTransport {

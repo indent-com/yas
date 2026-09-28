@@ -14,8 +14,8 @@ import {
   YAS_ENV_VERSION,
   YAS_FAMILY_ENV,
   YAS_TRANSFER_SENSITIVE_CONTENT_EXTENSION,
-} from "./generated";
-import type { YasConnection } from "./session";
+} from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_TRANSFER_MODE_MESSAGE,
   YAS_TRANSFER_SENDER_TO_RECEIVER,
@@ -23,7 +23,7 @@ import {
   encodeTransferDescriptor,
   transfersFor,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -31,7 +31,7 @@ import {
   decodeExtensions,
   encodeExtensions,
   type YasExtension,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_ENV_DELIVERY_INLINE,
@@ -45,7 +45,7 @@ export {
   YAS_ENV_MAX_VALUE_BYTES,
   YAS_ENV_SNAPSHOT_CONTENT_KIND,
   YAS_ENV_VERSION,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasEnvEntry {
   key: Uint8Array;

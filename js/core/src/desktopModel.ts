@@ -1,4 +1,4 @@
-import { Notifier, type ReactiveStore } from "./reactive";
+import { Notifier, type ReactiveStore } from "./reactive.js";
 
 export const DESKTOP_SUBSCRIBE_TRAY = 1 << 0;
 export const DESKTOP_SUBSCRIBE_NOTIFICATIONS = 1 << 1;

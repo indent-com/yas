@@ -4,8 +4,8 @@ import type {
   YasTransportEventMap,
   YasTransportMessage,
   YasTransportOptions,
-} from "../types";
-import { YAS_EVENT_HEADER_BYTES } from "../yas/generated";
+} from "../types.js";
+import { YAS_EVENT_HEADER_BYTES } from "../yas/generated.js";
 import {
   type Bytes,
   NoiseCipher,
@@ -19,7 +19,7 @@ import {
   equal,
   importIdentity,
   publicKey,
-} from "./uplink-crypto";
+} from "./uplink-crypto.js";
 
 const QUEUE_LIMIT = 4 * 1024 * 1024;
 const DATAGRAM_IN_FLIGHT = 64;

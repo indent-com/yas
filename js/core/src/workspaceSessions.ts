@@ -6,21 +6,21 @@ import {
   validateWorkspaceLayout,
   type LayoutRect,
   type WorkspaceLayout,
-} from "./layout/model";
+} from "./layout/model.js";
 import type {
   WorkspaceSessionHash,
   WorkspaceSessionKv,
   WorkspaceSessionKvEntry,
   WorkspaceSessionKvWatch,
   WorkspaceSessionOwnedKv,
-} from "./workspaceSessionKv";
+} from "./workspaceSessionKv.js";
 import {
   WorkspaceSessionKvConflictError,
   copyWorkspaceSessionHash,
   workspaceSessionHashesEqual,
-} from "./workspaceSessionKv";
-import { YasNativeWorkspaceKv } from "./yas/nativeWorkspaceKv";
-import type { YasConnection } from "./yas/session";
+} from "./workspaceSessionKv.js";
+import { YasNativeWorkspaceKv } from "./yas/nativeWorkspaceKv.js";
+import type { YasConnection } from "./yas/session.js";
 
 export type {
   WorkspaceSessionHash,
@@ -32,8 +32,8 @@ export type {
   WorkspaceSessionKvWatch,
   WorkspaceSessionKvWatchOptions,
   WorkspaceSessionOwnedKv,
-} from "./workspaceSessionKv";
-export { WorkspaceSessionKvConflictError } from "./workspaceSessionKv";
+} from "./workspaceSessionKv.js";
+export { WorkspaceSessionKvConflictError } from "./workspaceSessionKv.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });

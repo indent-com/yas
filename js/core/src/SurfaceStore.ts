@@ -4,9 +4,9 @@ import {
   videoColorSpace,
   SDR_COLOR,
   rejectSurfaceColorProfile,
-} from "./surfaceColor";
-import type { YasSurfaceColorSpace } from "./yas/packed";
-import type { YasSurface, ConnectionId, SurfaceId } from "./types";
+} from "./surfaceColor.js";
+import type { YasSurfaceColorSpace } from "./yas/packed.js";
+import type { YasSurface, ConnectionId, SurfaceId } from "./types.js";
 import {
   SURFACE_FRAME_FLAG_KEYFRAME,
   SURFACE_FRAME_CODEC_MASK,
@@ -15,11 +15,11 @@ import {
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_H264_444,
   CODEC_SUPPORT_AV1_444,
-} from "./surfaceModel";
+} from "./surfaceModel.js";
 // Shared with the codec probe rather than duplicated: the probe answers
 // for what this browser accepts at a given level, and a decoder configured
 // here at a different one would be asking a question nobody answered.
-import { av1LevelString, av1SequenceProfile } from "./videoCodec";
+import { av1LevelString, av1SequenceProfile } from "./videoCodec.js";
 
 /** Configure from the encoded stream, not the pane or logical window. Without
  * size hints Chromium guesses 1280×720 when initializing hardware decoding.

@@ -1,6 +1,6 @@
-import { SURFACE_HDR_PROBE } from "./surfaceHdrProbe";
-import type { YasSurfaceColorSpace } from "./yas/packed";
-import type { YasExtension } from "./yas/wire";
+import { SURFACE_HDR_PROBE } from "./surfaceHdrProbe.js";
+import type { YasSurfaceColorSpace } from "./yas/packed.js";
+import type { YasExtension } from "./yas/wire.js";
 import {
   YAS_SURFACE_COLOR_CAP_DISPLAY_P3,
   YAS_SURFACE_COLOR_CAP_HDR10_AV1,
@@ -8,7 +8,7 @@ import {
   YAS_SURFACE_COLOR_CAP_AV1_444,
   YAS_SURFACE_COLOR_CAP_H264_444,
   YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION,
-} from "./yas/generated";
+} from "./yas/generated.js";
 
 export const SDR_COLOR: VideoColorSpaceInit = {
   primaries: "bt709",

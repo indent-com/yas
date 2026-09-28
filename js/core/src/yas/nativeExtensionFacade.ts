@@ -4,7 +4,7 @@
  * flags, and 32-byte content hash.
  */
 
-import * as g from "./generated";
+import * as g from "./generated.js";
 import {
   type YasExtensionDefinitionIdentity,
   type YasExtensionRecord,
@@ -12,9 +12,9 @@ import {
   type YasExtensionSnapshot,
   YasExtensionClient,
   extensionLimitsFromExtensions,
-} from "./extension";
-import type { YasConnection } from "./session";
-import { YasDisconnectedError, YasProtocolError } from "./wire";
+} from "./extension.js";
+import type { YasConnection } from "./session.js";
+import { YasDisconnectedError, YasProtocolError } from "./wire.js";
 
 const encoder = new TextEncoder();
 

@@ -3,10 +3,10 @@ import type { Ref } from "react";
 import type { ConnectionStatus } from "@yas-run/core";
 import type { Terminal } from "@yas-run/browser";
 import { YasTerminalSurface } from "@yas-run/core";
-import type { YasTerminalProps } from "./types";
-import { useYasContext, useRequiredYasWorkspace } from "./YasContext";
-import { useYasConnection } from "./hooks/useYasConnection";
-import { useYasSession } from "./hooks/useYasSession";
+import type { YasTerminalProps } from "./types.js";
+import { useYasContext, useRequiredYasWorkspace } from "./YasContext.js";
+import { useYasConnection } from "./hooks/useYasConnection.js";
+import { useYasSession } from "./hooks/useYasSession.js";
 
 // ---------------------------------------------------------------------------
 // Public handle exposed via ref

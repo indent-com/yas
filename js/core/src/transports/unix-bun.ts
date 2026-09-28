@@ -3,9 +3,9 @@
 import {
   AbstractUnixSocketTransport,
   type UnixSocketTransportOptions,
-} from "./unix-base";
+} from "./unix-base.js";
 
-export type { UnixSocketTransportOptions } from "./unix-base";
+export type { UnixSocketTransportOptions } from "./unix-base.js";
 
 type BunSocket = import("bun").Socket<{ attempt: symbol }>;
 

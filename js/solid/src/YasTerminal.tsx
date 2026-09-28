@@ -8,8 +8,8 @@ import {
 } from "solid-js";
 import { YasTerminalSurface } from "@yas-run/core";
 import type { SessionId, TerminalPalette } from "@yas-run/core";
-import { useYasContext, useRequiredYasWorkspace } from "./YasContext";
-import { createYasWorkspaceState } from "./hooks/createYasWorkspace";
+import { useYasContext, useRequiredYasWorkspace } from "./YasContext.js";
+import { createYasWorkspaceState } from "./hooks/createYasWorkspace.js";
 
 export interface YasTerminalProps {
   sessionId: SessionId | null;

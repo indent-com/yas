@@ -1,4 +1,4 @@
-import type { SessionId } from "./types";
+import type { SessionId } from "./types.js";
 
 export const LSP_STATUS_OK = 0;
 export const LSP_STATUS_UNKNOWN_ID = 1;

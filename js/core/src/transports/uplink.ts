@@ -1,6 +1,6 @@
-import type { YasTransportOptions } from "../types";
-import { UplinkEvents, YasNoiseTransport } from "./noise";
-import { decodeKey, publicKey } from "./uplink-crypto";
+import type { YasTransportOptions } from "../types.js";
+import { UplinkEvents, YasNoiseTransport } from "./noise.js";
+import { decodeKey, publicKey } from "./uplink-crypto.js";
 
 interface UplinkTarget {
   attach: string;

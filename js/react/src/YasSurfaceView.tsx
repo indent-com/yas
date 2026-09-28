@@ -16,7 +16,7 @@ import type {
   SurfaceId,
   SurfaceTouchMode,
 } from "@yas-run/core";
-import { useRequiredYasWorkspace } from "./YasContext";
+import { useRequiredYasWorkspace } from "./YasContext.js";
 
 export interface YasSurfaceViewProps {
   connectionId: ConnectionId;

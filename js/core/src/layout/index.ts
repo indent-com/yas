@@ -5,7 +5,7 @@ export {
   sameLayoutTree,
   LAYOUT_MAX_DEPTH,
   LAYOUT_MAX_PANES,
-} from "./model";
+} from "./model.js";
 export type {
   LayoutNode,
   LayoutSplit,
@@ -13,7 +13,7 @@ export type {
   LayoutLeaf,
   LayoutRect,
   LayoutDirection,
-} from "./model";
+} from "./model.js";
 
 export {
   enumeratePanes,
@@ -41,11 +41,11 @@ export {
   isWebAssignment,
   parseWebAssignment,
   isContentAssignment,
-} from "./tree";
+} from "./tree.js";
 export type {
   WorkspaceLayout,
   LayoutPane,
   LayoutAssignments,
   TileAssignment,
   DiffSide,
-} from "./tree";
+} from "./tree.js";

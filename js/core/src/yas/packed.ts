@@ -1,12 +1,12 @@
 /** Validators for TOML-generated packed codecs. */
 
-import * as g from "./generated";
-import { decodeEventsBatch, encodeEventsBatch } from "./events";
+import * as g from "./generated.js";
+import { decodeEventsBatch, encodeEventsBatch } from "./events.js";
 import {
   decodeTerminalGridV1,
   type YasTerminalGridState,
-} from "./terminal-grid";
-import { YasCursor, YasProtocolError, YasWriter } from "./wire";
+} from "./terminal-grid.js";
+import { YasCursor, YasProtocolError, YasWriter } from "./wire.js";
 
 export interface YasSurfaceColorSpace {
   primaries: number;

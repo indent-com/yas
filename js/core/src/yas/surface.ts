@@ -6,7 +6,7 @@ import {
   YAS_SURFACE_COLOR_CAP_HDR10_AV1_444,
   YAS_SURFACE_COLOR_CAP_AV1_444,
   YAS_SURFACE_COLOR_CAP_H264_444,
-} from "./generated";
+} from "./generated.js";
 /** YAS Surface family v1 codecs and browser client. */
 
 import {
@@ -80,8 +80,8 @@ import {
   YAS_SURFACE_TEXT_INPUT_REQUESTED,
   YAS_SURFACE_TOUCH_PHASE_CANCEL,
   YAS_SURFACE_TOUCH_PHASE_FRAME,
-} from "./generated";
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
+} from "./generated.js";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -99,7 +99,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_SENDER_TO_RECEIVER,
@@ -107,7 +107,7 @@ import {
   transfersFor,
   type YasInlineOrTransfer,
   type YasTransfer,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -116,7 +116,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FAMILY_SURFACE,
@@ -144,7 +144,7 @@ export {
   YAS_SURFACE_UNWATCH,
   YAS_SURFACE_VERSION,
   YAS_SURFACE_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasSurfaceRecord {
   surfaceHandle: bigint;

@@ -18,7 +18,7 @@ import {
   YAS_PRE_HELLO_MAX_FRAME,
   YAS_STATUS_OK,
   YAS_STREAM_LENGTH_BYTES,
-} from "./generated";
+} from "./generated.js";
 
 export {
   YAS_CLASS_EVENT,
@@ -40,7 +40,7 @@ export {
   YAS_STATUS_STALE,
   YAS_STATUS_IO,
   YAS_STATUS_INTERNAL,
-} from "./generated";
+} from "./generated.js";
 
 export const YAS_PREFACE = Uint8Array.from(
   YAS_PREFACE_HEX.match(/../g)!.map((byte) => Number.parseInt(byte, 16)),

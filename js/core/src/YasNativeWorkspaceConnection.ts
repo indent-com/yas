@@ -2,19 +2,19 @@ import {
   detectSurfaceColorCapabilities,
   surfaceColorExtensions,
   onSurfaceColorChange,
-} from "./surfaceColor";
-import { plannedDropExtension, plannedDropName } from "./surfaceDrop";
-import { AudioPlayer } from "./AudioPlayer";
-import { serverPlatform, type YasPlatform } from "./yas/core";
-import { DesktopStore } from "./desktopModel";
-import { EXIT_STATUS_UNKNOWN } from "./exit-status";
-import { MediaStore, MprisStore } from "./mediaModel";
-import { SurfaceStore, type SurfaceFrameAckToken } from "./SurfaceStore";
-import { TerminalStore, type YasWasmModule } from "./TerminalStore";
+} from "./surfaceColor.js";
+import { plannedDropExtension, plannedDropName } from "./surfaceDrop.js";
+import { AudioPlayer } from "./AudioPlayer.js";
+import { serverPlatform, type YasPlatform } from "./yas/core.js";
+import { DesktopStore } from "./desktopModel.js";
+import { EXIT_STATUS_UNKNOWN } from "./exit-status.js";
+import { MediaStore, MprisStore } from "./mediaModel.js";
+import { SurfaceStore, type SurfaceFrameAckToken } from "./SurfaceStore.js";
+import { TerminalStore, type YasWasmModule } from "./TerminalStore.js";
 import {
   currentBrowserClipboardEpoch,
   noteBrowserClipboardMayHaveChanged as noteBrowserClipboardChange,
-} from "./clipboardAuthority";
+} from "./clipboardAuthority.js";
 import type {
   ConnectionId,
   ConnectionStatus,
@@ -26,7 +26,7 @@ import type {
   YasSearchResult,
   YasSession,
   YasClientList,
-} from "./types";
+} from "./types.js";
 import {
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_AV1_444,
@@ -36,18 +36,18 @@ import {
   SURFACE_FRAME_CODEC_H264,
   SURFACE_FRAME_CODEC_PNG,
   SURFACE_FRAME_FLAG_KEYFRAME,
-} from "./surfaceModel";
-import { getCodecSupport } from "./YasSurfaceCanvas";
+} from "./surfaceModel.js";
+import { getCodecSupport } from "./YasSurfaceCanvas.js";
 import type {
   AwaitSessionExitOptions,
   CreateSessionOptions,
   SurfaceTarget,
-} from "./workspaceConnectionTypes";
+} from "./workspaceConnectionTypes.js";
 import type {
   SurfaceAxisEvent,
   SurfaceDragItem,
   SurfaceTouchPoint,
-} from "./input";
+} from "./input.js";
 import {
   YAS_FAMILY_SELECTION,
   YAS_FAMILY_FONT,
@@ -156,58 +156,58 @@ import {
   YAS_STATUS_UNAVAILABLE,
   YAS_STATUS_UNSUPPORTED,
   YAS_TERMINAL_COPY_RANGE,
-} from "./yas/generated";
-import * as yasGenerated from "./yas/generated";
-import { YasFontClient, YasFontProtocol } from "./yas/font";
-import { YasNativeDesktopClientLifecycle } from "./yas/nativeDesktopMedia";
+} from "./yas/generated.js";
+import * as yasGenerated from "./yas/generated.js";
+import { YasFontClient, YasFontProtocol } from "./yas/font.js";
+import { YasNativeDesktopClientLifecycle } from "./yas/nativeDesktopMedia.js";
 import {
   YasNativeExtensionFacade,
   type YasNativeExtensionInstallRequest,
-} from "./yas/nativeExtensionFacade";
-import type { YasExtensionRecord } from "./yas/extension";
+} from "./yas/nativeExtensionFacade.js";
+import type { YasExtensionRecord } from "./yas/extension.js";
 import {
   YasNativeChannelFacade,
   type YasNativeChannelHandle,
   type YasNativeChannelNamesWatch,
   type YasNativeChannelOpenOptions,
-} from "./yas/nativeChannelFacade";
-import { YasNativeProductFamilies } from "./yas/nativeProductFamilies";
-import { decodeSurfaceCodecPayload } from "./yas/packed";
+} from "./yas/nativeChannelFacade.js";
+import { YasNativeProductFamilies } from "./yas/nativeProductFamilies.js";
+import { decodeSurfaceCodecPayload } from "./yas/packed.js";
 import {
   YasNativeWorkspaceFs,
   type YasNativeFsSyncHandle,
   type YasNativeFsSyncOptions,
-} from "./yas/nativeWorkspaceFs";
+} from "./yas/nativeWorkspaceFs.js";
 import {
   YasNativeWorkspaceGit,
   type YasNativeGitDiscoverOptions,
   type YasNativeGitFoundRepo,
   type YasNativeGitOpenOptions,
   type YasNativeGitRepoHandle,
-} from "./yas/nativeWorkspaceGit";
+} from "./yas/nativeWorkspaceGit.js";
 import {
   YasNativeWorkspaceLsp,
   type YasNativeLspHandle,
   type YasNativeLspOpenOptions,
-} from "./yas/nativeWorkspaceLsp";
-import { YasNativeWorkspaceKv } from "./yas/nativeWorkspaceKv";
-import type { FsFileIndex, FsGrepOptions, FsGrepResult } from "./fsModel";
+} from "./yas/nativeWorkspaceLsp.js";
+import { YasNativeWorkspaceKv } from "./yas/nativeWorkspaceKv.js";
+import type { FsFileIndex, FsGrepOptions, FsGrepResult } from "./fsModel.js";
 import type {
   WorkspaceSessionKvDeleteOptions,
   WorkspaceSessionKvPutOptions,
   WorkspaceSessionKvWatch,
   WorkspaceSessionKvWatchOptions,
-} from "./workspaceSessionKv";
+} from "./workspaceSessionKv.js";
 import {
   YasSelectionClient,
   selectionDragDropItemsExtension,
   type YasSelectionGet,
   type YasSelectionSlotRecord,
-} from "./yas/selection";
+} from "./yas/selection.js";
 import {
   YasConnection as NativeYasSession,
   type YasInvalidation,
-} from "./yas/session";
+} from "./yas/session.js";
 import {
   YasSurfaceClient,
   surfaceActivationRevision,
@@ -219,7 +219,7 @@ import {
   type YasSurfaceFrame,
   type YasSurfaceRecord,
   type YasSurfaceView,
-} from "./yas/surface";
+} from "./yas/surface.js";
 import {
   YasTerminalClient,
   decodeTerminalGridV1,
@@ -228,9 +228,9 @@ import {
   type YasTerminalRecord,
   type YasTerminalViewConfiguration,
   type YasTerminalView,
-} from "./yas/terminal";
-import { encodeBrowserTerminalGrid } from "./yas/terminalRenderer";
-import { equalBytes, YasResultError, YasWriter } from "./yas/wire";
+} from "./yas/terminal.js";
+import { encodeBrowserTerminalGrid } from "./yas/terminalRenderer.js";
+import { equalBytes, YasResultError, YasWriter } from "./yas/wire.js";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();

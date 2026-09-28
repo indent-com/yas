@@ -1,4 +1,4 @@
-import * as g from "./generated";
+import * as g from "./generated.js";
 import {
   YAS_CLASS_EVENT,
   YAS_FAMILY_TERMINAL,
@@ -90,8 +90,8 @@ import {
   YAS_TERMINAL_WHEEL_AT,
   YAS_TERMINAL_WHEEL_SOURCE_CONTINUOUS,
   YAS_TERMINAL_WRITE,
-} from "./generated";
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
+} from "./generated.js";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -109,7 +109,7 @@ import {
   estimateStateRetainedBytes,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_SENDER_TO_RECEIVER,
@@ -119,7 +119,7 @@ import {
   type YasTransfer,
   type YasTransferDescriptor,
   type YasTransferManager,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YAS_MAX_BULK_CHUNK,
@@ -129,9 +129,9 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
-export * from "./terminal-grid";
+export * from "./terminal-grid.js";
 export {
   YAS_FAMILY_TERMINAL,
   YAS_TERMINAL_CLOSE,
@@ -166,7 +166,7 @@ export {
   YAS_TERMINAL_WATCH,
   YAS_TERMINAL_WHEEL,
   YAS_TERMINAL_WRITE,
-} from "./generated";
+} from "./generated.js";
 
 const terminalStateTags = new Set([
   YAS_TERMINAL_STATE_TITLE_EXTENSION,

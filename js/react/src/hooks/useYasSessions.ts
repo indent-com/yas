@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { YasSession } from "@yas-run/core";
-import { useRequiredYasWorkspace } from "../YasContext";
+import { useRequiredYasWorkspace } from "../YasContext.js";
 
 export function useYasSessions(): readonly YasSession[] {
   const workspace = useRequiredYasWorkspace();

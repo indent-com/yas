@@ -1,7 +1,7 @@
 /** YAS persistent key/value family codecs and client primitives. */
 
-import * as g from "./generated";
-import type { YasConnection } from "./session";
+import * as g from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_PATCH,
@@ -11,7 +11,7 @@ import {
   encodeWatch,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   decodeInlineOrTransfer,
   decodeTransferDescriptor,
@@ -21,7 +21,7 @@ import {
   transfersFor,
   type YasInlineOrTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -31,7 +31,7 @@ import {
   encodeExtensions,
   equalBytes,
   type YasExtension,
-} from "./wire";
+} from "./wire.js";
 
 export interface YasKvOpen {
   prefix: Uint8Array;
