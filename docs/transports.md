@@ -145,6 +145,29 @@ Closing the channel shuts down the server. SIGTERM, SIGINT, and native Shutdown
 requests stop both the fd-channel receiver and the ordinary socket listener;
 shutdown remains visible to either task if it starts waiting later.
 
+### Read-only socket
+
+`yas server --read-only-sock PATH` (or `YAS_READ_ONLY_SOCK`, Unix only) listens
+on a second socket where every session is read-only, whatever its HELLO asks
+for. Clients there get the catalogue a read-only share gets: they watch
+terminals and windows (their own views, scrollback, search, captures) but
+cannot type, click, resize terminals, read or write files, run processes or
+reach KV and the environment. The socket is created owner-only like the main
+one; give viewers access with its directory or mode.
+
+Before the server decodes such a session's HELLO, its first frame goes through
+the same rewrite a read-only share's does: the preface and Core HELLO are
+buffered, the required read-only-session extension is added, and every later
+byte passes unchanged. The server then advertises and enforces the restricted
+catalogue itself. A stream that is not native YAS, or whose first frame is not
+a HELLO, is closed. The socket takes plain sessions only: composite transports
+(a datagram lane paired by token) are refused there.
+
+A relay that carries clients' bytes to an ordinary socket can do the same with
+`yas_wire::read_only::ReadOnlyIngress` (re-exported as
+`yas_client::wire::read_only`): push what the client sends, forward what it
+returns.
+
 ### Standard I/O (`yas connect --stdio`)
 
 `yas connect --stdio` turns its own stdin and stdout into one native YAS
@@ -164,6 +187,10 @@ and nothing more: an SSH exec channel (`ssh host yas connect --stdio`),
   binary stream.
 - Only the reliable stream is relayed. A server reached over WebTransport or
   WebRTC works, but without unreliable datagrams.
+- Whatever runs the command may write its own errors to stdout before the
+  session starts: `docker exec` reports a failed exec ("OCI runtime exec
+  failed…") on stdout. A client that sees something other than the YAS preface
+  there should show those bytes rather than a protocol error.
 
 In Rust, `yas_client::transport::Transport::from_split(child_stdout,
 child_stdin)` wraps the pipes and `Client::from_transport` runs HELLO over them

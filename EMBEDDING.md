@@ -361,6 +361,12 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   `docker exec -i CONTAINER yas connect --stdio`) and it relays them to that
   side's server
   ([docs/transports.md](docs/transports.md#standard-io-yas-connect---stdio)).
+- **Read-only viewers**: `wire::read_only::ReadOnlyIngress` turns the bytes a
+  client sends into a read-only session's (it rewrites the HELLO, then passes
+  everything through), for a relay that forwards clients to an ordinary
+  socket; `yas server --read-only-sock PATH` is a socket that does it for
+  every session
+  ([docs/transports.md](docs/transports.md#read-only-socket)).
 
 `cargo run -p yas-client --example run -- local -- uname -a` is a complete
 example; `crates/cli/tests/client_host.rs` exercises the API end to end.

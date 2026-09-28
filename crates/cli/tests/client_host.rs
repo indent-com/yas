@@ -1100,3 +1100,51 @@ mod over_ssh {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_session_on_the_read_only_socket_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let read_only = directory.path().join("viewers.sock");
+    let server = tokio::time::timeout(
+        TIMEOUT,
+        HostedServer::start(options().arg("--read-only-sock").arg(&read_only)),
+    )
+    .await
+    .expect("hosted server start timed out")
+    .expect("hosted server starts");
+    assert_eq!(
+        std::fs::metadata(&read_only).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the read-only socket is as private as the server's own"
+    );
+
+    // The server's own socket still grants everything.
+    let full = server.connect().await.unwrap();
+    let status = full
+        .spawn(&Command::new("true"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(status.success(), "{status:?}");
+
+    // A client there that asks for an ordinary session gets a read-only one.
+    let target = format!("socket:{}", read_only.display());
+    let viewer = tokio::time::timeout(
+        TIMEOUT,
+        Client::connect(Some(&target), &yas_client::ConnectOptions::named("viewer")),
+    )
+    .await
+    .expect("connect timed out")
+    .unwrap();
+    let spawn = viewer
+        .spawn(&Command::new("true"))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(spawn, Error::Unsupported(_)), "{spawn:?}");
+    assert!(viewer.open_root(directory.path(), false).await.is_err());
+    assert!(viewer.env_var("PATH").await.is_err());
+}

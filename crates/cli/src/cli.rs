@@ -677,6 +677,14 @@ pub enum Command {
         #[arg(long)]
         fd_channel: Option<i32>,
 
+        /// Also listen on PATH, where every session is read-only whatever it
+        /// asks for: clients there watch terminals and windows but cannot
+        /// type, click, read files or run anything (or set
+        /// YAS_READ_ONLY_SOCK; Unix only)
+        #[cfg(unix)]
+        #[arg(long, value_name = "PATH", env = "YAS_READ_ONLY_SOCK")]
+        read_only_sock: Option<String>,
+
         /// Export the server socket path as YAS_SOCK in spawned terminals
         /// (or set YAS_EXPORT_SOCK=1)
         #[arg(long)]

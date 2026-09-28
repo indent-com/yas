@@ -750,6 +750,8 @@ async fn async_main() {
             scrollback,
             #[cfg(unix)]
             fd_channel,
+            #[cfg(unix)]
+            read_only_sock,
             export_sock,
             inject_path,
             max_ptys,
@@ -869,6 +871,8 @@ async fn async_main() {
                         .ok()
                         .and_then(|s| s.parse().ok())
                 }),
+                #[cfg(unix)]
+                read_only_ipc_path: read_only_sock,
                 verbose: verbose
                     || std::env::var("YAS_VERBOSE")
                         .ok()

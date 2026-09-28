@@ -45,6 +45,7 @@ connections that are no longer needed.
 | `YAS_COMPOSITOR_DEVICE`              | CUDA GPU when NVENC is enabled                                    | Vulkan compositor render node; otherwise `YAS_VAAPI_DEVICE`                                            |
 | `YAS_CUDA_DEVICE`                    | `0`                                                               | CUDA device ordinal for NVENC and NVDEC                                                                |
 | `YAS_FD_CHANNEL`                     | unset                                                             | fd-channel file descriptor                                                                             |
+| `YAS_READ_ONLY_SOCK`                 | unset                                                             | Second socket where every session is read-only (also `--read-only-sock`; Unix)                         |
 | `YAS_EXPORT_SOCK`                    | unset                                                             | `1` exports the socket path as `YAS_SOCK` in spawned terminals (also `--export-sock`)                  |
 | `YAS_INJECT_PATH`                    | unset                                                             | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)                     |
 | `YAS_SURFACE_ENCODERS`               | see encoder table                                                 | Comma-separated encoder priority (also `--surface-encoders`)                                           |
