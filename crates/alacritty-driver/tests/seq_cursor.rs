@@ -295,3 +295,26 @@ fn growing_with_no_history_does_not_invent_rotation() {
     assert_eq!(named_lines(&d, 3), before);
     assert_eq!(d.cursor_seq(), cursor);
 }
+
+#[test]
+fn a_cursor_past_the_end_reads_nothing_and_resumes_at_the_end() {
+    let mut d = TerminalDriver::new(10, 40, 1000);
+    feed_lines(&mut d, 0..3);
+    d.process(b"prompt> ");
+    let (seq, col) = d.cursor_seq();
+
+    for (from_seq, from_col) in [(seq, col + 5), (seq + 2, 0), (seq + 1000, 7)] {
+        let read = d.seq_text(from_seq, from_col, None, 64 * 1024);
+        assert_eq!(read.text, "");
+        assert!(!read.truncated);
+        assert_eq!((read.start_seq, read.start_col), (seq, col));
+        assert_eq!((read.next_seq, read.next_col), (seq, col));
+    }
+
+    let bounded = d.seq_text(seq + 50, 0, Some(seq), 64 * 1024);
+    assert_eq!(bounded.text, "");
+    assert_eq!(
+        (bounded.start_seq, bounded.start_col),
+        (bounded.next_seq, bounded.next_col)
+    );
+}
