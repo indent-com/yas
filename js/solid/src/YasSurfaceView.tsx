@@ -43,7 +43,9 @@ export interface YasSurfaceViewProps {
    * do not create a server-side video subscription. Defaults to true.
    */
   live?: boolean;
-  /** How touchscreen contacts are delivered. Defaults to pointer emulation. */
+  /** How touchscreen contacts are delivered. Defaults to `"direct"`, which
+   * forwards every contact to the Wayland client's `wl_touch`; `"pointer"`
+   * opts into single-finger click/scroll emulation. */
   touchMode?: SurfaceTouchMode;
   /**
    * Surface zoom factor, e.g. 1.25 for 125% or an exact 1.25x scale.
