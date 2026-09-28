@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/../docs/site"
+
+if (( $# != 1 )); then
+  echo "usage: bin/dev-docs PORT" >&2
+  exit 2
+fi
+
+pnpm run sync
+exec pnpm exec astro dev --host --port "$1"
