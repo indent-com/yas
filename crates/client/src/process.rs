@@ -62,13 +62,13 @@ use std::ffi::OsStr;
 use std::time::Duration;
 
 use yas_wire::{
-    Encode, Extensions,
+    Encode, Extension, Extensions,
     core::ResultPrefix,
     family,
     process::{
         self as wire, Attach, Control, ControlAction, ControlResult, Cwd, EnvEntry,
-        EnvironmentKind, ExitKind, ExitRecord, ProcessRecord, RemovedProcess, Spawn, StreamBundle,
-        Wait, request_kind,
+        EnvironmentKind, ExitRecord, ProcessRecord, RemovedProcess, Spawn, StreamBundle, Wait,
+        request_kind,
     },
     schema::process as schema,
     state::{Phase, RecordKind, Watch as StateWatch},
@@ -79,10 +79,13 @@ use crate::error::{Error, Result};
 use crate::state::{STATE_CREDIT, Subscription};
 use crate::transfer::{ByteSink, ByteStream, DEFAULT_WINDOW};
 
+pub use yas_wire::process::ExitKind;
+
 /// What the child's stdin is connected to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Stdin {
-    /// End of file from the start (the Transfer is closed right after spawn).
+    /// Nothing to read: the null device where the server offers `SPAWN_STDIN_NULL`
+    /// ([`Client::launcher_flags`]), else a Transfer closed right after spawn.
     #[default]
     Null,
     /// A [`ByteSink`] the caller writes to ([`Process::stdin`]).
@@ -113,6 +116,7 @@ pub struct Command {
     stdin: Stdin,
     window: u64,
     operation_id: [u8; 16],
+    leave_residue: Option<Option<Duration>>,
 }
 
 impl Command {
@@ -128,6 +132,7 @@ impl Command {
             stdin: Stdin::Null,
             window: DEFAULT_WINDOW,
             operation_id: nonzero_id(),
+            leave_residue: None,
         }
     }
 
@@ -201,6 +206,16 @@ impl Command {
         self
     }
 
+    /// Leave the process group alone when the direct child exits (`SPAWN_LEAVE_RESIDUE`, Unix),
+    /// as a shell leaves `server &` running: output is forwarded until the streams close, or for
+    /// `grace` after the exit, then the exit is reported and whatever still runs keeps running,
+    /// untracked. [`Process::terminate`] still stops the whole group. Servers that do not offer
+    /// it ([`Client::launcher_flags`]) refuse the spawn.
+    pub fn leave_residue(&mut self, grace: Option<Duration>) -> &mut Self {
+        self.leave_residue = Some(grace);
+        self
+    }
+
     /// Connect stdin.
     pub fn stdin(&mut self, stdin: Stdin) -> &mut Self {
         self.stdin = stdin;
@@ -228,8 +243,24 @@ impl Command {
         self.operation_id
     }
 
-    fn to_wire(&self) -> Result<Spawn> {
+    /// The SPAWN request; `stdin_null`: the server gives [`Stdin::Null`] the null device.
+    fn to_wire(&self, stdin_null: bool) -> Result<Spawn> {
         let mut flags = 0u16;
+        let mut extensions = Extensions::default();
+        if let Some(grace) = self.leave_residue {
+            flags |= schema::SPAWN_LEAVE_RESIDUE as u16;
+            if let Some(grace) = grace {
+                let nanos = u64::try_from(grace.as_nanos()).unwrap_or(u64::MAX);
+                extensions.0.push(Extension {
+                    tag: schema::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+                    required: true,
+                    value: nanos.to_le_bytes().to_vec(),
+                });
+            }
+        }
+        if stdin_null && self.stdin == Stdin::Null {
+            flags |= schema::SPAWN_STDIN_NULL as u16;
+        }
         if self.merge_stderr {
             flags |= schema::SPAWN_MERGE_STDERR as u16;
         }
@@ -263,7 +294,7 @@ impl Command {
                 .collect(),
             stdout_receive_credit: self.window,
             stderr_receive_credit: if self.merge_stderr { 0 } else { self.window },
-            extensions: Extensions::default(),
+            extensions,
         })
     }
 }
@@ -711,7 +742,8 @@ impl Client {
     /// Spawn a process. See the [module docs](crate::process) for what
     /// happens to it and its children.
     pub async fn spawn(&self, command: &Command) -> Result<Process> {
-        let spawn = command.to_wire()?;
+        let stdin_null = self.launcher_flags() & schema::SPAWN_STDIN_NULL as u32 != 0;
+        let spawn = command.to_wire(stdin_null)?;
         let reply = self
             .call_ok(
                 family::PROCESS,
@@ -913,6 +945,13 @@ impl Client {
     pub fn process_limits(&self) -> Option<wire::Limits> {
         self.family_limits(family::PROCESS)
             .and_then(|limits| wire::Limits::from_extensions(&limits).ok())
+    }
+
+    /// The opt-in SPAWN flags this server honours (`SPAWN_LEAVE_RESIDUE`, `SPAWN_STDIN_NULL`);
+    /// 0 for servers that predate them. [`Stdin::Null`] uses the null device where offered.
+    pub fn launcher_flags(&self) -> u32 {
+        self.process_limits()
+            .map_or(0, |limits| limits.launcher_flags)
     }
 
     pub(crate) fn family_limits(&self, family_id: u16) -> Option<Extensions> {

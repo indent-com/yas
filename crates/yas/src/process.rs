@@ -193,7 +193,8 @@ pub struct Spawn {
 impl Spawn {
     fn validate(&self) -> Result<()> {
         validate_operation_id(&self.operation_id)?;
-        let known = crate::schema::process::SPAWN_FLAGS | crate::schema::process::SPAWN_LAUNCHER_FLAGS;
+        let known =
+            crate::schema::process::SPAWN_FLAGS | crate::schema::process::SPAWN_LAUNCHER_FLAGS;
         if self.flags & !(known as u16) != 0 {
             return Err(Error::Invalid("Process spawn flags"));
         }
@@ -967,50 +968,52 @@ impl Limits {
 
     pub fn to_extensions(self) -> Result<Extensions> {
         self.validate()?;
-        Ok(Extensions(vec![
-            limit_u32(crate::schema::process::LIMIT_MAX_ARGC, self.max_argc),
-            limit_u32(
-                crate::schema::process::LIMIT_MAX_ARG_BYTES,
-                self.max_arg_bytes,
-            ),
-            limit_u32(crate::schema::process::LIMIT_MAX_ENVC, self.max_envc),
-            limit_u32(
-                crate::schema::process::LIMIT_MAX_ENV_BYTES,
-                self.max_env_bytes,
-            ),
-            limit_u32(
-                crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION,
-                self.max_processes_per_session,
-            ),
-            limit_u32(
-                crate::schema::process::LIMIT_MAX_PROCESSES,
-                self.max_processes,
-            ),
-            limit_u32(
-                crate::schema::process::LIMIT_MAX_PENDING_SPAWNS,
-                self.max_pending_spawns,
-            ),
-            limit_u64(
-                crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES,
-                self.max_stream_buffer_bytes,
-            ),
-            limit_u64(
-                crate::schema::process::LIMIT_MAX_DETACHED_RETENTION_NS,
-                self.max_detached_retention_ns,
-            ),
-            limit_u32(
-                crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
-                self.max_mutation_replays,
-            ),
-        ]
-        .into_iter()
-        .chain((self.launcher_flags != 0).then(|| {
-            limit_u32(
-                crate::schema::process::LIMIT_LAUNCHER_FLAGS,
-                self.launcher_flags,
-            )
-        }))
-        .collect()))
+        Ok(Extensions(
+            vec![
+                limit_u32(crate::schema::process::LIMIT_MAX_ARGC, self.max_argc),
+                limit_u32(
+                    crate::schema::process::LIMIT_MAX_ARG_BYTES,
+                    self.max_arg_bytes,
+                ),
+                limit_u32(crate::schema::process::LIMIT_MAX_ENVC, self.max_envc),
+                limit_u32(
+                    crate::schema::process::LIMIT_MAX_ENV_BYTES,
+                    self.max_env_bytes,
+                ),
+                limit_u32(
+                    crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION,
+                    self.max_processes_per_session,
+                ),
+                limit_u32(
+                    crate::schema::process::LIMIT_MAX_PROCESSES,
+                    self.max_processes,
+                ),
+                limit_u32(
+                    crate::schema::process::LIMIT_MAX_PENDING_SPAWNS,
+                    self.max_pending_spawns,
+                ),
+                limit_u64(
+                    crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES,
+                    self.max_stream_buffer_bytes,
+                ),
+                limit_u64(
+                    crate::schema::process::LIMIT_MAX_DETACHED_RETENTION_NS,
+                    self.max_detached_retention_ns,
+                ),
+                limit_u32(
+                    crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
+                    self.max_mutation_replays,
+                ),
+            ]
+            .into_iter()
+            .chain((self.launcher_flags != 0).then(|| {
+                limit_u32(
+                    crate::schema::process::LIMIT_LAUNCHER_FLAGS,
+                    self.launcher_flags,
+                )
+            }))
+            .collect(),
+        ))
     }
 
     pub fn from_extensions(extensions: &Extensions) -> Result<Self> {

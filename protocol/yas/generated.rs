@@ -2282,6 +2282,7 @@ pub const CONTENT_INLINE: u64 = 1;
 pub const ENTRY_OPERATION_ID_EXTENSION: u64 = 1;
 pub const RESULT_CONFLICT_DETAIL_EXTENSION: u64 = 1;
 pub const RESULT_OS_ERROR_EXTENSION: u64 = 2;
+pub const APPLY_RESULT_OS_ERRORS_EXTENSION: u64 = 1;
 pub const MAX_OS_ERROR_TEXT_BYTES: u64 = 32;
 pub const PATCH_MODE: u64 = 1;
 pub const PATCH_MODIFIED_TIME: u64 = 2;
@@ -2425,7 +2426,8 @@ super::TypeMetadata { name: "conflict_detail", layout: "path:bytes_u32 containin
 super::TypeMetadata { name: "entry_operation_id_extension", layout: "EntryRecord extension tag 1 exact value operation_id:[u8;16], nonzero; lets watchers recognize mutation echoes without suppressing them" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tags 1..12 encode max roots/session:u32,watches/root:u32,path components:u32,component bytes:u32,path bytes:u32,inline bytes:u32,query records:u32,query bytes:u32,stages/session:u32,staged bytes:u64,batch items:u32,query concurrency:u32" },
 super::TypeMetadata { name: "family_capabilities", layout: "optional family limit extension tag LIMIT_CAPABILITIES exact value capabilities:u32; bitmask of CAPABILITY_* values the server implements; absent means zero; receivers ignore unknown bits; a client uses an opt-in value only when its capability bit is set" },
-super::TypeMetadata { name: "os_error", layout: "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, and the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error" },
+super::TypeMetadata { name: "os_error", layout: "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error, and an entry of ApplyOsErrors" },
+super::TypeMetadata { name: "apply_os_errors", layout: "repeated index:u16,OsError; exact value of optional ApplyResult extension tag APPLY_RESULT_OS_ERRORS_EXTENSION, present only when at least one item failed because of an OS error; one entry per such item, indices strictly ascending and naming non-OK items of the same Result; offered with CAPABILITY_OS_ERROR" },
 super::TypeMetadata { name: "query_read_extended_record", layout: "QueryReadRecord answering the opt-in question kinds: OK content READ_LIST QueryListEntries, READ_REALPATH raw absolute canonical platform path bytes, READ_STAT_ONLY QueryStatOnly; non-OK content is empty or exactly one OsError; READ_NO_FOLLOW is valid only with READ_STAT_ONLY among these kinds" },
 super::TypeMetadata { name: "query_list_entries", layout: "repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash" },
 super::TypeMetadata { name: "query_stat_only", layout: "kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed" },
@@ -2484,6 +2486,7 @@ super::ConstantMetadata { name: "CONTENT_INLINE", value: 1 },
 super::ConstantMetadata { name: "ENTRY_OPERATION_ID_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "RESULT_CONFLICT_DETAIL_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "RESULT_OS_ERROR_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "APPLY_RESULT_OS_ERRORS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "MAX_OS_ERROR_TEXT_BYTES", value: 32 },
 super::ConstantMetadata { name: "PATCH_MODE", value: 1 },
 super::ConstantMetadata { name: "PATCH_MODIFIED_TIME", value: 2 },

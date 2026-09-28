@@ -2877,7 +2877,11 @@ unchanged: ENOENT is NOT_FOUND, other OS errors are IO. FETCH of a directory
 stays INVALID with `{EISDIR, read}`; COMMIT onto a directory stays CONFLICT
 with both ConflictDetail and `{EISDIR, open}`. Escaping the root is IO without
 an OsError. Windows servers name every error UNKNOWN. APPLY item details keep
-their text.
+their text; an APPLY Result whose items failed because of OS errors adds
+optional ApplyResult extension `APPLY_RESULT_OS_ERRORS_EXTENSION` (1), whose
+value is `repeated index:u16,OsError`, one entry per such item in ascending
+index order (part of `CAPABILITY_OS_ERROR`). A MKDIR under a file is
+`{ENOTDIR, mkdir}`, a REMOVE of nothing `{ENOENT, unlink}`.
 
 READ question kinds `READ_LIST` (4), `READ_REALPATH` (5), and
 `READ_STAT_ONLY` (6) read no content and hash nothing. READ_LIST lists one

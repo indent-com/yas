@@ -1012,6 +1012,7 @@ export const YAS_FS_CONTENT_INLINE = 1 as const;
 export const YAS_FS_ENTRY_OPERATION_ID_EXTENSION = 1 as const;
 export const YAS_FS_RESULT_CONFLICT_DETAIL_EXTENSION = 1 as const;
 export const YAS_FS_RESULT_OS_ERROR_EXTENSION = 2 as const;
+export const YAS_FS_APPLY_RESULT_OS_ERRORS_EXTENSION = 1 as const;
 export const YAS_FS_MAX_OS_ERROR_TEXT_BYTES = 32 as const;
 export const YAS_FS_PATCH_MODE = 1 as const;
 export const YAS_FS_PATCH_MODIFIED_TIME = 2 as const;
@@ -8100,7 +8101,11 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "os_error",
-          "layout": "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, and the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error"
+          "layout": "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error, and an entry of ApplyOsErrors"
+        },
+        {
+          "name": "apply_os_errors",
+          "layout": "repeated index:u16,OsError; exact value of optional ApplyResult extension tag APPLY_RESULT_OS_ERRORS_EXTENSION, present only when at least one item failed because of an OS error; one entry per such item, indices strictly ascending and naming non-OK items of the same Result; offered with CAPABILITY_OS_ERROR"
         },
         {
           "name": "query_read_extended_record",
@@ -8263,6 +8268,10 @@ export const YAS_SCHEMA = {
         {
           "name": "RESULT_OS_ERROR_EXTENSION",
           "value": 2
+        },
+        {
+          "name": "APPLY_RESULT_OS_ERRORS_EXTENSION",
+          "value": 1
         },
         {
           "name": "MAX_OS_ERROR_TEXT_BYTES",

@@ -2281,10 +2281,17 @@ impl Encode for OsError {
 impl Decode for OsError {
     fn decode(input: &[u8]) -> Result<Self> {
         let mut decoder = Decoder::new(input);
+        let value = Self::decode_from(&mut decoder)?;
+        decoder.finish()?;
+        Ok(value)
+    }
+}
+
+impl OsError {
+    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self> {
         let code = decoder.i32()?;
         let name = decoder.len_bytes_u16()?;
         let operation = decoder.len_bytes_u16()?;
-        decoder.finish()?;
         let value = Self {
             code,
             name: ::core::str::from_utf8(name)
@@ -2885,6 +2892,59 @@ impl Encode for ApplyResult {
     }
 }
 
+impl ApplyResult {
+    /// The OS errors behind failed items (`APPLY_RESULT_OS_ERRORS_EXTENSION`), by item index;
+    /// empty when there are none or the server predates them.
+    pub fn os_errors(&self) -> Result<Vec<(u16, OsError)>> {
+        let Some(extension) = self.extensions.0.iter().find(|extension| {
+            extension.tag == crate::schema::fs::APPLY_RESULT_OS_ERRORS_EXTENSION as u16
+        }) else {
+            return Ok(Vec::new());
+        };
+        let mut decoder = Decoder::new(&extension.value);
+        let mut errors: Vec<(u16, OsError)> = Vec::new();
+        while decoder.remaining() > 0 {
+            let index = decoder.u16()?;
+            let os = OsError::decode_from(&mut decoder)?;
+            let failed = self
+                .items
+                .iter()
+                .any(|item| item.index == index && item.status != crate::schema::core::status::OK);
+            if !failed || errors.last().is_some_and(|(last, _)| *last >= index) {
+                return Err(Error::Invalid("FS APPLY OS errors"));
+            }
+            errors.push((index, os));
+        }
+        if errors.is_empty() {
+            return Err(Error::Invalid("FS APPLY OS errors"));
+        }
+        Ok(errors)
+    }
+
+    /// The `APPLY_RESULT_OS_ERRORS_EXTENSION` carrying `errors` (ascending indices), or None
+    /// when there are none.
+    pub fn os_errors_extension(errors: &[(u16, OsError)]) -> Result<Option<Extension>> {
+        if errors.is_empty() {
+            return Ok(None);
+        }
+        let mut value = Vec::new();
+        let mut last = None;
+        for (index, os) in errors {
+            if last.is_some_and(|last| last >= *index) {
+                return Err(Error::Invalid("FS APPLY OS errors"));
+            }
+            last = Some(*index);
+            put_u16(&mut value, *index);
+            os.encode_to(&mut value)?;
+        }
+        Ok(Some(Extension {
+            tag: crate::schema::fs::APPLY_RESULT_OS_ERRORS_EXTENSION as u16,
+            required: false,
+            value,
+        }))
+    }
+}
+
 impl Decode for ApplyResult {
     fn decode(input: &[u8]) -> Result<Self> {
         let mut decoder = Decoder::new(input);
@@ -3247,6 +3307,52 @@ mod tests {
         future.capabilities = u32::MAX;
         let future = Limits::from_extensions(&future.to_extensions().unwrap()).unwrap();
         assert_eq!(future.capabilities, u32::MAX);
+    }
+
+    #[test]
+    fn apply_os_errors_name_failed_items_in_order() {
+        let failed = |index: u16, status: u16| ApplyItemResult {
+            index,
+            status,
+            entry_revision: if status == crate::schema::core::status::OK {
+                1
+            } else {
+                0
+            },
+            modified_unix_ns: 0,
+            content_hash: None,
+            detail: String::new(),
+        };
+        let os = |name: &str| OsError {
+            code: 2,
+            name: name.into(),
+            operation: "mkdir".into(),
+        };
+        let mut result = ApplyResult {
+            root_revision: 1,
+            items: vec![
+                failed(0, crate::schema::core::status::OK),
+                failed(1, crate::schema::core::status::NOT_FOUND),
+                failed(2, crate::schema::core::status::IO),
+            ],
+            extensions: Extensions::default(),
+        };
+        assert!(result.os_errors().unwrap().is_empty());
+        assert!(ApplyResult::os_errors_extension(&[]).unwrap().is_none());
+        let errors = vec![(1, os("ENOENT")), (2, os("ENOTDIR"))];
+        result.extensions = Extensions(vec![
+            ApplyResult::os_errors_extension(&errors).unwrap().unwrap(),
+        ]);
+        let decoded = ApplyResult::decode(&result.encode().unwrap()).unwrap();
+        assert_eq!(decoded.os_errors().unwrap(), errors);
+        // Out of order, or naming an item that succeeded, is invalid.
+        assert!(ApplyResult::os_errors_extension(&[(2, os("EIO")), (1, os("EIO"))]).is_err());
+        result.extensions = Extensions(vec![
+            ApplyResult::os_errors_extension(&[(0, os("EIO"))])
+                .unwrap()
+                .unwrap(),
+        ]);
+        assert!(result.os_errors().is_err());
     }
 
     #[test]

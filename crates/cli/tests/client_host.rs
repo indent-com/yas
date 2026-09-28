@@ -523,3 +523,185 @@ async fn closing_stdin_after_the_child_closed_it_is_clean() {
         assert!(output.status.success());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_can_leave_its_background_running_with_a_null_stdin() {
+    use yas_client::wire::schema::process as schema;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert_eq!(
+        client.launcher_flags(),
+        (schema::SPAWN_LEAVE_RESIDUE | schema::SPAWN_STDIN_NULL) as u32
+    );
+    // The background `sleep` holds stdout: the exit comes after the grace, and
+    // the sleep keeps running.
+    let started = Instant::now();
+    let output = client
+        .spawn(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "sleep 60 & echo $!; readlink /proc/self/fd/0 || echo no-proc",
+                ])
+                .merge_stderr(true)
+                .leave_residue(Some(Duration::from_millis(300))),
+        )
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(output.status.success(), "{}", output.status);
+    assert_eq!(output.status.detail, "residual process group left running");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut lines = text.lines();
+    let pid: i32 = lines.next().unwrap().trim().parse().unwrap();
+    let stdin = lines.next().unwrap();
+    assert!(stdin == "/dev/null" || stdin == "no-proc", "{stdin}");
+    assert!(alive(pid), "the background survives its command");
+    // SAFETY: the test's own background process.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    // Without a grace, the exit waits for the streams.
+    let output = client
+        .spawn(
+            Command::new("sh")
+                .args(["-c", "(sleep 0.3; printf later) & printf now"])
+                .leave_residue(None),
+        )
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"nowlater");
+    assert!(output.status.detail.is_empty(), "{}", output.status.detail);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_answer_as_the_os_does() {
+    use yas_client::fs::{Kind, os_error};
+    use yas_client::wire::schema::fs as schema;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert_eq!(client.fs_capabilities(), schema::CAPABILITY_FLAGS as u32);
+    let directory = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(directory.path()).unwrap();
+    std::fs::write(base.join("file"), b"old").unwrap();
+    std::fs::create_dir(base.join("dir")).unwrap();
+    std::os::unix::fs::symlink(base.join("dir"), base.join("link")).unwrap();
+    std::os::unix::fs::symlink(base.join("file"), base.join("to-file")).unwrap();
+    let root = client.open_root(&base, true).await.unwrap();
+    let named = |error: Error| {
+        let os = os_error(&error).unwrap_or_else(|| panic!("no OS error in {error:?}"));
+        (os.name, os.operation)
+    };
+    let pair = |name: &str, operation: &str| (name.to_owned(), operation.to_owned());
+
+    let mut entries = root.list_dir("").await.unwrap();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    let kinds: Vec<(&[u8], Kind)> = entries
+        .iter()
+        .map(|entry| (entry.name.as_slice(), entry.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (b"dir".as_slice(), Kind::Directory),
+            (b"file".as_slice(), Kind::File),
+            (b"link".as_slice(), Kind::Symlink),
+            (b"to-file".as_slice(), Kind::Symlink),
+        ]
+    );
+    assert!(root.list_dir("link").await.unwrap().is_empty());
+    assert_eq!(
+        named(root.list_dir("file").await.unwrap_err()),
+        pair("ENOTDIR", "readdir")
+    );
+    assert_eq!(
+        named(root.list_dir("missing").await.unwrap_err()),
+        pair("ENOENT", "readdir")
+    );
+
+    assert_eq!(
+        root.realpath("link").await.unwrap(),
+        base.join("dir").as_os_str().as_encoded_bytes()
+    );
+    assert_eq!(
+        named(root.realpath("missing").await.unwrap_err()),
+        pair("ENOENT", "realpath")
+    );
+
+    assert_eq!(
+        root.stat_only("link", true).await.unwrap().kind,
+        Kind::Directory
+    );
+    assert_eq!(
+        root.stat_only("link", false).await.unwrap().kind,
+        Kind::Symlink
+    );
+    assert_eq!(root.stat_only("file", true).await.unwrap().size, 3);
+    assert_eq!(
+        named(root.stat_only("missing", false).await.unwrap_err()),
+        pair("ENOENT", "lstat")
+    );
+
+    // In place through a symlink: the same inode, the new bytes.
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(base.join("file")).unwrap().ino();
+    root.write_in_place("to-file", b"new content")
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(base.join("file")).unwrap(), b"new content");
+    assert_eq!(std::fs::metadata(base.join("file")).unwrap().ino(), inode);
+    assert!(
+        std::fs::symlink_metadata(base.join("to-file"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        named(root.write_in_place("dir", b"x").await.unwrap_err()),
+        pair("EISDIR", "open")
+    );
+    assert_eq!(
+        named(root.write_in_place("missing/file", b"x").await.unwrap_err()),
+        pair("ENOENT", "open")
+    );
+
+    assert_eq!(
+        named(root.read("missing").await.unwrap_err()),
+        pair("ENOENT", "open")
+    );
+    assert_eq!(
+        named(root.read("dir").await.unwrap_err()),
+        pair("EISDIR", "read")
+    );
+
+    root.create_dir("made", 0).await.unwrap();
+    root.create_dir("made", 0).await.unwrap();
+    assert!(base.join("made").is_dir());
+    assert_eq!(
+        named(root.create_dir("file", 0).await.unwrap_err()),
+        pair("EEXIST", "mkdir")
+    );
+    assert_eq!(
+        named(root.create_dir("file/under", 0).await.unwrap_err()),
+        pair("ENOTDIR", "mkdir")
+    );
+    assert_eq!(
+        named(root.create_dir("missing/deeper", 0).await.unwrap_err()),
+        pair("ENOENT", "mkdir")
+    );
+
+    root.unlink("to-file").await.unwrap();
+    assert!(
+        base.join("file").exists(),
+        "unlink removes the link, not its target"
+    );
+    assert_eq!(
+        named(root.unlink("to-file").await.unwrap_err()),
+        pair("ENOENT", "unlink")
+    );
+}

@@ -2503,8 +2503,15 @@ fn apply_items(
 ) -> Result<wire::ApplyResult, Error> {
     let _mutation = MUTATION_LOCK.lock().unwrap();
     let mut results = Vec::with_capacity(items.len());
+    let mut os_errors = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let outcome = apply_one(root, operation_id, item);
+        if let Err(error) = &outcome
+            && !matches!(error.kind(), Error::Conflict(_))
+            && let Some(os) = error.os_error()
+        {
+            os_errors.push((index as u16, os.clone()));
+        }
         let result = match outcome {
             Ok(entry) => wire::ApplyItemResult {
                 index: index as u16,
@@ -2535,10 +2542,15 @@ fn apply_items(
         };
         results.push(result);
     }
+    // Optional, so clients that predate it skip it; each item's status is unchanged.
+    let extensions = match wire::ApplyResult::os_errors_extension(&os_errors) {
+        Ok(Some(extension)) => Extensions(vec![extension]),
+        _ => Extensions::default(),
+    };
     Ok(wire::ApplyResult {
         root_revision: root.revision.load(Ordering::Acquire).max(1),
         items: results,
-        extensions: Extensions::default(),
+        extensions,
     })
 }
 
@@ -2585,7 +2597,8 @@ fn apply_one(
         } => {
             check_precondition(root, path, precondition)?;
             let target = mutation_target(root, path, false, "unlink")?;
-            let metadata = fs::symlink_metadata(&target).map_err(os_io("lstat"))?;
+            // Resolving the request's path is the request's operation.
+            let metadata = fs::symlink_metadata(&target).map_err(os_io("unlink"))?;
             if metadata.is_dir() {
                 if flags & schema::fs::REMOVE_RECURSIVE as u16 != 0 {
                     fs::remove_dir_all(&target).map_err(os_io("rmdir"))?;
@@ -3353,6 +3366,64 @@ mod tests {
         .unwrap();
         assert_eq!(result.items[0].status, schema::core::status::INTERNAL);
         assert!(result.items[0].detail.ends_with("(os error 17)"));
+        let os = result.os_errors().unwrap();
+        assert_eq!(os.len(), 1);
+        assert_eq!((os[0].0, os[0].1.name.as_str()), (0, "EEXIST"));
+        assert_eq!(os[0].1.operation, "mkdir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_reports_each_failed_items_os_error() {
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        fs::write(directory.0.join("file"), b"x").unwrap();
+        let mkdir = |components: &[&[u8]]| wire::ApplyItem::Mkdir {
+            path: path(components),
+            precondition: wire::Precondition::Any,
+            create_parents: false,
+            mode: 0,
+        };
+        let remove = |components: &[&[u8]]| wire::ApplyItem::Remove {
+            path: path(components),
+            precondition: wire::Precondition::Any,
+            flags: 0,
+        };
+        let items = [
+            mkdir(&[b"made"]),
+            mkdir(&[b"file", b"under"]),
+            mkdir(&[b"missing", b"deeper"]),
+            mkdir(&[b"made"]),
+            remove(&[b"gone"]),
+            remove(&[b"file"]),
+        ];
+        let result = apply_items(&root, [7; 16], &items).unwrap();
+        let statuses: Vec<u16> = result.items.iter().map(|item| item.status).collect();
+        assert_eq!(statuses[0], schema::core::status::OK);
+        assert_eq!(
+            statuses[3],
+            schema::core::status::OK,
+            "an existing directory is made"
+        );
+        assert_eq!(statuses[5], schema::core::status::OK);
+        let named: Vec<(u16, String, String)> = result
+            .os_errors()
+            .unwrap()
+            .into_iter()
+            .map(|(index, os)| (index, os.name, os.operation))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (1, "ENOTDIR".to_owned(), "mkdir".to_owned()),
+                (2, "ENOENT".to_owned(), "mkdir".to_owned()),
+                (4, "ENOENT".to_owned(), "unlink".to_owned()),
+            ]
+        );
+        // Every item succeeding carries no extension.
+        let result = apply_items(&root, [8; 16], &[mkdir(&[b"other"])]).unwrap();
+        assert!(result.extensions.0.is_empty());
+        assert!(result.os_errors().unwrap().is_empty());
     }
 
     #[cfg(unix)]

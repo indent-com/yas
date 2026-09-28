@@ -40,7 +40,7 @@ use yas_wire::{
     state::Watch as StateWatch,
 };
 
-pub use yas_wire::fs::Precondition;
+pub use yas_wire::fs::{OsError, Precondition};
 
 use crate::client::{Client, DEFAULT_REQUEST_TIMEOUT, Hook, Route};
 use crate::error::{Error, Result};
@@ -141,6 +141,72 @@ impl Entry {
     /// Whether this is a directory.
     pub fn is_dir(&self) -> bool {
         self.kind == EntryKind::Directory
+    }
+}
+
+/// What an entry is itself, as [`FsRoot::list_dir`] and [`FsRoot::stat_only`] say (a symlink
+/// is a symlink, a FIFO, socket or device is `Other`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link.
+    Symlink,
+    /// Anything else.
+    Other,
+}
+
+impl Kind {
+    fn from_wire(kind: u8) -> Self {
+        match u64::from(kind) {
+            schema::ENTRY_FILE => Self::File,
+            schema::ENTRY_DIRECTORY => Self::Directory,
+            schema::ENTRY_SYMLINK => Self::Symlink,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// One entry of [`FsRoot::list_dir`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    /// The raw name (one platform component).
+    pub name: Vec<u8>,
+    /// What the entry is itself.
+    pub kind: Kind,
+}
+
+/// What [`FsRoot::stat_only`] says of a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatOnly {
+    /// What it is (what a final symlink leads to, when followed).
+    pub kind: Kind,
+    /// The platform mode (`st_mode`, file-type bits included).
+    pub mode: u32,
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time, Unix nanoseconds.
+    pub modified_unix_ns: i64,
+}
+
+/// The OS error behind a failed FS call (errno's name and what the server was doing), from
+/// servers offering `CAPABILITY_OS_ERROR` ([`Client::fs_capabilities`]).
+pub fn os_error(error: &Error) -> Option<OsError> {
+    match error {
+        Error::Status { extensions, .. } => OsError::from_result_detail(extensions).ok().flatten(),
+        _ => None,
+    }
+}
+
+impl Client {
+    /// The opt-in FS values this server offers: a bitmask of `CAPABILITY_*`
+    /// (`yas_client::wire::schema::fs`), 0 for servers that predate them.
+    pub fn fs_capabilities(&self) -> u32 {
+        self.family_limits(family::FS)
+            .and_then(|limits| wire::Limits::from_extensions(&limits).ok())
+            .map_or(0, |limits| limits.capabilities)
     }
 }
 
@@ -423,6 +489,80 @@ impl FsRoot {
             })
     }
 
+    /// One directory level (`READ_LIST`, following a final symlink to the directory): each
+    /// entry's raw name and own kind, hidden ones included, in no defined order. Needs
+    /// `CAPABILITY_READ_LIST`; a failure carries its [`os_error`].
+    pub async fn list_dir(&self, directory: &str) -> Result<Vec<DirEntry>> {
+        let content = self
+            .read_question(directory, schema::READ_LIST as u16, true)
+            .await?;
+        Ok(wire::ListEntry::decode_list(&content)?
+            .into_iter()
+            .map(|entry| DirEntry {
+                name: entry.name,
+                kind: Kind::from_wire(entry.kind),
+            })
+            .collect())
+    }
+
+    /// The canonical absolute platform path, every symlink resolved (`READ_REALPATH`).
+    /// Needs `CAPABILITY_READ_REALPATH`; a failure carries its [`os_error`].
+    pub async fn realpath(&self, path: &str) -> Result<Vec<u8>> {
+        self.read_question(path, schema::READ_REALPATH as u16, true)
+            .await
+    }
+
+    /// `stat(2)` (`follow`) or `lstat(2)` without reading or hashing anything
+    /// (`READ_STAT_ONLY`). Needs `CAPABILITY_READ_STAT_ONLY`; a failure carries its
+    /// [`os_error`].
+    pub async fn stat_only(&self, path: &str, follow: bool) -> Result<StatOnly> {
+        let content = self
+            .read_question(path, schema::READ_STAT_ONLY as u16, follow)
+            .await?;
+        let stat = wire::StatOnly::decode(&content)?;
+        Ok(StatOnly {
+            kind: Kind::from_wire(stat.kind),
+            mode: stat.mode,
+            size: stat.size,
+            modified_unix_ns: stat.modified_unix_ns,
+        })
+    }
+
+    /// Ask one READ question whose failure may carry an OS error as its content.
+    async fn read_question(&self, path: &str, kind: u16, follow: bool) -> Result<Vec<u8>> {
+        let question = ReadQuestion {
+            kind,
+            flags: if follow {
+                0
+            } else {
+                schema::READ_NO_FOLLOW as u16
+            },
+            path: wire_path(path)?,
+        };
+        let records = self.query(vec![question]).await?;
+        let record = records
+            .into_iter()
+            .find_map(|record| match record {
+                QueryRecord::Read(read) if read.question_index == 0 => Some(read),
+                _ => None,
+            })
+            .ok_or_else(|| Error::protocol("FS READ omitted its answer"))?;
+        match Status::from_code(record.status) {
+            Status::Ok => Ok(record.content),
+            status => {
+                let mut extensions = Extensions::default();
+                if let Ok(Some(os)) = record.os_error() {
+                    extensions.0.push(os.result_extension()?);
+                }
+                Err(Error::status_from(
+                    format!("FS READ {path}"),
+                    status,
+                    extensions,
+                ))
+            }
+        }
+    }
+
     async fn read_one(&self, path: &str, kind: u16, follow: bool) -> Result<Option<Vec<u8>>> {
         let question = ReadQuestion {
             kind,
@@ -605,6 +745,58 @@ impl FsRoot {
                 })
                 .await;
         }
+        self.stage_and_commit(
+            wire_path,
+            content,
+            options.precondition.clone(),
+            if options.create_parents {
+                schema::STAGE_CREATE_PARENTS as u16
+            } else {
+                0
+            },
+            options.mode,
+            if options.durable {
+                (schema::COMMIT_SYNC_DATA | schema::COMMIT_SYNC_DIRECTORY) as u16
+            } else {
+                0
+            },
+        )
+        .await
+    }
+
+    /// Write a whole file as `open(2)` with `O_WRONLY|O_CREAT|O_TRUNC` and `write(2)` would
+    /// (`STAGE_IN_PLACE`), as Node's `writeFile` does: through a final symlink, an existing
+    /// file keeping its inode, owner and mode, a new one mode 0666 less the server's umask. Not
+    /// atomic: a failure can leave the file truncated. Needs `CAPABILITY_STAGE_IN_PLACE`; a
+    /// failure carries its [`os_error`].
+    pub async fn write_in_place(&self, path: &str, content: &[u8]) -> Result<Written> {
+        if content.len() as u64 > MAX_FILE_BYTES {
+            return Err(Error::invalid(format!(
+                "file is {} bytes; the YAS limit is {MAX_FILE_BYTES}",
+                content.len()
+            )));
+        }
+        self.stage_and_commit(
+            wire_path(path)?,
+            content,
+            Precondition::Any,
+            schema::STAGE_IN_PLACE as u16,
+            0,
+            0,
+        )
+        .await
+    }
+
+    /// Stage `content` (`STAGE_WRITE`, upload) and `COMMIT` it.
+    async fn stage_and_commit(
+        &self,
+        path: Path,
+        content: &[u8],
+        precondition: Precondition,
+        stage_flags: u16,
+        mode: u32,
+        commit_flags: u16,
+    ) -> Result<Written> {
         let hash = *blake3::hash(content).as_bytes();
         let hook: Hook = Box::new(|prefix: &ResultPrefix| {
             StageWriteResult::decode(&prefix.body)
@@ -618,14 +810,10 @@ impl FsRoot {
                 request_kind::STAGE_WRITE,
                 StageWrite {
                     root_handle: self.handle,
-                    path: wire_path,
-                    precondition: options.precondition.clone(),
-                    flags: if options.create_parents {
-                        schema::STAGE_CREATE_PARENTS as u16
-                    } else {
-                        0
-                    },
-                    mode: options.mode,
+                    path,
+                    precondition,
+                    flags: stage_flags,
+                    mode,
                     byte_len: content.len() as u64,
                     content_hash: hash,
                     initial_receive_credit: content.len() as u64,
@@ -651,11 +839,7 @@ impl FsRoot {
                 &Commit {
                     staging_handle: staged.staging_handle,
                     operation_id: nonzero_id(),
-                    flags: if options.durable {
-                        (schema::COMMIT_SYNC_DATA | schema::COMMIT_SYNC_DIRECTORY) as u16
-                    } else {
-                        0
-                    },
+                    flags: commit_flags,
                     extensions: Extensions::default(),
                 },
             )
@@ -665,6 +849,28 @@ impl FsRoot {
             revision: committed.entry_revision,
             modified_unix_ns: committed.modified_unix_ns,
         })
+    }
+
+    /// `mkdir(2)` of one directory (`mode` less the server's umask; 0: 0777): an existing
+    /// directory is fine, anything else fails with the OS's error (`EEXIST` for an entry already
+    /// there, `ENOENT` without its parent, …), which [`os_error`] names on servers offering
+    /// `CAPABILITY_OS_ERROR`.
+    pub async fn create_dir(&self, path: &str, mode: u32) -> Result<()> {
+        self.apply_one(ApplyItem::Mkdir {
+            path: wire_path(path)?,
+            precondition: Precondition::Any,
+            create_parents: false,
+            mode,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// `unlink(2)` of whatever is there (a directory is removed only when empty, as
+    /// `rmdir(2)`), failing with the OS's error, which [`os_error`] names on servers offering
+    /// `CAPABILITY_OS_ERROR`.
+    pub async fn unlink(&self, path: &str) -> Result<()> {
+        self.remove(path, false, Precondition::Any).await
     }
 
     /// Create a directory. With `parents`, create missing parents too and
@@ -749,6 +955,11 @@ impl FsRoot {
                 },
             )
             .await?;
+        let os = result
+            .os_errors()
+            .ok()
+            .and_then(|errors| errors.into_iter().find(|(index, _)| *index == 0))
+            .map(|(_, os)| os);
         let item = result
             .items
             .into_iter()
@@ -774,6 +985,9 @@ impl FsRoot {
             .result_extension()
         {
             extensions.0.push(extension);
+        }
+        if let Some(os) = os {
+            extensions.0.push(os.result_extension()?);
         }
         Err(Error::Status {
             operation: "FS mutation".into(),

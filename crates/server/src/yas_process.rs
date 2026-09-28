@@ -1186,7 +1186,10 @@ mod tests {
     }
 
     fn residue_request(script: String, grace: Option<Duration>) -> wire::Spawn {
-        let mut request = spawn_request(vec![executable("sh"), b"-c".to_vec(), script.into_bytes()], Vec::new());
+        let mut request = spawn_request(
+            vec![executable("sh"), b"-c".to_vec(), script.into_bytes()],
+            Vec::new(),
+        );
         request.flags = (schema::process::SPAWN_LEAVE_RESIDUE
             | schema::process::SPAWN_MERGE_STDERR
             | schema::process::SPAWN_STDIN_NULL) as u16;
@@ -1218,7 +1221,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(attachment.stdin_window, 0, "the null device has no stdin Transfer");
+        assert_eq!(
+            attachment.stdin_window, 0,
+            "the null device has no stdin Transfer"
+        );
         let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
         let elapsed = started.elapsed();
         let text = String::from_utf8(output).unwrap();
@@ -1228,8 +1234,14 @@ mod tests {
         assert_eq!(exit.kind, wire::ExitKind::Code);
         assert_eq!(exit.code, 3);
         assert_eq!(exit.detail, b"residual process group left running");
-        assert!(elapsed >= Duration::from_millis(300), "waited for the grace: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(2), "did not wait for the residue: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "waited for the grace: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "did not wait for the residue: {elapsed:?}"
+        );
         // Neither the exit, nor the session's end, nor the server's stops what was left running.
         assert!(alive(pid), "the residue runs after the exit");
         session.shutdown().await;
@@ -1256,7 +1268,11 @@ mod tests {
         assert_eq!(output, b"nowlater");
         assert_eq!(exit.kind, wire::ExitKind::Code);
         assert_eq!(exit.code, 0);
-        assert!(exit.detail.is_empty(), "{:?}", String::from_utf8_lossy(&exit.detail));
+        assert!(
+            exit.detail.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&exit.detail)
+        );
         session.shutdown().await;
         server.shutdown().await;
     }
@@ -1289,7 +1305,11 @@ mod tests {
                 Event::Output { stream, data, .. } => {
                     let acked = data.len() as u64;
                     attachment.acknowledge_output(stream, acked).unwrap();
-                    let pid = String::from_utf8(data).unwrap().trim().parse::<i32>().unwrap();
+                    let pid = String::from_utf8(data)
+                        .unwrap()
+                        .trim()
+                        .parse::<i32>()
+                        .unwrap();
                     break (pid, acked);
                 }
                 Event::Exit(exit) => panic!("exited early: {exit:?}"),
@@ -1310,7 +1330,10 @@ mod tests {
         let (_, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), acked).await;
         assert_eq!(exit.kind, wire::ExitKind::Signal);
         assert_eq!(exit.code, libc::SIGTERM);
-        assert!(started.elapsed() < Duration::from_secs(1), "the exit waits for no residue");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the exit waits for no residue"
+        );
         assert!(alive(pid), "the member ignoring SIGTERM outlives it");
         tokio::time::sleep(Duration::from_millis(2_500).saturating_sub(started.elapsed())).await;
         assert!(!alive(pid), "the escalation killed the group");
