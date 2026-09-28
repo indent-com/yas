@@ -139,12 +139,19 @@ pub(crate) async fn cmd_send(
         return Ok(());
     }
     let mut client = crate::yas_native::connect(on, hub).await?;
+    let record = find_terminal(&mut client, id).await?;
+    if record.lifecycle == terminal::Lifecycle::Exited {
+        return Err(format!(
+            "cannot send to pty {id}: it has {} (`yas terminal restart {id}` re-runs it)",
+            terminal_status(&record)?
+        ));
+    }
     client
         .send_typed_event(
             family::TERMINAL,
             terminal::event_kind::WRITE,
             &terminal::Write {
-                terminal_handle: terminal_handle(id)?,
+                terminal_handle: record.terminal_handle,
                 data: bytes,
             },
             true,
