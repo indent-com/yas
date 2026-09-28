@@ -342,6 +342,12 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   cache and runtime directories by default); `connect()` hands it a fresh
   socketpair per session, `socket_path()` exposes its private socket for
   `YAS_SOCK`, and dropping it (or the host process dying) stops the server.
+- **Pipes**: `Transport::from_split(child_stdout, child_stdin)` and
+  `Client::from_transport` run a session over a child's pipes. Run
+  `yas connect --stdio` at the other end (an SSH exec channel, or
+  `docker exec -i CONTAINER yas connect --stdio`) and it relays them to that
+  side's server
+  ([docs/transports.md](docs/transports.md#standard-io-yas-connect---stdio)).
 
 `cargo run -p yas-client --example run -- local -- uname -a` is a complete
 example; `crates/cli/tests/client_host.rs` exercises the API end to end.

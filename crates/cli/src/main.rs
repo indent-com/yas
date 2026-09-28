@@ -1,5 +1,6 @@
 mod cli;
 mod completion;
+mod connect;
 mod events_human;
 mod forward;
 mod generate;
@@ -1079,6 +1080,16 @@ async fn async_main() {
                 Err(e) => Err(e),
             };
             match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("yas: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Connect { stdio: _, no_start } => {
+            let conn = &cli.connect;
+            match connect::cmd_connect_stdio(conn.on.as_deref(), &conn.hub, !no_start).await {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("yas: {e}");

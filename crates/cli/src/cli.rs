@@ -622,6 +622,30 @@ pub enum Command {
         listen: String,
     },
 
+    /// Carry a native YAS session over this process's stdin and stdout
+    ///
+    /// With --stdio, stdin and stdout become one YAS session with the server
+    /// (`--on` picks it; the local server by default, started if none runs).
+    /// A program that can only run commands, such as `ssh host yas connect
+    /// --stdio` or `docker exec -i CONTAINER yas connect --stdio`, then speaks
+    /// YAS to that server through the command's pipes. Nothing else is written
+    /// to stdout; errors go to stderr. When stdin ends the server is told, and
+    /// the command exits once the server closes the session.
+    ///
+    /// Examples:
+    ///   ssh host yas connect --stdio
+    ///   docker exec -i sandbox yas connect --stdio
+    ///   yas --on socket:/run/yas/app.sock connect --stdio --no-start
+    Connect {
+        /// Relay the session over stdin and stdout (the only mode)
+        #[arg(long, required = true)]
+        stdio: bool,
+
+        /// Fail instead of starting the local server when none runs
+        #[arg(long)]
+        no_start: bool,
+    },
+
     /// Print the full CLI reference (usage guide for scripts and LLM agents)
     Learn,
     /// Run the yas terminal multiplexer server

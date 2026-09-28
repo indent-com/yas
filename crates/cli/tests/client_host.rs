@@ -826,3 +826,80 @@ async fn files_answer_as_the_os_does() {
         pair("ENOENT", "unlink")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_stdio_carries_a_session_over_a_childs_pipes() {
+    let server = start().await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_yas"))
+        .arg("--on")
+        .arg(format!("socket:{}", server.socket_path().display()))
+        .args(["connect", "--stdio", "--no-start"])
+        .env("YAS_PROXY", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let transport = yas_client::transport::Transport::from_split(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+    );
+    let client = tokio::time::timeout(
+        TIMEOUT,
+        Client::from_transport(transport, &HelloOptions::named("stdio-test")),
+    )
+    .await
+    .expect("HELLO over the pipes timed out")
+    .unwrap();
+    assert_eq!(client.server_name(), server.name());
+
+    // A whole process round trip, with more output than one pipe buffer.
+    let output = client
+        .spawn(Command::new("sh").args(["-c", "echo over-stdio; head -c 300000 /dev/zero"]))
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(output.stdout.starts_with(b"over-stdio\n"));
+    assert_eq!(output.stdout.len(), "over-stdio\n".len() + 300_000);
+
+    // Closing the session ends the relay cleanly, with nothing on stderr.
+    client.close();
+    drop(client);
+    let status = tokio::time::timeout(TIMEOUT, child.wait())
+        .await
+        .expect("connect --stdio outlived its session")
+        .unwrap();
+    let mut stderr = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr)
+        .await
+        .unwrap();
+    assert!(status.success(), "{status}: {stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_stdio_reports_an_unreachable_server_on_stderr_only() {
+    let root = tempfile::tempdir().unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_yas"))
+        .arg("--on")
+        .arg(format!(
+            "socket:{}",
+            root.path().join("nobody.sock").display()
+        ))
+        .args(["connect", "--stdio", "--no-start"])
+        .env("YAS_PROXY", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "stdout stays clean: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("yas: "),
+        "{output:?}"
+    );
+}

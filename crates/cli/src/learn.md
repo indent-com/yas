@@ -417,6 +417,20 @@ what marks it as a location; a bare word stays a command). Locations are
 remembered per server in its KV store, and the focused pane takes over the
 status bar with back/forward/reload and its title.
 
+## A session over pipes
+
+`yas connect --stdio` relays one native YAS session over its stdin and stdout
+to the server `--on` names (the local one by default, started unless
+`--no-start`). Use it where only a command with pipes gets through:
+
+```bash
+ssh host yas connect --stdio                  # SSH exec, no socket forwarding
+docker exec -i sandbox yas connect --stdio    # into a container's server
+```
+
+Stdout carries only the session; errors go to stderr and exit 1. It ends when
+the server closes, which it does after stdin ends. It refuses a terminal.
+
 ## Port forwarding
 
 Forward local ports to whatever the server can reach — `ssh -L` over any yas

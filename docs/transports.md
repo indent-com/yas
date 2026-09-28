@@ -145,6 +145,30 @@ Closing the channel shuts down the server. SIGTERM, SIGINT, and native Shutdown
 requests stop both the fd-channel receiver and the ordinary socket listener;
 shutdown remains visible to either task if it starts waiting later.
 
+### Standard I/O (`yas connect --stdio`)
+
+`yas connect --stdio` turns its own stdin and stdout into one native YAS
+session: it connects to the server `--on` names (the default target, else the
+local server, which it starts unless `--no-start` is given) and relays bytes
+both ways without looking at them. The peer on the pipes runs the whole YAS
+handshake. This reaches YAS through anything that can run a command with pipes
+and nothing more: an SSH exec channel (`ssh host yas connect --stdio`),
+`docker exec -i CONTAINER yas connect --stdio`, or a child process.
+
+- Stdout carries only the session. Errors go to stderr, and a connection that
+  fails exits 1 before any byte is written.
+- When stdin ends, the server's side is shut down for writing. The relay keeps
+  delivering what the server still sends, and exits 0 once the server closes.
+  If whoever reads stdout goes away, it exits 0 too.
+- It refuses to run on a terminal, whose line discipline would corrupt the
+  binary stream.
+- Only the reliable stream is relayed. A server reached over WebTransport or
+  WebRTC works, but without unreliable datagrams.
+
+In Rust, `yas_client::transport::Transport::from_split(child_stdout,
+child_stdin)` wraps the pipes and `Client::from_transport` runs HELLO over them
+([EMBEDDING.md](../EMBEDDING.md#rust-yas-client)).
+
 ---
 
 ## WebSocket
