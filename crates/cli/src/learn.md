@@ -142,6 +142,8 @@ yas terminal journal "$ID" --json
 ```
 
 `--wait` blocks server-side until the command finishes (exit 124 on timeout).
+Without an index it waits for the running command, or the next one to start if
+none is running, so a finished command is never mistaken for the one just sent.
 `wait --pattern` matches only output produced after the wait began.
 
 ## Terminal lifecycle

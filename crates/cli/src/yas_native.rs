@@ -1388,7 +1388,7 @@ fn wire_error(error: yas_wire::Error) -> String {
     format!("YAS wire error: {error}")
 }
 
-fn format_result_detail(detail: &Extensions) -> String {
+pub(crate) fn format_result_detail(detail: &Extensions) -> String {
     if detail.0.is_empty() {
         "no detail".to_string()
     } else {

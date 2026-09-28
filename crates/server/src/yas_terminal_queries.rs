@@ -49,6 +49,9 @@ pub(crate) enum Error {
     NotFound,
     Stale,
     TooLarge,
+    /// A command wait ran out of time before any command it could report on
+    /// had started.
+    Timeout,
     Internal,
 }
 
@@ -983,8 +986,13 @@ fn poll_command_wait(pty: &Pty, index: u64, timed_out: bool) -> Result<Option<Wa
     if !satisfied && !timed_out && !pty.exited {
         return Ok(None);
     }
-    if record.is_none() && (timed_out || pty.exited || index < pty.journal.oldest_index()) {
-        return Err(Error::NotFound);
+    if record.is_none() {
+        if pty.exited || index < pty.journal.oldest_index() {
+            return Err(Error::NotFound);
+        }
+        if timed_out {
+            return Err(Error::Timeout);
+        }
     }
     let records = record
         .map(|record| journal_record(pty_generation(pty), record))

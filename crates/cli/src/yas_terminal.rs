@@ -6,12 +6,17 @@ pub(crate) mod stream;
 use std::time::Duration;
 
 use yas_wire::{
-    Class, Decode, Encode, Extension, Extensions, family,
+    Class, Decode, Encode, Extension, Extensions,
+    core::Status,
+    family,
     state::{Phase, RecordKind, StateAck, StateEvent, Watch, WatchResult},
     terminal,
 };
 
-use crate::{terminal_args, yas_native::NativeClient};
+use crate::{
+    terminal_args,
+    yas_native::{NativeClient, format_result_detail},
+};
 
 const NS_PER_SECOND: u64 = 1_000_000_000;
 const QUERY_CREDIT: u64 = 1024 * 1024;
@@ -486,26 +491,43 @@ pub(crate) async fn cmd_output(
             } else {
                 yas_wire::schema::terminal::WAIT_LATEST_COMMAND as u8
             };
-            let query = terminal_query(
-                &mut client,
-                terminal::request_kind::WAIT,
-                &terminal::Wait {
-                    terminal_handle: terminal_record.terminal_handle,
-                    generation: terminal_record.generation,
-                    wait_kind,
-                    flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
-                    cursor_a: index.unwrap_or(0),
-                    cursor_b: 0,
-                    max_bytes,
-                    timeout_ns: timeout.saturating_mul(NS_PER_SECOND).max(1),
-                    needle: Vec::new(),
-                    initial_receive_credit: QUERY_CREDIT,
-                    extensions: Extensions::default(),
-                },
-                MAX_QUERY_BYTES,
-                Duration::from_secs(timeout.saturating_add(2)),
-            )
-            .await?;
+            let request = terminal::Wait {
+                terminal_handle: terminal_record.terminal_handle,
+                generation: terminal_record.generation,
+                wait_kind,
+                flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
+                cursor_a: index.unwrap_or(0),
+                cursor_b: 0,
+                max_bytes,
+                timeout_ns: timeout.saturating_mul(NS_PER_SECOND).max(1),
+                needle: Vec::new(),
+                initial_receive_credit: QUERY_CREDIT,
+                extensions: Extensions::default(),
+            };
+            let prefix = client
+                .request_result_with_timeout(
+                    family::TERMINAL,
+                    terminal::request_kind::WAIT,
+                    request.encode().map_err(wire_error)?,
+                    true,
+                    Duration::from_secs(timeout.saturating_add(2)),
+                )
+                .await?;
+            match prefix.status {
+                Status::Ok => {}
+                Status::Timeout => {
+                    eprintln!("yas: timed out waiting for a command in pty {id}");
+                    return Ok(124);
+                }
+                Status::NotFound => return Err(format!("pty {id}: no such command")),
+                status => {
+                    return Err(format!(
+                        "YAS Terminal WAIT failed with {status:?}: {}",
+                        format_result_detail(&prefix.detail)
+                    ));
+                }
+            }
+            let query = collect_query(&mut client, &prefix.body, MAX_QUERY_BYTES).await?;
             expect_content(&query, yas_wire::schema::terminal::CONTENT_JOURNAL as u8)?;
             let result =
                 terminal::JournalResult::decode(&query_bytes(query).await?).map_err(wire_error)?;
@@ -578,6 +600,15 @@ pub(crate) async fn cmd_output(
                 format_cursor(output.next_seq, output.next_col)
             );
         }
+    }
+    if let Some(record) = waited.as_ref().filter(|record| {
+        journal_running(record)
+            && record.flags & yas_wire::schema::terminal::JOURNAL_PTY_EXITED as u16 == 0
+    }) {
+        eprintln!(
+            "yas: timed out waiting for command {} in pty {id}",
+            record.index
+        );
     }
     Ok(waited.as_ref().map_or(0, journal_exit_code))
 }
@@ -760,7 +791,15 @@ async fn terminal_query<Request: Encode>(
             timeout,
         )
         .await?;
-    let query = terminal::QueryBody::decode(&body).map_err(wire_error)?;
+    collect_query(client, &body, maximum).await
+}
+
+async fn collect_query(
+    client: &mut NativeClient,
+    body: &[u8],
+    maximum: u64,
+) -> Result<CollectedQuery, String> {
+    let query = terminal::QueryBody::decode(body).map_err(wire_error)?;
     query
         .validate_receive_credit(QUERY_CREDIT)
         .map_err(wire_error)?;
