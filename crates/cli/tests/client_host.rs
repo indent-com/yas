@@ -391,7 +391,7 @@ async fn a_commands_background_children_die_with_it() {
         .output()
         .await
         .unwrap();
-    assert!(output.status.success());
+    assert!(output.status.success(), "{output:?}");
     let pid: i32 = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()

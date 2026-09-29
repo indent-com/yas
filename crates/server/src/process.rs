@@ -307,6 +307,10 @@ const PROCESS_SPAWN_LEAVE_RESIDUE: u8 = process_schema::SPAWN_LEAVE_RESIDUE as u
 const PROCESS_SPAWN_STDIN_NULL: u8 = process_schema::SPAWN_STDIN_NULL as u8;
 /// What a LEAVE_RESIDUE exit says when group members still held its streams.
 const RESIDUE_LEFT_RUNNING: &str = "residual process group left running";
+/// How long the final SIGKILL of a finished command's group waits for members
+/// that are already zombies to be reaped (see `kill_group_until_gone`).
+#[cfg(unix)]
+const RESIDUAL_ZOMBIE_WAIT: Duration = Duration::from_secs(1);
 const PROCESS_STREAM_STDOUT: u8 = process_schema::STREAM_STDOUT_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDERR: u8 = process_schema::STREAM_STDERR_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDIN_ACCEPTING: u8 = 1 << 0;
@@ -3076,6 +3080,9 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
         // The direct child is already reaped, so this targets only residual
         // group/job members. Running it as soon as their inherited pipes close
         // also avoids a Unix process-group-ID reuse window.
+        #[cfg(unix)]
+        let cleanup_failed = !kill_group_until_gone(record.pid, RESIDUAL_ZOMBIE_WAIT).await;
+        #[cfg(windows)]
         let cleanup_failed = force_kill(&record)
             .err()
             .is_some_and(|error| !process_tree_already_absent(&error));
@@ -3626,6 +3633,31 @@ fn process_tree_already_absent(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
+/// SIGKILL a process group; true once nothing is left of it.
+///
+/// macOS answers EPERM, not ESRCH, for a group whose remaining members are
+/// all zombies: XNU's killpg1 skips zombies, then has found nobody to signal.
+/// Orphans are reaped by init at once, so on EPERM this retries for up to
+/// `wait` for the group to disappear before it counts as a failure (a member
+/// this user may not signal, as on Linux).
+#[cfg(unix)]
+async fn kill_group_until_gone(pid: ProcessId, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match signal_group(pid, libc::SIGKILL) {
+            Ok(()) => return true,
+            Err(error) if process_tree_already_absent(&error) => return true,
+            Err(error)
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn process_group_absent(record: &Record) -> bool {
     signal_group(record.pid, 0)
@@ -3847,6 +3879,52 @@ mod maxima_tests {
                 .validate()
                 .unwrap_err()
                 .contains("processes per session")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod residual_tests {
+    use super::*;
+
+    /// A group whose members are all zombies waiting for their reaper is gone
+    /// as far as cleanup goes. macOS answers `kill(-pgid)` with EPERM, not
+    /// ESRCH, when only zombies are left (XNU's killpg1 skips them). The
+    /// background child that the group SIGTERM had just killed, and launchd
+    /// had not reaped yet, made the final SIGKILL of a finished command "fail",
+    /// and its exit turned into a host failure.
+    #[tokio::test]
+    async fn a_group_of_zombies_waiting_for_their_reaper_counts_as_gone() {
+        let pid = crate::pty::fork_child();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::setpgid(pid, pid) };
+        // The child is a zombie now, still unreaped: its group is only a zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
+        // Reap it a moment later, as init reaps an orphan.
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        });
+        let gone = kill_group_until_gone(pid as ProcessId, Duration::from_secs(5)).await;
+        reaper.join().unwrap();
+        assert!(
+            gone,
+            "the SIGKILL of a zombie-only group counted as a failure"
         );
     }
 }
