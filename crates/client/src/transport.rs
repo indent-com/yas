@@ -10,8 +10,8 @@
 //! `ssh:[USER@]HOST[:SOCKET]` (YAS on the remote host, installed if needed),
 //! `ws://`/`wss://` edges (`#passphrase` fragment or `?passphrase=`),
 //! `wt://` WebTransport edges, `uplink:` routes, `share:` WebRTC shares,
-//! `proxy:URI` (force the shared yas-proxy daemon), or a name from
-//! `yas.remotes`.
+//! `proxy:URI` (force the shared yas-proxy daemon), or a remote name from
+//! the home server's catalogue.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -753,24 +753,92 @@ pub async fn connect_via_composite_proxy(
 ///
 /// SSH resolves the canonical YAS socket and WebSocket negotiates `yas.v1`.
 /// Keeping that choice out of the byte stream prevents protocol sniffing.
+///
+/// Anything that is not a URI is a remote name, looked up in the home
+/// server's catalogue when [`ConnectOptions::remotes`] is set (see
+/// [`resolve_remote_name`]).
 pub async fn connect_uri(uri: &str, options: &ConnectOptions) -> Result<Transport, String> {
-    Box::pin(connect_uri_inner(
-        uri,
-        options,
-        std::collections::HashSet::new(),
-    ))
-    .await
+    if is_target_uri(uri) || !options.remotes {
+        return Box::pin(connect_target_uri(uri, options)).await;
+    }
+    let entries = home_remotes(options)
+        .await
+        .map_err(|error| format!("cannot look up remote '{uri}' on the home server: {error}"))?;
+    let resolved = resolve_remote_name(uri, &entries)?;
+    Box::pin(connect_target_uri(&resolved, options)).await
+}
+
+/// Where the catalogue lives. Must match `yas_server::relay::REMOTES_KEY`.
+const REMOTES_KEY: &[u8] = b"remotes";
+
+const TARGET_SCHEMES: &[&str] = &[
+    "proxy:", "ssh:", "tcp:", "wt://", "ws://", "wss://", "uplink:", "socket:", "share:", "local:",
+];
+
+fn is_target_uri(uri: &str) -> bool {
+    uri == "local" || TARGET_SCHEMES.iter().any(|scheme| uri.starts_with(scheme))
+}
+
+/// The home server's remotes catalogue, for resolving a bare target name.
+///
+/// The home server is the local default instance (`YAS_SOCK`, else the
+/// default socket), never the configured target: resolving `yas.target`
+/// through itself would recurse, and the home server is where
+/// `yas remote add` without `--on` writes.
+async fn home_remotes(
+    options: &ConnectOptions,
+) -> Result<Vec<yas_webserver::config::RemoteEntry>, String> {
+    let transport = connect_local(None, options).await?;
+    let client = crate::Client::from_transport(transport, &options.hello).await?;
+    let catalogue = client.kv(b"").await?;
+    let value = catalogue.get(REMOTES_KEY).await?;
+    // A missing key is an empty catalogue: a server with no remotes has
+    // never written one.
+    Ok(value.map_or_else(Vec::new, |value| {
+        yas_webserver::config::parse_remotes_full(&String::from_utf8_lossy(&value.value))
+    }))
+}
+
+/// Follow `name` through the catalogue to a URI. An entry may name another
+/// entry; disabled entries do not resolve.
+fn resolve_remote_name(
+    name: &str,
+    entries: &[yas_webserver::config::RemoteEntry],
+) -> Result<String, String> {
+    let mut visited = std::collections::HashSet::new();
+    let mut current = name;
+    loop {
+        if !visited.insert(current) {
+            return Err(format!("remotes: cycle detected resolving '{name}'"));
+        }
+        let Some(entry) = entries.iter().rev().find(|entry| entry.name == current) else {
+            return Err(if current == name {
+                format!(
+                    "unknown target '{name}' \
+                     (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, uplink:, proxy:, \
+                     local[:NAME], or a remote name from `yas remote list` on the home server)"
+                )
+            } else {
+                format!("remote '{name}' refers to '{current}', which is not a configured remote")
+            });
+        };
+        if entry.disabled {
+            return Err(format!(
+                "remote '{current}' is disabled; enable it with `yas remote toggle {current}`"
+            ));
+        }
+        if is_target_uri(&entry.uri) {
+            return Ok(entry.uri.clone());
+        }
+        current = &entry.uri;
+    }
 }
 
 fn proxy_executable(options: &ConnectOptions) -> Option<&Path> {
     options.executable.as_deref().filter(|_| options.proxy)
 }
 
-async fn connect_uri_inner(
-    uri: &str,
-    options: &ConnectOptions,
-    mut visited: std::collections::HashSet<String>,
-) -> Result<Transport, String> {
+async fn connect_target_uri(uri: &str, options: &ConnectOptions) -> Result<Transport, String> {
     if let Some(upstream) = uri.strip_prefix("proxy:") {
         let executable = options.executable.as_deref().ok_or_else(|| {
             format!(
@@ -858,20 +926,10 @@ async fn connect_uri_inner(
     if let Some(raw_name) = uri.strip_prefix("local:") {
         return connect_local(Some(raw_name), options).await;
     }
-
-    if options.remotes {
-        let entries = yas_webserver::config::read_remotes();
-        if let Some((_, target_uri)) = entries.into_iter().find(|(name, _)| name == uri) {
-            if !visited.insert(uri.to_string()) {
-                return Err(format!("yas.remotes: cycle detected resolving '{uri}'"));
-            }
-            return Box::pin(connect_uri_inner(&target_uri, options, visited)).await;
-        }
-    }
     Err(format!(
         "unknown target '{uri}' \
-         (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], \
-          or a name from yas.remotes)"
+         (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, uplink:, proxy:, \
+         or local[:NAME])"
     ))
 }
 
@@ -1417,5 +1475,80 @@ mod tests {
         drop(client);
         let result = read_frame(&mut server).await.unwrap();
         assert_eq!(result, payload);
+    }
+
+    fn remote(name: &str, uri: &str, disabled: bool) -> yas_webserver::config::RemoteEntry {
+        yas_webserver::config::RemoteEntry {
+            name: name.into(),
+            uri: uri.into(),
+            disabled,
+        }
+    }
+
+    #[test]
+    fn target_uris_are_not_names() {
+        for uri in [
+            "local",
+            "local:work",
+            "socket:/tmp/yas.sock",
+            "ssh:alice@host",
+            "tcp:127.0.0.1:1",
+            "ws://h",
+            "wss://h",
+            "wt://h",
+            "share:pass",
+            "uplink:https://relay#token",
+            "proxy:ssh:host",
+        ] {
+            assert!(is_target_uri(uri), "{uri}");
+        }
+        for name in ["work", "localhost", "rabbit"] {
+            assert!(!is_target_uri(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn remote_name_resolves_through_catalogue() {
+        let entries = [
+            remote("work", "socket:/tmp/work.sock", false),
+            remote("alias", "work", false),
+            remote("secret", "share:passphrase", false),
+        ];
+        assert_eq!(
+            resolve_remote_name("work", &entries).unwrap(),
+            "socket:/tmp/work.sock"
+        );
+        assert_eq!(
+            resolve_remote_name("alias", &entries).unwrap(),
+            "socket:/tmp/work.sock"
+        );
+        assert_eq!(
+            resolve_remote_name("secret", &entries).unwrap(),
+            "share:passphrase"
+        );
+    }
+
+    #[test]
+    fn remote_name_errors_are_specific() {
+        let entries = [
+            remote("off", "ssh:host", true),
+            remote("via-off", "off", false),
+            remote("a", "b", false),
+            remote("b", "a", false),
+            remote("dangling", "missing", false),
+            remote("secret", "share:passphrase", true),
+        ];
+        let unknown = resolve_remote_name("nope", &entries).unwrap_err();
+        assert!(unknown.starts_with("unknown target 'nope'"), "{unknown}");
+        let disabled = resolve_remote_name("off", &entries).unwrap_err();
+        assert!(disabled.contains("'off' is disabled"), "{disabled}");
+        let through = resolve_remote_name("via-off", &entries).unwrap_err();
+        assert!(through.contains("'off' is disabled"), "{through}");
+        let cycle = resolve_remote_name("a", &entries).unwrap_err();
+        assert!(cycle.contains("cycle"), "{cycle}");
+        let dangling = resolve_remote_name("dangling", &entries).unwrap_err();
+        assert!(dangling.contains("'missing'"), "{dangling}");
+        let secret = resolve_remote_name("secret", &entries).unwrap_err();
+        assert!(!secret.contains("passphrase"), "{secret}");
     }
 }

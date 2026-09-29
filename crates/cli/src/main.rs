@@ -1250,7 +1250,13 @@ fn mask_remote_credentials(uri: &str) -> String {
 /// catalogue is (`crates/cli/src/yas_remotes.rs`). `set-default` stays local:
 /// which server *this* CLI talks to by default is this machine's business, not
 /// something a server should hold an opinion about.
+///
+/// Without `--on` the verbs edit the home server, not `YAS_TARGET` or
+/// `yas.target`: names resolve against the home catalogue, so after
+/// `set-default work` a `toggle work` must still reach the catalogue that
+/// defines `work`.
 async fn cmd_remote(cmd: RemoteCommand, on: Option<&str>, hub: &str) -> Result<(), String> {
+    let on = Some(on.unwrap_or("local"));
     match cmd {
         RemoteCommand::List { reveal } => {
             let entries = yas_remotes::read(on, hub).await?;

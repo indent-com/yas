@@ -308,7 +308,7 @@ expectation.
 
 ### A named list: `yas.forwards`
 
-The same shape as `yas.remotes` ([../README.md](../../README.md),
+The same shape as the legacy `yas.remotes` file ([../README.md](../../README.md),
 [crates/webserver/src/config.rs](../../crates/webserver/src/config.rs)):
 its own ordered file at `~/.config/yas/yas.forwards`, `name = spec`
 per line, `#`-prefixed lines meaning **disabled but preserved**, mode 0600. `yas.conf` is a flat key→value map and cannot hold an ordered

@@ -66,7 +66,8 @@ pub struct Cli {
 #[derive(Args, Clone)]
 pub struct ConnectOpts {
     /// Remote to connect to: a URI (ssh:host, tcp:h:p, socket:/p, share:pass, local[:name])
-    /// or a named remote from yas.remotes. Overrides YAS_TARGET and yas.conf `target`.
+    /// or the name of a remote on the home server (see `yas remote`). Overrides
+    /// YAS_TARGET and yas.conf `yas.target`.
     #[arg(long, global = true)]
     pub on: Option<String>,
 
@@ -457,11 +458,16 @@ pub enum Command {
     /// Execute a process and connect its standard streams
     Run(RunArgs),
 
-    /// Manage named remotes in yas.remotes
+    /// Manage the server's named remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
-    /// name instead of a full URI.  They are stored in ~/.config/yas/yas.remotes
-    /// (mode 0o600) and can also be set as the default target via `yas.conf`.
+    /// name instead of a full URI. They are stored in a server's KV store (the
+    /// `remotes` key), which is also the catalogue its Relay publishes to the
+    /// browser. These verbs edit the home server (YAS_SOCK, else the default
+    /// local instance) unless --on names another; YAS_TARGET and `yas.target`
+    /// do not redirect them. `--on NAME`, YAS_TARGET, and `yas.target` look
+    /// names up on the home server. A legacy ~/.config/yas/yas.remotes file is
+    /// imported once into a server that has no catalogue yet.
     ///
     /// Examples:
     ///   yas remote add rabbit ssh:rabbit
@@ -481,9 +487,9 @@ pub enum Command {
     #[command(
         about = "Open the terminal UI in the browser",
         long_about = "Open the terminal UI in the browser\n\n\
-            Opens the browser with all named remotes from ~/.config/yas/yas.remotes\n\
-            plus the local yas server. Manage remotes with `yas remote add/remove`\n\
-            or through the Remotes dialog in the browser.\n\n\
+            Opens the browser on the local yas server, with that server's named\n\
+            remotes reachable through its Relay. Manage remotes with\n\
+            `yas remote add/remove` or through the Remotes dialog in the browser.\n\n\
             Examples:\n\
               yas open                        # local + all configured remotes\n\
               yas remote add rabbit ssh:rabbit\n\
@@ -2755,8 +2761,8 @@ pub enum RemoteCommand {
     },
 
     /// Disable or enable a named remote without removing it.
-    /// Disabled remotes are kept in yas.remotes (commented out) and excluded
-    /// from connection resolution until re-enabled.
+    /// Disabled remotes stay in the catalogue but are not published by the
+    /// Relay, and `--on NAME` refuses them until re-enabled.
     Toggle {
         /// Name of the remote to toggle
         name: String,
@@ -2764,8 +2770,9 @@ pub enum RemoteCommand {
 
     /// Set the default remote in yas.conf
     ///
-    /// After this, all agent subcommands (list, start, show, …) will connect
-    /// to this remote by default, without needing --on.
+    /// Writes `yas.target` in this machine's yas.conf. After this, commands
+    /// without --on connect to this remote. A name is looked up on the home
+    /// server at each connection.
     SetDefault {
         /// Name or URI to use as the default target.
         /// Pass an empty string or "local" to reset to local.

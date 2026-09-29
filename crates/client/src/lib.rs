@@ -14,7 +14,7 @@
 //! use yas_client::{Client, ConnectOptions};
 //!
 //! // Any target the CLI accepts: local[:NAME], socket:PATH, ssh:[USER@]HOST,
-//! // tcp:, ws(s)://, wt://, uplink:, share:, or a yas.remotes name.
+//! // tcp:, ws(s)://, wt://, uplink:, share:, or a remote name.
 //! let client = Client::connect(Some("ssh:build@ci.example"), &ConnectOptions::default()).await?;
 //! println!("connected to {} {}", client.server_name(), client.hello().server_release);
 //! # Ok(()) }

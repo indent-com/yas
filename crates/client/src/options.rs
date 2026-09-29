@@ -126,7 +126,8 @@ pub struct ConnectOptions {
     /// Start `local` / `local:NAME` servers that are not running (needs
     /// [`ConnectOptions::executable`]).
     pub start_local: bool,
-    /// Resolve bare target names through the user's `yas.remotes` file.
+    /// Resolve bare target names through the home server's remotes catalogue
+    /// (the `remotes` KV key on the local default server).
     pub remotes: bool,
     /// The SSH pool for `ssh:` targets. Build one with
     /// [`yas_ssh::SshPool::with_options`] to use in-memory keys and pinned
