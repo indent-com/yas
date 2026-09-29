@@ -10,9 +10,9 @@
  * `@yas-run/core` / `@yas-run/core/transports` instead.
  */
 
-export { NodeUnixSocketTransport } from "./transports/unix";
-export { BunUnixSocketTransport } from "./transports/unix-bun";
-export { DenoUnixSocketTransport } from "./transports/unix-deno";
-export type { UnixSocketTransportOptions } from "./transports/unix-base";
+export { NodeUnixSocketTransport } from "./transports/unix.js";
+export { BunUnixSocketTransport } from "./transports/unix-bun.js";
+export { DenoUnixSocketTransport } from "./transports/unix-deno.js";
+export type { UnixSocketTransportOptions } from "./transports/unix-base.js";
 
-export { loadYasWasm } from "./node-wasm";
+export { loadYasWasm } from "./node-wasm.js";

@@ -1,13 +1,13 @@
-import type { SurfaceId } from "../types";
+import type { SurfaceId } from "../types.js";
 import type {
   LayoutNode,
   LayoutSplit,
   LayoutChild,
   LayoutLeaf,
   LayoutRect,
-} from "./model";
+} from "./model.js";
 
-export type { WorkspaceLayout } from "./model";
+export type { WorkspaceLayout } from "./model.js";
 
 export interface LayoutPane {
   id: string;

@@ -1,7 +1,7 @@
 /** YAS Process family v1 codecs and browser client. */
 
-import * as g from "./generated";
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
+import * as g from "./generated.js";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -18,7 +18,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_RECEIVER_TO_SENDER,
@@ -28,7 +28,7 @@ import {
   transfersFor,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -37,7 +37,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FAMILY_PROCESS,
@@ -50,7 +50,7 @@ export {
   YAS_PROCESS_VERSION,
   YAS_PROCESS_WAIT,
   YAS_PROCESS_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export type YasProcessCwd =
   | { kind: "server-default" }

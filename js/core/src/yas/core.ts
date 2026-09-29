@@ -13,7 +13,7 @@ import {
   encodeExtensions,
   validateExtensionBody,
   type YasExtension,
-} from "./wire";
+} from "./wire.js";
 import {
   YAS_CORE_CANCEL,
   YAS_CORE_CLIENT_UPDATE,
@@ -49,7 +49,7 @@ import {
   YAS_OPERATION_DIRECTION_MASKS,
   YAS_RELAY_LIMIT_MAX_LINKS_PER_SESSION,
   YAS_RELAY_LIMIT_MAX_PENDING_CONNECTS,
-} from "./generated";
+} from "./generated.js";
 
 export {
   YAS_CORE_CANCEL,
@@ -66,7 +66,7 @@ export {
   YAS_FAMILY_FONT,
   YAS_FAMILY_RELAY,
   YAS_FAMILY_TRANSFER,
-} from "./generated";
+} from "./generated.js";
 
 export const YAS_RUNTIME_AVAILABLE = YAS_CORE_RUNTIME_AVAILABLE;
 export const YAS_RUNTIME_DEGRADED = YAS_CORE_RUNTIME_DEGRADED;

@@ -15,10 +15,10 @@ import {
   type FsGrepOptions,
   type FsGrepResult,
   type FsSyncOptions,
-} from "../fsModel";
-import { Notifier } from "../reactive";
-import type { SessionId } from "../types";
-import * as g from "./generated";
+} from "../fsModel.js";
+import { Notifier } from "../reactive.js";
+import type { SessionId } from "../types.js";
+import * as g from "./generated.js";
 import {
   YasFsClient,
   decodeFsConflictDetail,
@@ -35,8 +35,8 @@ import {
   type YasFsQueryRecord,
   type YasFsRoot,
   type YasFsRootSource,
-} from "./fs";
-import type { YasConnection } from "./session";
+} from "./fs.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -48,8 +48,8 @@ import {
   YAS_STATE_SNAPSHOT_END,
   YAS_STATE_SNAPSHOT_RECORDS,
   type YasStateBatch,
-} from "./state";
-import { YasProtocolError, YasResultError } from "./wire";
+} from "./state.js";
+import { YasProtocolError, YasResultError } from "./wire.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });

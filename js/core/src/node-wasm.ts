@@ -1,9 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import init from "@yas-run/browser";
-
-import type { YasWasmModule } from "./TerminalStore";
+import type { YasWasmModule } from "./TerminalStore.js";
 
 /**
  * Initialise the `@yas-run/browser` WASM module in a non-browser runtime
@@ -30,7 +28,7 @@ import type { YasWasmModule } from "./TerminalStore";
  */
 export async function loadYasWasm(wasmPath?: string): Promise<YasWasmModule> {
   const mod = (await import("@yas-run/browser")) as unknown as YasWasmModule & {
-    default?: unknown;
+    default?: (options: { module_or_path: unknown }) => Promise<unknown>;
   };
 
   // A self-initializing build (`--target nodejs`/`bundler`) has already
@@ -45,8 +43,6 @@ export async function loadYasWasm(wasmPath?: string): Promise<YasWasmModule> {
     ? fileURLToPath(location)
     : location;
   const bytes = await readFile(path);
-  await init({
-    module_or_path: bytes as unknown as Parameters<typeof init>[0],
-  });
+  await mod.default({ module_or_path: bytes });
   return mod;
 }

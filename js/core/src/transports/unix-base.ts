@@ -2,7 +2,7 @@ import type {
   YasTransport,
   YasTransportOptions,
   ConnectionStatus,
-} from "../types";
+} from "../types.js";
 
 export interface UnixSocketTransportOptions extends YasTransportOptions {}
 

@@ -1,5 +1,5 @@
 import type { YasSession, YasWorkspace } from "@yas-run/core";
-import { createYasWorkspaceState } from "./createYasWorkspace";
+import { createYasWorkspaceState } from "./createYasWorkspace.js";
 
 export function createYasSessions(
   workspace?: YasWorkspace,

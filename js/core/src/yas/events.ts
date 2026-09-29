@@ -1,7 +1,7 @@
 /** YAS process-wide binary event-journal family v1. */
 
-import * as g from "./generated";
-import type { YasConnection } from "./session";
+import * as g from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_SENDER_TO_RECEIVER,
@@ -10,7 +10,7 @@ import {
   transfersFor,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YAS_MAX_DECODED_FRAME,
   YasCursor,
@@ -22,7 +22,7 @@ import {
   encodeExtensions,
   equalBytes,
   type YasExtension,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_EVENTS_DUMP,
@@ -38,7 +38,7 @@ export {
   YAS_EVENTS_STREAM_STOPPED,
   YAS_EVENTS_VERSION,
   YAS_FAMILY_EVENTS,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasEventsConfig {
   revision: bigint;

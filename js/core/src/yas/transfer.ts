@@ -1,5 +1,5 @@
-import { YAS_FAMILY_TRANSFER } from "./core";
-import type { ConnectionStatus } from "../types";
+import { YAS_FAMILY_TRANSFER } from "./core.js";
+import type { ConnectionStatus } from "../types.js";
 import {
   YAS_TRANSFER_BYTE_DATA,
   YAS_TRANSFER_CLOSE,
@@ -18,8 +18,8 @@ import {
   YAS_TRANSFER_SENSITIVE_CONTENT_EXTENSION,
   YAS_TRANSFER_UPLOAD_STAGE_EXTENSION,
   YAS_TRANSFER_VERSION,
-} from "./generated";
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
+} from "./generated.js";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
 import {
   YAS_MAX_BULK_CHUNK,
   YAS_STATUS_CANCELLED,
@@ -32,7 +32,7 @@ import {
   decodeExtensions,
   encodeExtensions,
   type YasExtension,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_TRANSFER_BYTE_DATA,
@@ -43,7 +43,7 @@ export {
   YAS_TRANSFER_MODE_MESSAGE,
   YAS_TRANSFER_RESET,
   YAS_TRANSFER_VERSION,
-} from "./generated";
+} from "./generated.js";
 
 export const YAS_TRANSFER_RECEIVER_TO_SENDER =
   YAS_TRANSFER_DIRECTION_RECEIVER_TO_SENDER;

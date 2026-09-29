@@ -3,9 +3,9 @@ import { connect as netConnect, type Socket } from "node:net";
 import {
   AbstractUnixSocketTransport,
   type UnixSocketTransportOptions,
-} from "./unix-base";
+} from "./unix-base.js";
 
-export type { UnixSocketTransportOptions } from "./unix-base";
+export type { UnixSocketTransportOptions } from "./unix-base.js";
 
 /**
  * Node.js unix-domain-socket transport for `yas server` IPC.

@@ -9,7 +9,7 @@ import {
   type WorkspaceSessionStoreStatus,
   isWorkspaceSessionId,
   workspaceSessionKey,
-} from "./workspaceSessions";
+} from "./workspaceSessions.js";
 import {
   WorkspaceSessionKvConflictError,
   copyWorkspaceSessionHash,
@@ -17,9 +17,9 @@ import {
   type WorkspaceSessionHash,
   type WorkspaceSessionKvEntry,
   type WorkspaceSessionKvWatch,
-} from "./workspaceSessionKv";
-import { YasNativeWorkspaceKv } from "./yas/nativeWorkspaceKv";
-import type { YasConnection } from "./yas/session";
+} from "./workspaceSessionKv.js";
+import { YasNativeWorkspaceKv } from "./yas/nativeWorkspaceKv.js";
+import type { YasConnection } from "./yas/session.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
