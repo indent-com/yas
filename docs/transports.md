@@ -145,6 +145,16 @@ Closing the channel shuts down the server. SIGTERM, SIGINT, and native Shutdown
 requests stop both the fd-channel receiver and the ordinary socket listener;
 shutdown remains visible to either task if it starts waiting later.
 
+On macOS, keep your own descriptor for a passed socket open until the server
+has answered on it (its HELLO reply), and only then close it. XNU's unix-socket
+garbage collector only scans the queues of sockets that are themselves in
+flight, so a passed socket whose every other descriptor is closed looks
+unreachable while it waits in the server's end of the channel: if any unix
+socket on the machine closes before the server takes it, the collector flushes
+it, and the connection reads EOF (its peer gets `EPIPE`). A server that is
+still starting, or busy, loses connections that way. `yas_client::host`
+connects through the server's private socket on macOS instead.
+
 ### Read-only socket
 
 `yas server --read-only-sock PATH` (or `YAS_READ_ONLY_SOCK`, Unix only) listens

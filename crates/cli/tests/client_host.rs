@@ -98,6 +98,41 @@ async fn dropping_the_host_stops_the_server() {
     }
 }
 
+/// A session survives a server that takes its time to pick it up. On macOS
+/// a socketpair end passed over the fd channel and closed here was flushed
+/// by XNU's unix-socket garbage collector whenever a unix socket closed
+/// before the server took it, so the session read EOF (see
+/// `yas_client::host`, macOS).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_survives_a_server_slow_to_take_it() {
+    let server = start().await;
+    let pid = server.pid().unwrap() as i32;
+    // SAFETY: stops the hosted server only; it is resumed below.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let (client, ()) = tokio::join!(tokio::time::timeout(TIMEOUT, server.connect()), async {
+        // Closing unix sockets runs XNU's collector; keep closing some
+        // while the server cannot take the session.
+        for _ in 0..50 {
+            drop(std::os::unix::net::UnixStream::pair().unwrap());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // SAFETY: resumes the server stopped above.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    });
+    let client = client
+        .expect("connect timed out")
+        .expect("the session survives while the server is stopped");
+    let output = client
+        .spawn(Command::new("echo").arg("taken"))
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"taken\n");
+    assert!(server.shutdown().await.unwrap().success());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_server_arguments_fail_start_with_the_log() {
     let error = HostedServer::start(options().arg("--definitely-not-a-flag"))
