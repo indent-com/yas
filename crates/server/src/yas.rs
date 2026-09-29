@@ -8954,7 +8954,16 @@ impl Session {
         let name = format!("yas-app-{instance_id}");
         let path = runtime_dir.join(&name);
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).map_err(|_| Status::Io)?;
+        let listener = UnixListener::bind(&path).map_err(|error| {
+            // The client only sees Io; say which socket, and why (a runtime
+            // directory too long for a socket path, typically).
+            eprintln!(
+                "[surface] cannot bind the app socket {} ({} bytes): {error}",
+                path.display(),
+                path.as_os_str().len()
+            );
+            Status::Io
+        })?;
         let (reply, applied) = std::sync::mpsc::sync_channel(1);
         let submission = submit_app_socket_add_command(
             command_sender,

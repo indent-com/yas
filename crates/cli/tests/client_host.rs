@@ -133,6 +133,47 @@ async fn a_session_survives_a_server_slow_to_take_it() {
     assert!(server.shutdown().await.unwrap().success());
 }
 
+/// The server binds its desktop's Unix sockets in its runtime directory, the
+/// longest a window's `yas-app-<32 hex>-<16 hex>`, and a socket path holds 103
+/// bytes on macOS (107 on Linux). A private root deep enough that `<root>/run`
+/// leaves no room for them still gets a runtime directory that does, the
+/// server's own: private, and gone with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deep_private_root_gets_a_runtime_directory_short_enough_for_sockets() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    // `<root>/run` about 60 bytes, while `<root>/yas.sock` stays well inside
+    // a socket path (macOS's own temporary directory is ~50 bytes already).
+    let depth = 56usize.saturating_sub(base.path().as_os_str().len()).max(1);
+    let root = base.path().join("r".repeat(depth));
+    assert!(root.join("run").as_os_str().len() > 103 - "/yas-app-".len() - 49);
+    let server = tokio::time::timeout(TIMEOUT, HostedServer::start(options().root(&root)))
+        .await
+        .expect("hosted server start timed out")
+        .expect("hosted server starts");
+    let client = server.connect().await.unwrap();
+    let output = client
+        .spawn(Command::new("sh").args(["-c", r#"printf %s "$XDG_RUNTIME_DIR""#]))
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    let run = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap());
+    let app_socket = run.join(format!("yas-app-{}-{}", "0".repeat(32), "0".repeat(16)));
+    assert!(
+        app_socket.as_os_str().len() <= 103,
+        "{} is {} bytes",
+        app_socket.display(),
+        app_socket.as_os_str().len()
+    );
+    let mode = std::fs::metadata(&run).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{} is private", run.display());
+    drop(client);
+    server.shutdown().await.unwrap();
+    assert!(!run.exists(), "{} outlived the server", run.display());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_server_arguments_fail_start_with_the_log() {
     let error = HostedServer::start(options().arg("--definitely-not-a-flag"))

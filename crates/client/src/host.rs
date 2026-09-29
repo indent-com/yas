@@ -39,7 +39,10 @@
 //! [`HostOptions::socket`]), its log (`server.log`) and, with
 //! [`Isolation::Private`] (the default), its state, cache and runtime
 //! directories (`XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`), so
-//! it shares nothing with the user's own YAS servers. The server name
+//! it shares nothing with the user's own YAS servers. The server binds Unix
+//! sockets in its runtime directory (its desktop's), so when `<root>/run`
+//! would be too long for them, it gets a short temporary directory of its
+//! own instead, removed when the server is gone. The server name
 //! (`--name`) is unique unless set.
 //!
 //! The server also listens on that socket, because YAS servers always do;
@@ -92,6 +95,12 @@ pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long [`HostedServer::shutdown`] waits for the server to exit after the
 /// channel closes before killing it, by default.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
+/// The longest private runtime directory a hosted server is given. The
+/// server binds its desktop's app sockets there, `yas-app-<32 hex>-<16 hex>`
+/// (`bind_surface_app_endpoint` in yas-server), and a socket path holds 103
+/// bytes on macOS and the BSDs, 107 on Linux.
+const RUNTIME_DIR_MAX: usize = 103 - "/yas-app-".len() - 32 - 1 - 16;
 
 /// Environment variables removed from an inherited environment.
 const REDIRECTING_VARIABLES: &[&str] = &[
@@ -300,6 +309,8 @@ pub struct HostedServer {
     channel: Mutex<Option<UnixStream>>,
     child: Option<std::process::Child>,
     root: Option<Root>,
+    /// The runtime directory, when `<root>/run` is too long for sockets.
+    short_runtime_dir: Option<tempfile::TempDir>,
     root_path: PathBuf,
     socket: PathBuf,
     name: String,
@@ -380,17 +391,28 @@ impl HostedServer {
                 command.env_remove(key);
             }
         }
+        let mut short_runtime_dir = None;
         if options.isolation == Isolation::Private {
-            for (key, dir) in [
-                ("XDG_STATE_HOME", "state"),
-                ("XDG_CACHE_HOME", "cache"),
-                ("XDG_RUNTIME_DIR", "run"),
-            ] {
+            for (key, dir) in [("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache")] {
                 let path = root_path.join(dir);
                 create_private_dir(&path)
                     .map_err(|error| io_connect("cannot create a private directory", error))?;
                 command.env(key, path);
             }
+            let run = root_path.join("run");
+            let run = if run.as_os_str().len() <= RUNTIME_DIR_MAX {
+                create_private_dir(&run)
+                    .map_err(|error| io_connect("cannot create a private directory", error))?;
+                run
+            } else {
+                let dir = short_private_dir().map_err(|error| {
+                    io_connect(&format!("{} is too long for sockets", run.display()), error)
+                })?;
+                let path = dir.path().to_path_buf();
+                short_runtime_dir = Some(dir);
+                path
+            };
+            command.env("XDG_RUNTIME_DIR", run);
         }
         if !options.compositor {
             command.env("YAS_SKIP_COMPOSITOR", "1");
@@ -450,6 +472,7 @@ impl HostedServer {
             channel: Mutex::new(Some(ours)),
             child: Some(child),
             root: Some(root),
+            short_runtime_dir,
             root_path,
             socket,
             name,
@@ -675,6 +698,7 @@ impl Drop for HostedServer {
             return;
         };
         let root = self.root.take();
+        let short_runtime_dir = self.short_runtime_dir.take();
         // The server shuts down on channel EOF; reap it off-thread so drop
         // does not block, and kill it if it overstays the grace period.
         std::thread::spawn(move || {
@@ -696,7 +720,7 @@ impl Drop for HostedServer {
                     Ok(None) => std::thread::sleep(Duration::from_millis(20)),
                 }
             }
-            drop(root);
+            drop((root, short_runtime_dir));
         });
     }
 }
@@ -713,6 +737,38 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 /// Whether sessions connect to the private socket instead of being passed
 /// over the channel (see [macOS](self#macos)).
 const SESSIONS_OVER_SOCKET: bool = cfg!(target_vendor = "apple");
+
+/// A fresh 0700 directory whose path fits [`RUNTIME_DIR_MAX`]: in this
+/// user's `XDG_RUNTIME_DIR`, else the temporary directory, else `/tmp`
+/// (macOS's temporary directory alone is about 50 bytes).
+fn short_private_dir() -> std::io::Result<tempfile::TempDir> {
+    const PREFIX: &str = "yas-run-";
+    // tempfile's random suffix is six characters.
+    const NAME: usize = PREFIX.len() + 6;
+    let short_enough =
+        |base: &PathBuf| base.is_absolute() && base.as_os_str().len() + 1 + NAME <= RUNTIME_DIR_MAX;
+    let bases = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([std::env::temp_dir(), PathBuf::from("/tmp")])
+        .filter(short_enough);
+    let mut last = None;
+    for base in bases {
+        match tempfile::Builder::new().prefix(PREFIX).tempdir_in(&base) {
+            Ok(dir) => {
+                create_private_dir(dir.path())?;
+                return Ok(dir);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no base directory is short enough",
+        )
+    }))
+}
 
 fn io_connect(what: &str, error: std::io::Error) -> Error {
     Error::Connect(format!("{what}: {error}"))
