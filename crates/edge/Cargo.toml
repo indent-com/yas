@@ -6,6 +6,8 @@ description = "YAS browser edge service"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+# ui/ is the built web UI, which git ignores: see build.rs.
+include = ["/Cargo.toml", "/build.rs", "/src/**", "/ui/index.html.br", "/ui/sw.js.br"]
 
 [lib]
 name = "yas_edge"

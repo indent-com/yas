@@ -160,7 +160,7 @@ For local runs using an already built UI and CLI, build the fixture with
 `direnv exec . cargo build -p yas-cli --example uplink-e2e-fixture`, then run
 `direnv exec . e2e/node_modules/.bin/playwright test --config e2e/playwright.uplink.config.ts`.
 
-CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, and `./bin/coverage`. These delegate to `nix run .#<task>`, etc.
+CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, `./bin/coverage`, and `./bin/package-crates`. These delegate to `nix run .#<task>`, etc.
 
 ## Packaging
 
@@ -170,7 +170,15 @@ Every `nix run` target has a corresponding script in `bin/`:
 ./bin/build-tarballs         # release tarballs -> dist/tarballs/
 ./bin/publish-npm-packages   # npm publish @yas-run/browser, @yas-run/core, @yas-run/react, @yas-run/solid
 ./bin/publish-crates         # cargo publish
+./bin/package-crates         # build every crates.io crate from its package, as its users will
 ```
+
+`publish-crates` publishes with `--no-verify`, so nothing there notices a crate
+that only builds inside the repository; `package-crates` (a CI job) does. A
+crate's build must not reach outside its own directory: `yas-wire` builds from
+its checked-in `src/generated.rs` when `protocol/` is not there, and `yas-edge`
+embeds the web UI from `js/ui/dist`, or from the copy in `crates/edge/ui/` that
+both scripts put into its package.
 
 `build-tarballs` accepts an optional output directory argument (default `dist/tarballs`).
 The version and platform are derived from `flake.nix` and the build host.

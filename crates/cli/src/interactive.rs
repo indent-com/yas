@@ -5,11 +5,10 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use yas_edge::{INDEX_HTML_BR as WEB_INDEX_HTML_BR, SW_JS_BR as WEB_SW_JS_BR};
 
 use crate::transport::{self, read_frame, write_frame};
 
-const WEB_INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
-const WEB_SW_JS_BR: &[u8] = include_bytes!("../../../js/ui/dist/sw.js.br");
 const YAS_SUBPROTOCOL: &str = yas_wire::schema::transport::WEBSOCKET_SUBPROTOCOL;
 const YAS_PREFACE: &[u8; 8] = &yas_wire::PREFACE;
 const YAS_MAX_FRAME_SIZE: usize = yas_wire::schema::transport::RECOMMENDED_WIRE_FRAME as usize;

@@ -7,6 +7,7 @@
 /.direnv/
 /.moo/
 /crates/browser/pkg
+/crates/edge/ui/
 /e2e/.e2e-muster-dir
 /e2e/.e2e-socket
 /e2e/playwright-report/
