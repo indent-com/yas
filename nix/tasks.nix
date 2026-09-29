@@ -444,6 +444,38 @@ let
     '';
   };
 
+  # publish-crates publishes with `--no-verify`, which compiles nothing, so a
+  # crate that builds only inside the repository (a build script or
+  # include_bytes! reaching outside its own directory) was published broken:
+  # yas-wire 0.4.0's build script read ../../protocol. This packages every
+  # crate publish-crates publishes and builds each from its package, as
+  # crates.io users will; cargo verifies them in dependency order, each
+  # against the others' packages. The vendored forks come from crates.io at
+  # the versions pinned, which publish-crates publishes first.
+  package-crates = pkgs.writeShellApplication {
+    name = "yas-package-crates";
+    runtimeInputs = [
+      rustToolchain
+      pkgs.jq
+      pkgs.pkg-config
+      pkgs.libopus
+    ];
+    text = ''
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+      mapfile -t packages < <(
+        cargo metadata --locked --no-deps --format-version 1 | jq -r '
+          .packages[]
+          | select(.publish == null or (.publish | index("crates-io")))
+          | "--package=" + .name
+        '
+      )
+      echo "=== Packaging and building ''${#packages[@]} crates ==="
+      cargo package --locked "''${packages[@]}" "$@"
+    '';
+  };
+
   deploy-website = pkgs.writeShellApplication {
     name = "deploy-website";
     runtimeInputs = [
@@ -678,6 +710,7 @@ in
     js-publish
     publish-npm-packages
     publish-crates
+    package-crates
     deploy-website
     ;
   inherit
