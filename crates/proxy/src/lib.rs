@@ -1055,10 +1055,12 @@ async fn connect_ws_mode(
             .max_message_size(Some(64 * 1024))
             .max_frame_size(Some(64 * 1024))
     });
+    // Nagle's algorithm off (`disable_nagle`), as for tcp: upstreams: a request's small frames
+    // must not wait for the ACK of the one before, which the relay delays (40 ms on Linux).
     let (mut ws, response) = tokio_tungstenite::connect_async_tls_with_config(
         request,
         config,
-        false,
+        true,
         Some(yas_webrtc_forwarder::tls::websocket_connector()),
     )
     .await
