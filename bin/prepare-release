@@ -287,9 +287,13 @@ node - "$target_version" "${js_manifests[@]}" <<'NODE'
 const fs = require("fs");
 const [version, ...manifests] = process.argv.slice(2);
 
+// @yas-run/browser is built from crates/browser outside the pnpm workspace,
+// so `workspace:*` cannot stamp its published range; it tracks the release.
 for (const manifest of manifests) {
   const pkg = JSON.parse(fs.readFileSync(manifest, "utf8"));
   pkg.version = version;
+  if (pkg.peerDependencies?.["@yas-run/browser"] !== undefined)
+    pkg.peerDependencies["@yas-run/browser"] = `^${version}`;
   fs.writeFileSync(manifest, `${JSON.stringify(pkg, null, 2)}\n`);
 }
 NODE
@@ -339,6 +343,11 @@ for (const manifest of manifests) {
   const pkg = JSON.parse(fs.readFileSync(manifest, "utf8"));
   if (pkg.version !== expected) {
     console.error(`release: failed to update ${manifest} to version ${expected}`);
+    process.exit(1);
+  }
+  const browser = pkg.peerDependencies?.["@yas-run/browser"];
+  if (browser !== undefined && browser !== `^${expected}`) {
+    console.error(`release: failed to update ${manifest} @yas-run/browser peer to ^${expected}`);
     process.exit(1);
   }
 }

@@ -391,7 +391,12 @@ You can also run a `@yas-run/core` client **server-side** (Node/Bun/Deno) to dri
 local `yas server` over its unix-domain socket — e.g. to script terminals or run
 headless commands. The non-browser building blocks live under the
 `@yas-run/core/node` subpath (kept out of the package root so `node:net` and
-runtime globals never leak into browser bundles):
+runtime globals never leak into browser bundles). The packages are plain ES
+modules; install `@yas-run/core` with its matching `@yas-run/browser` peer:
+
+```bash
+npm install @yas-run/core @yas-run/browser
+```
 
 ```ts
 import { YasWorkspace, exitCodeFromStatus, nullLogger } from "@yas-run/core";
@@ -412,6 +417,17 @@ const workspace = new YasWorkspace({
   wasm,
   logger: nullLogger, // no-op logger; omit to log lifecycle events to console
   connections: [{ id: "default", transport }],
+});
+
+// Families are negotiated after the HELLO round trip; wait before creating.
+await new Promise<void>((resolve) => {
+  const check = () => {
+    if (!workspace.getSnapshot().ready) return;
+    unsubscribe();
+    resolve();
+  };
+  const unsubscribe = workspace.subscribe(check);
+  check();
 });
 
 const session = await workspace.createSession({
