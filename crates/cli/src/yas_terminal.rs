@@ -23,6 +23,27 @@ const MAX_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const READ_PAGE_BYTES: u32 = 8 * 1024 * 1024;
 const STATE_CREDIT: u64 = 1024 * 1024;
 
+/// Like `println!`, but a closed stdout (`yas terminal list | head -1`) is
+/// not an error: the command still finishes and exits with its own status.
+macro_rules! outln {
+    () => {
+        write_stdout(b"\n")
+    };
+    ($($arg:tt)*) => {
+        write_stdout(format!("{}\n", format_args!($($arg)*)).as_bytes())
+    };
+}
+
+fn write_stdout(bytes: &[u8]) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(bytes).and_then(|()| stdout.flush())
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        eprintln!("yas: cannot write to stdout: {error}");
+    }
+}
+
 /// OutputResult framing around its text: the fixed fields plus the text length.
 const OUTPUT_RESULT_OVERHEAD: u64 = 36;
 
@@ -42,7 +63,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
         .collect::<Vec<_>>();
     terminals.sort_by_key(|record| record.terminal_handle);
 
-    println!("ID\tTAG\tTITLE\tCOMMAND\tCWD\tSTATUS");
+    outln!("ID\tTAG\tTITLE\tCOMMAND\tCWD\tSTATUS");
     for record in terminals {
         let id = terminal_id(record.terminal_handle)?;
         let tag = text_extension(
@@ -67,7 +88,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
         .map(|value| String::from_utf8_lossy(value).into_owned())
         .unwrap_or_default();
         let status = terminal_status(&record)?;
-        println!("{id}\t{tag}\t{title}\t{command}\t{cwd}\t{status}");
+        outln!("{id}\t{tag}\t{title}\t{command}\t{cwd}\t{status}");
     }
     Ok(())
 }
@@ -103,7 +124,7 @@ pub(crate) async fn cmd_start(
         )
         .await?;
     let id = terminal_id(result.terminal_handle)?;
-    println!("{id}");
+    outln!("{id}");
     Ok(id)
 }
 
@@ -390,10 +411,9 @@ pub(crate) async fn cmd_cwd(on: Option<&str>, hub: &str, id: u64) -> Result<(), 
     .await?;
     expect_content(&query, yas_wire::schema::terminal::CONTENT_PATH as u8)?;
     let bytes = query_bytes(query).await?;
-    std::io::Write::write_all(&mut std::io::stdout(), &bytes)
-        .map_err(|error| format!("cannot write terminal cwd: {error}"))?;
+    write_stdout(&bytes);
     if !bytes.ends_with(b"\n") {
-        println!();
+        outln!();
     }
     Ok(())
 }
@@ -409,7 +429,7 @@ pub(crate) async fn cmd_journal(
     let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if !json {
-        println!("INDEX\tSTATUS\tEXIT\tMS\tSTART_SEQ\tEND_SEQ\tCOMMAND");
+        outln!("INDEX\tSTATUS\tEXIT\tMS\tSTART_SEQ\tEND_SEQ\tCOMMAND");
     }
     let mut cursor = from.unwrap_or(0);
     let mut tail = from.is_none();
@@ -442,7 +462,7 @@ pub(crate) async fn cmd_journal(
             terminal::JournalResult::decode(&query_bytes(query).await?).map_err(wire_error)?;
         for entry in &journal.records {
             if json {
-                println!("{}", journal_record_json(entry));
+                outln!("{}", journal_record_json(entry));
             } else {
                 print_journal_record(entry);
             }
@@ -584,12 +604,11 @@ pub(crate) async fn cmd_output(
             "next_cursor".into(),
             format_cursor(output.next_seq, output.next_col).into(),
         );
-        println!("{value}");
+        outln!("{value}");
     } else {
-        std::io::Write::write_all(&mut std::io::stdout(), &output.text)
-            .map_err(|error| format!("cannot write terminal output: {error}"))?;
+        write_stdout(&output.text);
         if !output.text.is_empty() && !output.text.ends_with(b"\n") {
-            println!();
+            outln!();
         }
         if evicted {
             eprintln!("yas: output start had scrolled out of the backlog");
@@ -958,7 +977,7 @@ fn print_query_rows_with_separator(
             .map_err(|_| "YAS Terminal returned non-UTF-8 text".to_string())?
     };
     if !*first && !text.is_empty() {
-        println!();
+        outln!();
     }
     print!("{text}");
     *first = false;
@@ -1177,7 +1196,7 @@ fn journal_record_json(record: &terminal::JournalRecord) -> serde_json::Value {
 fn print_journal_record(record: &terminal::JournalRecord) {
     let exit = journal_exit(record).map(|value| value.to_string());
     let duration = journal_duration(record).map(|value| value.to_string());
-    println!(
+    outln!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         record.index,
         journal_status(record),
@@ -1268,7 +1287,7 @@ async fn cmd_since(
     let output = terminal::OutputResult::decode(&query_bytes(query).await?).map_err(wire_error)?;
     let next = format_cursor(output.next_seq, output.next_col);
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "pty": id,
@@ -1281,10 +1300,9 @@ async fn cmd_since(
             })
         );
     } else {
-        std::io::Write::write_all(&mut std::io::stdout(), &output.text)
-            .map_err(|error| format!("cannot write terminal history: {error}"))?;
+        write_stdout(&output.text);
         if !output.text.is_empty() && !output.text.ends_with(b"\n") {
-            println!();
+            outln!();
         }
         eprintln!("cursor: {next}");
     }
@@ -1355,7 +1373,7 @@ async fn wait_for_pattern(
         (sequence, column) = (output.next_seq, output.next_col);
         pending.push_str(&String::from_utf8_lossy(&output.text));
         if let Some(line) = first_matching_line(&mut pending, regex) {
-            println!("{line}");
+            outln!("{line}");
             return Ok(0);
         }
         if output.flags & yas_wire::schema::terminal::OUTPUT_TRUNCATED as u16 != 0 {
@@ -1393,7 +1411,7 @@ fn first_matching_line(pending: &mut String, regex: &regex::Regex) -> Option<Str
 }
 
 fn print_terminal_exit(record: &terminal::TerminalRecord) -> Result<i32, String> {
-    println!("{}", terminal_status(record)?);
+    outln!("{}", terminal_status(record)?);
     terminal_exit_code(record)
 }
 
