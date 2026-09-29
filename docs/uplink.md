@@ -2,13 +2,15 @@
 
 `yas uplink <control-url> --allow-client PUBLIC_KEY`, with the private key in
 `YAS_UPLINK_IDENTITY`, makes
-the local YAS server reachable outside NAT. It holds an outbound WebTransport
-session to a relay. Each relay-initiated stream must complete end-to-end
+the local YAS server reachable outside NAT. It holds an outbound session to a
+relay: WebTransport (HTTP/3 over UDP), or WebSockets (over TCP) where a network
+blocks UDP. Each relay-initiated stream must complete end-to-end
 mutual authentication before it can reach the local server socket. This document
 specifies the protocol between the uplink and its control endpoint and
 relay. It leaves the relay side abstract: a WebTransport server that opens
-one bidirectional stream per consumer and
-forwards opaque bytes can act as a relay. The inner stream carries Noise records.
+one bidirectional stream per consumer, or a WebSocket server that asks for
+one WebSocket per consumer, and forwards opaque bytes can act as a relay. The
+inner stream carries Noise records.
 
 ## Roles
 
@@ -16,7 +18,7 @@ forwards opaque bytes can act as a relay. The inner stream carries Noise records
 | ---------------- | -------------------------------------------------------------------- |
 | uplink           | `yas uplink` — connects out, bridges streams to the local YAS server |
 | control endpoint | HTTPS URL that authenticates the uplink and allocates it a relay     |
-| relay            | WebTransport server the uplink stays connected to                    |
+| relay            | WebTransport or WebSocket server the uplink stays connected to       |
 | consumer         | A YAS client reaching the server through the relay                   |
 
 ## End-to-end trust and setup
@@ -150,11 +152,20 @@ Accept: application/json
 A success response is the **relay pool**:
 
 ```json
-{ "relays": ["https://relay-1.example.com:4443/t/kfV3aB#sha256=<base64url>"] }
+{
+  "relays": ["https://relay-1.example.com:4443/t/kfV3aB#sha256=<base64url>"],
+  "websockets": ["wss://relay-1.example.com/uplink/producer/Qm9vdA"]
+}
 ```
 
-- `relays` is a non-empty array of `https` URLs. Any other scheme is an
-  error.
+- `relays` is an array of `https` URLs: WebTransport relays. Any other
+  scheme is an error.
+- `websockets` is an array of `wss` URLs: WebSocket relays (see
+  [WebSocket relay session](#websocket-relay-session-version-1)). Any other
+  scheme, plaintext `ws` included, is an error. Uplinks older than this
+  field ignore it, so a control endpoint can offer both kinds to every uplink.
+- Either array may be empty or absent, not both. An uplink only uses the
+  relays its transport allows (see [Choosing a transport](#choosing-a-transport)).
 - **A relay URL is a credential.** Whatever authenticates the uplink to
   the relay (a token in the path, a capability URL) is embedded in it.
   Implementations MUST NOT log relay URLs; log `host:port` instead.
@@ -229,10 +240,33 @@ Both producers and consumers must upgrade and configure keys. Old
 `uplink:https://relay.example#CLIENT_TOKEN` URIs and unencrypted consumer
 streams are intentionally rejected. Relays must forward Noise bytes unchanged.
 
+## Choosing a transport
+
+`yas uplink --transport auto|webtransport|websocket` (or
+`YAS_UPLINK_TRANSPORT`) chooses what carries the relay session:
+
+- `auto` (the default) tries the pool's WebTransport relays first, then its
+  WebSocket relays. While the pool also names WebSocket relays, a WebTransport
+  session that isn't up within **5 seconds** counts as failed: a network that
+  drops UDP gives no error, and QUIC would otherwise wait out its idle
+  timeout. After WebTransport fails to connect, or a WebTransport session
+  ends within 60 seconds of starting, the uplink tries WebSocket relays first
+  for the next 10 minutes, then WebTransport first again.
+- `webtransport` uses only the pool's `relays`; `websocket` only its
+  `websockets`. A pool with none of them is retried like a failed control
+  request.
+
+Both carry the same Noise streams to the same local server; only WebTransport
+carries datagrams.
+
 ## Relay session
 
-The uplink shuffles the pool and tries each relay in order: a
-WebTransport (HTTP/3 CONNECT) session to the relay URL. Liveness settings
+The uplink shuffles the pool's relays of each transport and tries them in the
+order above.
+
+### WebTransport relay session
+
+A WebTransport (HTTP/3 CONNECT) session to the relay URL. Liveness settings
 are a **10s keepalive** and a **30s idle timeout**, so a dead relay is
 noticed within 30 seconds without any application-level pings.
 
@@ -240,6 +274,52 @@ The uplink never opens streams. The relay opens **one bidirectional stream
 per consumer**. After Noise authentication, the uplink bridges decrypted
 bytes to a fresh local YAS socket. Direct streams carry the normal YAS preface
 and length-prefixed frames, unparsed and unreframed inside Noise.
+
+### WebSocket relay session (version 1)
+
+A relay can't open streams over one WebSocket, so it asks the uplink to open
+one WebSocket per consumer instead. Both kinds of WebSocket use the
+subprotocol `yas-uplink.v1`: the uplink offers it in
+`Sec-WebSocket-Protocol` and fails the relay unless the relay selects it. A
+later version of this carrier gets a new subprotocol, which the uplink offers
+alongside.
+
+- **TLS.** `wss` only. A `#sha256=` fragment pins the relay's certificate
+  exactly as for WebTransport relays (and is stripped before connecting);
+  otherwise the system roots (or `SSL_CERT_FILE`/`SSL_CERT_DIR`) verify it.
+  The relay URL is a credential: implementations MUST NOT log it.
+- **Session.** The uplink holds one WebSocket to the relay URL. The relay
+  sends a **text message per consumer**, a JSON object naming a stream URL:
+
+  ```json
+  { "stream": "wss://relay-1.example.com/uplink/stream/c2Vzc2lvbg" }
+  ```
+
+  The stream URL is a single-use credential, and must be `wss` on the
+  session's own origin (scheme, host and port), without userinfo or a
+  fragment, so the session's TLS trust applies to it. The uplink ignores
+  messages that aren't such an object (unknown fields included, for later
+  relays) and never sends data messages on the session.
+
+- **Streams.** For each request the uplink opens a WebSocket to the stream
+  URL (same subprotocol, same pin) and treats it as a WebTransport stream:
+  Noise authentication, then the local socket. Binary messages carry opaque
+  chunks of at most 64 KiB whose boundaries mean nothing; text messages are
+  ignored. Noise's authenticated FIN carries the half-close, so neither end
+  closes a stream WebSocket before both directions are done; closing it ends
+  both. At most 64 streams may be authenticating per session; the uplink
+  ignores requests beyond that, and the relay gives up on a stream the uplink
+  doesn't open within 10 seconds.
+- **Liveness.** The uplink pings every **10 seconds** and gives the session up
+  after **30 seconds** without hearing anything from the relay. A relay should
+  likewise drop a session it hears nothing on for 30 seconds.
+- **Datagrams.** None: an encrypted composite selector asking for a datagram
+  lane is refused on a WebSocket session (the stream closes), and consumers
+  on reliable carriers never send one.
+
+A relay pairs a consumer's attachment (`/attach` and its WSS worker) with a
+stream WebSocket just as it would with a WebTransport stream, forwarding the
+bytes unchanged either way.
 
 ### Encrypted native datagrams
 
@@ -293,8 +373,9 @@ move audio onto unreliable datagrams.
 ### Closure
 
 Failed authentication or unavailable local IPC closes the consumer stream.
-On SIGINT the outer session closes with application code 2. The worker should
-close its consumer connection when the corresponding stream closes.
+On SIGINT the outer session closes: a WebTransport session with application
+code 2, a WebSocket session with close code 1001 (going away). The worker
+should close its consumer connection when the corresponding stream closes.
 
 ## Reconnection
 
@@ -305,12 +386,46 @@ close its consumer connection when the corresponding stream closes.
   re-balanced on every reconnect — and reset the backoff.
 - Pool exhausted with no session established: back off (same schedule as
   the control endpoint) and re-query.
-- On SIGINT the uplink closes the active session with code 2 instead of
-  letting it idle out on the relay.
+- On SIGINT the uplink closes the active session (code 2, or WebSocket close
+  code 1001) instead of letting it idle out on the relay.
 
 Relay URLs stay valid for as long as their embedded credential does; the
 uplink treats each pool response as single-use and re-queries rather than
 caching it.
+
+## Embedding the uplink
+
+The uplink is a library as well as a command:
+`yas_proxy::uplink_producer` (re-exported as `yas_client::uplink_producer`).
+It installs no process-wide TLS provider, changes no environment and never
+exits the process.
+
+```rust
+use yas_client::uplink_producer::{Event, Identity, Local, Producer, Transport};
+
+let identity = Identity::from_base64(&private_key)?;
+let producer = Producer::new(
+    "https://relay.example/uplink/control",
+    &token,
+    identity.server_config(allowed_client_keys)?,
+    Local::socket(socket_path), // a Unix socket, or a named pipe on Windows
+)?
+.transport(Transport::Auto)
+.on_event(|event: &Event| eprintln!("[uplink] {event}"));
+let handle = producer.handle();
+tokio::spawn(producer.run_until(shutdown));
+// Later, without restarting the session:
+handle.set_server_config(identity.server_config(new_allowlist)?);
+handle.set_token(renewed_token);
+```
+
+`Local::custom` reaches a server some other way. `Event` values (a relay
+session up, with its carrier; a session ended; a relay failing…) display as
+the lines `yas uplink` prints. A new allowlist applies to consumers that start
+their handshake afterwards; consumers already connected keep their authority
+until they disconnect, as across a restart. A new token applies from the next
+control request. `run_until` returns an error only when the control endpoint
+refuses the token.
 
 ## Browser embedding
 
@@ -372,7 +487,12 @@ in process arguments. Both endpoints must upgrade together.
 
 `direnv exec . cargo test -p yas-cli --test uplink_e2e` exercises the complete
 CLI path through a local HTTPS control endpoint and WSS/WebTransport relay to
-an isolated YAS server. CI includes this test in the Rust workspace test suite.
+an isolated YAS server: over WebTransport, over WebSockets when forced, and
+falling back to WebSockets when the WebTransport relay's UDP goes nowhere. CI
+includes this test in the Rust workspace test suite.
+`cargo test -p yas-proxy uplink_producer` covers the library: pools, the
+transport order, WebSocket sessions and streams, allowlist changes while
+running, and refusals before local IPC.
 
 For private relay infrastructure, `SSL_CERT_FILE` and `SSL_CERT_DIR` select
 outer TLS trust roots consistently for HTTPS, WSS, and WebTransport (unless a

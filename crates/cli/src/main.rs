@@ -947,8 +947,9 @@ async fn async_main() {
             url,
             identity,
             allow_client,
+            transport,
         } => {
-            if let Err(e) = uplink::cmd_uplink(url, identity, allow_client).await {
+            if let Err(e) = uplink::cmd_uplink(url, identity, allow_client, transport).await {
                 eprintln!("yas: {e}");
                 std::process::exit(1);
             }
