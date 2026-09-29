@@ -2017,8 +2017,11 @@ cursor are both the current end.
 WAIT kinds are OUTPUT 0, COMMAND 1, and LATEST_COMMAND 2, with zero flags.
 OUTPUT uses `a=sequence,b=column`, requires a nonempty needle, and returns an
 OutputResult. COMMAND uses `a=command_index,b=0` and an empty needle;
-LATEST_COMMAND requires `a=b=0` and an empty needle. Both command waits return
-a JournalResult containing exactly one command record. Timeouts and byte
+LATEST_COMMAND requires `a=b=0` and an empty needle; it selects the running
+command, or the next command to start when none is running. Both command waits
+return a JournalResult containing exactly one command record. A command wait
+whose timeout expires before its command exists fails with `TIMEOUT`; one whose
+terminal has exited without it fails with `NOT_FOUND`. Timeouts and byte
 limits are nonzero.
 
 COPY_RANGE rows are inclusive, oldest-retained-relative when nonnegative, and

@@ -1120,9 +1120,11 @@ pub enum TerminalCommand {
 
     /// Print one command's output (needs OSC 133 shell integration).
     ///
-    /// Defaults to the newest command. With --wait, blocks server-side until
-    /// the command finishes and exits with its status (124 if the wait timed
-    /// out), which is how to run something in a live shell and collect the
+    /// Defaults to the newest command. With --wait and no INDEX, it picks the
+    /// command that is running, or if none is, the next one to start (so a
+    /// command sent just before still counts), blocks server-side until that
+    /// command finishes, and exits with its status (124 if the wait timed
+    /// out). This is how to run something in a live shell and collect the
     /// result:
     ///   yas terminal send 3 'cargo test\n'
     ///   yas terminal output 3 --wait 600

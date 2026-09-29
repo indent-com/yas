@@ -6086,6 +6086,7 @@ const fn terminal_query_status(error: &super::yas_terminal_queries::Error) -> St
         super::yas_terminal_queries::Error::NotFound => Status::NotFound,
         super::yas_terminal_queries::Error::Stale => Status::Stale,
         super::yas_terminal_queries::Error::TooLarge => Status::ResourceExhausted,
+        super::yas_terminal_queries::Error::Timeout => Status::Timeout,
         super::yas_terminal_queries::Error::Internal => Status::Internal,
     }
 }
@@ -52383,6 +52384,143 @@ mod tests {
             .await
             .status,
             Status::Cancelled,
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+        delivery.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_output_past_end_is_empty_and_command_wait_times_out() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let delivery_state = state.clone();
+        let delivery = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_state.delivery_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                let _ = super::super::tick(&delivery_state).await;
+            }
+        });
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::TERMINAL]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x43; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"/bin/sh".to_vec(),
+                        b"-c".to_vec(),
+                        b"printf 'ready\\n'; exec cat".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let mut frames = Vec::new();
+        let created = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &mut frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OUTPUT,
+            11,
+            &yas_terminal::Output {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                cursor_kind: yas_wire::schema::terminal::OUTPUT_CURSOR_SEQUENCE as u8,
+                flags: yas_wire::schema::terminal::OUTPUT_REQUEST_FLAGS as u8,
+                cursor_a: 1_000_000,
+                cursor_b: 0,
+                max_bytes: 64 * 1024,
+                initial_receive_credit: 64 * 1024,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let output = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OUTPUT,
+            11,
+        )
+        .await;
+        assert_eq!(output.status, Status::Ok);
+        let yas_terminal::QueryDelivery::Inline(bytes) =
+            yas_terminal::QueryBody::decode(&output.body)
+                .unwrap()
+                .delivery
+        else {
+            panic!("an empty OUTPUT answer is inline");
+        };
+        let output = yas_terminal::OutputResult::decode(&bytes).unwrap();
+        assert!(output.text.is_empty());
+        assert!(output.next_seq < 1_000_000);
+        assert_eq!(
+            (output.start_seq, output.start_col),
+            (output.next_seq, output.next_col)
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::WAIT,
+            12,
+            &yas_terminal::Wait {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                wait_kind: yas_wire::schema::terminal::WAIT_LATEST_COMMAND as u8,
+                flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
+                cursor_a: 0,
+                cursor_b: 0,
+                max_bytes: 64 * 1024,
+                timeout_ns: 200_000_000,
+                needle: Vec::new(),
+                initial_receive_credit: 64 * 1024,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_sensitive_result(
+                &mut client,
+                &codec,
+                family::TERMINAL,
+                yas_wire::schema::terminal::request::WAIT,
+                12,
+            )
+            .await
+            .status,
+            Status::Timeout,
         );
 
         drop(client);
