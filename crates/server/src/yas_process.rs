@@ -286,14 +286,9 @@ impl Runtime {
     }
 
     pub(crate) fn limits(&self) -> wire::Limits {
-        // LEAVE_RESIDUE needs Unix process groups; STDIN_NULL works everywhere.
-        let launcher_flags = if cfg!(unix) {
-            schema::process::SPAWN_LAUNCHER_FLAGS as u32
-        } else {
-            schema::process::SPAWN_STDIN_NULL as u32
-        };
+        // LEAVE_RESIDUE works with Unix process groups and Windows jobs alike.
         wire::Limits {
-            launcher_flags,
+            launcher_flags: schema::process::SPAWN_LAUNCHER_FLAGS as u32,
             ..self.server.maxima().limits()
         }
     }
@@ -756,12 +751,12 @@ impl Attachment {
         )
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) async fn next(&mut self) -> Option<Event> {
         self.events.recv().await
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn acknowledge_output(
         &self,
         stream: Stream,
@@ -989,11 +984,12 @@ fn native_signal(value: u16) -> Result<u32, Error> {
 
 #[cfg(windows)]
 fn native_signal(value: u16) -> Result<u32, Error> {
+    use process::windows_signal;
     match value {
-        value if value == schema::process::SIGNAL_INTERRUPT as u16 => Ok(2),
-        value if value == schema::process::SIGNAL_TERMINATE as u16 => Ok(15),
-        value if value == schema::process::SIGNAL_KILL as u16 => Ok(9),
-        value if value == schema::process::SIGNAL_HANGUP as u16 => Ok(1),
+        value if value == schema::process::SIGNAL_INTERRUPT as u16 => Ok(windows_signal::INTERRUPT),
+        value if value == schema::process::SIGNAL_TERMINATE as u16 => Ok(windows_signal::TERMINATE),
+        value if value == schema::process::SIGNAL_KILL as u16 => Ok(windows_signal::KILL),
+        value if value == schema::process::SIGNAL_HANGUP as u16 => Ok(windows_signal::HANGUP),
         _ => Err(Error::Invalid("unknown portable Process signal".to_owned())),
     }
 }
@@ -1540,6 +1536,436 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(waited, exit);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+}
+
+/// Windows process semantics against real children: console control, jobs, LEAVE_RESIDUE.
+/// `ping` answers CTRL_BREAK with statistics and keeps going, so it stands for a process that
+/// ignores it; `waitfor` has no handler, so CTRL_BREAK ends it with STATUS_CONTROL_C_EXIT.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess,
+    };
+    use yas_wire::{Extension, Extensions};
+
+    /// STATUS_CONTROL_C_EXIT, as the exit code's bits.
+    const CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+
+    fn system32(program: &str) -> Vec<u8> {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        format!(r"{root}\System32\{program}").into_bytes()
+    }
+
+    fn request(argv: &[&[u8]], flags: u64, operation: u8) -> wire::Spawn {
+        wire::Spawn {
+            operation_id: [operation; 16],
+            flags: (flags | schema::process::SPAWN_MERGE_STDERR | schema::process::SPAWN_STDIN_NULL)
+                as u16,
+            environment_kind: wire::EnvironmentKind::Session,
+            cwd: wire::Cwd::ServerDefault,
+            argv: argv.iter().map(|value| value.to_vec()).collect(),
+            env: Vec::new(),
+            stdout_receive_credit: 1024 * 1024,
+            stderr_receive_credit: 0,
+            extensions: Extensions::default(),
+        }
+    }
+
+    fn with_residue_grace(mut request: wire::Spawn, grace: Duration) -> wire::Spawn {
+        request.extensions = Extensions(vec![Extension {
+            tag: schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+            required: true,
+            value: (grace.as_nanos() as u64).to_le_bytes().to_vec(),
+        }]);
+        request
+    }
+
+    fn powershell(script: &str) -> Vec<Vec<u8>> {
+        vec![
+            system32(r"WindowsPowerShell\v1.0\powershell.exe"),
+            b"-NoProfile".to_vec(),
+            b"-NonInteractive".to_vec(),
+            b"-Command".to_vec(),
+            script.as_bytes().to_vec(),
+        ]
+    }
+
+    /// Starts a `ping` that shares the script's console and pipes, prints its PID on a line of
+    /// its own, then runs `rest`.
+    fn residue_script(rest: &str) -> Vec<Vec<u8>> {
+        powershell(&format!(
+            "$p = Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' \
+             -NoNewWindow -PassThru; [Console]::Out.WriteLine('PID ' + $p.Id); {rest}"
+        ))
+    }
+
+    async fn control(session: &Session, handle: u64, action: wire::ControlAction, value: u16) {
+        session
+            .control(&wire::Control {
+                process_handle: handle,
+                operation_id: rand_operation(),
+                action,
+                value,
+                extensions: Extensions::default(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn rand_operation() -> [u8; 16] {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let mut id = [0x5a; 16];
+        id[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        id
+    }
+
+    /// Reads output until `until` finds what it wants in it, crediting as it goes.
+    async fn read_until<T>(
+        attachment: &mut Attachment,
+        acked: &mut u64,
+        mut until: impl FnMut(&str) -> Option<T>,
+    ) -> T {
+        let mut output = String::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), attachment.next())
+                .await
+                .expect("output in time")
+                .expect("the attachment is open")
+            {
+                Event::Output { stream, data, .. } => {
+                    *acked += data.len() as u64;
+                    attachment.acknowledge_output(stream, *acked).unwrap();
+                    output.push_str(&String::from_utf8_lossy(&data));
+                    if let Some(found) = until(&output) {
+                        return found;
+                    }
+                }
+                Event::Exit(exit) => panic!("exited early: {exit:?}; output {output:?}"),
+                Event::StdinProgress { .. } => {}
+            }
+        }
+    }
+
+    async fn exit_of(attachment: &mut Attachment, acked: &mut u64, within: Duration) -> ExitInfo {
+        loop {
+            match tokio::time::timeout(within, attachment.next())
+                .await
+                .expect("the exit in time")
+                .expect("the attachment is open")
+            {
+                Event::Output { stream, data, .. } => {
+                    *acked += data.len() as u64;
+                    attachment.acknowledge_output(stream, *acked).unwrap();
+                }
+                Event::Exit(exit) => return exit,
+                Event::StdinProgress { .. } => {}
+            }
+        }
+    }
+
+    fn residue_pid(output: &str) -> Option<u32> {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("PID "))
+            .and_then(|pid| pid.trim().parse().ok())
+    }
+
+    fn alive(pid: u32) -> bool {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let running =
+                GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE as u32;
+            CloseHandle(process);
+            running
+        }
+    }
+
+    fn kill(pid: u32) {
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !process.is_null() {
+                TerminateProcess(process, 1);
+                CloseHandle(process);
+            }
+        }
+    }
+
+    async fn gone_within(pid: u32, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        !alive(pid)
+    }
+
+    #[test]
+    fn leave_residue_is_offered() {
+        let runtime = Runtime::new(Server::new(false, true));
+        let flags = runtime.limits().launcher_flags;
+        assert_ne!(flags & schema::process::SPAWN_LEAVE_RESIDUE as u32, 0);
+        assert_ne!(flags & schema::process::SPAWN_STDIN_NULL as u32, 0);
+    }
+
+    #[tokio::test]
+    async fn terminate_sends_ctrl_break_to_the_group() {
+        ctrl_break_ends_waitfor().await;
+    }
+
+    async fn ctrl_break_ends_waitfor() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([31; 16], None).unwrap();
+        let mut attachment = session
+            .spawn(
+                &request(
+                    &[
+                        &system32("waitfor.exe"),
+                        b"/t",
+                        b"60",
+                        b"yastestneversignalled",
+                    ],
+                    0,
+                    1,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = std::time::Instant::now();
+        control(
+            &session,
+            attachment.process_handle,
+            wire::ControlAction::Terminate,
+            0,
+        )
+        .await;
+        let mut acked = 0;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(10)).await;
+        assert_eq!(
+            (exit.kind, exit.code),
+            (wire::ExitKind::Code, CONTROL_C_EXIT),
+            "CTRL_BREAK ended it: {exit:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "before the kill grace: {:?}",
+            started.elapsed()
+        );
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// A server without a console (as `yas connect` starts one) reaches the group through the
+    /// child's own hidden console. Ignored: it gives up this process's console, which the other
+    /// tests share; run it alone (`--ignored without_a_console`).
+    #[tokio::test]
+    #[ignore]
+    async fn without_a_console_terminate_still_sends_ctrl_break() {
+        unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+        ctrl_break_ends_waitfor().await;
+    }
+
+    #[tokio::test]
+    async fn terminate_never_leaves_a_process_that_ignores_ctrl_break_running() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([32; 16], None).unwrap();
+        let mut attachment = session
+            .spawn(
+                &request(&[&system32("PING.EXE"), b"-n", b"120", b"127.0.0.1"], 0, 2),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut acked = 0;
+        read_until(&mut attachment, &mut acked, |output| {
+            output.contains("127.0.0.1").then_some(())
+        })
+        .await;
+        let started = std::time::Instant::now();
+        control(
+            &session,
+            attachment.process_handle,
+            wire::ControlAction::Terminate,
+            0,
+        )
+        .await;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(10)).await;
+        assert_eq!(exit.kind, wire::ExitKind::Killed, "{exit:?}");
+        assert_eq!(
+            exit.reason,
+            schema::process::EXIT_REASON_TERMINATE_TIMEOUT as u8,
+            "{exit:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "within the kill grace: {:?}",
+            started.elapsed()
+        );
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signals_map_to_ctrl_break_and_the_job() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([33; 16], None).unwrap();
+        // INTERRUPT is CTRL_BREAK: waitfor has no handler for it.
+        let mut waiting = session
+            .spawn(
+                &request(
+                    &[
+                        &system32("waitfor.exe"),
+                        b"/t",
+                        b"60",
+                        b"yastestneverinterrupted",
+                    ],
+                    0,
+                    3,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        control(
+            &session,
+            waiting.process_handle,
+            wire::ControlAction::Signal,
+            schema::process::SIGNAL_INTERRUPT as u16,
+        )
+        .await;
+        let mut acked = 0;
+        let exit = exit_of(&mut waiting, &mut acked, Duration::from_secs(10)).await;
+        assert_eq!(
+            (exit.kind, exit.code),
+            (wire::ExitKind::Code, CONTROL_C_EXIT)
+        );
+        // KILL ends the job, and says so.
+        let mut pinging = session
+            .spawn(
+                &request(&[&system32("PING.EXE"), b"-n", b"120", b"127.0.0.1"], 0, 4),
+                None,
+            )
+            .await
+            .unwrap();
+        control(
+            &session,
+            pinging.process_handle,
+            wire::ControlAction::Signal,
+            schema::process::SIGNAL_KILL as u16,
+        )
+        .await;
+        let mut acked = 0;
+        let exit = exit_of(&mut pinging, &mut acked, Duration::from_secs(5)).await;
+        assert_eq!(exit.kind, wire::ExitKind::Killed, "{exit:?}");
+        assert_eq!(exit.reason, schema::process::EXIT_REASON_CLIENT as u8);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn leave_residue_reports_the_exit_after_its_grace_and_leaves_the_job_running() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([34; 16], None).unwrap();
+        let started = std::time::Instant::now();
+        let mut attachment = session
+            .spawn(
+                &with_residue_grace(
+                    request(
+                        &residue_script("exit 3")
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>(),
+                        schema::process::SPAWN_LEAVE_RESIDUE,
+                        5,
+                    ),
+                    Duration::from_millis(500),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut acked = 0;
+        let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(20)).await;
+        assert_eq!(
+            (exit.kind, exit.code),
+            (wire::ExitKind::Code, 3),
+            "{exit:?}"
+        );
+        assert_eq!(exit.detail, b"residual process group left running");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(alive(pid), "the residue runs after the exit");
+        session.shutdown().await;
+        server.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(alive(pid), "the residue outlives its session and server");
+        kill(pid);
+    }
+
+    #[tokio::test]
+    async fn leave_residue_terminate_ends_the_job_after_the_kill_grace() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([35; 16], None).unwrap();
+        let mut attachment = session
+            .spawn(
+                &with_residue_grace(
+                    request(
+                        &residue_script("Start-Sleep -Seconds 120")
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>(),
+                        schema::process::SPAWN_LEAVE_RESIDUE,
+                        6,
+                    ),
+                    Duration::from_millis(100),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut acked = 0;
+        let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let started = std::time::Instant::now();
+        control(
+            &session,
+            attachment.process_handle,
+            wire::ControlAction::Terminate,
+            0,
+        )
+        .await;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(10)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the exit waits for no residue: {:?} {exit:?}",
+            started.elapsed()
+        );
+        assert!(
+            gone_within(
+                pid,
+                Duration::from_secs(5).saturating_sub(started.elapsed())
+            )
+            .await,
+            "TERMINATE ended the job, ping included"
+        );
         session.shutdown().await;
         server.shutdown().await;
     }

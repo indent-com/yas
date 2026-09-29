@@ -30,9 +30,12 @@ use yas_wire::schema::process as process_schema;
 use crate::pty;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+use windows_sys::Win32::System::Console::{
+    AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleProcessList,
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -40,12 +43,15 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread,
+    THREAD_SUSPEND_RESUME,
 };
 
 const DEFAULT_MAX_WATCHERS_PER_GENERATION: usize = 64;
@@ -1233,12 +1239,6 @@ impl Manager {
             return Err(NativeError::Invalid("invalid Process spawn".to_owned()));
         }
         #[cfg(windows)]
-        if request.flags & PROCESS_SPAWN_LEAVE_RESIDUE != 0 {
-            return Err(NativeError::Invalid(
-                "LEAVE_RESIDUE needs Unix process groups".to_owned(),
-            ));
-        }
-        #[cfg(windows)]
         {
             let strings_valid = request
                 .argv
@@ -1728,9 +1728,27 @@ impl Manager {
                     }
                 }
                 NativeControl::Terminate => {
-                    graceful_terminate(&record)
-                        .map_err(|error| NativeError::Io(error.to_string()))?;
-                    timeout_cause = Some(PROCESS_KILL_TERMINATE_TIMEOUT);
+                    #[cfg(unix)]
+                    {
+                        graceful_terminate(&record)
+                            .map_err(|error| NativeError::Io(error.to_string()))?;
+                        timeout_cause = Some(PROCESS_KILL_TERMINATE_TIMEOUT);
+                    }
+                    // CTRL_BREAK reaches no process without a console, nor one that
+                    // detached from it: TERMINATE then ends the job at once rather than
+                    // leave it running.
+                    #[cfg(windows)]
+                    if graceful_terminate(&record).is_ok() {
+                        timeout_cause = Some(PROCESS_KILL_TERMINATE_TIMEOUT);
+                    } else {
+                        force_kill(&record).map_err(|error| NativeError::Io(error.to_string()))?;
+                        if inner.child_outcome.is_none() {
+                            inner.exit_override = Some(ExitOverride {
+                                reason: PROCESS_EXIT_KILLED,
+                                kill_cause: PROCESS_KILL_TERMINATE_TIMEOUT,
+                            });
+                        }
+                    }
                 }
                 NativeControl::Kill => {
                     force_kill(&record).map_err(|error| NativeError::Io(error.to_string()))?;
@@ -1740,7 +1758,12 @@ impl Manager {
                     });
                 }
                 NativeControl::Signal(signal) => {
-                    control_signal(&record, signal)?;
+                    if control_signal(&record, signal)? && inner.child_outcome.is_none() {
+                        inner.exit_override = Some(ExitOverride {
+                            reason: PROCESS_EXIT_KILLED,
+                            kill_cause: PROCESS_KILL_CLIENT,
+                        });
+                    }
                 }
                 NativeControl::Detach => {
                     inner.bindings.swap_remove(binding);
@@ -2412,7 +2435,7 @@ fn command_for(
         .stderr(Stdio::piped());
     // Suspension closes the otherwise unavoidable race between CreateProcess
     // and assigning the child to its kill-on-close job.
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+    command.creation_flags(console::creation_flags());
     command
 }
 
@@ -2598,6 +2621,148 @@ fn create_kill_on_close_job() -> io::Result<JobHandle> {
             return Err(io::Error::last_os_error());
         }
         Ok(handle)
+    }
+}
+
+/// Let what is left in a job outlive its handle: a LEAVE_RESIDUE process's residue survives the
+/// record, the session and the server, as setsid'd members do on Unix. TerminateJobObject
+/// still ends it while the handle is open.
+#[cfg(windows)]
+fn release_job_on_close(job: &JobHandle) -> io::Result<()> {
+    unsafe {
+        let limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        if SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Whether no process is left in the job (a failed query counts as "some are").
+#[cfg(windows)]
+fn job_empty(job: &JobHandle) -> bool {
+    unsafe {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+        QueryInformationJobObject(
+            job.0,
+            JobObjectBasicAccountingInformation,
+            (&raw mut info).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) != 0
+            && info.ActiveProcesses == 0
+    }
+}
+
+/// Up to 64 process IDs in the job.
+#[cfg(windows)]
+fn job_members(job: &JobHandle) -> io::Result<Vec<u32>> {
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST with room for 64 IDs (ULONG_PTR each).
+    #[repr(C)]
+    struct List {
+        assigned: u32,
+        listed: u32,
+        ids: [usize; 64],
+    }
+    unsafe {
+        let mut list: List = std::mem::zeroed();
+        if QueryInformationJobObject(
+            job.0,
+            JobObjectBasicProcessIdList,
+            (&raw mut list).cast(),
+            std::mem::size_of::<List>() as u32,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            let error = io::Error::last_os_error();
+            // A longer list still fills the first 64.
+            if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return Err(error);
+            }
+        }
+        let listed = (list.listed as usize).min(list.ids.len());
+        Ok(list.ids[..listed].iter().map(|id| *id as u32).collect())
+    }
+}
+
+/// Console control on Windows. CTRL_BREAK is the only console event that can be aimed at one
+/// process group (each child starts one), and it reaches only processes attached to the
+/// sender's console.
+///
+/// A server with a console (started from a terminal) lets its children share it and sends the
+/// event directly. A server without one (started detached, as `yas connect` and services do)
+/// gives each child a hidden console of its own (CREATE_NO_WINDOW, so no window opens on a
+/// desktop either) and, to send the event, attaches for a moment to the console of a live
+/// member of the child's job, one attachment at a time.
+#[cfg(windows)]
+mod console {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// Decided once, before any attachment could change the answer: the first spawn asks.
+    fn server_has_console() -> bool {
+        static HAS_CONSOLE: OnceLock<bool> = OnceLock::new();
+        *HAS_CONSOLE.get_or_init(|| {
+            let mut pids = [0u32; 1];
+            unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 1) != 0 }
+        })
+    }
+
+    pub(super) fn creation_flags() -> u32 {
+        let flags = CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED;
+        if server_has_console() {
+            flags
+        } else {
+            flags | CREATE_NO_WINDOW
+        }
+    }
+
+    static ATTACHED: StdMutex<()> = StdMutex::new(());
+
+    /// Send CTRL_BREAK to the process group `group` (the direct child's PID, which its
+    /// descendants keep after it exits), whose members are in `job`.
+    pub(super) fn ctrl_break(group: u32, job: &JobHandle) -> io::Result<()> {
+        if server_has_console() {
+            return if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) } != 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+        }
+        let mut members = job_members(job)?;
+        // The direct child first, while it runs; any member shares its console otherwise.
+        if let Some(index) = members.iter().position(|pid| *pid == group) {
+            members.swap(0, index);
+        }
+        let _attached = ATTACHED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Attaching may replace the standard handles of a process started without them.
+        let standard = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .map(|which| (which, unsafe { GetStdHandle(which) }));
+        let mut last = io::Error::other("no process of the group has a console");
+        for pid in members {
+            if unsafe { AttachConsole(pid) } == 0 {
+                last = io::Error::last_os_error();
+                continue;
+            }
+            let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) } != 0;
+            let error = io::Error::last_os_error();
+            unsafe {
+                FreeConsole();
+                for (which, handle) in standard {
+                    SetStdHandle(which, handle);
+                }
+            }
+            return if sent { Ok(()) } else { Err(error) };
+        }
+        Err(last)
     }
 }
 
@@ -2798,6 +2963,12 @@ async fn wait_child(record: Arc<Record>, mut child: Child) {
     #[cfg(unix)]
     if !record.preserve_residual && !record.leave_residue {
         let _ = graceful_terminate(&record);
+    }
+    // What a LEAVE_RESIDUE command leaves running is not the job's to kill when its handle
+    // closes; TERMINATE still ends it (escalate_residue).
+    #[cfg(windows)]
+    if record.leave_residue {
+        let _ = release_job_on_close(&record.job);
     }
     schedule_residual_cleanup(record.clone());
     try_queue_terminal(&record);
@@ -3004,7 +3175,6 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
         .0
         .terminate_timeout_tasks
         .fetch_add(1, Ordering::AcqRel);
-    #[cfg(unix)]
     if record.leave_residue {
         tokio::spawn(escalate_residue(record, cause));
         return;
@@ -3050,9 +3220,9 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
 }
 
 /// TERMINATE's escalation for a LEAVE_RESIDUE process, as a shell stops a job: whatever became
-/// of the direct child, the group gets SIGKILL after the kill grace unless it is gone already,
-/// and nobody waits for streams that members which left the group still hold.
-#[cfg(unix)]
+/// of the direct child, the group gets SIGKILL (on Windows, the job is terminated) after the
+/// kill grace unless it is gone already, and nobody waits for streams that members which left
+/// the group (or broke away from the job) still hold.
 async fn escalate_residue(record: Arc<Record>, cause: u8) {
     tokio::time::sleep(record.server.0.policy.kill_grace).await;
     if !process_group_absent(&record) && force_kill(&record).is_ok() {
@@ -3419,11 +3589,7 @@ fn graceful_terminate(record: &Record) -> io::Result<()> {
 
 #[cfg(windows)]
 fn graceful_terminate(record: &Record) -> io::Result<()> {
-    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, record.pid) } != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    console::ctrl_break(record.pid, &record.job)
 }
 
 #[cfg(unix)]
@@ -3457,6 +3623,11 @@ fn process_tree_already_absent(_error: &io::Error) -> bool {
     false
 }
 
+#[cfg(windows)]
+fn process_group_absent(record: &Record) -> bool {
+    job_empty(&record.job)
+}
+
 #[cfg(unix)]
 fn cleanup_terminate(record: &Record) -> io::Result<()> {
     graceful_terminate(record)
@@ -3467,30 +3638,51 @@ fn cleanup_terminate(record: &Record) -> io::Result<()> {
     force_kill(record)
 }
 
+/// Signal the group; true when that killed it outright (so the exit says KILLED, as KILL's does).
 #[cfg(unix)]
-fn control_signal(record: &Record, value: u32) -> Result<(), NativeError> {
+fn control_signal(record: &Record, value: u32) -> Result<bool, NativeError> {
     let signal = i32::try_from(value).ok().filter(|signal| *signal > 0);
     match signal {
-        Some(signal) => signal_group(record.pid, signal).map_err(|error| {
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                NativeError::Invalid("invalid signal".to_owned())
-            } else {
-                NativeError::Io(os_error_detail(error).to_owned())
-            }
-        }),
+        Some(signal) => signal_group(record.pid, signal)
+            .map(|()| false)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    NativeError::Invalid("invalid signal".to_owned())
+                } else {
+                    NativeError::Io(os_error_detail(error).to_owned())
+                }
+            }),
         None => Err(NativeError::Invalid("invalid signal".to_owned())),
     }
 }
 
+/// The portable signals as Windows can deliver them: CTRL_BREAK is the only console event that
+/// reaches one process group, so INTERRUPT, TERMINATE and HANGUP send it; KILL ends the job.
+/// True when that killed the group outright.
 #[cfg(windows)]
-fn control_signal(record: &Record, value: u32) -> Result<(), NativeError> {
-    if value != CTRL_BREAK_EVENT {
-        return Err(NativeError::Invalid(
+fn control_signal(record: &Record, value: u32) -> Result<bool, NativeError> {
+    match value {
+        windows_signal::KILL => force_kill(record)
+            .map(|()| true)
+            .map_err(|error| NativeError::Io(error.to_string())),
+        windows_signal::INTERRUPT | windows_signal::TERMINATE | windows_signal::HANGUP => {
+            graceful_terminate(record)
+                .map(|()| false)
+                .map_err(|_| NativeError::Io("console control is unavailable".to_owned()))
+        }
+        _ => Err(NativeError::Invalid(
             "signal is unsupported on Windows".to_owned(),
-        ));
+        )),
     }
-    graceful_terminate(record)
-        .map_err(|_| NativeError::Io("console control is unavailable".to_owned()))
+}
+
+/// What [`control_signal`] takes on Windows for the portable signals (their Unix numbers).
+#[cfg(windows)]
+pub(crate) mod windows_signal {
+    pub(crate) const HANGUP: u32 = 1;
+    pub(crate) const INTERRUPT: u32 = 2;
+    pub(crate) const KILL: u32 = 9;
+    pub(crate) const TERMINATE: u32 = 15;
 }
 
 #[cfg(unix)]

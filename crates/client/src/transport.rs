@@ -372,12 +372,36 @@ pub async fn connect_ipc(path: &str) -> Result<Transport, String> {
     }
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::ClientOptions;
         Ok(Transport::NamedPipe(
-            ClientOptions::new()
-                .open(path)
+            open_pipe(path)
+                .await
                 .map_err(|e| format!("cannot connect to {path}: {e}"))?,
         ))
+    }
+}
+
+/// Open a client end of the named pipe `path`. Every instance may be taken for a while: the
+/// server makes its next one only once it accepts the last (a liveness probe that just closed
+/// its end included), which a server still starting does only once it is up, and Windows
+/// answers ERROR_PIPE_BUSY meanwhile, so that is waited out (for 10 seconds at most) rather
+/// than reported.
+#[cfg(windows)]
+pub(crate) async fn open_pipe(
+    path: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match ClientOptions::new().open(path) {
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            opened => return opened,
+        }
     }
 }
 
@@ -539,10 +563,9 @@ pub async fn connect_via_native_proxy(
 
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::ClientOptions;
         let message = format!("target-yas {upstream_uri}\n");
-        let mut stream = ClientOptions::new()
-            .open(&socket)
+        let mut stream = open_pipe(&socket)
+            .await
             .map_err(|error| format!("yas-proxy: connect to {socket}: {error}"))?;
         stream
             .write_all(message.as_bytes())
@@ -667,13 +690,12 @@ async fn connect_via_composite_proxy_at(
     socket: &str,
     upstream_uri: &str,
 ) -> Result<Transport, String> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    let mut main = ClientOptions::new()
-        .open(socket)
+    let mut main = open_pipe(socket)
+        .await
         .map_err(|error| format!("yas-proxy: connect to {socket}: {error}"))?;
     let (maximum, token) = request_composite_proxy(&mut main, upstream_uri).await?;
-    let mut sideband = ClientOptions::new()
-        .open(socket)
+    let mut sideband = open_pipe(socket)
+        .await
         .map_err(|error| format!("yas-proxy: connect to {socket}: {error}"))?;
     finish_composite_proxy_side(&mut sideband, token).await?;
     let (reader, writer) = tokio::io::split(main);
@@ -1117,6 +1139,15 @@ fn spawn_detached_server(
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // Out of the job this CLI runs in, when that job lets it: Windows' OpenSSH server puts
+        // each session in a kill-on-close job, which would end the server (and everything it
+        // runs) with the ssh connection that started it, where Unix's setsid lets it outlive
+        // it. A job that forbids breaking away refuses the spawn: then it stays in.
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        if let Ok(child) = cmd.spawn() {
+            return Ok(SpawnedServer::monitor(child));
+        }
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     let child = cmd

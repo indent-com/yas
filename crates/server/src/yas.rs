@@ -1240,6 +1240,10 @@ impl Services {
                     )
                 }
             })
+            // Windows keeps each drive's current directory in the block as `=C:=C:\…`, which
+            // std lists as a variable named `=C:`: no ENV entry can carry a name with `=`, and
+            // one such entry would fail the whole snapshot.
+            .filter(|(key, _)| !key.is_empty() && !key.contains(&b'=') && !key.contains(&0))
             .collect::<BTreeMap<_, _>>();
         // This is the effective configured identity, not merely the value the
         // parent process happened to export before configuration was loaded.

@@ -1214,6 +1214,14 @@ const fn case_behavior() -> u8 {
 
 fn append_wire_path(path: &mut PathBuf, relative: &wire::Path) -> Result<(), Error> {
     for component in &relative.components {
+        #[cfg(windows)]
+        {
+            let name = std::str::from_utf8(component)
+                .map_err(|_| Error::Invalid("invalid UTF-8 FS path component"))?;
+            if let Some(problem) = windows_name_problem(name) {
+                return Err(Error::Invalid(problem));
+            }
+        }
         let value = component_os(component);
         let mut parts = OsPath::new(&value).components();
         match (parts.next(), parts.next()) {
@@ -1222,6 +1230,54 @@ fn append_wire_path(path: &mut PathBuf, relative: &wire::Path) -> Result<(), Err
         }
     }
     Ok(())
+}
+
+/// Why Windows programs could not use `name` as a file name, if they could not. Every path the
+/// server touches is verbatim (`\\?\C:\…`), which would create names that the Win32 path rules
+/// (Explorer, cmd, Git, Node) turn into something else: `nul` or `com1.txt` into a device,
+/// `a.` or `a ` into `a`, `a:b` into a stream of `a`. Such components are refused rather
+/// than creating files nothing else can open or delete.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_name_problem(name: &str) -> Option<&'static str> {
+    if name.ends_with(['.', ' ']) {
+        return Some("a name Windows can't keep: it ends with a dot or a space");
+    }
+    if name
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Some("a character Windows doesn't allow in a name");
+    }
+    // A device name stays one with an extension, and with spaces before it.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let device = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|number| {
+            matches!(
+                number,
+                "0" | "1"
+                    | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        })
+    });
+    device.then_some("a name Windows reserves for a device")
 }
 
 fn relative_path(root: &Root, absolute: &OsPath) -> Result<wire::Path, Error> {
@@ -2961,6 +3017,56 @@ mod tests {
     fn path(components: &[&[u8]]) -> wire::Path {
         wire::Path {
             components: components.iter().map(|value| value.to_vec()).collect(),
+        }
+    }
+
+    #[test]
+    fn windows_refuses_names_its_programs_cannot_use() {
+        for name in [
+            "nul",
+            "NUL",
+            "con.txt",
+            "aux.tar.gz",
+            "prn ",
+            "nul .txt",
+            "com1",
+            "LPT9.log",
+            "com0",
+            "COM\u{b9}",
+            "lpt\u{b3}.x",
+            "conin$",
+            "CONOUT$",
+            "a.",
+            "a ",
+            "a:b",
+            "a*b",
+            "what?",
+            "<x>",
+            "a|b",
+            "\"q\"",
+            "tab\there",
+        ] {
+            assert!(windows_name_problem(name).is_some(), "{name:?} passed");
+        }
+        for name in [
+            "a",
+            "nul-ish",
+            "console",
+            "com10",
+            "lpt",
+            "com",
+            "cons.txt",
+            ".gitignore",
+            "a.b",
+            " a",
+            "a b",
+            "é",
+            "COM\u{b9}0",
+            "auxiliary",
+            "file.nul",
+            "..x",
+        ] {
+            assert_eq!(windows_name_problem(name), None, "{name:?} refused");
         }
     }
 

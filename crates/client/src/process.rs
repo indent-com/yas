@@ -50,7 +50,16 @@
 //!   parent-death signal.
 //!
 //! On Windows the child runs in a kill-on-close job object that contains its
-//! whole tree; `Terminate` sends `CTRL_BREAK`, `Kill` terminates the job.
+//! whole tree, in a process group of its own. When the direct child exits,
+//! the job is terminated once its pipes close or after the kill grace (a
+//! [`Command::leave_residue`] process's job is left running instead).
+//! `Terminate` sends `CTRL_BREAK` to the group and terminates the job after
+//! the kill grace; a group no console event can reach (no console, or one it
+//! left) has its job terminated at once. `Kill` terminates the job. Of the
+//! [`Signal`]s, `Kill` terminates the job and the others send `CTRL_BREAK`,
+//! the only console event that reaches one process group. Children get a
+//! hidden console of their own when the server has none, so no window opens
+//! for them on a desktop.
 //!
 //! Operation IDs deduplicate `SPAWN` and `CONTROL` **within one session**: if
 //! a call times out locally, resending the same [`Command`] (same
@@ -228,11 +237,12 @@ impl Command {
         self
     }
 
-    /// Leave the process group alone when the direct child exits (`SPAWN_LEAVE_RESIDUE`, Unix),
-    /// as a shell leaves `server &` running: output is forwarded until the streams close, or for
-    /// `grace` after the exit, then the exit is reported and whatever still runs keeps running,
-    /// untracked. [`Process::terminate`] still stops the whole group. Servers that do not offer
-    /// it ([`Client::launcher_flags`]) refuse the spawn.
+    /// Leave the process group (on Windows, the job) alone when the direct child exits
+    /// (`SPAWN_LEAVE_RESIDUE`), as a shell leaves `server &` running: output is forwarded until
+    /// the streams close, or for `grace` after the exit, then the exit is reported and whatever
+    /// still runs keeps running, untracked. [`Process::terminate`] still stops the whole group.
+    /// Servers that do not offer it ([`Client::launcher_flags`]; older Windows
+    /// servers) refuse the spawn.
     pub fn leave_residue(&mut self, grace: Option<Duration>) -> &mut Self {
         self.leave_residue = Some(grace);
         self
