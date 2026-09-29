@@ -2010,7 +2010,9 @@ index; with it, `from_index` is the number of records skipped back from
 and PROBE 3. COMMAND uses `a=command_index,b=column`, LATEST_COMMAND requires
 `a=0`, and SEQUENCE/PROBE use `a=sequence,b=column`; OUTPUT flags are zero.
 Every OUTPUT next cursor is normalized to SEQUENCE with `a=next_seq` and
-`b=next_col`, including COMMAND, LATEST_COMMAND, and PROBE results.
+`b=next_col`, including COMMAND, LATEST_COMMAND, and PROBE results. A SEQUENCE
+cursor past the end of the output returns empty text whose start and next
+cursor are both the current end.
 
 WAIT kinds are OUTPUT 0, COMMAND 1, and LATEST_COMMAND 2, with zero flags.
 OUTPUT uses `a=sequence,b=column`, requires a nonempty needle, and returns an

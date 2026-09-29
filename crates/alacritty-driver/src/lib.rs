@@ -924,6 +924,13 @@ impl TerminalDriver {
             out.evicted = true;
         }
         out.start_seq = seq;
+        // A cursor past the end of the output reads nothing and resumes from
+        // the end, so a result's start never lies after its next cursor.
+        if (seq, out.start_col) > (out.next_seq, out.next_col) {
+            out.start_seq = out.next_seq;
+            out.start_col = out.next_col;
+            return out;
+        }
         if seq > end_inclusive {
             return out;
         }
