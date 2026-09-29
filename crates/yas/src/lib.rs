@@ -47,12 +47,10 @@ pub mod terminal;
 pub mod transfer;
 
 /// Registry, kind, status, layout metadata, and vectors generated from the
-/// canonical TOML files under `protocol/yas`.
+/// canonical TOML files under `protocol/yas` (checked in as `src/generated.rs`,
+/// so that the packaged crate builds without the repository).
 pub mod schema {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../protocol/yas/generated.rs"
-    ));
+    include!("generated.rs");
 
     /// Look up the canonical metadata for one exact family version.
     pub fn family_metadata(family_id: u16, version: u16) -> Option<&'static FamilyMetadata> {
@@ -134,10 +132,7 @@ mod generated_artifact_tests {
         );
         assert_eq!(
             include_str!(concat!(env!("OUT_DIR"), "/yas_schema.rs")),
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../protocol/yas/generated.rs"
-            ))
+            include_str!("generated.rs")
         );
         assert_eq!(PREFACE, [0x59, 0x41, 0x53, 0, 1, 0, 0x0d, 0x0a]);
         assert_eq!(schema::core::request::HELLO, 0);

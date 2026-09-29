@@ -343,6 +343,13 @@ let
 
       $plan_only && exit 0
 
+      # yas-edge's package carries the built web UI (crates/edge/build.rs).
+      echo "=== Building the web UI yas-edge embeds ==="
+      ui=$(nix build --no-link --print-out-paths .#yas-ui)
+      mkdir -p crates/edge/ui
+      cp "$ui/index.html.br" "$ui/sw.js.br" crates/edge/ui/
+      chmod u+w crates/edge/ui/index.html.br crates/edge/ui/sw.js.br
+
       if [ -z "''${CARGO_REGISTRY_TOKEN:-}" ] \
         && [ -n "''${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
         echo "=== Exchanging OIDC token for crates.io publish token ==="
@@ -395,7 +402,13 @@ let
           return 0
         fi
         echo "--- publishing $1 ---"
-        cargo publish -p "$1" --no-verify
+        # git ignores yas-edge's copy of the UI (crates/edge/ui), and cargo
+        # counts a file it packages that git ignores as uncommitted.
+        local dirty=()
+        if [ "$1" = yas-edge ]; then
+          dirty=(--allow-dirty)
+        fi
+        cargo publish -p "$1" --no-verify "''${dirty[@]}"
       }
 
       # Wait until every crate in a layer is indexed on crates.io before
@@ -441,6 +454,63 @@ let
           wait_for_crate "$crate" "$VERSION"
         done
       done
+    '';
+  };
+
+  # publish-crates publishes with `--no-verify`, which compiles nothing, so a
+  # crate that builds only inside the repository (a build script or
+  # include_bytes! reaching outside its own directory) was published broken:
+  # yas-wire 0.4.0's build script read ../../protocol. This packages every
+  # crate publish-crates publishes and builds each from its package, as
+  # crates.io users will; cargo verifies them in dependency order, each
+  # against the others' packages. The vendored forks come from crates.io at
+  # the versions pinned, which publish-crates publishes first.
+  package-crates = pkgs.writeShellApplication {
+    name = "yas-package-crates";
+    runtimeInputs = [
+      rustToolchain
+      pkgs.jq
+      pkgs.pkg-config
+      pkgs.libopus
+    ];
+    text = ''
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+      # yas-edge's package carries the web UI (crates/edge/build.rs). Its
+      # contents do not matter to the build, so without a built UI at hand,
+      # empty placeholders stand in, as in lint; they go when this exits.
+      echo "=== Setting up yas-edge's UI ==="
+      mkdir -p crates/edge/ui
+      placeholder_assets=()
+      cleanup_ui() {
+        if (( ''${#placeholder_assets[@]} )); then
+          rm -f "''${placeholder_assets[@]}"
+        fi
+      }
+      trap cleanup_ui EXIT
+      for asset in index.html.br sw.js.br; do
+        if [ ! -e "crates/edge/ui/$asset" ]; then
+          if [ -e "js/ui/dist/$asset" ]; then
+            cp "js/ui/dist/$asset" crates/edge/ui/
+          else
+            : > "crates/edge/ui/$asset"
+          fi
+          placeholder_assets+=("crates/edge/ui/$asset")
+        fi
+      done
+
+      mapfile -t packages < <(
+        cargo metadata --locked --no-deps --format-version 1 | jq -r '
+          .packages[]
+          | select(.publish == null or (.publish | index("crates-io")))
+          | "--package=" + .name
+        '
+      )
+      echo "=== Packaging and building ''${#packages[@]} crates ==="
+      # --allow-dirty: git ignores crates/edge/ui, and cargo counts a file it
+      # packages that git ignores as uncommitted.
+      cargo package --locked --allow-dirty "''${packages[@]}" "$@"
     '';
   };
 
@@ -678,6 +748,7 @@ in
     js-publish
     publish-npm-packages
     publish-crates
+    package-crates
     deploy-website
     ;
   inherit

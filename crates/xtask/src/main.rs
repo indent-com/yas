@@ -78,7 +78,7 @@ fn run() -> Result<(), String> {
             contents: &generated.vectors,
         },
         Artifact {
-            path: schema_dir.join("generated.rs"),
+            path: workspace.join("crates/yas/src/generated.rs"),
             contents: &generated.rust,
         },
         Artifact {
