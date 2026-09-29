@@ -1191,19 +1191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cros-codecs"
-version = "0.0.6"
-dependencies = [
- "anyhow",
- "byteorder",
- "crc32fast",
- "log",
- "nix",
- "thiserror",
- "zerocopy 0.8.57",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8225,6 +8212,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yas-cros-codecs"
+version = "0.0.6-yas.1"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "crc32fast",
+ "log",
+ "nix",
+ "thiserror",
+ "zerocopy 0.8.57",
+]
+
+[[package]]
 name = "yas-desktop"
 version = "0.3.1"
 dependencies = [
@@ -8369,7 +8369,6 @@ dependencies = [
  "avif-serialize",
  "blake3",
  "close_fds",
- "cros-codecs",
  "getrandom 0.4.3",
  "half",
  "ignore",
@@ -8408,6 +8407,7 @@ dependencies = [
  "x264-sys",
  "yas-composite-transport",
  "yas-compositor",
+ "yas-cros-codecs",
  "yas-desktop",
  "yas-fonts",
  "yas-fssync",

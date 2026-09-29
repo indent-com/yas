@@ -81,7 +81,9 @@ opus = "0.4"
 yas-desktop = { workspace = true }
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
 anyhow = "1"
-cros-codecs = { path = "../../vendor/cros-codecs", features = ["backend"] }
+# The YAS fork of cros-codecs 0.0.6 (vendor/cros-codecs/YAS-PATCH.md),
+# published as its own crate so this one can be.
+cros-codecs = { package = "yas-cros-codecs", version = "=0.0.6-yas.1", path = "../../vendor/cros-codecs", features = ["backend"] }
 # Codec-specific software camera decoders.  These are the last-resort path
 # when no native NVDEC, VA-API, or Vulkan Video device accepts the exact
 # H.264/AV1 profile and chroma format.  Neither dependency uses FFmpeg.

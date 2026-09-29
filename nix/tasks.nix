@@ -188,28 +188,55 @@ let
       esac
 
       metadata=$(cargo metadata --locked --no-deps --format-version 1)
-      vendored_manifest=vendor/yas-alacritty-terminal/Cargo.toml
-      vendored_metadata=$(cargo metadata --locked --no-deps --format-version 1 \
-        --manifest-path "$vendored_manifest")
-      VENDORED_CRATE=$(jq -er '
-        if (.packages | length) == 1 and
-          .packages[0].name == "yas-alacritty-terminal" and
-          (.packages[0].publish == null or
-            (.packages[0].publish | index("crates-io")))
-        then .packages[0].name
-        else error("unexpected vendored terminal crate metadata")
-        end
-      ' <<<"$vendored_metadata")
-      VENDORED_VERSION=$(jq -er '.packages[0].version' <<<"$vendored_metadata")
-      jq -e --arg version "$VENDORED_VERSION" '
-        any(.packages[] | select(.name == "yas-terminal-driver") |
-          .dependencies[];
-          .name == "yas-alacritty-terminal" and
-          .rename == "alacritty_terminal" and
-          .source == null and
-          .req == ("=" + $version) and
-          (.path | endswith("/vendor/yas-alacritty-terminal")))
-      ' <<<"$metadata" >/dev/null
+
+      # Forks under vendor/ that publishable crates depend on.  crates.io keeps
+      # no path dependencies, so each fork is published first, under a name of
+      # its own, and the one workspace crate using it pins its exact version:
+      #   <vendor/ directory> <crate> <dependent crate> <dependency key>
+      vendored_specs=(
+        "yas-alacritty-terminal yas-alacritty-terminal yas-terminal-driver alacritty_terminal"
+        "cros-codecs yas-cros-codecs yas-server cros-codecs"
+      )
+      vendored_crates=()
+      vendored_versions=()
+      vendored_manifests=()
+      declare -A vendored=()
+      for spec in "''${vendored_specs[@]}"; do
+        read -r directory vendored_crate dependent key <<<"$spec"
+        vendored_manifest=vendor/$directory/Cargo.toml
+        vendored_metadata=$(cargo metadata --locked --no-deps --format-version 1 \
+          --manifest-path "$vendored_manifest")
+        vendored_version=$(jq -er --arg crate "$vendored_crate" '
+          if (.packages | length) == 1 and
+            .packages[0].name == $crate and
+            (.packages[0].publish == null or
+              (.packages[0].publish | index("crates-io")))
+          then .packages[0].version
+          else error("unexpected vendored crate metadata for " + $crate)
+          end
+        ' <<<"$vendored_metadata")
+        if ! jq -e \
+          --arg crate "$vendored_crate" \
+          --arg version "$vendored_version" \
+          --arg dependent "$dependent" \
+          --arg key "$key" \
+          --arg directory "$directory" '
+          any(.packages[] | select(.name == $dependent) |
+            .dependencies[];
+            .name == $crate and
+            .rename == $key and
+            .source == null and
+            .req == ("=" + $version) and
+            (.path | endswith("/vendor/" + $directory)))
+        ' <<<"$metadata" >/dev/null; then
+          echo "FATAL: $dependent must depend on $key = { package = \"$vendored_crate\", version = \"=$vendored_version\", path = \".../vendor/$directory\" }" >&2
+          exit 1
+        fi
+        vendored_crates+=("$vendored_crate")
+        vendored_versions+=("$vendored_version")
+        vendored_manifests+=("$vendored_manifest")
+        vendored["$vendored_crate"]=1
+      done
 
       mapfile -t crates < <(
         jq -r '
@@ -245,13 +272,33 @@ let
 
       for crate in "''${crates[@]}"; do
         while IFS= read -r dependency; do
-          if [ -n "''${workspace_crates[$dependency]:-}" ] \
-            && [ -z "''${publishable_crates[$dependency]:-}" ]; then
-            echo "FATAL: publishable crate $crate depends on non-publishable workspace crate $dependency" >&2
+          if [ -n "''${workspace_crates[$dependency]:-}" ]; then
+            if [ -z "''${publishable_crates[$dependency]:-}" ]; then
+              echo "FATAL: publishable crate $crate depends on non-publishable workspace crate $dependency" >&2
+              exit 1
+            fi
+          elif [ -z "''${vendored[$dependency]:-}" ]; then
+            echo "FATAL: publishable crate $crate depends on $dependency by path, but $dependency is neither a workspace crate nor a vendored crate this script publishes" >&2
             exit 1
           fi
         done < <(dependencies "$crate")
       done
+
+      # cargo publish strips the path and keeps only the version requirement,
+      # so a path dependency without one cannot be published at all.
+      unversioned=$(jq -r '
+        .packages[]
+        | select(.publish == null or (.publish | index("crates-io")))
+        | .name as $crate
+        | .dependencies[]
+        | select(.kind != "dev" and .path != null and .req == "*")
+        | "  \($crate) -> \(.name)"
+      ' <<<"$metadata")
+      if [ -n "$unversioned" ]; then
+        echo "FATAL: path dependencies of publishable crates without a version requirement:" >&2
+        echo "$unversioned" >&2
+        exit 1
+      fi
 
       declare -A planned=()
       layers=()
@@ -287,7 +334,7 @@ let
         done
       done
 
-      echo "layer 1: $VENDORED_CRATE"
+      echo "layer 1: ''${vendored_crates[*]}"
       layer_number=1
       for layer in "''${layers[@]}"; do
         layer_number=$((layer_number + 1))
@@ -371,13 +418,19 @@ let
         echo "--- $crate@$version is available ---"
       }
 
-      if is_published "$VENDORED_CRATE" "$VENDORED_VERSION"; then
-        echo "--- $VENDORED_CRATE@$VENDORED_VERSION already published, skipping ---"
-      else
-        echo "--- publishing $VENDORED_CRATE@$VENDORED_VERSION ---"
-        cargo publish --manifest-path "$vendored_manifest" --no-verify --locked
-      fi
-      wait_for_crate "$VENDORED_CRATE" "$VENDORED_VERSION"
+      for index in "''${!vendored_crates[@]}"; do
+        crate=''${vendored_crates[$index]}
+        version=''${vendored_versions[$index]}
+        if is_published "$crate" "$version"; then
+          echo "--- $crate@$version already published, skipping ---"
+        else
+          echo "--- publishing $crate@$version ---"
+          cargo publish --manifest-path "''${vendored_manifests[$index]}" --no-verify --locked
+        fi
+      done
+      for index in "''${!vendored_crates[@]}"; do
+        wait_for_crate "''${vendored_crates[$index]}" "''${vendored_versions[$index]}"
+      done
 
       for layer in "''${layers[@]}"; do
         read -r -a layer_crates <<<"$layer"
@@ -889,23 +942,29 @@ in
       fi
       echo ""
 
-      echo "=== Vendored YAS Alacritty dependency ==="
-      cargo metadata --locked --format-version 1 | jq -e '
-        [.packages[] | select(.name == "yas-alacritty-terminal")] as $engines |
-        [.packages[] | select(.name == "yas-terminal-driver") |
-          .dependencies[] |
-          select(.name == "yas-alacritty-terminal" and
-            .rename == "alacritty_terminal")] as $dependencies |
-        ($engines | length) == 1 and
-        $engines[0].source == null and
-        ($engines[0].manifest_path |
-          endswith("/vendor/yas-alacritty-terminal/Cargo.toml")) and
-        ($dependencies | length) == 1 and
-        $dependencies[0].source == null and
-        $dependencies[0].req == ("=" + $engines[0].version) and
-        ($dependencies[0].path |
-          endswith("/vendor/yas-alacritty-terminal"))
-      ' >/dev/null
+      echo "=== Vendored YAS Alacritty and cros-codecs dependencies ==="
+      full_metadata=$(cargo metadata --locked --format-version 1)
+      check_vendored() {
+        jq -e --arg crate "$1" --arg dependent "$2" --arg key "$3" \
+          --arg directory "$4" '
+          [.packages[] | select(.name == $crate)] as $forks |
+          [.packages[] | select(.name == $dependent) |
+            .dependencies[] |
+            select(.name == $crate and .rename == $key)] as $dependencies |
+          ($forks | length) == 1 and
+          $forks[0].source == null and
+          ($forks[0].manifest_path |
+            endswith("/vendor/" + $directory + "/Cargo.toml")) and
+          ($dependencies | length) == 1 and
+          $dependencies[0].source == null and
+          $dependencies[0].req == ("=" + $forks[0].version) and
+          ($dependencies[0].path |
+            endswith("/vendor/" + $directory))
+        ' <<<"$full_metadata" >/dev/null
+      }
+      check_vendored yas-alacritty-terminal yas-terminal-driver \
+        alacritty_terminal yas-alacritty-terminal
+      check_vendored yas-cros-codecs yas-server cros-codecs cros-codecs
       echo ""
 
       if [ "$check" = true ]; then
