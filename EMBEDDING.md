@@ -422,10 +422,11 @@ const session = await workspace.createSession({
 });
 ```
 
-The unix transport speaks yas's framing protocol (4-byte little-endian
-length-prefixed frames) for you — there is no need to re-implement the wire
-format. `BunUnixSocketTransport` and `DenoUnixSocketTransport` are the
-runtime-native equivalents.
+The unix transport carries the YAS byte stream (the preface, then 4-byte
+little-endian length-prefixed frames) for you; there is no need to
+re-implement the wire format. `BunUnixSocketTransport` and
+`DenoUnixSocketTransport` are the runtime-native equivalents; Deno needs
+`--allow-read --allow-write` for the socket path.
 
 ### Exit status
 
