@@ -9753,16 +9753,19 @@ impl Session {
                     .max_by_key(|(_, pixels)| u64::from(pixels.width) * u64::from(pixels.height))
                     .map(|(_, pixels)| (pixels.width, pixels.height, pixels.pixels.clone()))
             });
-            let command_tx = shared
-                .compositor
-                .as_ref()
-                .map(|compositor| compositor.handle.command_tx.clone());
+            let command_tx = shared.compositor.as_ref().map(|compositor| {
+                (
+                    compositor.handle.command_tx.clone(),
+                    compositor.handle.command_sender(),
+                )
+            });
             (snapshot, command_tx)
         };
         let mut captured = match command_tx {
-            Some(command_tx) => {
+            Some((command_tx, loop_waker)) => {
                 super::request_surface_capture_with_timeout(
                     command_tx,
+                    move || loop_waker.wake(),
                     surface_id,
                     0,
                     Duration::from_secs(5),
