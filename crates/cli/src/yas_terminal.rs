@@ -19,6 +19,14 @@ const MAX_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const READ_PAGE_BYTES: u32 = 8 * 1024 * 1024;
 const STATE_CREDIT: u64 = 1024 * 1024;
 
+/// OutputResult framing around its text: the fixed fields plus the text length.
+const OUTPUT_RESULT_OVERHEAD: u64 = 36;
+
+/// Collection limit for an OUTPUT reply whose text is capped at `max_bytes`.
+fn output_collection_limit(max_bytes: u32) -> u64 {
+    (u64::from(max_bytes.max(1)) + OUTPUT_RESULT_OVERHEAD).min(MAX_QUERY_BYTES)
+}
+
 pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> {
     let mut client = crate::yas_native::connect(on, hub).await?;
     let mut terminals = client
@@ -531,7 +539,7 @@ pub(crate) async fn cmd_output(
             initial_receive_credit: QUERY_CREDIT,
             extensions: Extensions::default(),
         },
-        u64::from(max_bytes).min(MAX_QUERY_BYTES),
+        output_collection_limit(max_bytes),
         Duration::from_secs(10),
     )
     .await?;
@@ -1214,7 +1222,7 @@ async fn cmd_since(
             initial_receive_credit: QUERY_CREDIT,
             extensions: Extensions::default(),
         },
-        u64::from(request_max.max(1)).min(MAX_QUERY_BYTES),
+        output_collection_limit(request_max),
         Duration::from_secs(10),
     )
     .await?;
@@ -1263,7 +1271,7 @@ async fn probe_output_cursor(
             initial_receive_credit: QUERY_CREDIT,
             extensions: Extensions::default(),
         },
-        1,
+        output_collection_limit(1),
         Duration::from_secs(10),
     )
     .await?;
@@ -1300,7 +1308,7 @@ async fn wait_for_pattern(
                 initial_receive_credit: QUERY_CREDIT,
                 extensions: Extensions::default(),
             },
-            u64::from(terminal_args::OUTPUT_MAX_BYTES),
+            output_collection_limit(terminal_args::OUTPUT_MAX_BYTES),
             Duration::from_secs(10),
         )
         .await?;
@@ -1714,5 +1722,25 @@ mod tests {
         assert_eq!(launch.environment[0].key, b"A");
         assert_eq!(launch.environment[1].key, b"Z");
         assert_eq!(launch.extensions.0[0].value, 3_000_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn output_collection_limit_covers_result_framing() {
+        for text_len in [0usize, 1, 4096] {
+            let encoded = terminal::OutputResult {
+                generation: 1,
+                flags: 0,
+                start_seq: u64::MAX / 2,
+                start_col: 7,
+                next_seq: u64::MAX / 2,
+                next_col: 7 + text_len as u32,
+                text: vec![b'x'; text_len],
+            }
+            .encode()
+            .unwrap();
+            let limit = output_collection_limit(text_len as u32);
+            assert!(encoded.len() as u64 <= limit, "{} > {limit}", encoded.len());
+        }
+        assert_eq!(output_collection_limit(u32::MAX), MAX_QUERY_BYTES);
     }
 }
