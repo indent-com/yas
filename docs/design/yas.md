@@ -3241,16 +3241,17 @@ SPAWN flags: `MERGE_STDERR` (1) puts stderr on stdout's pipe; `DETACHABLE` (2)
 keeps the child past its session. `STDIN_NULL` (8) gives the child the null
 device as stdin: the Result carries no stdin descriptor, so a program sees
 what a detached command sees (tools that read a piped stdin, such as ripgrep
-without a path, act as they would outside a pipe). `LEAVE_RESIDUE` (4, Unix
-only; UNSUPPORTED elsewhere) is for launchers of shell commands: when the
-direct child exits, its process group is not signalled. Output is forwarded
+without a path, act as they would outside a pipe). `LEAVE_RESIDUE` (4) is for
+launchers of shell commands: when the direct child exits, its process group is
+not signalled (on Windows, its job is neither terminated nor killed when its
+handle closes). Output is forwarded
 until the streams close or the residue grace passes after that exit (SPAWN
 extension tag 3 `residue_grace_ns: u64`; absent, until the streams close),
 then the exit is reported; members still holding the streams are left
 running, untracked, and what they write is drained and discarded. TERMINATE,
 owner loss and shutdown still signal the group while the direct child runs;
-TERMINATE's escalation SIGKILLs members left after the kill grace and stops
-waiting for their streams. The exit's detail says `residual process group left
+TERMINATE's escalation SIGKILLs members left after the kill grace (terminates
+the job on Windows) and stops waiting for their streams. The exit's detail says `residual process group left
 running` when members held the streams.
 
 Catalog records contain argv0, native PID for diagnostics, lifecycle, owner
