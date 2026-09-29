@@ -1443,6 +1443,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_after_a_fast_exit_returns_the_exit_record() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([4; 16], None).unwrap();
+        for _ in 0..50 {
+            let mut attachment = session
+                .spawn(
+                    &spawn_request(
+                        vec![executable("sh"), b"-c".to_vec(), b"exit 7".to_vec()],
+                        Vec::new(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            let handle = attachment.process_handle;
+            while !matches!(
+                tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Event::Exit(_)
+            ) {}
+            let exit = session
+                .wait(&wire::Wait {
+                    process_handle: handle,
+                    timeout_ns: 5_000_000_000,
+                    extensions: Extensions::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(exit.code, 7);
+        }
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn empty_environment_is_exact_and_wait_observes_exit() {
         let server = Server::new(false, true);
         let runtime = Runtime::new(server.clone());
