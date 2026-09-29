@@ -3453,11 +3453,28 @@ fn process_tree_already_absent(error: &io::Error) -> bool {
 }
 
 /// SIGKILL a process group; true once nothing is left of it.
+///
+/// macOS answers EPERM, not ESRCH, for a group whose remaining members are
+/// all zombies: XNU's killpg1 skips zombies, then has found nobody to signal.
+/// Orphans are reaped by init at once, so on EPERM this retries for up to
+/// `wait` for the group to disappear before it counts as a failure (a member
+/// this user may not signal, as on Linux).
 #[cfg(unix)]
-async fn kill_group_until_gone(pid: ProcessId, _wait: Duration) -> bool {
-    signal_group(pid, libc::SIGKILL)
-        .err()
-        .is_none_or(|error| process_tree_already_absent(&error))
+async fn kill_group_until_gone(pid: ProcessId, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match signal_group(pid, libc::SIGKILL) {
+            Ok(()) => return true,
+            Err(error) if process_tree_already_absent(&error) => return true,
+            Err(error)
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 #[cfg(unix)]
