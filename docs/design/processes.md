@@ -184,6 +184,15 @@ behind is dropped alone: its Transfers are reset with `RESOURCE_EXHAUSTED`, and 
 processes go on. (Servers up to 0.4.0 dropped the owner too when it fell behind,
 and closed the lagging session's whole Process endpoint with it.)
 
+The pacing outlasts the child. Once it has exited and nothing of its group is left,
+what its pipes still hold reaches the owner however slowly the owner takes it: the
+kill grace, and a `LEAVE_RESIDUE` grace, bound only the time the group's residue
+keeps the streams open. The server stops waiting for the owner when no reader has
+waited for it for 250 ms (a process outside the group holds a pipe open with nothing
+coming) or when a stream has given 1 MiB more (such a process writes on). An owner
+that stops reading keeps its process's slot until it reads, drops the streams, or
+its session ends, as a local pipe's reader would.
+
 Catalogue State is coalesced under its subscription credit. Output offsets are
 lifetime counters, so a later `ATTACH` reports the exact skipped prefix rather
 than pretending to replay bytes that were not retained. A detachable final

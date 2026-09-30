@@ -962,10 +962,11 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
             let exit = native_exit_info(exit);
             let route = {
                 let mut routes = inner.routes.lock().unwrap();
-                let route = routes
-                    .get(&process_id)
-                    .cloned()
-                    .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
+                // Its route failed as the exit was queued: that attachment is gone already, and
+                // its WAITs find the exit through the process.
+                let Some(route) = routes.get(&process_id).cloned() else {
+                    return Ok(());
+                };
                 let process_handle = route.process_handle.load(Ordering::Acquire);
                 if process_handle != 0 {
                     // Record the replay before the route disappears: a WAIT
@@ -1406,6 +1407,250 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2_500).saturating_sub(started.elapsed())).await;
         assert!(!alive(pid), "the escalation killed the group");
         session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    fn watch_request(handle: u64) -> wire::Attach {
+        wire::Attach {
+            process_handle: handle,
+            flags: 0,
+            stdout_receive_credit: 1 << 20,
+            stderr_receive_credit: 1 << 20,
+            extensions: Extensions::default(),
+        }
+    }
+
+    /// `sh -c SCRIPT`, SCRIPT's programs named by absolute path (spawn_request's environment is
+    /// empty).
+    fn sh(script: &str) -> Vec<Vec<u8>> {
+        let mut script = script.to_owned();
+        for name in ["head", "sleep", "yes"] {
+            let path = String::from_utf8(executable(name)).unwrap();
+            script = script.replace(&format!("{{{name}}}"), &path);
+        }
+        vec![executable("sh"), b"-c".to_vec(), script.into_bytes()]
+    }
+
+    /// What a command a session starts then says: its output and exit.
+    async fn runs_a_command(session: &Session) -> (Vec<u8>, i32) {
+        let mut after = session
+            .spawn(
+                &spawn_request(vec![executable("echo"), b"after".to_vec()], Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        let (output, exit) = output_and_exit(&mut after, Duration::from_secs(5), 0).await;
+        (output, exit.code)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_evicted_watcher_gives_back_its_process_slot() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([4; 16], None).unwrap();
+        let watcher = runtime.session([5; 16], None).unwrap();
+        // More rounds than a session has process slots (16).
+        for round in 0..20 {
+            let mut attachment = owner
+                .spawn(
+                    &spawn_request(sh("{sleep} 0.2; {head} -c 3145728 /dev/zero"), Vec::new()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let watched = watcher
+                .attach(&watch_request(attachment.process_handle))
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+            let (control, mut events) = watched.split();
+            let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(10), 0).await;
+            assert_eq!((output.len(), exit.code), (3145728, 0), "round {round}");
+            // The watcher never acknowledges: it falls a window behind and is dropped.
+            while tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .unwrap()
+                .is_some()
+            {}
+            assert!(events.failure().is_some(), "round {round}");
+            // What the adapter does next.
+            let _ = control.detach().await;
+        }
+        assert_eq!(runs_a_command(&watcher).await, (b"after\n".to_vec(), 0));
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_watcher_whose_queue_fills_after_the_exit_fails_alone() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([6; 16], None).unwrap();
+        let watcher = runtime.session([7; 16], None).unwrap();
+        let mut attachment = owner
+            .spawn(
+                &spawn_request(
+                    sh(
+                        "{sleep} 0.3; i=0; while [ $i -lt 80 ]; do echo x; {sleep} 0.02; \
+                        i=$((i+1)); done; printf z; exit 0",
+                    ),
+                    Vec::new(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        // Never read: its route queue (80 events) fills with the 80 lines, and the last
+        // frame comes after the child exits.
+        let _watched = watcher
+            .attach(&watch_request(attachment.process_handle))
+            .await
+            .unwrap();
+        // The owner acknowledges its first 48 frames only: with 32 unacknowledged, the reader
+        // waits for it, and `z` stays in the pipe as the child exits.
+        let (mut frames, mut end) = (0, 0u64);
+        while frames < 80 {
+            match tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Event::Output {
+                    stream,
+                    lifetime_offset,
+                    data,
+                } => {
+                    frames += 1;
+                    end = lifetime_offset + data.len() as u64;
+                    if frames <= 48 {
+                        attachment.acknowledge_output(stream, end).unwrap();
+                    }
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        attachment.acknowledge_output(Stream::Stdout, end).unwrap();
+        let (rest, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), end).await;
+        assert_eq!((rest, exit.code), (b"z".to_vec(), 0));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(watcher.inner.closed.borrow().is_none());
+        assert_eq!(runs_a_command(&watcher).await, (b"after\n".to_vec(), 0));
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_that_drops_its_stream_after_the_exit_still_waits_for_it() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([10; 16], None).unwrap();
+        // The reader takes a window (1 MiB) and waits for the owner; the last 32 KiB stay in
+        // the pipe as the child exits.
+        let attachment = owner
+            .spawn(
+                &spawn_request(sh("{head} -c 1081344 /dev/zero; exit 4"), Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let (control, _events) = attachment.split();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        // What the adapter does when its client drops the stream.
+        control.detach().await.unwrap();
+        let wait = wire::Wait {
+            process_handle: handle,
+            timeout_ns: 5_000_000_000,
+            extensions: Extensions::default(),
+        };
+        let exit = owner.wait(&wait).await.unwrap();
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_slow_to_take_its_window_after_the_exit_gets_all_its_output() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([12; 16], None).unwrap();
+        let mut attachment = owner
+            .spawn(
+                &spawn_request(sh("{head} -c 1081344 /dev/zero; exit 4"), Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Longer than the kill grace (2 s): a slow link, or a client that waits for the exit
+        // before it reads.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output.len(), 1081344);
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_residue_owner_slow_to_take_its_window_after_the_exit_gets_all_its_output() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([13; 16], None).unwrap();
+        let mut request = residue_request(String::new(), Some(Duration::from_millis(300)));
+        request.argv = sh("{head} -c 1081344 /dev/zero; exit 4");
+        let mut attachment = owner.spawn(&request, None).await.unwrap();
+        // Longer than its grace: nothing of the group is left, so the grace does not cut it.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output.len(), 1081344);
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_residue_writing_on_ends_its_grace_though_the_owner_reads_nothing() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([14; 16], None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut request = residue_request(String::new(), Some(Duration::from_millis(300)));
+        request.argv = sh(&format!(
+            "{{yes}} & echo $! > '{}'; exit 0",
+            pid_file.display()
+        ));
+        let started = std::time::Instant::now();
+        let mut attachment = owner.spawn(&request, None).await.unwrap();
+        // The owner takes nothing until the exit: the residue fills its window and blocks.
+        let exit = loop {
+            if let Event::Exit(exit) =
+                tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            {
+                break exit;
+            }
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.detail, b"residual process group left running");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(pid), "the residue is left running");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        owner.shutdown().await;
         server.shutdown().await;
     }
 

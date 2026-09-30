@@ -311,6 +311,14 @@ const RESIDUE_LEFT_RUNNING: &str = "residual process group left running";
 /// that are already zombies to be reaped (see `kill_group_until_gone`).
 #[cfg(unix)]
 const RESIDUAL_ZOMBIE_WAIT: Duration = Duration::from_secs(1);
+/// Once nothing of a finished process's group is left, how long its streams may stay open with
+/// no reader waiting for the owner to take its window before the cleanup stops waiting for them
+/// (a holder outside the group keeps a pipe open with nothing coming): see `drain_paced`.
+const DRAIN_IDLE: Duration = Duration::from_millis(250);
+/// How much more a stream may give while the cleanup waits for its owner (`drain_paced`): more
+/// than a pipe holds (1 MiB at most unless root raised /proc/sys/fs/pipe-max-size), so it bounds
+/// only a holder outside the group that writes on.
+const DRAIN_BUDGET: u64 = 1024 * 1024;
 const PROCESS_STREAM_STDOUT: u8 = process_schema::STREAM_STDOUT_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDERR: u8 = process_schema::STREAM_STDERR_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDIN_ACCEPTING: u8 = 1 << 0;
@@ -1185,6 +1193,8 @@ struct RecordInner {
     stderr: Option<StreamState>,
     stdout_readers: u8,
     stderr_readers: u8,
+    /// Output readers waiting for the owner to take its window (`owner_with_room`).
+    paced_readers: u8,
     child_outcome: Option<ChildOutcome>,
     tree_cleanup_done: bool,
     exit_override: Option<ExitOverride>,
@@ -1519,6 +1529,7 @@ impl Manager {
                 stderr: (!merged).then_some(StreamState { next: 0 }),
                 stdout_readers: 1,
                 stderr_readers: if merged { 0 } else { 1 },
+                paced_readers: 0,
                 child_outcome: None,
                 tree_cleanup_done: false,
                 exit_override: None,
@@ -1763,7 +1774,12 @@ impl Manager {
                 return Err(NativeError::NotFound);
             };
             let residual_running = residual_running(&record, &inner);
-            if inner.terminal_queued || (inner.child_outcome.is_some() && !residual_running) {
+            // Detach goes through until the exit is queued: its output may still be draining,
+            // and a binding nobody acknowledges would hold the readers the owner paces.
+            let detach = matches!(action, NativeControl::Detach);
+            if inner.terminal_queued
+                || (inner.child_outcome.is_some() && !residual_running && !detach)
+            {
                 return Err(NativeError::Conflict);
             }
             match action {
@@ -2985,6 +3001,10 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 }
                 drop(inner);
                 for binding in evicted {
+                    // Its endpoint goes on: free the slot, or the process holds one for good.
+                    if let Some(endpoint) = binding.endpoint.upgrade() {
+                        remove_bound_slot(&endpoint, binding.process_id, &record);
+                    }
                     binding.out.evict(binding.process_id);
                 }
             }
@@ -3000,11 +3020,16 @@ async fn owner_with_room(
     record: &Record,
     stream: u8,
 ) -> Option<(u64, u32, mpsc::Sender<NativeEventEnvelope>)> {
+    // Counted in `paced_readers` while it waits, however it stops (an abort drops it).
+    let mut paced = Paced {
+        record,
+        counted: false,
+    };
     loop {
         // Created before the check: an acknowledgement in between still wakes it.
         let changed = record.changed.notified();
         {
-            let inner = record.inner.lock().unwrap();
+            let mut inner = record.inner.lock().unwrap();
             let owner = inner
                 .bindings
                 .iter()
@@ -3027,8 +3052,67 @@ async fn owner_with_room(
                     owner.out.events.clone(),
                 ));
             }
+            if !paced.counted {
+                paced.counted = true;
+                inner.paced_readers += 1;
+                drop(inner);
+                record.changed.notify_waiters();
+            }
         }
         changed.await;
+    }
+}
+
+/// An output reader waiting for its owner (`owner_with_room`), as `paced_readers` counts it.
+struct Paced<'a> {
+    record: &'a Record,
+    counted: bool,
+}
+
+impl Drop for Paced<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.record.inner.lock().unwrap().paced_readers -= 1;
+            self.record.changed.notify_waiters();
+        }
+    }
+}
+
+/// The cleanup of a finished process whose streams are still open once nothing of its group is
+/// left: what holds them is the child's own output that its owner has not taken yet (it paces
+/// the readers), so they go on until the pipes close, however slowly the owner takes its window.
+/// It stops waiting when no reader has waited for the owner for `DRAIN_IDLE` (a holder outside
+/// the group keeps a pipe open with nothing coming) or a stream has given `DRAIN_BUDGET` more (one
+/// that writes on). True when the streams closed.
+async fn drain_paced(record: &Record) -> bool {
+    let next = |inner: &RecordInner| {
+        (
+            inner.stdout.next,
+            inner.stderr.as_ref().map_or(0, |state| state.next),
+        )
+    };
+    let start = next(&record.inner.lock().unwrap());
+    loop {
+        let changed = record.changed.notified();
+        let paced = {
+            let inner = record.inner.lock().unwrap();
+            if io_tasks_done(&inner) {
+                return true;
+            }
+            let (stdout, stderr) = next(&inner);
+            if inner.tree_cleanup_done
+                || stdout - start.0 > DRAIN_BUDGET
+                || stderr - start.1 > DRAIN_BUDGET
+            {
+                return false;
+            }
+            inner.paced_readers > 0
+        };
+        if paced {
+            changed.await;
+        } else if tokio::time::timeout(DRAIN_IDLE, changed).await.is_err() {
+            return false;
+        }
     }
 }
 
@@ -3126,6 +3210,9 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
                     _ = &mut deadline => break false,
                 }
             };
+            // The grace is for the group's residue: with none left, the streams hold the
+            // child's own output, which its owner takes at its own pace.
+            let closed = closed || (process_group_absent(&record) && drain_paced(&record).await);
             if closed {
                 {
                     let mut inner = record.inner.lock().unwrap();
@@ -3191,6 +3278,12 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
         let cleanup_failed = force_kill(&record)
             .err()
             .is_some_and(|error| !process_tree_already_absent(&error));
+        // Nothing of the group writes any more: what the pipes still hold is the child's own
+        // output, which its owner takes at its own pace. (Only a holder outside the group, or a
+        // group that could not be killed, stops the readers.)
+        if !cleanup_failed {
+            drain_paced(&record).await;
+        }
         let (stdin_abort, output_aborts) = {
             let mut inner = record.inner.lock().unwrap();
             if inner.tree_cleanup_done {
