@@ -1,3 +1,7 @@
+// The WebSocket and local-socket tests are Unix-only: on Windows the helpers
+// only they use would fail CI's `-D warnings`.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use super::*;
 use tokio::io::AsyncReadExt;
 
@@ -607,6 +611,22 @@ async fn websocket_session_serves_consumers_and_takes_allowlist_changes() {
                 .any(|line| line.contains("a WebSocket session carries no datagrams"))
         );
 
+        // A consumer still connected when the session ends goes with it, as
+        // a WebTransport stream goes with its connection.
+        relay.ask("lingering");
+        let (_, stream) = relay.stream().await;
+        let mut lingering = yas_uplink::connect(stream, keys.other.clone())
+            .await
+            .unwrap();
+        lingering
+            .write_all(yas_wire::PREFACE.as_slice())
+            .await
+            .unwrap();
+        lingering.flush().await.unwrap();
+        let (mut held, _) = listener.accept().await.unwrap();
+        let mut preface = vec![0; yas_wire::PREFACE.len()];
+        held.read_exact(&mut preface).await.unwrap();
+
         // Shutting down closes the session with a close frame.
         active.close().await;
         match tokio::time::timeout(Duration::from_secs(5), session).await {
@@ -615,6 +635,14 @@ async fn websocket_session_serves_consumers_and_takes_allowlist_changes() {
             }
             _ => panic!("the session didn't end"),
         }
+        let mut rest = Vec::new();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), held.read_to_end(&mut rest))
+                .await
+                .is_ok(),
+            "the lingering consumer's local connection closes with the session"
+        );
+        drop(lingering);
         let _ = keys.server_public;
     })
     .await

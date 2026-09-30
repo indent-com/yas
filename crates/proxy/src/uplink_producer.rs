@@ -612,6 +612,10 @@ impl Producer {
         active.set(Session::WebSocket(sink.clone()));
 
         let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING));
+        // Stream WebSockets are connections of their own: they end with the
+        // session (dropped, the set aborts them), as WebTransport streams end
+        // with their QUIC connection.
+        let mut streams = tokio::task::JoinSet::new();
         let mut keepalive = tokio::time::interval(KEEPALIVE);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await;
@@ -627,7 +631,7 @@ impl Producer {
                         let Ok(permit) = pending.clone().try_acquire_owned() else {
                             continue;
                         };
-                        tokio::spawn(websocket_stream(
+                        streams.spawn(websocket_stream(
                             stream,
                             relay.cert_hash.clone(),
                             self.shared.clone(),
@@ -648,6 +652,7 @@ impl Producer {
                     Some(Err(error)) => break error.to_string(),
                     None => break "the relay closed the connection".to_owned(),
                 },
+                Some(_) = streams.join_next(), if !streams.is_empty() => {}
                 _ = keepalive.tick() => {
                     if heard.elapsed() >= IDLE_TIMEOUT {
                         break format!("nothing from the relay for {}s", IDLE_TIMEOUT.as_secs());
