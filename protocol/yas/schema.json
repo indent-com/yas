@@ -5232,6 +5232,10 @@
         {
           "name": "stage_in_place",
           "layout": "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID"
+        },
+        {
+          "name": "apply_in_place",
+          "layout": "APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID"
         }
       ],
       "constants": [
@@ -5636,6 +5640,14 @@
           "value": 1
         },
         {
+          "name": "APPLY_ITEM_IN_PLACE",
+          "value": 2
+        },
+        {
+          "name": "APPLY_ITEM_EXTENDED_FLAGS",
+          "value": 2
+        },
+        {
           "name": "REMOVE_RECURSIVE",
           "value": 1
         },
@@ -5804,8 +5816,12 @@
           "value": 16
         },
         {
+          "name": "CAPABILITY_APPLY_IN_PLACE",
+          "value": 32
+        },
+        {
           "name": "CAPABILITY_FLAGS",
-          "value": 31
+          "value": 63
         }
       ]
     },
@@ -8801,6 +8817,14 @@
           "required": false,
           "hard_min": 1,
           "hard_max": 16384
+        },
+        {
+          "name": "LAUNCHER_FLAGS_EXTENDED",
+          "tag": 19,
+          "type": "u32",
+          "required": false,
+          "hard_min": 0,
+          "hard_max": 65535
         }
       ],
       "requests": [
@@ -8877,6 +8901,15 @@
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "StateAck"
+        },
+        {
+          "name": "EXIT",
+          "kind": 2,
+          "direction": "server_to_client",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "ExitReport"
         }
       ],
       "types": [
@@ -8891,6 +8924,18 @@
         {
           "name": "remove_record",
           "layout": "process_handle:u64"
+        },
+        {
+          "name": "exit_report",
+          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream"
+        },
+        {
+          "name": "keep_output_extension",
+          "layout": "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES"
+        },
+        {
+          "name": "output_elision",
+          "layout": "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream"
         },
         {
           "name": "exit_record",
@@ -8933,6 +8978,18 @@
         {
           "name": "SPAWN_LAUNCHER_FLAGS",
           "value": 12
+        },
+        {
+          "name": "SPAWN_REPORT_EXIT",
+          "value": 16
+        },
+        {
+          "name": "SPAWN_KEEP_OUTPUT",
+          "value": 32
+        },
+        {
+          "name": "SPAWN_LAUNCHER_FLAGS_EXTENDED",
+          "value": 60
         },
         {
           "name": "ENV_EMPTY",
@@ -9119,6 +9176,22 @@
           "value": 3
         },
         {
+          "name": "SPAWN_KEEP_OUTPUT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "MAX_KEEP_OUTPUT_TAIL_BYTES",
+          "value": 1048576
+        },
+        {
+          "name": "EXIT_STDOUT_ELIDED_EXTENSION",
+          "value": 1
+        },
+        {
+          "name": "EXIT_STDERR_ELIDED_EXTENSION",
+          "value": 2
+        },
+        {
           "name": "MAX_ARGC",
           "value": 1024
         },
@@ -9285,6 +9358,10 @@
         {
           "name": "LIMIT_LAUNCHER_FLAGS",
           "value": 11
+        },
+        {
+          "name": "LIMIT_LAUNCHER_FLAGS_EXTENDED",
+          "value": 19
         }
       ]
     },

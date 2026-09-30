@@ -541,6 +541,9 @@ mod generated_artifact_tests {
             ("fs.apply.payload", true, |bytes| {
                 fs::Apply::decode(bytes).map(|_| ())
             }),
+            ("fs.apply.in_place.payload", true, |bytes| {
+                fs::Apply::decode(bytes).map(|_| ())
+            }),
             ("fs.entry.inline.payload", true, |bytes| {
                 fs::EntryRecord::decode(bytes).map(|_| ())
             }),

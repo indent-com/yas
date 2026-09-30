@@ -1053,6 +1053,10 @@ async fn establish_connection(
         // every 15 s and give up after 3 consecutive misses (~45 s).
         keepalive_interval: Some(std::time::Duration::from_secs(15)),
         keepalive_max: 3,
+        // YAS requests are small frames, often several in a row: with Nagle's algorithm, one
+        // waits for the ACK of the one before, which the server delays (40 ms on Linux) since it
+        // has nothing to answer until the whole request is in.
+        nodelay: true,
         ..Default::default()
     };
 

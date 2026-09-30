@@ -17,7 +17,11 @@ use yas_client::{Client, Error, HelloOptions};
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 fn options() -> HostOptions {
-    HostOptions::new(env!("CARGO_BIN_EXE_yas"))
+    options_for(env!("CARGO_BIN_EXE_yas"))
+}
+
+fn options_for(binary: impl Into<std::path::PathBuf>) -> HostOptions {
+    HostOptions::new(binary)
         .arg("--no-persistent-extensions")
         .env("YAS_EXT", "0")
         .env("YAS_CHANNEL", "0")
@@ -419,6 +423,658 @@ async fn a_default_server_refuses_a_seventeenth_process_and_extra_environment() 
     assert!(matches!(error, Error::Invalid(_)), "{error}");
 }
 
+/// Waits at most [`TIMEOUT`] for `future`, naming what it waited for.
+async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} took over {TIMEOUT:?}"))
+}
+
+/// The session still runs commands: the Process family was not taken down.
+async fn still_runs_commands(client: &Client) {
+    let output = within(
+        "a command after it",
+        client
+            .spawn(Command::new("echo").arg("after"))
+            .await
+            .unwrap()
+            .output(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.stdout, b"after\n");
+    assert!(output.status.success(), "{}", output.status);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_writing_faster_than_its_output_is_read_loses_none_of_it() {
+    use tokio::io::AsyncReadExt;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    // Three times the largest stream buffer a default server keeps, written as fast as the
+    // pipe takes it: the server reads it no faster than this client does (it used to drop the
+    // stream NOT_FOUND about a window in, and the exit never came).
+    const BYTES: u64 = 3 * 8 * 1024 * 1024;
+    let mut process = client
+        .spawn(Command::new("sh").args([
+            "-c".to_owned(),
+            format!("head -c {BYTES} /dev/zero; printf end; echo tail >&2; exit 9"),
+        ]))
+        .await
+        .unwrap();
+    let stdout = process.take_stdout().unwrap();
+    let stderr = process.take_stderr().unwrap();
+    // Read as Ultimator's bash does: the exit is awaited while the output streams in.
+    let reader = tokio::spawn(async move {
+        tokio::join!(stdout.read_to_end(BYTES + 1024), stderr.read_to_end(1024))
+    });
+    let status = within("the exit", process.wait()).await.unwrap();
+    assert_eq!(status.code(), Some(9), "{status}\n{}", server_log(&server));
+    let (stdout, stderr) = within("the output", reader).await.unwrap();
+    let stdout = stdout.unwrap_or_else(|error| panic!("{error}\n{}", server_log(&server)));
+    assert_eq!(stdout.len() as u64, BYTES + 3);
+    assert!(stdout.ends_with(b"end"));
+    assert!(stdout[..BYTES as usize].iter().all(|byte| *byte == 0));
+    assert_eq!(stderr.unwrap(), b"tail\n");
+
+    // A reader slower than the writer, a few KiB at a time: the writer waits for it.
+    const SLOW: usize = 4 * 1024 * 1024;
+    let mut process = client
+        .spawn(
+            Command::new("head")
+                .args(["-c".to_owned(), SLOW.to_string()])
+                .arg("/dev/zero"),
+        )
+        .await
+        .unwrap();
+    let mut stdout = process.take_stdout().unwrap();
+    let mut total = 0;
+    let mut buffer = vec![0u8; 64 * 1024];
+    within("the slow reads", async {
+        loop {
+            let n = stdout.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    assert_eq!(total, SLOW);
+    assert!(within("the exit", process.wait()).await.unwrap().success());
+
+    still_runs_commands(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_output_stream_leaves_its_process_and_session_working() {
+    use tokio::io::AsyncReadExt;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let mut process = client
+        .spawn(Command::new("sh").args(["-c", "head -c 25165824 /dev/zero; exit 4"]))
+        .await
+        .unwrap();
+    let mut stdout = process.take_stdout().unwrap();
+    let mut some = vec![0u8; 1024 * 1024];
+    within("the first MiB", stdout.read_exact(&mut some))
+        .await
+        .unwrap();
+    // Dropped half-way: what the command writes next goes nowhere, and it still finishes.
+    drop(stdout);
+    let status = within("the exit", process.wait()).await.unwrap();
+    assert_eq!(status.code(), Some(4), "{status}\n{}", server_log(&server));
+    still_runs_commands(&client).await;
+}
+
+/// A spawned process whose attachment goes before its exit (it was detached, or its streams
+/// were dropped) is asked for its exit with WAIT, which its attachment would have reported.
+/// Nothing holds it to the session meanwhile: a detached one gives back its slot, and either
+/// can be attached to again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_whose_attachment_went_is_waited_for_and_held_by_nothing() {
+    use yas_client::wire::schema::process as schema;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert_ne!(
+        client.launcher_flags() & schema::SPAWN_REPORT_EXIT as u32,
+        0
+    );
+    let per_session = client.process_limits().unwrap().max_processes_per_session as usize;
+    // Detached, each gives back its slot: one more than the session holds still spawns.
+    let mut detached = Vec::new();
+    for _ in 0..per_session {
+        let process = client
+            .spawn(Command::new("sleep").arg("30").detachable(true))
+            .await
+            .unwrap();
+        within("a detach", process.detach()).await.unwrap();
+        detached.push(process);
+    }
+    let one_more = within(
+        "a spawn beside the detached",
+        client.spawn(Command::new("sh").args(["-c", "exit 6"])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        within("its exit", one_more.wait()).await.unwrap().code(),
+        Some(6)
+    );
+    // A detached one can be attached to again, and its exit comes (by WAIT).
+    let again = within("an attach", client.attach(detached[0].handle(), false))
+        .await
+        .unwrap();
+    detached[0].kill().await.unwrap();
+    let status = within("a detached one's exit", detached[0].wait())
+        .await
+        .unwrap();
+    // (Each answer stamps the time it is given.)
+    let attached = within("its exit, attached", again.wait()).await.unwrap();
+    assert_eq!(
+        (&status.kind, &status.reason, status.raw_code),
+        (&attached.kind, &attached.reason, attached.raw_code)
+    );
+    for process in &detached[1..] {
+        process.kill().await.unwrap();
+        within("a detached one's exit", process.wait())
+            .await
+            .unwrap();
+    }
+    // An ordinary one whose streams were dropped: the same.
+    let mut sleeper = client.spawn(Command::new("sleep").arg("30")).await.unwrap();
+    drop(sleeper.take_stdout());
+    drop(sleeper.take_stderr());
+    let again = within("an attach", client.attach(sleeper.handle(), false))
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", server_log(&server)));
+    assert_eq!(
+        within(
+            "a short wait",
+            sleeper.wait_timeout(Duration::from_millis(200))
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    sleeper.kill().await.unwrap();
+    let status = within("its exit", sleeper.wait()).await.unwrap();
+    // (Each answer stamps the time it is given.)
+    let attached = within("its exit, attached", again.wait()).await.unwrap();
+    assert_eq!(
+        (&status.kind, &status.reason, status.raw_code),
+        (&attached.kind, &attached.reason, attached.raw_code)
+    );
+    // One whose stdin was aborted: its attachment goes with it.
+    let mut reader = client
+        .spawn(
+            Command::new("sh")
+                .args(["-c", "sleep 0.3; exit 3"])
+                .stdin(Stdin::Piped),
+        )
+        .await
+        .unwrap();
+    reader.take_stdin().unwrap().abort();
+    assert_eq!(
+        within("its exit, stdin aborted", reader.wait())
+            .await
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+    still_runs_commands(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watcher_that_falls_behind_is_dropped_alone() {
+    let server = start().await;
+    let owner = server.connect().await.unwrap();
+    let watcher = server.connect().await.unwrap();
+    const BYTES: u64 = 3 * 8 * 1024 * 1024;
+    let mut process = owner
+        .spawn(Command::new("sh").args([
+            "-c".to_owned(),
+            format!("sleep 1; head -c {BYTES} /dev/zero; exit 3"),
+        ]))
+        .await
+        .unwrap();
+    // Another session watches, and reads nothing until the command is done.
+    let mut watched = within("the attach", watcher.attach(process.handle(), false))
+        .await
+        .unwrap();
+    let watched_stdout = watched.take_stdout().unwrap();
+    let stdout = process.take_stdout().unwrap();
+    let stdout = within("the owner's output", stdout.read_to_end(BYTES + 1024))
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", server_log(&server)));
+    assert_eq!(stdout.len() as u64, BYTES);
+    assert_eq!(
+        within("the exit", process.wait()).await.unwrap().code(),
+        Some(3)
+    );
+    // The watcher fell a window behind: its stream was dropped, and says why.
+    let dropped = within(
+        "the watcher's output",
+        watched_stdout.read_to_end(BYTES + 1024),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        dropped.status(),
+        Some(yas_client::wire::core::Status::ResourceExhausted),
+        "{dropped}"
+    );
+    // Both sessions still run commands (the watcher's used to lose its Process family).
+    still_runs_commands(&watcher).await;
+    still_runs_commands(&owner).await;
+}
+
+/// A server started with `--process-max-waits 1`, with that one WAIT held on a
+/// `sleep` and shown to be held: a second WAIT is refused.
+async fn hold_the_only_wait(
+    client: &Client,
+) -> (yas_client::process::Process, tokio::task::JoinHandle<()>) {
+    let sleeper = client.spawn(Command::new("sleep").arg("30")).await.unwrap();
+    let handle = sleeper.handle();
+    let holder = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client.wait_process(handle, None).await;
+        })
+    };
+    // The holder's WAIT goes first on the one connection.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let refused = client
+        .wait_process(handle, Some(Duration::from_millis(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.status(),
+        Some(yas_client::wire::core::Status::ResourceExhausted),
+        "{refused}"
+    );
+    (sleeper, holder)
+}
+
+/// Commands whose exits must come whole: a non-zero exit with stderr, output
+/// beyond the stream buffer read while the exit is awaited, a signal.
+async fn exits_come_with_all_their_output(server: &HostedServer, client: &Client) {
+    let output = client
+        .spawn(Command::new("sh").args(["-c", "echo out; echo 'went wrong' >&2; exit 42"]))
+        .await
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42), "{}", output.status);
+    assert_eq!(output.stdout, b"out\n");
+    assert_eq!(output.stderr, b"went wrong\n");
+
+    // Three times the largest stream buffer a default server keeps: the
+    // command blocks on its pipe until this reads, and its exit arrives while
+    // the tail is still on its way, as Ultimator's bash reads it.
+    const BYTES: u64 = 3 * 8 * 1024 * 1024;
+    let mut process = client
+        .spawn(Command::new("sh").args([
+            "-c".to_owned(),
+            format!("head -c {BYTES} /dev/zero; printf end; echo tail >&2; exit 9"),
+        ]))
+        .await
+        .unwrap();
+    let stdout = process.take_stdout().unwrap();
+    let stderr = process.take_stderr().unwrap();
+    let reader = tokio::spawn(async move {
+        (
+            stdout.read_to_end(BYTES + 1024).await.unwrap(),
+            stderr.read_to_end(1024).await,
+        )
+    });
+    let status = tokio::time::timeout(TIMEOUT, process.wait())
+        .await
+        .unwrap_or_else(|_| panic!("no exit\n{}", server_log(server)))
+        .unwrap();
+    assert_eq!(status.code(), Some(9), "{status}");
+    let (stdout, stderr) = tokio::time::timeout(TIMEOUT, reader)
+        .await
+        .expect("output after the exit")
+        .unwrap();
+    let stderr = stderr.unwrap_or_else(|error| panic!("{error}\n{}", server_log(server)));
+    assert_eq!(stdout.len() as u64, BYTES + 3);
+    assert!(stdout.ends_with(b"end"));
+    assert!(stdout[..BYTES as usize].iter().all(|byte| *byte == 0));
+    assert_eq!(stderr, b"tail\n");
+
+    let sleeper = client.spawn(Command::new("sleep").arg("30")).await.unwrap();
+    assert_eq!(
+        sleeper
+            .wait_timeout(Duration::from_millis(100))
+            .await
+            .unwrap(),
+        None
+    );
+    sleeper.signal(Signal::Terminate).await.unwrap();
+    let status = sleeper.wait().await.unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
+    // Asked again, the same exit (an older server's WAITs may each give it another time).
+    let same = |other: &yas_client::process::ExitStatus| {
+        (&other.kind, &other.reason, other.raw_code)
+            == (&status.kind, &status.reason, status.raw_code)
+    };
+    let again = sleeper.wait().await.unwrap();
+    assert!(same(&again), "{again:?} after {status:?}");
+    let again = sleeper
+        .wait_timeout(Duration::from_millis(1))
+        .await
+        .unwrap()
+        .expect("exited");
+    assert!(same(&again), "{again:?} after {status:?}");
+
+    for _ in 0..20 {
+        let output = client
+            .spawn(&Command::new("true"))
+            .await
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spawned_process_reports_its_exit_without_a_wait() {
+    use yas_client::wire::schema::process as schema;
+    let server = tokio::time::timeout(
+        TIMEOUT,
+        HostedServer::start(
+            options()
+                .arg("--verbose")
+                .args(["--process-max-waits", "1"]),
+        ),
+    )
+    .await
+    .expect("hosted server start timed out")
+    .expect("hosted server starts");
+    let client = server.connect().await.unwrap();
+    assert_ne!(
+        client.launcher_flags() & schema::SPAWN_REPORT_EXIT as u32,
+        0
+    );
+    // With the only WAIT held, every exit below comes unasked.
+    let (sleeper, holder) = hold_the_only_wait(&client).await;
+    exits_come_with_all_their_output(&server, &client).await;
+    // A process attached to (not spawned) is still waited for: another session, its only
+    // WAIT held too, attaches to this one's sleeper and is refused a second WAIT.
+    let other = server.connect().await.unwrap();
+    let (other_sleeper, other_holder) = hold_the_only_wait(&other).await;
+    let attached = other.attach(sleeper.handle(), false).await.unwrap();
+    let refused = attached
+        .wait_timeout(Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.status(),
+        Some(yas_client::wire::core::Status::ResourceExhausted),
+        "{refused}"
+    );
+    for (which, (sleeper, holder)) in [(sleeper, holder), (other_sleeper, other_holder)]
+        .into_iter()
+        .enumerate()
+    {
+        sleeper.kill().await.unwrap();
+        // Killed by YAS at this client's request, as a WAIT would answer it.
+        let status = sleeper.wait().await.unwrap();
+        assert_eq!(
+            (&status.kind, &status.reason),
+            (
+                &yas_client::process::ExitKind::Killed,
+                &yas_client::process::ExitReason::Client
+            ),
+            "sleeper {which}: {status:?}"
+        );
+        tokio::time::timeout(TIMEOUT, holder)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// A process spawned with `keep_output`: its streams' heads and tails, and what was dropped.
+async fn kept(client: &Client, command: &Command) -> yas_client::process::Output {
+    let process = client.spawn(command).await.unwrap();
+    within("the kept output", process.output_limited(4 << 20))
+        .await
+        .unwrap()
+}
+
+/// What a WHATWG UTF-8 decoder makes of `text`, as an elision counts it.
+fn elision_of(offset: usize, text: &str) -> yas_client::process::OutputElision {
+    yas_client::process::OutputElision {
+        offset: offset as u64,
+        bytes: text.len() as u64,
+        lines: text.matches('\n').count() as u64,
+        code_points: text.chars().count() as u64,
+        utf16_units: text.encode_utf16().count() as u64,
+    }
+}
+
+/// With `keep_output`, each stream is sent as its head and its tail, cut between characters,
+/// and the exit says exactly what was dropped between them: far more output than the session
+/// takes runs at the speed of its pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kept_output_is_its_head_and_tail_and_the_exit_counts_the_rest() {
+    use yas_client::wire::schema::process as schema;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert_ne!(
+        client.launcher_flags() & schema::SPAWN_KEEP_OUTPUT as u32,
+        0
+    );
+
+    // 64 MiB of `yes` on stdout, 1 MiB on stderr: 1,000 + 2,000 bytes of each come.
+    const BYTES: usize = 64 << 20;
+    let yes = kept(
+        &client,
+        Command::new("sh")
+            .args([
+                "-c".to_owned(),
+                format!("yes | head -c {BYTES}; yes e | head -c 1048576 >&2; exit 4"),
+            ])
+            .keep_output(1_000, 2_000),
+    )
+    .await;
+    assert_eq!(yes.status.code(), Some(4), "{}", server_log(&server));
+    assert_eq!(yes.stdout, "y\n".repeat(1_500).into_bytes());
+    assert_eq!(yes.stderr, "e\n".repeat(1_500).into_bytes());
+    assert_eq!(
+        yes.elided,
+        [
+            Some(elision_of(1_000, &"y\n".repeat((BYTES - 3_000) / 2))),
+            Some(elision_of(1_000, &"e\n".repeat((1_048_576 - 3_000) / 2))),
+        ]
+    );
+    // Mixed widths: the cuts fall inside emoji and CJK, and move to their ends.
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("mixed");
+    let middle = "中文 🙂 ascii\n".repeat(700);
+    let whole = format!("ab🙂中{middle}🙂中cd");
+    std::fs::write(&file, &whole).unwrap();
+    // 3 bytes of head end within 🙂 (2 + 4), 8 of tail start within 🙂 (…🙂 中 c d).
+    let (head, tail) = (3, 8);
+    let head_len = 6;
+    let tail_start = whole.len() - "中cd".len();
+    assert!(whole.is_char_boundary(head_len) && whole.is_char_boundary(tail_start));
+    let mixed = kept(
+        &client,
+        Command::new("sh")
+            .args([
+                "-c".to_owned(),
+                format!("cat '{0}'; cat '{0}' >&2", file.display()),
+            ])
+            .keep_output(head, tail),
+    )
+    .await;
+    assert!(mixed.status.success(), "{}", mixed.status);
+    let expected = [&whole[..head_len], &whole[tail_start..]]
+        .concat()
+        .into_bytes();
+    assert_eq!(
+        String::from_utf8_lossy(&mixed.stdout),
+        String::from_utf8_lossy(&expected)
+    );
+    assert_eq!(mixed.stderr, expected);
+    let dropped = Some(elision_of(head_len, &whole[head_len..tail_start]));
+    assert_eq!(mixed.elided, [dropped, dropped]);
+
+    // What fits is all sent, and nothing said dropped; merged stderr is stdout's.
+    let fits = kept(
+        &client,
+        Command::new("sh")
+            .args(["-c", "printf 'out 🙂'; printf ' err' >&2"])
+            .merge_stderr(true)
+            .keep_output(100, 100),
+    )
+    .await;
+    assert_eq!(fits.stdout, "out 🙂 err".as_bytes());
+    assert_eq!(fits.elided, [None, None]);
+    let merged = kept(
+        &client,
+        Command::new("sh")
+            .args(["-c", "yes o | head -c 100000; yes e | head -c 100000 >&2"])
+            .merge_stderr(true)
+            .keep_output(10, 10),
+    )
+    .await;
+    assert_eq!(merged.stdout, b"o\no\no\no\no\ne\ne\ne\ne\ne\n");
+    assert_eq!(merged.elided[0].unwrap().bytes, 200_000 - 20);
+    assert_eq!(merged.elided[1], None);
+
+    // A residue holding the streams past the grace: the tail kept so far goes out before
+    // the exit, which counts what was dropped until then.
+    let residue = kept(
+        &client,
+        Command::new("sh")
+            .args(["-c", "yes | head -c 3000000; (sleep 2; echo late) &"])
+            .leave_residue(Some(Duration::from_millis(300)))
+            .keep_output(10, 10),
+    )
+    .await;
+    assert_eq!(residue.status.detail, "residual process group left running");
+    assert_eq!(residue.stdout, "y\n".repeat(10).into_bytes());
+    assert_eq!(
+        residue.elided[0],
+        Some(elision_of(10, &"y\n".repeat((3_000_000 - 20) / 2)))
+    );
+    still_runs_commands(&client).await;
+}
+
+/// Against a server from before SPAWN_REPORT_EXIT, the same commands are
+/// waited for with WAIT. Run with
+/// `YAS_OLD_SERVER=/path/to/yas cargo test -p yas-cli --test client_host -- --ignored`, with a
+/// binary that paces process output (its long output must not reset the stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs YAS_OLD_SERVER: a yas binary from before SPAWN_REPORT_EXIT"]
+async fn a_server_from_before_report_exit_is_waited_for() {
+    use yas_client::wire::schema::process as schema;
+    let binary = std::env::var_os("YAS_OLD_SERVER").expect("YAS_OLD_SERVER names a yas binary");
+    let server = tokio::time::timeout(
+        TIMEOUT,
+        HostedServer::start(options_for(binary).args(["--process-max-waits", "1"])),
+    )
+    .await
+    .expect("hosted server start timed out")
+    .expect("hosted server starts");
+    let client = server.connect().await.unwrap();
+    assert_eq!(
+        client.launcher_flags() & schema::SPAWN_REPORT_EXIT as u32,
+        0
+    );
+    // Its exits take a WAIT: with the only one held, waiting is refused.
+    let (sleeper, holder) = hold_the_only_wait(&client).await;
+    let process = client
+        .spawn(Command::new("sh").args(["-c", "exit 5"]))
+        .await
+        .unwrap();
+    let refused = process.wait().await.unwrap_err();
+    assert_eq!(
+        refused.status(),
+        Some(yas_client::wire::core::Status::ResourceExhausted),
+        "{refused}"
+    );
+    sleeper.kill().await.unwrap();
+    tokio::time::timeout(TIMEOUT, holder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(process.wait().await.unwrap().code(), Some(5));
+    exits_come_with_all_their_output(&server, &client).await;
+}
+
+/// Every stdout/stderr stream holds its window of the session's receive budget
+/// while it is open, writing or not. A client that asks for a wider budget
+/// gets windows that still all fit: at 256 processes a session in 256 MiB,
+/// 384 KiB each, where 16 MiB gives 24 KiB. With 255 quiet processes holding
+/// theirs (510 streams, 191 MiB: more than the default budget), one more still
+/// gets credit, and all of its output at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wider_receive_budget_fits_every_process_window() {
+    const BUDGET: u64 = 256 << 20;
+    const QUIET: usize = 255;
+    let server = within(
+        "hosted server start",
+        HostedServer::start(
+            options()
+                .args(["--process-max-per-session", "256"])
+                .args(["--process-max", "1024"])
+                .hello(HelloOptions::named("yas-test").receive_budget(BUDGET)),
+        ),
+    )
+    .await
+    .expect("hosted server starts");
+    let narrow = server
+        .connect_with(&HelloOptions::named("yas-test"))
+        .await
+        .unwrap();
+    assert_eq!(narrow.default_process_window(), 24 * 1024);
+    drop(narrow);
+    let client = server.connect().await.unwrap();
+    assert_eq!(client.receive_budget(), BUDGET);
+    assert_eq!(client.default_process_window(), 384 * 1024);
+    let mut quiet = Vec::with_capacity(QUIET);
+    for _ in 0..QUIET {
+        quiet.push(client.spawn(Command::new("sleep").arg("60")).await.unwrap());
+    }
+    // Three windows of output: it comes whole only if credit keeps coming.
+    const BYTES: usize = 3 * 384 * 1024;
+    let started = Instant::now();
+    let output = within(
+        "a command beside the quiet ones",
+        client
+            .spawn(Command::new("sh").args(["-c", &format!("head -c {BYTES} /dev/zero; echo end")]))
+            .await
+            .unwrap()
+            .output(),
+    )
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    assert!(output.status.success(), "{}", output.status);
+    assert_eq!(output.stdout.len(), BYTES + 4);
+    assert!(output.stdout.ends_with(b"end\n"));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    for process in &quiet {
+        process.kill().await.unwrap();
+    }
+    for process in &quiet {
+        within("a quiet process's exit", process.wait())
+            .await
+            .unwrap();
+    }
+    drop(quiet);
+    still_runs_commands(&client).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commands_background_children_die_with_it() {
     let server = start().await;
@@ -771,7 +1427,10 @@ async fn a_command_can_leave_its_background_running_with_a_null_stdin() {
     let client = server.connect().await.unwrap();
     assert_eq!(
         client.launcher_flags(),
-        (schema::SPAWN_LEAVE_RESIDUE | schema::SPAWN_STDIN_NULL) as u32
+        (schema::SPAWN_LEAVE_RESIDUE
+            | schema::SPAWN_STDIN_NULL
+            | schema::SPAWN_REPORT_EXIT
+            | schema::SPAWN_KEEP_OUTPUT) as u32
     );
     // The background `sleep` holds stdout: the exit comes after the grace, and
     // the sleep keeps running.
@@ -888,28 +1547,38 @@ async fn files_answer_as_the_os_does() {
         pair("ENOENT", "lstat")
     );
 
-    // In place through a symlink: the same inode, the new bytes.
+    // In place through a symlink: the same inode, the new bytes. Inline-sized content goes in
+    // one APPLY (CAPABILITY_APPLY_IN_PLACE), bigger content is staged: both answer alike.
     use std::os::unix::fs::MetadataExt;
     let inode = std::fs::metadata(base.join("file")).unwrap().ino();
-    root.write_in_place("to-file", b"new content")
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(base.join("file")).unwrap(), b"new content");
-    assert_eq!(std::fs::metadata(base.join("file")).unwrap().ino(), inode);
-    assert!(
-        std::fs::symlink_metadata(base.join("to-file"))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(
-        named(root.write_in_place("dir", b"x").await.unwrap_err()),
-        pair("EISDIR", "open")
-    );
-    assert_eq!(
-        named(root.write_in_place("missing/file", b"x").await.unwrap_err()),
-        pair("ENOENT", "open")
-    );
+    let staged = vec![b's'; yas_client::wire::fs::MAX_INLINE_BYTES + 1];
+    for content in [&b"new content"[..], &staged] {
+        let written = root.write_in_place("to-file", content).await.unwrap();
+        assert_eq!(written.hash, *blake3::hash(content).as_bytes());
+        assert_eq!(std::fs::read(base.join("file")).unwrap(), content);
+        assert_eq!(std::fs::metadata(base.join("file")).unwrap().ino(), inode);
+        assert!(
+            std::fs::symlink_metadata(base.join("to-file"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let error = root.write_in_place("dir", content).await.unwrap_err();
+        assert!(error.is_conflict(), "{error:?}");
+        assert_eq!(named(error), pair("EISDIR", "open"));
+        assert_eq!(
+            named(
+                root.write_in_place("missing/file", content)
+                    .await
+                    .unwrap_err()
+            ),
+            pair("ENOENT", "open")
+        );
+        // A new file is made where it is named.
+        let _ = std::fs::remove_file(base.join("fresh"));
+        root.write_in_place("fresh", content).await.unwrap();
+        assert_eq!(std::fs::read(base.join("fresh")).unwrap(), content);
+    }
 
     assert_eq!(
         named(root.read("missing").await.unwrap_err()),
@@ -1529,12 +2198,17 @@ exec sleep 600"#;
         std::fs::canonicalize(String::from_utf8(cwd).unwrap()).unwrap(),
         std::fs::canonicalize(directory.path()).unwrap()
     );
-    // Nothing else starts: waiting for the next command finds none.
+    // Nothing else starts: waiting for the next command times out (TIMEOUT
+    // since #54; NOT_FOUND is for an exited terminal or an evicted index).
     let waited = client
         .wait_terminal_command(id, None, Duration::from_millis(200))
         .await
         .unwrap_err();
-    assert!(waited.is_not_found(), "{waited:?}");
+    assert_eq!(
+        waited.status(),
+        Some(yas_client::wire::core::Status::Timeout),
+        "{waited:?}"
+    );
     client.close_terminal(id).await.unwrap();
 }
 
@@ -1546,6 +2220,11 @@ async fn surfaces_are_none_without_the_compositor() {
     assert!(client.surfaces().await.unwrap().is_empty());
     let missing = client
         .capture_surface(1, CaptureFormat::Png)
+        .await
+        .unwrap_err();
+    assert!(missing.is_not_found(), "{missing:?}");
+    let missing = client
+        .capture_surface_at(1, 1, CaptureFormat::Png)
         .await
         .unwrap_err();
     assert!(missing.is_not_found(), "{missing:?}");
@@ -1633,7 +2312,46 @@ async fn surfaces_capture_take_input_and_close_with_the_paste_probe() {
         .await
         .unwrap();
     client.type_surface_text(surface.id, "é").await.unwrap();
+    // At the revision listed, the capture goes at once.
+    let listed = client.surface(surface.id).await.unwrap();
+    let png = client
+        .capture_surface_at(surface.id, listed.revision, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
     client.resize_surface(surface.id, 320, 240).await.unwrap();
+    // Once the window changed, that revision is stale: the server says so, and
+    // capture_surface_at looks the window up again rather than failing.
+    let deadline = Instant::now() + TIMEOUT;
+    while client.surface(surface.id).await.unwrap().revision == listed.revision {
+        assert!(
+            Instant::now() < deadline,
+            "the resize never changed the window"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stale = client
+        .request_raw(
+            yas_client::wire::family::SURFACE,
+            yas_client::wire::surface::request_kind::CAPTURE,
+            yas_client::wire::Encode::encode(&yas_client::wire::surface::Capture {
+                surface_handle: surface.id,
+                revision: listed.revision,
+                initial_receive_credit: 0,
+                formats: vec![yas_client::wire::schema::surface::CAPTURE_PNG as u8],
+                extensions: Default::default(),
+            })
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status, yas_client::wire::core::Status::Stale);
+    let png = client
+        .capture_surface_at(surface.id, listed.revision, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
 
     // A read-only session sees the window but cannot send it input.
     let viewer = server

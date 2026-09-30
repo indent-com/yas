@@ -134,6 +134,10 @@ const cases: readonly [string, (payload: Uint8Array) => Uint8Array][] = [
   ],
   ["fs.apply.payload", (payload) => encodeFsApply(decodeFsApply(payload))],
   [
+    "fs.apply.in_place.payload",
+    (payload) => encodeFsApply(decodeFsApply(payload)),
+  ],
+  [
     "fs.apply_result.payload",
     (payload) => encodeFsApplyResult(decodeFsApplyResult(payload)),
   ],

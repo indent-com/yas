@@ -1076,6 +1076,8 @@ export const YAS_FS_APPLY_SYMLINK = 4 as const;
 export const YAS_FS_APPLY_HARDLINK = 5 as const;
 export const YAS_FS_APPLY_ITEM_CREATE_PARENTS = 1 as const;
 export const YAS_FS_APPLY_ITEM_FLAGS = 1 as const;
+export const YAS_FS_APPLY_ITEM_IN_PLACE = 2 as const;
+export const YAS_FS_APPLY_ITEM_EXTENDED_FLAGS = 2 as const;
 export const YAS_FS_REMOVE_RECURSIVE = 1 as const;
 export const YAS_FS_REMOVE_FLAGS = 1 as const;
 export const YAS_FS_FILE_CONTENT_KIND = 0 as const;
@@ -1118,7 +1120,8 @@ export const YAS_FS_CAPABILITY_READ_LIST = 2 as const;
 export const YAS_FS_CAPABILITY_READ_REALPATH = 4 as const;
 export const YAS_FS_CAPABILITY_READ_STAT_ONLY = 8 as const;
 export const YAS_FS_CAPABILITY_STAGE_IN_PLACE = 16 as const;
-export const YAS_FS_CAPABILITY_FLAGS = 31 as const;
+export const YAS_FS_CAPABILITY_APPLY_IN_PLACE = 32 as const;
+export const YAS_FS_CAPABILITY_FLAGS = 63 as const;
 export const YAS_FAMILY_GIT = 49 as const;
 export const YAS_GIT_VERSION = 1 as const;
 export const YAS_GIT_OPEN = 0 as const;
@@ -1646,12 +1649,16 @@ export const YAS_PROCESS_CONTROL = 4 as const;
 export const YAS_PROCESS_WAIT = 5 as const;
 export const YAS_PROCESS_STATE = 0 as const;
 export const YAS_PROCESS_STATE_ACK = 1 as const;
+export const YAS_PROCESS_EXIT = 2 as const;
 export const YAS_PROCESS_SPAWN_MERGE_STDERR = 1 as const;
 export const YAS_PROCESS_SPAWN_DETACHABLE = 2 as const;
 export const YAS_PROCESS_SPAWN_LEAVE_RESIDUE = 4 as const;
 export const YAS_PROCESS_SPAWN_STDIN_NULL = 8 as const;
 export const YAS_PROCESS_SPAWN_FLAGS = 3 as const;
 export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS = 12 as const;
+export const YAS_PROCESS_SPAWN_REPORT_EXIT = 16 as const;
+export const YAS_PROCESS_SPAWN_KEEP_OUTPUT = 32 as const;
+export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS_EXTENDED = 60 as const;
 export const YAS_PROCESS_ENV_EMPTY = 0 as const;
 export const YAS_PROCESS_ENV_SESSION = 1 as const;
 export const YAS_PROCESS_CWD_SERVER_DEFAULT = 0 as const;
@@ -1698,6 +1705,10 @@ export const YAS_PROCESS_STREAM_STDERR_CONTENT_KIND = 2 as const;
 export const YAS_PROCESS_SPAWN_SURFACE_APP_EXTENSION = 1 as const;
 export const YAS_PROCESS_SPAWN_RESOURCE_TAG_EXTENSION = 2 as const;
 export const YAS_PROCESS_SPAWN_RESIDUE_GRACE_EXTENSION = 3 as const;
+export const YAS_PROCESS_SPAWN_KEEP_OUTPUT_EXTENSION = 4 as const;
+export const YAS_PROCESS_MAX_KEEP_OUTPUT_TAIL_BYTES = 1048576 as const;
+export const YAS_PROCESS_EXIT_STDOUT_ELIDED_EXTENSION = 1 as const;
+export const YAS_PROCESS_EXIT_STDERR_ELIDED_EXTENSION = 2 as const;
 export const YAS_PROCESS_MAX_ARGC = 1024 as const;
 export const YAS_PROCESS_MAX_ARG_BYTES = 1048576 as const;
 export const YAS_PROCESS_MAX_ARG_LEN = 65536 as const;
@@ -1740,6 +1751,7 @@ export const YAS_PROCESS_LIMIT_MAX_DETACHED_RETENTION_NS = 9 as const;
 export const YAS_PROCESS_MAX_MUTATION_REPLAYS = 65536 as const;
 export const YAS_PROCESS_LIMIT_MAX_MUTATION_REPLAYS = 10 as const;
 export const YAS_PROCESS_LIMIT_LAUNCHER_FLAGS = 11 as const;
+export const YAS_PROCESS_LIMIT_LAUNCHER_FLAGS_EXTENDED = 19 as const;
 export const YAS_FAMILY_NET = 65 as const;
 export const YAS_NET_VERSION = 1 as const;
 export const YAS_NET_OPEN = 0 as const;
@@ -2248,6 +2260,7 @@ export const YAS_FAMILY_LIMIT_POLICIES: Readonly<Record<number, readonly YasFami
     [16, 4, false, 1n, 16384n],
     [17, 4, false, 1n, 65536n],
     [18, 4, false, 1n, 16384n],
+    [19, 4, false, 0n, 65535n],
   ],
   65: [
     [1, 4, true, 1n, 255n],
@@ -2622,6 +2635,7 @@ export const YAS_OPERATION_POLICIES: Readonly<Record<string, YasOperationPolicy>
   "64/2/5": [1, 0, 0],
   "64/0/0": [1, 0, 0],
   "64/0/1": [0, 0, 0],
+  "64/0/2": [1, 0, 0],
   "65/1/0": [1, 0, 0],
   "65/2/0": [1, 0, 0],
   "65/1/1": [1, 0, 0],
@@ -2873,6 +2887,7 @@ export const YAS_OPERATION_DIRECTION_MASKS: Readonly<Record<string, number>> = {
   "64/1/5": 1,
   "64/0/0": 2,
   "64/0/1": 1,
+  "64/0/2": 2,
   "65/1/0": 1,
   "65/1/1": 1,
   "65/0/0": 3,
@@ -8145,6 +8160,10 @@ export const YAS_SCHEMA = {
         {
           "name": "stage_in_place",
           "layout": "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID"
+        },
+        {
+          "name": "apply_in_place",
+          "layout": "APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID"
         }
       ],
       "constants": [
@@ -8549,6 +8568,14 @@ export const YAS_SCHEMA = {
           "value": 1
         },
         {
+          "name": "APPLY_ITEM_IN_PLACE",
+          "value": 2
+        },
+        {
+          "name": "APPLY_ITEM_EXTENDED_FLAGS",
+          "value": 2
+        },
+        {
           "name": "REMOVE_RECURSIVE",
           "value": 1
         },
@@ -8717,8 +8744,12 @@ export const YAS_SCHEMA = {
           "value": 16
         },
         {
+          "name": "CAPABILITY_APPLY_IN_PLACE",
+          "value": 32
+        },
+        {
           "name": "CAPABILITY_FLAGS",
-          "value": 31
+          "value": 63
         }
       ]
     },
@@ -11714,6 +11745,14 @@ export const YAS_SCHEMA = {
           "required": false,
           "hard_min": 1,
           "hard_max": 16384
+        },
+        {
+          "name": "LAUNCHER_FLAGS_EXTENDED",
+          "tag": 19,
+          "type": "u32",
+          "required": false,
+          "hard_min": 0,
+          "hard_max": 65535
         }
       ],
       "requests": [
@@ -11790,6 +11829,15 @@ export const YAS_SCHEMA = {
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "StateAck"
+        },
+        {
+          "name": "EXIT",
+          "kind": 2,
+          "direction": "server_to_client",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "ExitReport"
         }
       ],
       "types": [
@@ -11804,6 +11852,18 @@ export const YAS_SCHEMA = {
         {
           "name": "remove_record",
           "layout": "process_handle:u64"
+        },
+        {
+          "name": "exit_report",
+          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream"
+        },
+        {
+          "name": "keep_output_extension",
+          "layout": "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES"
+        },
+        {
+          "name": "output_elision",
+          "layout": "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream"
         },
         {
           "name": "exit_record",
@@ -11846,6 +11906,18 @@ export const YAS_SCHEMA = {
         {
           "name": "SPAWN_LAUNCHER_FLAGS",
           "value": 12
+        },
+        {
+          "name": "SPAWN_REPORT_EXIT",
+          "value": 16
+        },
+        {
+          "name": "SPAWN_KEEP_OUTPUT",
+          "value": 32
+        },
+        {
+          "name": "SPAWN_LAUNCHER_FLAGS_EXTENDED",
+          "value": 60
         },
         {
           "name": "ENV_EMPTY",
@@ -12032,6 +12104,22 @@ export const YAS_SCHEMA = {
           "value": 3
         },
         {
+          "name": "SPAWN_KEEP_OUTPUT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "MAX_KEEP_OUTPUT_TAIL_BYTES",
+          "value": 1048576
+        },
+        {
+          "name": "EXIT_STDOUT_ELIDED_EXTENSION",
+          "value": 1
+        },
+        {
+          "name": "EXIT_STDERR_ELIDED_EXTENSION",
+          "value": 2
+        },
+        {
           "name": "MAX_ARGC",
           "value": 1024
         },
@@ -12198,6 +12286,10 @@ export const YAS_SCHEMA = {
         {
           "name": "LIMIT_LAUNCHER_FLAGS",
           "value": 11
+        },
+        {
+          "name": "LIMIT_LAUNCHER_FLAGS_EXTENDED",
+          "value": 19
         }
       ]
     },
@@ -15375,6 +15467,10 @@ export const YAS_GOLDEN_VECTORS = {
       "hex": "4000010000"
     },
     {
+      "name": "yas.process.event.exit.header",
+      "hex": "4000020008"
+    },
+    {
       "name": "yas.net.request.open.header",
       "hex": "410000000901000000"
     },
@@ -15909,6 +16005,10 @@ export const YAS_GOLDEN_VECTORS = {
     {
       "name": "fs.apply.payload",
       "hex": "0100000000000000050505050505050505050505050505050100010020000000000000000500000001000100610400000001000000a40100000300000079617300000000"
+    },
+    {
+      "name": "fs.apply.in_place.payload",
+      "hex": "0100000000000000050505050505050505050505050505050000010020000000000002000500000001000100610400000001000000a40100000300000079617300000000"
     },
     {
       "name": "fs.entry.inline.payload",

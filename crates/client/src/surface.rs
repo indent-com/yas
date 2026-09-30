@@ -4,7 +4,8 @@
 //! `YAS_SKIP_COMPOSITOR=1`; [`crate::host::HostOptions::compositor`] for a
 //! hosted one), the programs it starts get a `WAYLAND_DISPLAY`, and each
 //! window they map is a surface in the catalogue ([`Client::surfaces`]). A
-//! client can capture one as an image ([`Client::capture_surface`]), click,
+//! client can capture one as an image ([`Client::capture_surface`], or
+//! [`Client::capture_surface_at`] with the revision it listed), click,
 //! scroll and type into it, resize, focus and close it: what `yas surface`
 //! does, for programs that drive GUIs (a screenshot, then a click).
 //!
@@ -116,9 +117,34 @@ impl Client {
         Ok(SurfaceInfo::from_record(&self.surface_record(id).await?))
     }
 
-    /// What the window shows now, as an image.
+    /// What the window shows now, as an image: its revision looked up, then `CAPTURE`, two
+    /// round trips. [`Client::capture_surface_at`] takes one with a revision already listed.
     pub async fn capture_surface(&self, id: u64, format: CaptureFormat) -> Result<Vec<u8>> {
         let record = self.surface_record(id).await?;
+        self.capture(id, record.revision, format).await
+    }
+
+    /// What the window shows now, as an image, given the revision the caller last saw it at
+    /// ([`SurfaceInfo::revision`], from [`Client::surfaces`] or [`Client::surface`]): one
+    /// round trip. When the window changed since (the server answers `STALE`), it is looked up
+    /// again and captured at its current revision, as [`Client::capture_surface`] does.
+    pub async fn capture_surface_at(
+        &self,
+        id: u64,
+        revision: u64,
+        format: CaptureFormat,
+    ) -> Result<Vec<u8>> {
+        match self.capture(id, revision, format).await {
+            Err(error) if error.status() == Some(yas_wire::core::Status::Stale) => {
+                self.capture_surface(id, format).await
+            }
+            captured => captured,
+        }
+    }
+
+    /// `CAPTURE` of the window at `revision`, which the server answers `STALE` unless it
+    /// is the window's current one.
+    async fn capture(&self, id: u64, revision: u64, format: CaptureFormat) -> Result<Vec<u8>> {
         let hook: Hook = Box::new(|prefix: &ResultPrefix| {
             InlineOrTransfer::decode(&prefix.body)
                 .map(|result| delivery_routes(&result))
@@ -130,7 +156,7 @@ impl Client {
                 request_kind::CAPTURE,
                 wire::Capture {
                     surface_handle: id,
-                    revision: record.revision,
+                    revision,
                     initial_receive_credit: CAPTURE_CREDIT,
                     formats: vec![match format {
                         CaptureFormat::Png => schema::CAPTURE_PNG as u8,

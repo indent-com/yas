@@ -3047,6 +3047,8 @@ enum ProcessOperationOutcome {
         fingerprint: [u8; 32],
         stdout_receive_credit: u64,
         stderr_receive_credit: u64,
+        /// SPAWN_REPORT_EXIT: send the exit to this session as an EXIT event.
+        report_exit: bool,
         outcome: Result<super::yas_process::Attachment, super::yas_process::Error>,
     },
     Attach {
@@ -9753,16 +9755,19 @@ impl Session {
                     .max_by_key(|(_, pixels)| u64::from(pixels.width) * u64::from(pixels.height))
                     .map(|(_, pixels)| (pixels.width, pixels.height, pixels.pixels.clone()))
             });
-            let command_tx = shared
-                .compositor
-                .as_ref()
-                .map(|compositor| compositor.handle.command_tx.clone());
+            let command_tx = shared.compositor.as_ref().map(|compositor| {
+                (
+                    compositor.handle.command_tx.clone(),
+                    compositor.handle.command_sender(),
+                )
+            });
             (snapshot, command_tx)
         };
         let mut captured = match command_tx {
-            Some(command_tx) => {
+            Some((command_tx, loop_waker)) => {
                 super::request_surface_capture_with_timeout(
                     command_tx,
+                    move || loop_waker.wake(),
                     surface_id,
                     0,
                     Duration::from_secs(5),
@@ -18208,6 +18213,7 @@ impl Session {
         let operation_id = request.operation_id;
         let stdout_receive_credit = request.stdout_receive_credit;
         let stderr_receive_credit = request.stderr_receive_credit;
+        let report_exit = request.flags & yas_wire::schema::process::SPAWN_REPORT_EXIT as u16 != 0;
         let session = self.process.as_ref().ok_or(())?.session.clone();
         let internal = self.internal.clone();
         let cancellation = self.cancellation.clone();
@@ -18225,6 +18231,7 @@ impl Session {
                         fingerprint,
                         stdout_receive_credit,
                         stderr_receive_credit,
+                        report_exit,
                         outcome,
                     },
                     _slot: None,
@@ -25382,6 +25389,7 @@ impl Session {
                 fingerprint,
                 stdout_receive_credit,
                 stderr_receive_credit,
+                report_exit,
                 outcome,
             } => {
                 if kind != yas_process_wire::request_kind::SPAWN {
@@ -25439,6 +25447,7 @@ impl Session {
                     }
                 };
                 let body = bundle.encode().map_err(|_| ())?;
+                let report_exit = report_exit.then_some(bundle.process_handle);
                 self.record_process_replay(
                     operation_id,
                     kind,
@@ -25462,7 +25471,7 @@ impl Session {
                     self.remove_process_attachment(attachment_id, true);
                     return Err(());
                 }
-                self.activate_process_attachment(attachment_id, events)?;
+                self.activate_process_attachment(attachment_id, events, report_exit)?;
                 Ok(())
             }
             ProcessOperationOutcome::Attach {
@@ -25523,7 +25532,7 @@ impl Session {
                     self.remove_process_attachment(attachment_id, true);
                     return Err(());
                 }
-                self.activate_process_attachment(attachment_id, events)?;
+                self.activate_process_attachment(attachment_id, events, None)?;
                 Ok(())
             }
             ProcessOperationOutcome::Control {
@@ -25798,10 +25807,13 @@ impl Session {
         ))
     }
 
+    /// Start forwarding an installed attachment's streams; with `report_exit` (the handle of a
+    /// process spawned with SPAWN_REPORT_EXIT), its exit is sent as an EXIT event too.
     fn activate_process_attachment(
         &mut self,
         attachment_id: u32,
         events: super::yas_process::AttachmentEvents,
+        report_exit: Option<u64>,
     ) -> Result<(), ()> {
         let attachment = self
             .process
@@ -25825,6 +25837,7 @@ impl Session {
             attachment.stdout_transfer,
             stdout_flow,
             attachment.stderr_transfer.zip(stderr_flow),
+            report_exit,
             self.out.clone(),
             self.internal.clone(),
             self.cancellation.clone(),
@@ -26080,6 +26093,8 @@ impl Session {
                 self.outbound_sensitive.remove(&transfer_id);
             }
         }
+        // A SPAWN_REPORT_EXIT process whose attachment goes before its exit reports none: the
+        // client knows (it dropped a stream, detached, or saw its streams reset) and WAITs.
         if detach {
             tokio::spawn(async move {
                 let _ = attachment.control.detach().await;
@@ -31000,6 +31015,36 @@ struct ProcessOutputChunk {
     data: Vec<u8>,
 }
 
+/// A SPAWN_REPORT_EXIT process's exit, as the EXIT event its session gets unasked.
+async fn send_exit_report(
+    out: &FrameSender,
+    process_handle: u64,
+    exit: super::yas_process::ExitInfo,
+    connection: &ConnectionCancellation,
+) {
+    // KEEP_OUTPUT: what was dropped of each stream.
+    let elided = exit
+        .elided
+        .iter()
+        .zip([false, true])
+        .filter_map(|(elided, stderr)| elided.map(|elided| elided.extension(stderr)))
+        .collect();
+    let report = yas_process_wire::ExitReport {
+        process_handle,
+        exit: exit.into_record(monotonic_ns()),
+        extensions: Extensions(elided),
+    };
+    let _ = send_event_with_sensitivity(
+        out,
+        family::PROCESS,
+        yas_process_wire::event_kind::EXIT,
+        &report,
+        connection,
+        true,
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_process_attachment(
     attachment_id: u32,
@@ -31009,12 +31054,14 @@ fn spawn_process_attachment(
     stdout_transfer: u32,
     stdout_flow: Arc<FlowControl>,
     stderr: Option<(u32, Arc<FlowControl>)>,
+    report_exit: Option<u64>,
     out: FrameSender,
     internal: mpsc::Sender<Internal>,
     connection: ConnectionCancellation,
     cancellation: ConnectionCancellation,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let exit_out = out.clone();
         let (stdout_tx, stdout_rx) = mpsc::channel(PROCESS_STREAM_QUEUE);
         let stdout_task = tokio::spawn(run_process_output(
             attachment_id,
@@ -31110,14 +31157,40 @@ fn spawn_process_attachment(
                         return;
                     }
                 }
-                Some(super::yas_process::Event::Exit(_)) => {
+                Some(super::yas_process::Event::Exit(exit)) => {
                     exited = true;
+                    // As a WAIT would answer it, at once: the streams go on with what
+                    // the process wrote before, at the pace of their credit.
+                    // In a task of its own: removing the attachment meanwhile aborts this
+                    // one, and the exit is already this attachment's to report.
+                    if let Some(process_handle) = report_exit {
+                        let (out, connection) = (exit_out.clone(), connection.clone());
+                        tokio::spawn(async move {
+                            send_exit_report(&out, process_handle, exit, &connection).await;
+                        });
+                    }
                     let _ = internal
                         .send(Internal::ProcessExited { attachment_id })
                         .await;
                     break;
                 }
-                None => break,
+                None => {
+                    // The route failed (its output fell a window behind): the session resets
+                    // this attachment's Transfers with why, rather than end them cleanly
+                    // short, and cancels this task and its streams meanwhile.
+                    if let Some(detail) = events.failure() {
+                        let _ = internal
+                            .send(Internal::ProcessFailed {
+                                attachment_id,
+                                status: Status::ResourceExhausted,
+                                detail,
+                            })
+                            .await;
+                        cancellation.cancelled().await;
+                        return;
+                    }
+                    break;
+                }
             }
         }
         drop(stdout_tx);
@@ -51786,7 +51859,7 @@ mod tests {
             yas_process_wire::Limits {
                 max_mutation_replays: MAX_PROCESS_OPERATION_REPLAYS as u32,
                 launcher_flags: if cfg!(unix) {
-                    yas_wire::schema::process::SPAWN_LAUNCHER_FLAGS as u32
+                    yas_wire::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32
                 } else {
                     yas_wire::schema::process::SPAWN_STDIN_NULL as u32
                 },
@@ -52146,6 +52219,142 @@ mod tests {
         assert_eq!(stdout, input);
         assert!(stderr_bytes.is_empty());
         assert_eq!(stale_replay.unwrap().status, Status::Stale);
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_spawn_with_report_exit_is_sent_its_exit_without_a_wait() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let sh = std::env::split_paths(&std::env::var_os("PATH").expect("test PATH is set"))
+            .map(|directory| directory.join("sh"))
+            .find(|path| path.is_file())
+            .expect("sh is on PATH")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, hello, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::PROCESS]).await;
+        let descriptor = hello
+            .families
+            .iter()
+            .find(|descriptor| descriptor.family_id == family::PROCESS)
+            .expect("Process negotiated");
+        let limits = yas_process_wire::Limits::from_extensions(&descriptor.limits).unwrap();
+        assert_ne!(
+            limits.launcher_flags & yas_wire::schema::process::SPAWN_REPORT_EXIT as u32,
+            0
+        );
+
+        let spawn = yas_process_wire::Spawn {
+            operation_id: [0x72; 16],
+            flags: (yas_wire::schema::process::SPAWN_REPORT_EXIT
+                | yas_wire::schema::process::SPAWN_STDIN_NULL) as u16,
+            environment_kind: yas_process_wire::EnvironmentKind::Empty,
+            cwd: yas_process_wire::Cwd::ServerDefault,
+            argv: vec![
+                sh,
+                b"-c".to_vec(),
+                b"printf out; printf err >&2; exit 3".to_vec(),
+            ],
+            env: Vec::new(),
+            stdout_receive_credit: 1024 * 1024,
+            stderr_receive_credit: 1024 * 1024,
+            extensions: Extensions::default(),
+        };
+        write_request(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            11,
+            &spawn,
+        )
+        .await;
+        let (spawned, _) = next_process_result_collecting_state(
+            &mut client,
+            &codec,
+            yas_process_wire::request_kind::SPAWN,
+            11,
+        )
+        .await;
+        assert_eq!(spawned.status, Status::Ok);
+        let streams = yas_process_wire::StreamBundle::decode(&spawned.body).unwrap();
+        assert!(streams.stdin.is_none());
+        let stderr = streams.stderr.as_ref().expect("separate stderr Transfer");
+
+        // No WAIT is sent: the exit comes on its own, next to the streams.
+        let mut stdout = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_closed = false;
+        let mut stderr_closed = false;
+        let mut exit = None;
+        while !stdout_closed || !stderr_closed || exit.is_none() {
+            let frame = next_frame(&mut client, &codec).await;
+            match (frame.header.family, frame.header.kind) {
+                (family::PROCESS, yas_process_wire::event_kind::EXIT) => {
+                    assert_eq!(
+                        frame.header,
+                        FrameHeader {
+                            sensitive: true,
+                            ..FrameHeader::event(
+                                family::PROCESS,
+                                yas_process_wire::event_kind::EXIT,
+                            )
+                        }
+                    );
+                    assert!(exit.is_none(), "a second EXIT");
+                    let report = yas_process_wire::ExitReport::decode(&frame.payload).unwrap();
+                    assert_eq!(report.process_handle, streams.process_handle);
+                    assert_eq!(
+                        yas_process_wire::ExitReport::handle_of(&frame.payload),
+                        Some(streams.process_handle)
+                    );
+                    exit = Some(report.exit);
+                }
+                (family::TRANSFER, yas_wire::schema::transfer::event::BYTE_DATA) => {
+                    let data = ByteData::decode(&frame.payload).unwrap();
+                    let target = if data.transfer_id == streams.stdout.transfer_id {
+                        &mut stdout
+                    } else if data.transfer_id == stderr.transfer_id {
+                        &mut stderr_bytes
+                    } else {
+                        panic!("bytes for unknown Process Transfer")
+                    };
+                    assert_eq!(data.offset, target.len() as u64);
+                    target.extend_from_slice(&data.data);
+                }
+                (family::TRANSFER, yas_wire::schema::transfer::event::CLOSE) => {
+                    let close = Close::decode(&frame.payload).unwrap();
+                    assert_eq!(close.status, Status::Ok.code());
+                    if close.transfer_id == streams.stdout.transfer_id {
+                        assert_eq!(close.final_data_bytes, stdout.len() as u64);
+                        stdout_closed = true;
+                    } else if close.transfer_id == stderr.transfer_id {
+                        assert_eq!(close.final_data_bytes, stderr_bytes.len() as u64);
+                        stderr_closed = true;
+                    } else {
+                        panic!("CLOSE for unknown Process Transfer")
+                    }
+                }
+                _ => panic!(
+                    "unexpected native frame from a reported Process: {:?}",
+                    frame.header
+                ),
+            }
+        }
+        let exit = exit.unwrap();
+        assert_eq!(exit.kind, yas_process_wire::ExitKind::Code);
+        assert_eq!(exit.code, 3);
+        assert_ne!(exit.exited_server_ns, 0);
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr_bytes, b"err");
 
         drop(client);
         timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();

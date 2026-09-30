@@ -539,6 +539,15 @@ pub enum Command {
             required = true
         )]
         allow_client: Vec<String>,
+
+        /// What carries the relay session: auto (WebTransport, else WebSocket
+        /// where UDP is blocked), webtransport or websocket
+        #[arg(
+            long,
+            env = "YAS_UPLINK_TRANSPORT",
+            value_parser = ["auto", "webtransport", "websocket"]
+        )]
+        transport: Option<String>,
     },
 
     /// Print an X25519 key pair as JSON (private_key and public_key, base64url)

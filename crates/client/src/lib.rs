@@ -75,6 +75,9 @@ pub use client::{Client, DEFAULT_REQUEST_TIMEOUT};
 pub use error::{Error, Result, format_result_detail};
 pub use options::{ConnectOptions, HelloOptions, read_only_extension};
 
+/// The producer side of YAS uplinks (`yas uplink`): publish a YAS server
+/// through a relay, over WebTransport or WebSockets.
+pub use yas_proxy::uplink_producer;
 /// The wire codecs this crate speaks (`yas-wire`), for the escape hatches
 /// ([`Client::request`], [`Client::request_raw`]).
 pub use yas_wire as wire;

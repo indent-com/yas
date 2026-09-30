@@ -1752,6 +1752,15 @@ describe("YAS v1", () => {
     matches("fs.conflict_detail.payload", encodeFsConflictDetail(fsConflict));
     const fsApply = decodeFsApply(fromHex(vector("fs.apply.payload")));
     matches("fs.apply.payload", encodeFsApply(fsApply));
+    const fsApplyInPlace = decodeFsApply(
+      fromHex(vector("fs.apply.in_place.payload")),
+    );
+    expect(fsApplyInPlace.items[0]).toMatchObject({
+      kind: "write-inline",
+      inPlace: true,
+      createParents: false,
+    });
+    matches("fs.apply.in_place.payload", encodeFsApply(fsApplyInPlace));
     const fsApplyResult = decodeFsApplyResult(
       fromHex(vector("fs.apply_result.payload")),
     );

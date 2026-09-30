@@ -62,6 +62,8 @@ mod net;
 mod nvdec_decode;
 mod nvenc_encode;
 #[cfg(any(unix, windows))]
+mod output_keep;
+#[cfg(any(unix, windows))]
 mod process;
 mod pty;
 mod read_only_stream;
@@ -2419,8 +2421,12 @@ fn downscale_target_color_mode(
     }
 }
 
+/// Ask the compositor for a surface's pixels: the command, then `wake` for its
+/// loop (an idle one would see the command only at its next dispatch timeout, a
+/// second later), then the reply, or None after `timeout`.
 async fn request_surface_capture_with_timeout(
     command_tx: std::sync::mpsc::SyncSender<CompositorCommand>,
+    wake: impl FnOnce(),
     surface_id: u16,
     scale_120: u16,
     timeout: Duration,
@@ -2433,6 +2439,7 @@ async fn request_surface_capture_with_timeout(
             reply: tx,
         })
         .ok()?;
+    wake();
 
     // The compositor replies through a blocking std::sync::mpsc channel.
     // Wait for it off the async runtime so this request never stalls the
@@ -15718,12 +15725,22 @@ mod tests {
             })
             .unwrap();
 
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake = {
+            let woken = woken.clone();
+            move || woken.store(true, std::sync::atomic::Ordering::SeqCst)
+        };
         let result =
-            request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
+            request_surface_capture_with_timeout(command_tx, wake, 7, 0, Duration::from_millis(50))
+                .await;
 
         let (w, h, pixels) = result.unwrap();
         assert_eq!((w, h), (2, 3));
         assert_eq!(pixels.to_rgba(w, h), vec![1, 2, 3, 4]);
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the compositor loop is woken for the command"
+        );
     }
 
     #[tokio::test]
@@ -15736,8 +15753,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
+        let result = request_surface_capture_with_timeout(
+            command_tx,
+            || {},
+            7,
+            0,
+            Duration::from_millis(50),
+        )
+        .await;
 
         assert!(result.is_none());
     }
