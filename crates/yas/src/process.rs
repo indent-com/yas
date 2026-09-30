@@ -1071,7 +1071,7 @@ impl Decode for OutputElision {
             || value.lines > value.code_points
             || value.code_points > value.bytes
             || value.utf16_units < value.code_points
-            || value.utf16_units > 2 * value.code_points
+            || value.utf16_units > value.code_points.saturating_mul(2)
         {
             return Err(Error::Invalid("Process output elision"));
         }
@@ -1686,6 +1686,50 @@ fn read_limit_u64(extensions: &Extensions, tag: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn elision_bytes(fields: [u64; 5]) -> Vec<u8> {
+        fields
+            .iter()
+            .flat_map(|field| field.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn an_output_elision_is_its_five_counts_and_they_must_agree() {
+        let elision = OutputElision {
+            offset: 7,
+            bytes: 10,
+            lines: 2,
+            code_points: 6,
+            utf16_units: 8,
+        };
+        let encoded = elision.extension(false).value;
+        assert_eq!(encoded, elision_bytes([7, 10, 2, 6, 8]));
+        assert_eq!(OutputElision::decode(&encoded).unwrap(), elision);
+        for end in 0..encoded.len() {
+            assert!(
+                OutputElision::decode(&encoded[..end]).is_err(),
+                "prefix {end}"
+            );
+        }
+        for fields in [
+            [0, 0, 0, 0, 0],
+            [0, 10, 7, 6, 6],
+            [0, 10, 0, 11, 11],
+            [0, 10, 0, 6, 5],
+            [0, 10, 0, 6, 13],
+        ] {
+            assert!(
+                OutputElision::decode(&elision_bytes(fields)).is_err(),
+                "{fields:?}"
+            );
+        }
+        // Twice these code points is past u64: checked without overflowing.
+        let widest = [u64::MAX; 5];
+        assert!(OutputElision::decode(&elision_bytes(widest)).is_ok());
+        let halves = [0, u64::MAX, 0, u64::MAX / 2 + 1, u64::MAX];
+        assert!(OutputElision::decode(&elision_bytes(halves)).is_ok());
+    }
 
     fn every_truncation<T>(value: &T)
     where
