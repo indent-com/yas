@@ -1465,12 +1465,17 @@ exec sleep 600"#;
         std::fs::canonicalize(String::from_utf8(cwd).unwrap()).unwrap(),
         std::fs::canonicalize(directory.path()).unwrap()
     );
-    // Nothing else starts: waiting for the next command finds none.
+    // Nothing else starts: waiting for the next command times out (TIMEOUT
+    // since #54; NOT_FOUND is for an exited terminal or an evicted index).
     let waited = client
         .wait_terminal_command(id, None, Duration::from_millis(200))
         .await
         .unwrap_err();
-    assert!(waited.is_not_found(), "{waited:?}");
+    assert_eq!(
+        waited.status(),
+        Some(yas_client::wire::core::Status::Timeout),
+        "{waited:?}"
+    );
     client.close_terminal(id).await.unwrap();
 }
 
