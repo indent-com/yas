@@ -1505,7 +1505,12 @@ export class YasConnection {
     kind: number,
     reject: (error: unknown) => void,
   ): (error: unknown) => void {
+    let rejected = false;
     return (error) => {
+      // A send that fails the session rejects the Request there first; the
+      // send error that follows never reaches the caller.
+      if (rejected) return;
+      rejected = true;
       this.emitRequestFailure({ family, kind, error });
       reject(error);
     };

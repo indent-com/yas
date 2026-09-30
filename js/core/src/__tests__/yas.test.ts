@@ -4624,6 +4624,24 @@ describe("YAS v1", () => {
     expect(failures[0]?.error).toMatchObject({ status: YAS_STATUS_INVALID });
   });
 
+  it("reports a send failure that fails the session once", async () => {
+    const { transport, connection } = await connected();
+    const failures: YasRequestFailure[] = [];
+    connection.onRequestFailure((failure) => failures.push(failure));
+    transport.send = () => {
+      transport.setStatus("error");
+      throw new Error("edge write failed");
+    };
+
+    const error = await connection
+      .request(YAS_FAMILY_CORE, YAS_CORE_PING, new Uint8Array())
+      .catch((rejection: unknown) => rejection);
+
+    expect(failures).toEqual([
+      { family: YAS_FAMILY_CORE, kind: YAS_CORE_PING, error },
+    ]);
+  });
+
   it("preserves a synchronous send failure through transport close status", async () => {
     const { transport, connection } = await connected();
     const sendError = new Error("edge write failed");
