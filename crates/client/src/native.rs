@@ -37,8 +37,11 @@ use crate::{ConnectOptions, HelloOptions};
 const HELLO_REQUEST_ID: u32 = 1;
 const WATCH_CREDIT: u64 = yas_wire::schema::transport::RECOMMENDED_BUFFERED;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const MAX_PENDING_FRAMES: usize = 1_024;
-const MAX_PENDING_BYTES: usize = yas_wire::schema::transport::RECOMMENDED_BUFFERED as usize;
+/// Frames parked while a caller waits for another, at least, and per this many bytes of the
+/// declared receive budget (1,024 in the default 16 MiB): a peer within its credit parks no
+/// more bytes than the budget.
+const MIN_PENDING_FRAMES: usize = 1_024;
+const PENDING_BYTES_PER_FRAME: u64 = 16 * 1024;
 pub const MAX_COLLECTED_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
 
 type Reader = Box<dyn AsyncRead + Unpin + Send>;
@@ -982,7 +985,13 @@ impl NativeClient {
             .pending_bytes
             .checked_add(frame.payload.len())
             .ok_or_else(|| Error::protocol("pending YAS frame accounting overflow"))?;
-        if self.pending.len() >= MAX_PENDING_FRAMES || next_bytes > MAX_PENDING_BYTES {
+        let budget = self.local_receive.max_buffered;
+        let max_frames = usize::try_from(budget / PENDING_BYTES_PER_FRAME)
+            .unwrap_or(usize::MAX)
+            .max(MIN_PENDING_FRAMES);
+        if self.pending.len() >= max_frames
+            || u64::try_from(next_bytes).unwrap_or(u64::MAX) > budget
+        {
             return Err(Error::protocol(
                 "native YAS peer exceeded the bounded pending-frame queue",
             ));
@@ -1437,6 +1446,124 @@ mod tests {
             }],
             extensions: Extensions::default(),
         }
+    }
+
+    /// Answer a client's HELLO on `server_stream` with [`test_server_hello`]: the codec
+    /// for what follows, and the client's HELLO.
+    async fn answer_hello(
+        server_stream: &mut tokio::io::DuplexStream,
+    ) -> (FrameCodec, ClientHello) {
+        let mut preface = [0; yas_wire::PREFACE.len()];
+        server_stream.read_exact(&mut preface).await.unwrap();
+        let pre_hello = FrameCodec::pre_hello();
+        let hello_frame = read_frame(server_stream, &pre_hello).await.unwrap();
+        let client_hello = ClientHello::decode(&hello_frame.payload).unwrap();
+        let result_frame = Frame {
+            header: FrameHeader::result(
+                family::CORE,
+                yas_wire::core::request_kind::HELLO,
+                HELLO_REQUEST_ID,
+            ),
+            payload: ResultPrefix {
+                status: Status::Ok,
+                detail: Extensions::default(),
+                body: test_server_hello().encode().unwrap(),
+            }
+            .encode()
+            .unwrap(),
+        };
+        server_stream
+            .write_all(&pre_hello.encode_stream(&result_frame).unwrap())
+            .await
+            .unwrap();
+        let codec = FrameCodec::new(
+            FrameLimits {
+                max_wire_frame: client_hello.receive.max_frame,
+                max_decoded_frame: client_hello.receive.max_decoded,
+            },
+            [],
+        )
+        .unwrap();
+        (codec, client_hello)
+    }
+
+    /// A client that declares a wider receive budget parks as much as it declared while it
+    /// waits for another frame: 17 MiB of Transfer data in 1,372 frames within 64 MiB, past
+    /// both the default's caps (16 MiB, 1,024 frames).
+    #[tokio::test]
+    async fn frames_parked_within_a_wider_receive_budget_keep_the_session() {
+        const BUDGET: u64 = 64 << 20;
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 272;
+        const SMALL: usize = 1_100;
+        let (client_stream, mut server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (codec, client_hello) = answer_hello(&mut server_stream).await;
+            assert_eq!(client_hello.receive.max_buffered, BUDGET);
+            for index in 0..CHUNKS + SMALL {
+                let (offset, size) = if index < CHUNKS {
+                    (index * CHUNK, CHUNK)
+                } else {
+                    (CHUNKS * CHUNK + index - CHUNKS, 1)
+                };
+                let data = Frame {
+                    header: FrameHeader::event(
+                        family::TRANSFER,
+                        yas_wire::transfer::kind::BYTE_DATA,
+                    ),
+                    payload: ByteData {
+                        transfer_id: 7,
+                        offset: offset as u64,
+                        data: vec![0; size],
+                    }
+                    .encode()
+                    .unwrap(),
+                };
+                server_stream
+                    .write_all(&codec.encode_stream(&data).unwrap())
+                    .await
+                    .unwrap();
+            }
+            // What the client waits for: another Transfer's end.
+            let close = Frame {
+                header: FrameHeader::event(family::TRANSFER, yas_wire::transfer::kind::CLOSE),
+                payload: TransferClose {
+                    transfer_id: 8,
+                    final_data_bytes: 0,
+                    status: Status::Ok.code(),
+                    detail: Vec::new(),
+                }
+                .encode()
+                .unwrap(),
+            };
+            server_stream
+                .write_all(&codec.encode_stream(&close).unwrap())
+                .await
+                .unwrap();
+            server_stream
+        });
+        let mut client = NativeClient::connect_transport(
+            transport::Transport::Duplex(client_stream),
+            &HelloOptions::named("yas-test").receive_budget(BUDGET),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.receive_budget(), BUDGET);
+        let close = client
+            .next_matching_event(family::TRANSFER, yas_wire::transfer::kind::CLOSE)
+            .await
+            .unwrap();
+        assert_eq!(
+            TransferClose::decode(&close.payload).unwrap().transfer_id,
+            8
+        );
+        assert_eq!(client.pending.len(), CHUNKS + SMALL);
+        assert!(
+            client.pending_bytes > CHUNKS * CHUNK,
+            "{}",
+            client.pending_bytes
+        );
+        drop(server.await.unwrap());
     }
 
     #[tokio::test]
