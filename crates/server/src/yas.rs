@@ -31120,7 +31120,23 @@ fn spawn_process_attachment(
                         .await;
                     break;
                 }
-                None => break,
+                None => {
+                    // The route failed (its output fell a window behind): the session resets
+                    // this attachment's Transfers with why, rather than end them cleanly
+                    // short, and cancels this task and its streams meanwhile.
+                    if let Some(detail) = events.failure() {
+                        let _ = internal
+                            .send(Internal::ProcessFailed {
+                                attachment_id,
+                                status: Status::ResourceExhausted,
+                                detail,
+                            })
+                            .await;
+                        cancellation.cancelled().await;
+                        return;
+                    }
+                    break;
+                }
             }
         }
         drop(stdout_tx);

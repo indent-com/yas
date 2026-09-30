@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use yas_wire::process as wire;
 use yas_wire::schema::process as process_schema;
@@ -311,6 +311,14 @@ const RESIDUE_LEFT_RUNNING: &str = "residual process group left running";
 /// that are already zombies to be reaped (see `kill_group_until_gone`).
 #[cfg(unix)]
 const RESIDUAL_ZOMBIE_WAIT: Duration = Duration::from_secs(1);
+/// Once nothing of a finished process's group is left, how long its streams may stay open with
+/// no reader waiting for the owner to take its window before the cleanup stops waiting for them
+/// (a holder outside the group keeps a pipe open with nothing coming): see `drain_paced`.
+const DRAIN_IDLE: Duration = Duration::from_millis(250);
+/// How much more a stream may give while the cleanup waits for its owner (`drain_paced`): more
+/// than a pipe holds (1 MiB at most unless root raised /proc/sys/fs/pipe-max-size), so it bounds
+/// only a holder outside the group that writes on.
+const DRAIN_BUDGET: u64 = 1024 * 1024;
 const PROCESS_STREAM_STDOUT: u8 = process_schema::STREAM_STDOUT_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDERR: u8 = process_schema::STREAM_STDERR_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDIN_ACCEPTING: u8 = 1 << 0;
@@ -334,6 +342,10 @@ const PROCESS_KILL_TERMINATE_TIMEOUT: u8 = process_schema::EXIT_REASON_TERMINATE
 const PROCESS_KILL_SERVER_SHUTDOWN: u8 = process_schema::EXIT_REASON_SERVER_SHUTDOWN as u8;
 const PROCESS_MAX_UNACKED_PACKETS: usize = 1_024;
 const PROCESS_DEFAULT_STREAM_WINDOW: u64 = 1024 * 1024;
+/// Unacknowledged frames a process's owner may have on one stream: its window in whole frames,
+/// so a burst of small writes fits the adapter's queues (80 route events) as a full window does.
+const PROCESS_OWNER_UNACKED_FRAMES: usize =
+    (PROCESS_DEFAULT_STREAM_WINDOW / OUTPUT_FRAME_PAYLOAD as u64) as usize;
 
 pub(crate) const NATIVE_STREAM_STDOUT: u8 = PROCESS_STREAM_STDOUT;
 pub(crate) const NATIVE_STREAM_STDERR: u8 = PROCESS_STREAM_STDERR;
@@ -630,14 +642,35 @@ pub(crate) enum NativeControl {
 #[derive(Clone)]
 struct EndpointOutput {
     events: mpsc::Sender<NativeEventEnvelope>,
-    closed: watch::Sender<Option<String>>,
+    evictions: Arc<Evictions>,
+}
+
+/// The processes of one endpoint whose binding the output readers dropped: a watcher that fell
+/// a window behind, or one whose queue was full. Its adapter fails those attachments alone; the
+/// endpoint and its other processes go on.
+#[derive(Default)]
+pub(crate) struct Evictions {
+    process_ids: StdMutex<Vec<u32>>,
+    notify: Notify,
+}
+
+impl Evictions {
+    /// Waits for evictions (one waiter: the endpoint's adapter).
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// The process IDs evicted since the last call.
+    pub(crate) fn take(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.process_ids.lock().unwrap())
+    }
 }
 
 impl EndpointOutput {
-    fn kick(&self, reason: &str) {
-        if self.closed.borrow().is_none() {
-            let _ = self.closed.send(Some(reason.to_owned()));
-        }
+    fn evict(&self, process_id: u32) {
+        self.evictions.process_ids.lock().unwrap().push(process_id);
+        // A permit is kept when the adapter is not waiting yet.
+        self.evictions.notify.notify_one();
     }
 
     fn send_native(&self, event: NativeEvent, guard: Option<WriterGuard>) -> bool {
@@ -740,19 +773,22 @@ impl Server {
         &self,
         session_id: [u8; 16],
         event_capacity: usize,
-    ) -> (
-        Manager,
-        mpsc::Receiver<NativeEventEnvelope>,
-        watch::Receiver<Option<String>>,
-    ) {
+    ) -> (Manager, mpsc::Receiver<NativeEventEnvelope>, Arc<Evictions>) {
         debug_assert!(session_id.iter().any(|byte| *byte != 0));
         let id = self.0.next_endpoint.fetch_add(1, Ordering::Relaxed);
         let (events, receiver) = mpsc::channel(event_capacity.max(1));
-        let (closed, closed_receiver) = watch::channel(None);
+        let evictions = Arc::new(Evictions::default());
         (
-            self.endpoint_with_id(EndpointOutput { events, closed }, id, session_id),
+            self.endpoint_with_id(
+                EndpointOutput {
+                    events,
+                    evictions: evictions.clone(),
+                },
+                id,
+                session_id,
+            ),
             receiver,
-            closed_receiver,
+            evictions,
         )
     }
 
@@ -1157,6 +1193,8 @@ struct RecordInner {
     stderr: Option<StreamState>,
     stdout_readers: u8,
     stderr_readers: u8,
+    /// Output readers waiting for the owner to take its window (`owner_with_room`).
+    paced_readers: u8,
     child_outcome: Option<ChildOutcome>,
     tree_cleanup_done: bool,
     exit_override: Option<ExitOverride>,
@@ -1491,6 +1529,7 @@ impl Manager {
                 stderr: (!merged).then_some(StreamState { next: 0 }),
                 stdout_readers: 1,
                 stderr_readers: if merged { 0 } else { 1 },
+                paced_readers: 0,
                 child_outcome: None,
                 tree_cleanup_done: false,
                 exit_override: None,
@@ -1735,7 +1774,12 @@ impl Manager {
                 return Err(NativeError::NotFound);
             };
             let residual_running = residual_running(&record, &inner);
-            if inner.terminal_queued || (inner.child_outcome.is_some() && !residual_running) {
+            // Detach goes through until the exit is queued: its output may still be draining,
+            // and a binding nobody acknowledges would hold the readers the owner paces.
+            let detach = matches!(action, NativeControl::Detach);
+            if inner.terminal_queued
+                || (inner.child_outcome.is_some() && !residual_running && !detach)
+            {
                 return Err(NativeError::Conflict);
             }
             match action {
@@ -2855,6 +2899,11 @@ async fn stdin_writer(
 async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRead + Unpin) {
     let mut buffer = vec![0u8; OUTPUT_FRAME_PAYLOAD];
     loop {
+        // The process's owner takes all of its output: the pipe is read no further ahead of
+        // what the owner has taken than its window, so a writer faster than the owner's
+        // Transfer blocks on its pipe. (It used to be evicted, which closed the owner's whole
+        // Process endpoint.) Other watchers are still dropped when they fall a window behind.
+        let owner = owner_with_room(&record, stream).await;
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Err(_) => {
@@ -2862,6 +2911,17 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 break;
             }
             Ok(n) => {
+                // Room in the owner's event queue too, taken before the lock: its frame never
+                // finds the queue full.
+                let owner = match owner {
+                    Some((endpoint_id, process_id, events)) => events
+                        .reserve_owned()
+                        .await
+                        .ok()
+                        .map(|permit| (endpoint_id, process_id, permit)),
+                    None => None,
+                };
+                let mut owner = owner;
                 let mut inner = record.inner.lock().unwrap();
                 let state = if stream == PROCESS_STREAM_STDOUT {
                     &mut inner.stdout
@@ -2878,6 +2938,30 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 let mut evicted = Vec::new();
                 let mut index = 0;
                 while index < inner.bindings.len() {
+                    if let Some((endpoint_id, process_id, _)) = owner
+                        && inner.bindings[index].endpoint_id == endpoint_id
+                        && inner.bindings[index].process_id == process_id
+                    {
+                        let (_, _, permit) = owner.take().expect("owner permit");
+                        permit.send(NativeEventEnvelope {
+                            event: NativeEvent::Output {
+                                process_id,
+                                stream,
+                                offset,
+                                data: buffer[..n].to_vec(),
+                            },
+                            _guard: None,
+                        });
+                        let binding = &mut inner.bindings[index];
+                        let credit = if stream == PROCESS_STREAM_STDOUT {
+                            &mut binding.stdout
+                        } else {
+                            binding.stderr.as_mut().expect("separate stderr binding")
+                        };
+                        credit.frames.push_back(next);
+                        index += 1;
+                        continue;
+                    }
                     let has_credit = {
                         let binding = &inner.bindings[index];
                         let credit = if stream == PROCESS_STREAM_STDOUT {
@@ -2917,14 +3001,119 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 }
                 drop(inner);
                 for binding in evicted {
-                    binding
-                        .out
-                        .kick("native process watcher exceeded its output window");
+                    // Its endpoint goes on: free the slot, or the process holds one for good.
+                    if let Some(endpoint) = binding.endpoint.upgrade() {
+                        remove_bound_slot(&endpoint, binding.process_id, &record);
+                    }
+                    binding.out.evict(binding.process_id);
                 }
             }
         }
     }
     stream_closed(&record, stream);
+}
+
+/// Waits until the process's owner, while it is bound, can take another whole frame of
+/// `stream` (its window and unacknowledged frames); answers where to send it. None when the
+/// owner is not bound (it left, or detached): the output then goes to the watchers alone.
+async fn owner_with_room(
+    record: &Record,
+    stream: u8,
+) -> Option<(u64, u32, mpsc::Sender<NativeEventEnvelope>)> {
+    // Counted in `paced_readers` while it waits, however it stops (an abort drops it).
+    let mut paced = Paced {
+        record,
+        counted: false,
+    };
+    loop {
+        // Created before the check: an acknowledgement in between still wakes it.
+        let changed = record.changed.notified();
+        {
+            let mut inner = record.inner.lock().unwrap();
+            let owner = inner
+                .bindings
+                .iter()
+                .find(|binding| Weak::ptr_eq(&binding.endpoint, &record.owner))?;
+            let (next, credit) = if stream == PROCESS_STREAM_STDOUT {
+                (inner.stdout.next, &owner.stdout)
+            } else {
+                match (inner.stderr.as_ref(), owner.stderr.as_ref()) {
+                    (Some(state), Some(credit)) => (state.next, credit),
+                    _ => return None,
+                }
+            };
+            let debt = next.saturating_sub(credit.acked);
+            if debt.saturating_add(OUTPUT_FRAME_PAYLOAD as u64) <= PROCESS_DEFAULT_STREAM_WINDOW
+                && credit.frames.len() < PROCESS_OWNER_UNACKED_FRAMES
+            {
+                return Some((
+                    owner.endpoint_id,
+                    owner.process_id,
+                    owner.out.events.clone(),
+                ));
+            }
+            if !paced.counted {
+                paced.counted = true;
+                inner.paced_readers += 1;
+                drop(inner);
+                record.changed.notify_waiters();
+            }
+        }
+        changed.await;
+    }
+}
+
+/// An output reader waiting for its owner (`owner_with_room`), as `paced_readers` counts it.
+struct Paced<'a> {
+    record: &'a Record,
+    counted: bool,
+}
+
+impl Drop for Paced<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.record.inner.lock().unwrap().paced_readers -= 1;
+            self.record.changed.notify_waiters();
+        }
+    }
+}
+
+/// The cleanup of a finished process whose streams are still open once nothing of its group is
+/// left: what holds them is the child's own output that its owner has not taken yet (it paces
+/// the readers), so they go on until the pipes close, however slowly the owner takes its window.
+/// It stops waiting when no reader has waited for the owner for `DRAIN_IDLE` (a holder outside
+/// the group keeps a pipe open with nothing coming) or a stream has given `DRAIN_BUDGET` more (one
+/// that writes on). True when the streams closed.
+async fn drain_paced(record: &Record) -> bool {
+    let next = |inner: &RecordInner| {
+        (
+            inner.stdout.next,
+            inner.stderr.as_ref().map_or(0, |state| state.next),
+        )
+    };
+    let start = next(&record.inner.lock().unwrap());
+    loop {
+        let changed = record.changed.notified();
+        let paced = {
+            let inner = record.inner.lock().unwrap();
+            if io_tasks_done(&inner) {
+                return true;
+            }
+            let (stdout, stderr) = next(&inner);
+            if inner.tree_cleanup_done
+                || stdout - start.0 > DRAIN_BUDGET
+                || stderr - start.1 > DRAIN_BUDGET
+            {
+                return false;
+            }
+            inner.paced_readers > 0
+        };
+        if paced {
+            changed.await;
+        } else if tokio::time::timeout(DRAIN_IDLE, changed).await.is_err() {
+            return false;
+        }
+    }
 }
 
 fn stream_closed(record: &Arc<Record>, stream: u8) {
@@ -3021,6 +3210,9 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
                     _ = &mut deadline => break false,
                 }
             };
+            // The grace is for the group's residue: with none left, the streams hold the
+            // child's own output, which its owner takes at its own pace.
+            let closed = closed || (process_group_absent(&record) && drain_paced(&record).await);
             if closed {
                 {
                     let mut inner = record.inner.lock().unwrap();
@@ -3086,6 +3278,12 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
         let cleanup_failed = force_kill(&record)
             .err()
             .is_some_and(|error| !process_tree_already_absent(&error));
+        // Nothing of the group writes any more: what the pipes still hold is the child's own
+        // output, which its owner takes at its own pace. (Only a holder outside the group, or a
+        // group that could not be killed, stops the readers.)
+        if !cleanup_failed {
+            drain_paced(&record).await;
+        }
         let (stdin_abort, output_aborts) = {
             let mut inner = record.inner.lock().unwrap();
             if inner.tree_cleanup_done {

@@ -419,6 +419,155 @@ async fn a_default_server_refuses_a_seventeenth_process_and_extra_environment() 
     assert!(matches!(error, Error::Invalid(_)), "{error}");
 }
 
+/// Waits at most [`TIMEOUT`] for `future`, naming what it waited for.
+async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} took over {TIMEOUT:?}"))
+}
+
+/// The session still runs commands: the Process family was not taken down.
+async fn still_runs_commands(client: &Client) {
+    let output = within(
+        "a command after it",
+        client
+            .spawn(Command::new("echo").arg("after"))
+            .await
+            .unwrap()
+            .output(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.stdout, b"after\n");
+    assert!(output.status.success(), "{}", output.status);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_writing_faster_than_its_output_is_read_loses_none_of_it() {
+    use tokio::io::AsyncReadExt;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    // Three times the largest stream buffer a default server keeps, written as fast as the
+    // pipe takes it: the server reads it no faster than this client does (it used to drop the
+    // stream NOT_FOUND about a window in, and the exit never came).
+    const BYTES: u64 = 3 * 8 * 1024 * 1024;
+    let mut process = client
+        .spawn(Command::new("sh").args([
+            "-c".to_owned(),
+            format!("head -c {BYTES} /dev/zero; printf end; echo tail >&2; exit 9"),
+        ]))
+        .await
+        .unwrap();
+    let stdout = process.take_stdout().unwrap();
+    let stderr = process.take_stderr().unwrap();
+    // Read as Ultimator's bash does: the exit is awaited while the output streams in.
+    let reader = tokio::spawn(async move {
+        tokio::join!(stdout.read_to_end(BYTES + 1024), stderr.read_to_end(1024))
+    });
+    let status = within("the exit", process.wait()).await.unwrap();
+    assert_eq!(status.code(), Some(9), "{status}\n{}", server_log(&server));
+    let (stdout, stderr) = within("the output", reader).await.unwrap();
+    let stdout = stdout.unwrap_or_else(|error| panic!("{error}\n{}", server_log(&server)));
+    assert_eq!(stdout.len() as u64, BYTES + 3);
+    assert!(stdout.ends_with(b"end"));
+    assert!(stdout[..BYTES as usize].iter().all(|byte| *byte == 0));
+    assert_eq!(stderr.unwrap(), b"tail\n");
+
+    // A reader slower than the writer, a few KiB at a time: the writer waits for it.
+    const SLOW: usize = 4 * 1024 * 1024;
+    let mut process = client
+        .spawn(
+            Command::new("head")
+                .args(["-c".to_owned(), SLOW.to_string()])
+                .arg("/dev/zero"),
+        )
+        .await
+        .unwrap();
+    let mut stdout = process.take_stdout().unwrap();
+    let mut total = 0;
+    let mut buffer = vec![0u8; 64 * 1024];
+    within("the slow reads", async {
+        loop {
+            let n = stdout.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    assert_eq!(total, SLOW);
+    assert!(within("the exit", process.wait()).await.unwrap().success());
+
+    still_runs_commands(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_output_stream_leaves_its_process_and_session_working() {
+    use tokio::io::AsyncReadExt;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let mut process = client
+        .spawn(Command::new("sh").args(["-c", "head -c 25165824 /dev/zero; exit 4"]))
+        .await
+        .unwrap();
+    let mut stdout = process.take_stdout().unwrap();
+    let mut some = vec![0u8; 1024 * 1024];
+    within("the first MiB", stdout.read_exact(&mut some))
+        .await
+        .unwrap();
+    // Dropped half-way: what the command writes next goes nowhere, and it still finishes.
+    drop(stdout);
+    let status = within("the exit", process.wait()).await.unwrap();
+    assert_eq!(status.code(), Some(4), "{status}\n{}", server_log(&server));
+    still_runs_commands(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watcher_that_falls_behind_is_dropped_alone() {
+    let server = start().await;
+    let owner = server.connect().await.unwrap();
+    let watcher = server.connect().await.unwrap();
+    const BYTES: u64 = 3 * 8 * 1024 * 1024;
+    let mut process = owner
+        .spawn(Command::new("sh").args([
+            "-c".to_owned(),
+            format!("sleep 1; head -c {BYTES} /dev/zero; exit 3"),
+        ]))
+        .await
+        .unwrap();
+    // Another session watches, and reads nothing until the command is done.
+    let mut watched = within("the attach", watcher.attach(process.handle(), false))
+        .await
+        .unwrap();
+    let watched_stdout = watched.take_stdout().unwrap();
+    let stdout = process.take_stdout().unwrap();
+    let stdout = within("the owner's output", stdout.read_to_end(BYTES + 1024))
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", server_log(&server)));
+    assert_eq!(stdout.len() as u64, BYTES);
+    assert_eq!(
+        within("the exit", process.wait()).await.unwrap().code(),
+        Some(3)
+    );
+    // The watcher fell a window behind: its stream was dropped, and says why.
+    let dropped = within(
+        "the watcher's output",
+        watched_stdout.read_to_end(BYTES + 1024),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        dropped.status(),
+        Some(yas_client::wire::core::Status::ResourceExhausted),
+        "{dropped}"
+    );
+    // Both sessions still run commands (the watcher's used to lose its Process family).
+    still_runs_commands(&watcher).await;
+    still_runs_commands(&owner).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commands_background_children_die_with_it() {
     let server = start().await;

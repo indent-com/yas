@@ -3277,7 +3277,10 @@ discoverable until its retained exit result expires.
 ATTACH returns new stdout/stderr Transfers beginning at the process's current
 lifetime offsets; earlier output is explicitly reported as a gap and is not
 replayed. At most one attachment owns the stdin Transfer at a time, while any
-number may observe output. CONTROL provides portable signal, terminate, kill,
+number may observe output. The spawning session's credit paces the child (its
+pipe is read at most a window ahead); an attachment of another session that falls
+a window behind has its Transfers reset `RESOURCE_EXHAUSTED`, and nothing else
+changes. CONTROL provides portable signal, terminate, kill,
 and detach actions with operation IDs. Closing the stdin Transfer half-closes
 stdin. WAIT returns the final exit record or TIMEOUT.
 
