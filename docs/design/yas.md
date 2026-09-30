@@ -3273,10 +3273,11 @@ without a WAIT: one EXIT Event (`0x0002`, sensitive), `[process_handle: u64,
 exit: bytes_u32 containing ExitRecord, Extensions]`, the record a WAIT would
 return at that moment. The streams go on with what the process wrote before its
 exit, at the pace of their credit, so the event can arrive before their last
-bytes and their CLOSE. The report outlives the streams: when the spawning
-session's attachment goes before the exit (it dropped its streams, or their
-route failed), the server waits for the exit itself and still sends the EXIT,
-once. It takes none of the session's pending WAITs, and
+bytes and their CLOSE. The spawning session's attachment sends it: when that
+attachment goes before the exit (a Transfer RESET on any of its streams, stdin
+included, from either side, or a DETACH), no EXIT is sent and the client WAITs
+for the exit instead, as it would without the flag. yas-client does so on its
+own. The report takes none of the session's pending WAITs, and
 nothing changes for other sessions: they, and sessions that ATTACH, still WAIT.
 A SPAWN retried under its operation ID shares the original attachment, whose
 exit is reported once.

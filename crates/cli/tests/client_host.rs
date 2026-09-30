@@ -528,6 +528,104 @@ async fn a_dropped_output_stream_leaves_its_process_and_session_working() {
     still_runs_commands(&client).await;
 }
 
+/// A spawned process whose attachment goes before its exit (it was detached, or its streams
+/// were dropped) is asked for its exit with WAIT, which its attachment would have reported.
+/// Nothing holds it to the session meanwhile: a detached one gives back its slot, and either
+/// can be attached to again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_whose_attachment_went_is_waited_for_and_held_by_nothing() {
+    use yas_client::wire::schema::process as schema;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert_ne!(
+        client.launcher_flags() & schema::SPAWN_REPORT_EXIT as u32,
+        0
+    );
+    let per_session = client.process_limits().unwrap().max_processes_per_session as usize;
+    // Detached, each gives back its slot: one more than the session holds still spawns.
+    let mut detached = Vec::new();
+    for _ in 0..per_session {
+        let process = client
+            .spawn(Command::new("sleep").arg("30").detachable(true))
+            .await
+            .unwrap();
+        within("a detach", process.detach()).await.unwrap();
+        detached.push(process);
+    }
+    let one_more = within(
+        "a spawn beside the detached",
+        client.spawn(Command::new("sh").args(["-c", "exit 6"])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        within("its exit", one_more.wait()).await.unwrap().code(),
+        Some(6)
+    );
+    // A detached one can be attached to again, and its exit comes (by WAIT).
+    let again = within("an attach", client.attach(detached[0].handle(), false))
+        .await
+        .unwrap();
+    detached[0].kill().await.unwrap();
+    let status = within("a detached one's exit", detached[0].wait())
+        .await
+        .unwrap();
+    // (Each answer stamps the time it is given.)
+    let attached = within("its exit, attached", again.wait()).await.unwrap();
+    assert_eq!(
+        (&status.kind, &status.reason, status.raw_code),
+        (&attached.kind, &attached.reason, attached.raw_code)
+    );
+    for process in &detached[1..] {
+        process.kill().await.unwrap();
+        within("a detached one's exit", process.wait())
+            .await
+            .unwrap();
+    }
+    // An ordinary one whose streams were dropped: the same.
+    let mut sleeper = client.spawn(Command::new("sleep").arg("30")).await.unwrap();
+    drop(sleeper.take_stdout());
+    drop(sleeper.take_stderr());
+    let again = within("an attach", client.attach(sleeper.handle(), false))
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", server_log(&server)));
+    assert_eq!(
+        within(
+            "a short wait",
+            sleeper.wait_timeout(Duration::from_millis(200))
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    sleeper.kill().await.unwrap();
+    let status = within("its exit", sleeper.wait()).await.unwrap();
+    // (Each answer stamps the time it is given.)
+    let attached = within("its exit, attached", again.wait()).await.unwrap();
+    assert_eq!(
+        (&status.kind, &status.reason, status.raw_code),
+        (&attached.kind, &attached.reason, attached.raw_code)
+    );
+    // One whose stdin was aborted: its attachment goes with it.
+    let mut reader = client
+        .spawn(
+            Command::new("sh")
+                .args(["-c", "sleep 0.3; exit 3"])
+                .stdin(Stdin::Piped),
+        )
+        .await
+        .unwrap();
+    reader.take_stdin().unwrap().abort();
+    assert_eq!(
+        within("its exit, stdin aborted", reader.wait())
+            .await
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+    still_runs_commands(&client).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_watcher_that_falls_behind_is_dropped_alone() {
     let server = start().await;

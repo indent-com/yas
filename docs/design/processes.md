@@ -95,8 +95,10 @@ nonzero operation IDs. `WAIT` returns the final portable exit record or
 (family-limit tag 19), is sent that record as an `EXIT` event once the exit is
 final, so a command's exit costs no round trip of its own: SPAWN's Result, its
 output and its exit all travel from one request. yas-client sets it whenever
-offered, and `Process::wait` then takes no request and no pending-`WAIT` slot;
-against older servers it sends `WAIT` as before. Closing stdin half-closes the
+offered, and `Process::wait` then takes no request and no pending-`WAIT` slot
+unless the attachment that reports the exit went first (a stream reset or
+dropped before its end, a detach), when it sends `WAIT`, as it does against
+older servers. Closing stdin half-closes the
 child stream. An ordinary child belongs
 to its spawning session and is terminated when it disappears; a detachable
 child remains discoverable until its retained final record expires.

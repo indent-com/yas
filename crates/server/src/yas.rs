@@ -3011,16 +3011,6 @@ struct ProcessAttachment {
     stdout_transfer: u32,
     stderr_transfer: Option<u32>,
     exited: bool,
-    /// SPAWN_REPORT_EXIT: the exit goes to this session unasked, whatever becomes of the
-    /// attachment.
-    report_exit: Option<ExitReport>,
-}
-
-/// A SPAWN_REPORT_EXIT process's exit report: its handle, and whether its EXIT was sent.
-#[derive(Clone)]
-struct ExitReport {
-    process_handle: u64,
-    sent: Arc<AtomicBool>,
 }
 
 struct ProcessInputTransfer {
@@ -25799,7 +25789,6 @@ impl Session {
                 stdout_transfer,
                 stderr_transfer,
                 exited: false,
-                report_exit: None,
             },
         );
         Ok((
@@ -25840,10 +25829,6 @@ impl Session {
             .stderr_transfer
             .map(|transfer_id| self.outbound.get(&transfer_id).cloned().ok_or(()))
             .transpose()?;
-        let report_exit = report_exit.map(|process_handle| ExitReport {
-            process_handle,
-            sent: Arc::new(AtomicBool::new(false)),
-        });
         let task = spawn_process_attachment(
             attachment_id,
             attachment.control.clone(),
@@ -25852,19 +25837,17 @@ impl Session {
             attachment.stdout_transfer,
             stdout_flow,
             attachment.stderr_transfer.zip(stderr_flow),
-            report_exit.clone(),
+            report_exit,
             self.out.clone(),
             self.internal.clone(),
             self.cancellation.clone(),
             attachment.cancellation.clone(),
         );
-        let attachment = self
-            .process
+        self.process
             .as_mut()
             .and_then(|process| process.attachments.get_mut(&attachment_id))
-            .ok_or(())?;
-        attachment.task = Some(task);
-        attachment.report_exit = report_exit;
+            .ok_or(())?
+            .task = Some(task);
         Ok(())
     }
 
@@ -26110,39 +26093,11 @@ impl Session {
                 self.outbound_sensitive.remove(&transfer_id);
             }
         }
-        // A SPAWN_REPORT_EXIT process whose attachment goes before its exit (its streams were
-        // dropped, or its output route failed) still reports it: the server waits for it.
-        let report = attachment
-            .report_exit
-            .filter(|report| !report.sent.load(Ordering::Acquire))
-            .zip(self.process.as_ref().map(|process| process.session.clone()));
-        if detach || report.is_some() {
-            let out = self.out.clone();
-            let connection = self.cancellation.clone();
-            let control = attachment.control;
+        // A SPAWN_REPORT_EXIT process whose attachment goes before its exit reports none: the
+        // client knows (it dropped a stream, detached, or saw its streams reset) and WAITs.
+        if detach {
             tokio::spawn(async move {
-                if detach {
-                    let _ = control.detach().await;
-                } else {
-                    drop(control);
-                }
-                let Some((report, session)) = report else {
-                    return;
-                };
-                let wait = yas_process_wire::Wait {
-                    process_handle: report.process_handle,
-                    timeout_ns: 0,
-                    extensions: Extensions::default(),
-                };
-                let exit = tokio::select! {
-                    exit = session.wait(&wait) => exit,
-                    _ = connection.cancelled() => return,
-                };
-                if let Ok(exit) = exit
-                    && !report.sent.swap(true, Ordering::AcqRel)
-                {
-                    send_exit_report(&out, report.process_handle, exit, &connection).await;
-                }
+                let _ = attachment.control.detach().await;
             });
         }
     }
@@ -31092,7 +31047,7 @@ fn spawn_process_attachment(
     stdout_transfer: u32,
     stdout_flow: Arc<FlowControl>,
     stderr: Option<(u32, Arc<FlowControl>)>,
-    report_exit: Option<ExitReport>,
+    report_exit: Option<u64>,
     out: FrameSender,
     internal: mpsc::Sender<Internal>,
     connection: ConnectionCancellation,
@@ -31199,10 +31154,13 @@ fn spawn_process_attachment(
                     exited = true;
                     // As a WAIT would answer it, at once: the streams go on with what
                     // the process wrote before, at the pace of their credit.
-                    if let Some(report) = &report_exit
-                        && !report.sent.swap(true, Ordering::AcqRel)
-                    {
-                        send_exit_report(&exit_out, report.process_handle, exit, &connection).await;
+                    // In a task of its own: removing the attachment meanwhile aborts this
+                    // one, and the exit is already this attachment's to report.
+                    if let Some(process_handle) = report_exit {
+                        let (out, connection) = (exit_out.clone(), connection.clone());
+                        tokio::spawn(async move {
+                            send_exit_report(&out, process_handle, exit, &connection).await;
+                        });
                     }
                     let _ = internal
                         .send(Internal::ProcessExited { attachment_id })

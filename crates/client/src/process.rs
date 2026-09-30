@@ -86,6 +86,7 @@
 //! never more than 1 MiB nor less than 16 KiB.
 
 use std::ffi::OsStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use yas_wire::{
@@ -489,10 +490,13 @@ pub struct Process {
     reported: Option<ReportedExit>,
 }
 
-/// The exit a server reports unasked (an EXIT event), received once and kept.
+/// The exit a server reports unasked (an EXIT event), received once and kept. Its attachment
+/// reports it: once that goes before the exit (a stream dropped or reset, the process
+/// detached), the exit is asked for with WAIT.
 struct ReportedExit {
     frames: tokio::sync::Mutex<crate::client::FrameReceiver>,
-    status: tokio::sync::OnceCell<ExitStatus>,
+    status: std::sync::OnceLock<ExitStatus>,
+    lost: Arc<crate::client::ReportLost>,
 }
 
 impl std::fmt::Debug for ReportedExit {
@@ -504,21 +508,57 @@ impl std::fmt::Debug for ReportedExit {
 }
 
 impl ReportedExit {
-    async fn wait(&self, client: &Client) -> Result<ExitStatus> {
-        self.status
-            .get_or_try_init(|| async {
-                use yas_wire::Decode;
-                let frame = self.frames.lock().await.recv().await.ok_or_else(|| {
-                    client
-                        .closed_reason()
-                        .unwrap_or_else(|| Error::protocol("Process EXIT route closed"))
-                })?;
-                Ok(ExitStatus::from_wire(
-                    ExitReport::decode(&frame.payload)?.exit,
-                ))
-            })
-            .await
-            .cloned()
+    /// The exit, waiting at most `timeout`: None if it is still running then.
+    async fn wait(
+        &self,
+        client: &Client,
+        handle: u64,
+        timeout: Option<Duration>,
+    ) -> Result<Option<ExitStatus>> {
+        use yas_wire::Decode;
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        let until_deadline = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(until_deadline);
+        if let Some(status) = self.status.get() {
+            return Ok(Some(status.clone()));
+        }
+        let mut frames = tokio::select! {
+            frames = self.frames.lock() => frames,
+            () = &mut until_deadline => return Ok(None),
+        };
+        if let Some(status) = self.status.get() {
+            return Ok(Some(status.clone()));
+        }
+        let frame = tokio::select! {
+            biased;
+            frame = frames.recv() => frame,
+            // Its attachment went: an EXIT it sent first may still be here.
+            () = self.lost.lost() => frames.try_recv().ok(),
+            () = &mut until_deadline => return Ok(None),
+        };
+        let status = match frame {
+            Some(frame) => ExitStatus::from_wire(ExitReport::decode(&frame.payload)?.exit),
+            None if self.lost.is_lost() => {
+                let left = deadline.map(|deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                });
+                match client.wait_process(handle, left).await? {
+                    Some(status) => status,
+                    None => return Ok(None),
+                }
+            }
+            None => {
+                return Err(client
+                    .closed_reason()
+                    .unwrap_or_else(|| Error::protocol("Process EXIT route closed")));
+            }
+        };
+        Ok(Some(self.status.get_or_init(|| status).clone()))
     }
 }
 
@@ -581,24 +621,23 @@ impl Process {
 
     /// Wait for the process to exit. A process this session spawned from a server that
     /// reports exits (SPAWN_REPORT_EXIT, in [`Client::launcher_flags`]) takes no request:
-    /// the server sends the exit as it happens. Otherwise this asks with WAIT.
+    /// the server sends the exit as it happens. Otherwise, or once the attachment that would
+    /// report it went first (a stream dropped or reset before its end, a detach), this asks
+    /// with WAIT.
     pub async fn wait(&self) -> Result<ExitStatus> {
-        if let Some(reported) = &self.reported {
-            return reported.wait(&self.client).await;
-        }
-        self.client
-            .wait_process(self.handle, None)
-            .await?
-            .ok_or_else(|| Error::protocol("Process WAIT without timeout timed out"))
+        let status = match &self.reported {
+            Some(reported) => reported.wait(&self.client, self.handle, None).await?,
+            None => self.client.wait_process(self.handle, None).await?,
+        };
+        status.ok_or_else(|| Error::protocol("Process WAIT without timeout timed out"))
     }
 
     /// Wait at most `timeout`; `None` if it is still running.
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<Option<ExitStatus>> {
         if let Some(reported) = &self.reported {
-            return match tokio::time::timeout(timeout, reported.wait(&self.client)).await {
-                Ok(status) => status.map(Some),
-                Err(_) => Ok(None),
-            };
+            return reported
+                .wait(&self.client, self.handle, Some(timeout))
+                .await;
         }
         self.client.wait_process(self.handle, Some(timeout)).await
     }
@@ -627,6 +666,10 @@ impl Process {
 
     /// Make a detachable process independent of this session's attachment.
     pub async fn detach(&self) -> Result<()> {
+        // Its attachment goes, and would have reported the exit.
+        if let Some(reported) = &self.reported {
+            reported.lost.mark();
+        }
         self.client
             .control_process(self.handle, ControlAction::Detach, 0)
             .await
@@ -957,11 +1000,13 @@ impl Client {
             }
             None => None,
         };
+        let lost = reply.take_report_lost().unwrap_or_default();
         let reported = reply
             .take(Route::ProcessExit(bundle.process_handle))
             .map(|frames| ReportedExit {
                 frames: tokio::sync::Mutex::new(frames),
-                status: tokio::sync::OnceCell::new(),
+                status: std::sync::OnceLock::new(),
+                lost,
             });
         Ok(Process {
             client: self.clone(),
