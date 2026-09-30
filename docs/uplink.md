@@ -270,6 +270,15 @@ A WebTransport (HTTP/3 CONNECT) session to the relay URL. Liveness settings
 are a **10s keepalive** and a **30s idle timeout**, so a dead relay is
 noticed within 30 seconds without any application-level pings.
 
+Its congestion control is CUBIC with a **16 MiB initial window**, and the
+uplink asks for an **8 MiB UDP receive buffer**. quinn paces a window over the
+round trip, and answers leave the connection app-limited, so the window
+never grows past what they need. From QUIC's usual 14,720 bytes, a 1 MiB
+answer settles at two round trips; from 16 MiB, it takes one. Loss still
+shrinks the window, and each stream's 1.25 MB receive window still bounds
+what one consumer has in flight. A relay should do the same for what it
+sends.
+
 The uplink never opens streams. The relay opens **one bidirectional stream
 per consumer**. After Noise authentication, the uplink bridges decrypted
 bytes to a fresh local YAS socket. Direct streams carry the normal YAS preface

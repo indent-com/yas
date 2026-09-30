@@ -61,6 +61,17 @@ const MAX_PENDING: usize = 64;
 /// Liveness of a session: a keepalive this often, dead after this long silent.
 const KEEPALIVE: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The congestion window a WebTransport session starts with: CUBIC's, but
+/// large enough that an answer goes out at once. quinn paces a window over
+/// the round trip (1.25 windows per RTT), and a burst leaves the connection
+/// app-limited, which keeps the window from growing past it: from quinn's
+/// 14,720 bytes, a 1 MiB answer settles at two round trips. Loss shrinks the
+/// window as ever, and a stream's receive window (1.25 MB) still bounds what
+/// one consumer has in flight.
+const INITIAL_WINDOW: u64 = 16 << 20;
+/// The UDP receive buffer asked for (the kernel may give less): a paced burst
+/// is up to 256 datagrams, well over Linux's default of 208 KiB.
+const RECEIVE_BUFFER: usize = 8 << 20;
 /// How long a WebSocket (session or stream) may take to open.
 const WEBSOCKET_CONNECT: Duration = Duration::from_secs(10);
 /// How long [`Transport::Auto`] waits for a WebTransport session before it
@@ -946,8 +957,9 @@ enum SessionEnd {
 }
 
 /// A WebTransport client with the liveness settings of docs/uplink.md (10 s
-/// keepalive, 30 s idle timeout), on YAS's rustls provider, verifying the
-/// relay with the platform's roots or a certificate pin.
+/// keepalive, 30 s idle timeout) and a window for bursts ([`INITIAL_WINDOW`],
+/// [`RECEIVE_BUFFER`]), on YAS's rustls provider, verifying the relay with
+/// the platform's roots or a certificate pin.
 fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
     let provider = yas_webrtc_forwarder::tls::provider();
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -974,11 +986,36 @@ fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
     transport.max_idle_timeout(Some(
         wt::quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("30s fits in an idle timeout"),
     ));
+    let mut cubic = wt::quinn::congestion::CubicConfig::default();
+    cubic.initial_window(INITIAL_WINDOW);
+    transport.congestion_controller_factory(Arc::new(cubic));
     config.transport_config(Arc::new(transport));
-    let endpoint = wt::quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
-        .or_else(|_| wt::quinn::Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))
+    let socket = udp_socket((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+        .or_else(|_| udp_socket((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))
         .map_err(|error| format!("UDP socket: {error}"))?;
+    let runtime = wt::quinn::default_runtime().ok_or("UDP socket: no async runtime")?;
+    let endpoint =
+        wt::quinn::Endpoint::new(wt::quinn::EndpointConfig::default(), None, socket, runtime)
+            .map_err(|error| format!("UDP socket: {error}"))?;
     Ok(wt::Client::new(endpoint, config))
+}
+
+/// A UDP socket bound to `address` (dual-stack for IPv6's unspecified one, as
+/// quinn's own client endpoint is), asking for [`RECEIVE_BUFFER`].
+fn udp_socket(address: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if address.is_ipv6() {
+        let _ = socket.set_only_v6(false);
+    }
+    // What the kernel allows (net.core.rmem_max on Linux) is still better than
+    // its default, and none is no reason to fail.
+    let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
+    socket.bind(&address.into())?;
+    Ok(socket.into())
 }
 
 /// A WebSocket to `url` (`wss`, a session's or a stream's) speaking

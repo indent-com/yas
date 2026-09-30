@@ -67,6 +67,41 @@ async fn nothing_accepted(listener: &tokio::net::UnixListener) -> bool {
         .is_err()
 }
 
+/// A 1 MiB answer goes out in one round trip, not two: the session starts
+/// with a window for it (quinn paces a window over the round trip, and an
+/// app-limited connection never grows its window past what it sent).
+#[tokio::test]
+async fn webtransport_sessions_start_with_a_window_for_bursts() {
+    yas_webrtc_forwarder::tls::install_default_provider();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let hash = wt::crypto::sha256(&yas_webrtc_forwarder::tls::provider(), cert.cert.der());
+        let mut relay = wt::ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        let client = webtransport_client(Some(hash.as_ref())).unwrap();
+        let url: url::Url = format!("https://127.0.0.1:{}/", relay.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let (connected, _accepted) = tokio::join!(client.connect(url), async {
+            relay.accept().await.unwrap().ok().await.unwrap()
+        });
+        let session = connected.unwrap();
+        let window = (*session).stats().path.cwnd;
+        assert!(
+            window >= INITIAL_WINDOW,
+            "the session starts with a {window}-byte window"
+        );
+    })
+    .await
+    .expect("window test stalled");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn producer_authenticates_before_ipc_and_encrypts_datagrams() {
