@@ -962,8 +962,9 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
             let exit = native_exit_info(exit);
             let route = {
                 let mut routes = inner.routes.lock().unwrap();
-                // Its route failed as the exit was queued: that attachment is gone already, and
-                // its WAITs find the exit through the process.
+                // Its route failed as the exit was queued: that attachment is gone already. No
+                // replay is recorded (the handle left with the route), so a WAIT in this session
+                // answers CONFLICT while the exit is in flight, then NOT_FOUND.
                 let Some(route) = routes.get(&process_id).cloned() else {
                     return Ok(());
                 };
