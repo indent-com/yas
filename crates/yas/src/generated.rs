@@ -2346,6 +2346,8 @@ pub const APPLY_SYMLINK: u64 = 4;
 pub const APPLY_HARDLINK: u64 = 5;
 pub const APPLY_ITEM_CREATE_PARENTS: u64 = 1;
 pub const APPLY_ITEM_FLAGS: u64 = 1;
+pub const APPLY_ITEM_IN_PLACE: u64 = 2;
+pub const APPLY_ITEM_EXTENDED_FLAGS: u64 = 2;
 pub const REMOVE_RECURSIVE: u64 = 1;
 pub const REMOVE_FLAGS: u64 = 1;
 pub const FILE_CONTENT_KIND: u64 = 0;
@@ -2388,7 +2390,8 @@ pub const CAPABILITY_READ_LIST: u64 = 2;
 pub const CAPABILITY_READ_REALPATH: u64 = 4;
 pub const CAPABILITY_READ_STAT_ONLY: u64 = 8;
 pub const CAPABILITY_STAGE_IN_PLACE: u64 = 16;
-pub const CAPABILITY_FLAGS: u64 = 31;
+pub const CAPABILITY_APPLY_IN_PLACE: u64 = 32;
+pub const CAPABILITY_FLAGS: u64 = 63;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "OPEN", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "flags:u16,reserved:u16=0,source:bytes_u32 containing RootSource,Extensions; ResultPrefix + root_handle:u64,root_revision:u64,path_model:u8,case_behavior:u8,reserved:u16=0,canonical_path:bytes_u32,Extensions" },
 super::OperationMetadata { name: "CLOSE", class: 1, kind: 1, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,Extensions; ResultPrefix; idempotent and invalidates root-scoped watches/stages" },
@@ -2432,6 +2435,7 @@ super::TypeMetadata { name: "query_read_extended_record", layout: "QueryReadReco
 super::TypeMetadata { name: "query_list_entries", layout: "repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash" },
 super::TypeMetadata { name: "query_stat_only", layout: "kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed" },
 super::TypeMetadata { name: "stage_in_place", layout: "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID" },
+super::TypeMetadata { name: "apply_in_place", layout: "APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[
 super::LimitMetadata { name: "MAX_ROOTS_PER_SESSION", tag: 1, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 64 },
@@ -2550,6 +2554,8 @@ super::ConstantMetadata { name: "APPLY_SYMLINK", value: 4 },
 super::ConstantMetadata { name: "APPLY_HARDLINK", value: 5 },
 super::ConstantMetadata { name: "APPLY_ITEM_CREATE_PARENTS", value: 1 },
 super::ConstantMetadata { name: "APPLY_ITEM_FLAGS", value: 1 },
+super::ConstantMetadata { name: "APPLY_ITEM_IN_PLACE", value: 2 },
+super::ConstantMetadata { name: "APPLY_ITEM_EXTENDED_FLAGS", value: 2 },
 super::ConstantMetadata { name: "REMOVE_RECURSIVE", value: 1 },
 super::ConstantMetadata { name: "REMOVE_FLAGS", value: 1 },
 super::ConstantMetadata { name: "FILE_CONTENT_KIND", value: 0 },
@@ -2592,7 +2598,8 @@ super::ConstantMetadata { name: "CAPABILITY_READ_LIST", value: 2 },
 super::ConstantMetadata { name: "CAPABILITY_READ_REALPATH", value: 4 },
 super::ConstantMetadata { name: "CAPABILITY_READ_STAT_ONLY", value: 8 },
 super::ConstantMetadata { name: "CAPABILITY_STAGE_IN_PLACE", value: 16 },
-super::ConstantMetadata { name: "CAPABILITY_FLAGS", value: 31 },
+super::ConstantMetadata { name: "CAPABILITY_APPLY_IN_PLACE", value: 32 },
+super::ConstantMetadata { name: "CAPABILITY_FLAGS", value: 63 },
 ];
 }
 pub mod git {
@@ -5160,6 +5167,7 @@ GoldenVector { name: "fs.grep.payload", hex: "0100000000000000020014000500000009
 GoldenVector { name: "fs.stage_write.payload", hex: "0100000000000000050000000100010061040000000100000001000000a401000003000000000000000303030303030303030303030303030303030303030303030303030303030303000400000000000000000000" },
 GoldenVector { name: "fs.commit.payload", hex: "0200000000000000040404040404040404040404040404040100000000000000" },
 GoldenVector { name: "fs.apply.payload", hex: "0100000000000000050505050505050505050505050505050100010020000000000000000500000001000100610400000001000000a40100000300000079617300000000" },
+GoldenVector { name: "fs.apply.in_place.payload", hex: "0100000000000000050505050505050505050505050505050000010020000000000002000500000001000100610400000001000000a40100000300000079617300000000" },
 GoldenVector { name: "fs.entry.inline.payload", hex: "050000000100010061010000000000000000000000a4010000010000000000000003000000000000000606060606060606060606060606060606060606060606060606060606060606010000000300000079617300000000" },
 GoldenVector { name: "fs.query.path_record.payload", hex: "05000000010001006100000000" },
 GoldenVector { name: "fs.query.read_record.payload", hex: "000000000100000005000000010001006103000000796173" },

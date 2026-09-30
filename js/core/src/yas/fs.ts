@@ -244,6 +244,11 @@ export type YasFsApplyItem =
       createParents?: boolean;
       mode: number;
       content: Uint8Array;
+      /**
+       * APPLY_ITEM_IN_PLACE (offered with CAPABILITY_APPLY_IN_PLACE): write
+       * through the file as open(2) would; never with createParents.
+       */
+      inPlace?: boolean;
     }
   | {
       kind: "mkdir";
@@ -1637,11 +1642,18 @@ export function decodeFsCommitResult(bytes: Uint8Array): YasFsCommitResult {
 function encodeFsApplyItem(value: YasFsApplyItem): Uint8Array {
   const body = new YasWriter();
   let kind: number;
-  const itemFlags =
+  let itemFlags =
     value.kind !== "remove" && value.createParents
       ? g.YAS_FS_APPLY_ITEM_CREATE_PARENTS
       : 0;
   if (value.kind === "write-inline") {
+    if (value.inPlace) {
+      if (value.createParents)
+        throw new YasProtocolError(
+          "FS APPLY in-place write cannot create parents",
+        );
+      itemFlags |= g.YAS_FS_APPLY_ITEM_IN_PLACE;
+    }
     if (value.content.length > g.YAS_FS_MAX_INLINE_BYTES)
       throw new YasProtocolError("FS inline apply content exceeds its limit");
     kind = g.YAS_FS_APPLY_WRITE_INLINE;
@@ -1708,9 +1720,17 @@ function decodeFsApplyItem(cursor: YasCursor): YasFsApplyItem {
   const item = new YasCursor(bytes);
   const kind = item.u16("FS APPLY item kind");
   const itemFlags = item.u16("FS APPLY item flags");
-  if (itemFlags & ~g.YAS_FS_APPLY_ITEM_FLAGS)
+  if (
+    itemFlags &
+    ~(g.YAS_FS_APPLY_ITEM_FLAGS | g.YAS_FS_APPLY_ITEM_EXTENDED_FLAGS)
+  )
     throw new YasProtocolError("FS APPLY item flags are invalid");
   const createParents = Boolean(itemFlags & g.YAS_FS_APPLY_ITEM_CREATE_PARENTS);
+  const inPlace = Boolean(itemFlags & g.YAS_FS_APPLY_ITEM_IN_PLACE);
+  if (inPlace && kind !== g.YAS_FS_APPLY_WRITE_INLINE)
+    throw new YasProtocolError(
+      "FS APPLY in-place flag on an item that writes no file",
+    );
   let value: YasFsApplyItem;
   if (kind === g.YAS_FS_APPLY_WRITE_INLINE)
     value = {
@@ -1720,6 +1740,7 @@ function decodeFsApplyItem(cursor: YasCursor): YasFsApplyItem {
       createParents,
       mode: item.u32("FS mode"),
       content: new Uint8Array(item.bytesU32("FS inline content")),
+      ...(inPlace ? { inPlace } : {}),
     };
   else if (kind === g.YAS_FS_APPLY_MKDIR)
     value = {

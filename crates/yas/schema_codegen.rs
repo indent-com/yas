@@ -2511,6 +2511,28 @@ fn vectors(artifact: &Artifact) -> VectorArtifact {
     push_u32(&mut fs_apply, 0);
     push_vector(&mut vectors, "fs.apply.payload", &fs_apply);
 
+    let mut fs_apply_in_place = Vec::new();
+    push_u64(&mut fs_apply_in_place, 1);
+    fs_apply_in_place.extend_from_slice(&[5; 16]);
+    push_u16(&mut fs_apply_in_place, 0);
+    push_u16(&mut fs_apply_in_place, 1);
+    push_u32(&mut fs_apply_in_place, 4 + fs_apply_item_body.len() as u32);
+    push_u16(
+        &mut fs_apply_in_place,
+        family_constant(artifact, "yas.fs", "APPLY_WRITE_INLINE") as u16,
+    );
+    push_u16(
+        &mut fs_apply_in_place,
+        family_constant(artifact, "yas.fs", "APPLY_ITEM_IN_PLACE") as u16,
+    );
+    fs_apply_in_place.extend_from_slice(&fs_apply_item_body);
+    push_u32(&mut fs_apply_in_place, 0);
+    push_vector(
+        &mut vectors,
+        "fs.apply.in_place.payload",
+        &fs_apply_in_place,
+    );
+
     let mut fs_entry = Vec::new();
     push_bytes_u32(&mut fs_entry, &fs_path_a);
     push_u64(&mut fs_entry, 1);

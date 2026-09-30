@@ -5232,6 +5232,10 @@
         {
           "name": "stage_in_place",
           "layout": "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID"
+        },
+        {
+          "name": "apply_in_place",
+          "layout": "APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID"
         }
       ],
       "constants": [
@@ -5636,6 +5640,14 @@
           "value": 1
         },
         {
+          "name": "APPLY_ITEM_IN_PLACE",
+          "value": 2
+        },
+        {
+          "name": "APPLY_ITEM_EXTENDED_FLAGS",
+          "value": 2
+        },
+        {
           "name": "REMOVE_RECURSIVE",
           "value": 1
         },
@@ -5804,8 +5816,12 @@
           "value": 16
         },
         {
+          "name": "CAPABILITY_APPLY_IN_PLACE",
+          "value": 32
+        },
+        {
           "name": "CAPABILITY_FLAGS",
-          "value": 31
+          "value": 63
         }
       ]
     },

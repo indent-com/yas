@@ -888,28 +888,38 @@ async fn files_answer_as_the_os_does() {
         pair("ENOENT", "lstat")
     );
 
-    // In place through a symlink: the same inode, the new bytes.
+    // In place through a symlink: the same inode, the new bytes. Inline-sized content goes in
+    // one APPLY (CAPABILITY_APPLY_IN_PLACE), bigger content is staged: both answer alike.
     use std::os::unix::fs::MetadataExt;
     let inode = std::fs::metadata(base.join("file")).unwrap().ino();
-    root.write_in_place("to-file", b"new content")
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(base.join("file")).unwrap(), b"new content");
-    assert_eq!(std::fs::metadata(base.join("file")).unwrap().ino(), inode);
-    assert!(
-        std::fs::symlink_metadata(base.join("to-file"))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(
-        named(root.write_in_place("dir", b"x").await.unwrap_err()),
-        pair("EISDIR", "open")
-    );
-    assert_eq!(
-        named(root.write_in_place("missing/file", b"x").await.unwrap_err()),
-        pair("ENOENT", "open")
-    );
+    let staged = vec![b's'; yas_client::wire::fs::MAX_INLINE_BYTES + 1];
+    for content in [&b"new content"[..], &staged] {
+        let written = root.write_in_place("to-file", content).await.unwrap();
+        assert_eq!(written.hash, *blake3::hash(content).as_bytes());
+        assert_eq!(std::fs::read(base.join("file")).unwrap(), content);
+        assert_eq!(std::fs::metadata(base.join("file")).unwrap().ino(), inode);
+        assert!(
+            std::fs::symlink_metadata(base.join("to-file"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let error = root.write_in_place("dir", content).await.unwrap_err();
+        assert!(error.is_conflict(), "{error:?}");
+        assert_eq!(named(error), pair("EISDIR", "open"));
+        assert_eq!(
+            named(
+                root.write_in_place("missing/file", content)
+                    .await
+                    .unwrap_err()
+            ),
+            pair("ENOENT", "open")
+        );
+        // A new file is made where it is named.
+        let _ = std::fs::remove_file(base.join("fresh"));
+        root.write_in_place("fresh", content).await.unwrap();
+        assert_eq!(std::fs::read(base.join("fresh")).unwrap(), content);
+    }
 
     assert_eq!(
         named(root.read("missing").await.unwrap_err()),

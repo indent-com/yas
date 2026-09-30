@@ -142,6 +142,16 @@ destination is `CONFLICT` carrying OsError `{EISDIR, open}`. Other failures
 carry OsError with operation `open` (resolving or opening the target) or
 `write`. `STAGE_CREATE_PARENTS` with `STAGE_IN_PLACE` is `INVALID`.
 
+Content that fits inline can be written in place in one round trip rather than
+two: an APPLY `WRITE_INLINE` item with item flag `APPLY_ITEM_IN_PLACE` (2),
+advertised by `CAPABILITY_APPLY_IN_PLACE`, writes exactly as COMMIT of an
+in-place stage does, with no sync flags. Its item result describes the file
+written, and a directory at the destination is `CONFLICT` whose
+ApplyOsErrors entry is `{EISDIR, open}`. The flag is `INVALID` on other
+item kinds and with `APPLY_ITEM_CREATE_PARENTS`. yas-client's
+`write_in_place` sends it for content within the server's inline limit and
+stages the rest.
+
 ## OS error detail
 
 Every failed top-level FS Result caused by an OS error carries the optional

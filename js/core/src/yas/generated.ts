@@ -1076,6 +1076,8 @@ export const YAS_FS_APPLY_SYMLINK = 4 as const;
 export const YAS_FS_APPLY_HARDLINK = 5 as const;
 export const YAS_FS_APPLY_ITEM_CREATE_PARENTS = 1 as const;
 export const YAS_FS_APPLY_ITEM_FLAGS = 1 as const;
+export const YAS_FS_APPLY_ITEM_IN_PLACE = 2 as const;
+export const YAS_FS_APPLY_ITEM_EXTENDED_FLAGS = 2 as const;
 export const YAS_FS_REMOVE_RECURSIVE = 1 as const;
 export const YAS_FS_REMOVE_FLAGS = 1 as const;
 export const YAS_FS_FILE_CONTENT_KIND = 0 as const;
@@ -1118,7 +1120,8 @@ export const YAS_FS_CAPABILITY_READ_LIST = 2 as const;
 export const YAS_FS_CAPABILITY_READ_REALPATH = 4 as const;
 export const YAS_FS_CAPABILITY_READ_STAT_ONLY = 8 as const;
 export const YAS_FS_CAPABILITY_STAGE_IN_PLACE = 16 as const;
-export const YAS_FS_CAPABILITY_FLAGS = 31 as const;
+export const YAS_FS_CAPABILITY_APPLY_IN_PLACE = 32 as const;
+export const YAS_FS_CAPABILITY_FLAGS = 63 as const;
 export const YAS_FAMILY_GIT = 49 as const;
 export const YAS_GIT_VERSION = 1 as const;
 export const YAS_GIT_OPEN = 0 as const;
@@ -8145,6 +8148,10 @@ export const YAS_SCHEMA = {
         {
           "name": "stage_in_place",
           "layout": "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID"
+        },
+        {
+          "name": "apply_in_place",
+          "layout": "APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID"
         }
       ],
       "constants": [
@@ -8549,6 +8556,14 @@ export const YAS_SCHEMA = {
           "value": 1
         },
         {
+          "name": "APPLY_ITEM_IN_PLACE",
+          "value": 2
+        },
+        {
+          "name": "APPLY_ITEM_EXTENDED_FLAGS",
+          "value": 2
+        },
+        {
           "name": "REMOVE_RECURSIVE",
           "value": 1
         },
@@ -8717,8 +8732,12 @@ export const YAS_SCHEMA = {
           "value": 16
         },
         {
+          "name": "CAPABILITY_APPLY_IN_PLACE",
+          "value": 32
+        },
+        {
           "name": "CAPABILITY_FLAGS",
-          "value": 31
+          "value": 63
         }
       ]
     },
@@ -15909,6 +15928,10 @@ export const YAS_GOLDEN_VECTORS = {
     {
       "name": "fs.apply.payload",
       "hex": "0100000000000000050505050505050505050505050505050100010020000000000000000500000001000100610400000001000000a40100000300000079617300000000"
+    },
+    {
+      "name": "fs.apply.in_place.payload",
+      "hex": "0100000000000000050505050505050505050505050505050000010020000000000002000500000001000100610400000001000000a40100000300000079617300000000"
     },
     {
       "name": "fs.entry.inline.payload",
