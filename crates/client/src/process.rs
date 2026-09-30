@@ -483,10 +483,14 @@ impl std::fmt::Display for ExitStatus {
 pub struct Output {
     /// How it ended.
     pub status: ExitStatus,
-    /// Everything it wrote to stdout (and stderr, when merged).
+    /// Everything it wrote to stdout (and stderr, when merged); with
+    /// [`Command::keep_output`], its head then its tail, as `elided` says.
     pub stdout: Vec<u8>,
-    /// Everything it wrote to stderr (empty when merged).
+    /// Everything it wrote to stderr (empty when merged), or its head then its tail.
     pub stderr: Vec<u8>,
+    /// What `KEEP_OUTPUT` dropped of stdout and of stderr ([`Process::elided`]): None when
+    /// nothing was, the stream then whole.
+    pub elided: [Option<OutputElision>; 2],
 }
 
 /// A running (or finished) process and the streams this session holds.
@@ -729,6 +733,7 @@ impl Process {
             status,
             stdout,
             stderr,
+            elided: [self.elided(false), self.elided(true)],
         })
     }
 

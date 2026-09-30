@@ -840,34 +840,12 @@ async fn a_spawned_process_reports_its_exit_without_a_wait() {
     }
 }
 
-/// A process spawned with `keep_output`: its streams, their heads and tails.
-struct Kept {
-    status: yas_client::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    elided: [Option<yas_client::process::OutputElision>; 2],
-}
-
-async fn kept(client: &Client, command: &Command) -> Kept {
-    let mut process = client.spawn(command).await.unwrap();
-    let stdout = process.take_stdout().unwrap();
-    let stderr = process.take_stderr();
-    let (stdout, stderr) = within("the kept output", async move {
-        tokio::join!(stdout.read_to_end(4 << 20), async move {
-            match stderr {
-                Some(stderr) => stderr.read_to_end(4 << 20).await,
-                None => Ok(Vec::new()),
-            }
-        })
-    })
-    .await;
-    let status = within("the exit", process.wait()).await.unwrap();
-    Kept {
-        status,
-        stdout: stdout.unwrap(),
-        stderr: stderr.unwrap(),
-        elided: [process.elided(false), process.elided(true)],
-    }
+/// A process spawned with `keep_output`: its streams' heads and tails, and what was dropped.
+async fn kept(client: &Client, command: &Command) -> yas_client::process::Output {
+    let process = client.spawn(command).await.unwrap();
+    within("the kept output", process.output_limited(4 << 20))
+        .await
+        .unwrap()
 }
 
 /// What a WHATWG UTF-8 decoder makes of `text`, as an elision counts it.
