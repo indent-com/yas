@@ -80,10 +80,12 @@
 //! flags to a hosted server.
 //!
 //! Every stdout/stderr stream holds its [`Command::window`] of the
-//! session's receive budget (16 MiB) while it is open. Unless a command sets
+//! session's receive budget ([`crate::HelloOptions::receive_budget`], 16 MiB
+//! unless the client asks for more) while it is open. Unless a command sets
 //! one, [`Client::default_process_window`] sizes it so that the server's
-//! per-session maximum of processes fits: 384 KiB at the default of 16,
-//! never more than 1 MiB nor less than 16 KiB.
+//! per-session maximum of processes fits: 384 KiB at the default of 16 in
+//! 16 MiB (or 256 in 256 MiB), never more than 1 MiB nor less than 16 KiB.
+//! Over a network a stream carries at most about a window a round trip.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -1178,13 +1180,13 @@ impl Client {
     /// The output window a [`Command`] gets unless it sets one: 1 MiB, or
     /// less when the server admits so many processes per session that their
     /// stdout and stderr windows would not fit in three quarters of the
-    /// session's receive budget (16 MiB), leaving the rest for everything
-    /// else the session receives. Never below 16 KiB.
+    /// session's receive budget ([`Client::receive_budget`]), leaving the
+    /// rest for everything else the session receives. Never below 16 KiB.
     pub fn default_process_window(&self) -> u64 {
         let per_session = self.process_limits().map_or(1, |limits| {
             u64::from(limits.max_processes_per_session).max(1)
         });
-        let budget = yas_wire::schema::transport::RECOMMENDED_BUFFERED / 4 * 3;
+        let budget = self.receive_budget() / 4 * 3;
         (budget / (2 * per_session)).clamp(MIN_AUTO_WINDOW, DEFAULT_WINDOW)
     }
 

@@ -159,12 +159,17 @@ So do the server-wide budgets:
 `YAS_PROCESS_MAX_SPAWNING` (concurrent native spawn calls server-wide) defaults
 to the pending-spawn maximum.
 
-A session's streams share its receive budgets, 16 MiB each way:
+A session's streams share its receive budgets, each side's HELLO
+`receive_max_buffered` (16 MiB unless a client declares more, up to 1 GiB):
 
 - **stdout and stderr**: every open stream holds the receive credit its client
-  granted, and that credit comes out of the client's declared buffer. A client
-  that runs many processes on one session should use smaller windows. yas-client
-  divides three quarters of the budget between the server's per-session maximum.
+  granted, whether or not it writes, and that credit comes out of the client's
+  declared buffer: once it is all held, a new stream gets none until another
+  lets go. A client that runs many processes on one session should use smaller
+  windows, or declare a wider buffer. yas-client divides three quarters of its
+  budget (`HelloOptions::receive_budget`) between the stdout and stderr of the
+  server's per-session maximum: 24 KiB each at 256 processes in 16 MiB, 384 KiB
+  in 256 MiB. Over a network a stream carries about a window a round trip.
   The server sends output as far as the credit reaches, so a window smaller than
   one 64 KiB chunk still makes progress (servers that predate configurable
   maxima waited for credit through a whole chunk).

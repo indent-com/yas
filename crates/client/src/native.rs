@@ -113,7 +113,10 @@ impl NativeClient {
         let hello_request = ClientHello {
             min_minor: 1,
             max_minor: 1,
-            receive: ReceiveLimits::recommended(max_datagram),
+            receive: ReceiveLimits {
+                max_buffered: options.receive_budget,
+                ..ReceiveLimits::recommended(max_datagram)
+            },
             client_instance: rand::random(),
             client_name: options.client_name.clone(),
             client_release: options.client_release.clone(),
@@ -212,6 +215,12 @@ impl NativeClient {
 
     pub fn hello(&self) -> &ServerHello {
         &self.hello
+    }
+
+    /// The receive budget this client offered in HELLO
+    /// ([`crate::HelloOptions::receive_budget`]).
+    pub fn receive_budget(&self) -> u64 {
+        self.local_receive.max_buffered
     }
 
     pub fn supports_datagrams(&self) -> bool {
