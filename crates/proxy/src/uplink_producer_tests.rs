@@ -84,7 +84,8 @@ async fn webtransport_sessions_start_with_a_window_for_bursts() {
                     .into(),
             )
             .unwrap();
-        let client = webtransport_client(Some(hash.as_ref())).unwrap();
+        let (client, receive_buffer) = webtransport_client(Some(hash.as_ref())).unwrap();
+        assert!(receive_buffer.is_some_and(|bytes| bytes > 0));
         let url: url::Url = format!("https://127.0.0.1:{}/", relay.local_addr().unwrap().port())
             .parse()
             .unwrap();
@@ -123,7 +124,7 @@ async fn producer_authenticates_before_ipc_and_encrypts_datagrams() {
                     .into(),
             )
             .unwrap();
-        let outer = webtransport_client(Some(hash.as_ref())).unwrap();
+        let (outer, _) = webtransport_client(Some(hash.as_ref())).unwrap();
         let url: url::Url = format!("https://127.0.0.1:{}/", worker.local_addr().unwrap().port())
             .parse()
             .unwrap();
@@ -1011,6 +1012,15 @@ fn events_read_as_yas_uplink_prints_them() {
         }
         .to_string(),
         "relay pool exhausted; re-querying in 4s"
+    );
+    assert_eq!(
+        Event::ReceiveBuffer { bytes: 16 << 20 }.to_string(),
+        "UDP receive buffer: 16777216 bytes"
+    );
+    assert_eq!(
+        Event::ReceiveBuffer { bytes: 425_984 }.to_string(),
+        "UDP receive buffer: 425984 bytes, under the 8388608 asked for \
+         (the system caps it: net.core.rmem_max on Linux)"
     );
 }
 

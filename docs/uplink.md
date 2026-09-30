@@ -276,8 +276,10 @@ round trip, and answers leave the connection app-limited, so the window
 never grows past what they need. From QUIC's usual 14,720 bytes, a 1 MiB
 answer settles at two round trips; from 16 MiB, it takes one. Loss still
 shrinks the window, and each stream's 1.25 MB receive window still bounds
-what one consumer has in flight. A relay should do the same for what it
-sends.
+what one consumer has in flight. A system may allow a smaller buffer (Linux
+caps it at `net.core.rmem_max`, then doubles it for bookkeeping): the
+session goes on, and the uplink says what it got as it connects (`UDP
+receive buffer: N bytes`). A relay should do the same for what it sends.
 
 The uplink never opens streams. The relay opens **one bidirectional stream
 per consumer**. After Noise authentication, the uplink bridges decrypted

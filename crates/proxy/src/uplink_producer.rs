@@ -281,6 +281,11 @@ pub enum Event {
     /// A consumer stream couldn't be served (a WebSocket stream the relay
     /// asked for that didn't open, a datagram lane this session can't carry).
     StreamFailed { error: String },
+    /// The UDP receive buffer a WebTransport session got, in bytes, as the
+    /// system reports it (Linux doubles what it allows, for its bookkeeping).
+    /// A system allowing less than the uplink asks for only makes bursts lose
+    /// more packets; the session goes on.
+    ReceiveBuffer { bytes: usize },
 }
 
 impl fmt::Display for Event {
@@ -311,6 +316,12 @@ impl fmt::Display for Event {
                 write!(f, "local yas server unavailable at {local}: {error}")
             }
             Self::StreamFailed { error } => write!(f, "consumer stream failed: {error}"),
+            Self::ReceiveBuffer { bytes } if *bytes < RECEIVE_BUFFER => write!(
+                f,
+                "UDP receive buffer: {bytes} bytes, under the {RECEIVE_BUFFER} asked for \
+                 (the system caps it: net.core.rmem_max on Linux)"
+            ),
+            Self::ReceiveBuffer { bytes } => write!(f, "UDP receive buffer: {bytes} bytes"),
         }
     }
 }
@@ -546,8 +557,8 @@ impl Producer {
         limit: Option<Duration>,
         active: &Active,
     ) -> SessionEnd {
-        let client = match webtransport_client(relay.cert_hash.as_deref()) {
-            Ok(client) => client,
+        let (client, receive_buffer) = match webtransport_client(relay.cert_hash.as_deref()) {
+            Ok(made) => made,
             Err(error) => return SessionEnd::NeverConnected(error),
         };
         // Careful: the URL is the credential — show `relay.label` only.
@@ -573,6 +584,9 @@ impl Producer {
             relay: relay.label.clone(),
             carrier: Carrier::WebTransport,
         });
+        if let Some(bytes) = receive_buffer {
+            self.emit(Event::ReceiveBuffer { bytes });
+        }
         active.set(Session::WebTransport(Box::new(session.clone())));
 
         let routes = DatagramRoutes::new(MAX_DATAGRAM_ROUTES);
@@ -959,8 +973,9 @@ enum SessionEnd {
 /// A WebTransport client with the liveness settings of docs/uplink.md (10 s
 /// keepalive, 30 s idle timeout) and a window for bursts ([`INITIAL_WINDOW`],
 /// [`RECEIVE_BUFFER`]), on YAS's rustls provider, verifying the relay with
-/// the platform's roots or a certificate pin.
-fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
+/// the platform's roots or a certificate pin; with the UDP receive buffer it
+/// got, where the system says.
+fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<(wt::Client, Option<usize>), String> {
     let provider = yas_webrtc_forwarder::tls::provider();
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -993,11 +1008,12 @@ fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
     let socket = udp_socket((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
         .or_else(|_| udp_socket((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))
         .map_err(|error| format!("UDP socket: {error}"))?;
+    let receive_buffer = socket2::SockRef::from(&socket).recv_buffer_size().ok();
     let runtime = wt::quinn::default_runtime().ok_or("UDP socket: no async runtime")?;
     let endpoint =
         wt::quinn::Endpoint::new(wt::quinn::EndpointConfig::default(), None, socket, runtime)
             .map_err(|error| format!("UDP socket: {error}"))?;
-    Ok(wt::Client::new(endpoint, config))
+    Ok((wt::Client::new(endpoint, config), receive_buffer))
 }
 
 /// A UDP socket bound to `address` (dual-stack for IPv6's unspecified one, as
