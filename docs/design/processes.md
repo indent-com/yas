@@ -98,7 +98,13 @@ output and its exit all travel from one request. yas-client sets it whenever
 offered, and `Process::wait` then takes no request and no pending-`WAIT` slot
 unless the attachment that reports the exit went first (a stream reset or
 dropped before its end, a detach), when it sends `WAIT`, as it does against
-older servers. Closing stdin half-closes the
+older servers. With it, `SPAWN_KEEP_OUTPUT` sends only a head and a tail of
+each output stream, as the SPAWN asks: the server drops the middle as it reads
+it, so a command writing far more than its client keeps runs at the speed of
+its pipe, and the `EXIT` event says what was dropped, counted as a UTF-8
+decoder would count it (bytes, lines, code points, UTF-16 units).
+yas-client's `Command::keep_output` asks for it where offered, and
+`Process::elided` reads the counts. Closing stdin half-closes the
 child stream. An ordinary child belongs
 to its spawning session and is terminated when it disappears; a detachable
 child remains discoverable until its retained final record expires.

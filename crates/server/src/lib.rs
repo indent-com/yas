@@ -62,6 +62,7 @@ mod net;
 mod nvdec_decode;
 mod nvenc_encode;
 #[cfg(any(unix, windows))]
+mod output_keep;
 mod process;
 mod pty;
 mod read_only_stream;

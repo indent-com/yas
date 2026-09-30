@@ -31022,10 +31022,17 @@ async fn send_exit_report(
     exit: super::yas_process::ExitInfo,
     connection: &ConnectionCancellation,
 ) {
+    // KEEP_OUTPUT: what was dropped of each stream.
+    let elided = exit
+        .elided
+        .iter()
+        .zip([false, true])
+        .filter_map(|(elided, stderr)| elided.map(|elided| elided.extension(stderr)))
+        .collect();
     let report = yas_process_wire::ExitReport {
         process_handle,
         exit: exit.into_record(monotonic_ns()),
-        extensions: Extensions::default(),
+        extensions: Extensions(elided),
     };
     let _ = send_event_with_sensitivity(
         out,

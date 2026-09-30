@@ -139,6 +139,8 @@ pub(crate) struct ExitInfo {
     pub(crate) reason: u8,
     pub(crate) code: i32,
     pub(crate) detail: Vec<u8>,
+    /// KEEP_OUTPUT: what was dropped of stdout and of stderr (in the EXIT event only).
+    pub(crate) elided: [Option<wire::OutputElision>; 2],
 }
 
 impl ExitInfo {
@@ -382,9 +384,18 @@ impl Session {
         resolved_cwd: Option<Vec<u8>>,
     ) -> Result<Attachment, Error> {
         let cwd = resolve_cwd(&request.cwd, resolved_cwd)?;
-        // REPORT_EXIT asks the YAS connection for an EXIT event; the process is the same.
-        let flags = u8::try_from(request.flags & !(schema::process::SPAWN_REPORT_EXIT as u16))
-            .map_err(|_| Error::Invalid("Process SPAWN flags do not fit v1".to_owned()))?;
+        // REPORT_EXIT asks the YAS connection for an EXIT event, and KEEP_OUTPUT (with it) the
+        // output's head and tail alone: the process is the same.
+        let flags = u8::try_from(
+            request.flags
+                & !((schema::process::SPAWN_REPORT_EXIT | schema::process::SPAWN_KEEP_OUTPUT)
+                    as u16),
+        )
+        .map_err(|_| Error::Invalid("Process SPAWN flags do not fit v1".to_owned()))?;
+        let keep_output = request
+            .keep_output()
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .map(|(head, tail)| (head, tail as usize));
         let process_id = self.allocate_process_id()?;
         let (route, events) = self.install_route(process_id, false)?;
         let session_env = (request.environment_kind == wire::EnvironmentKind::Session)
@@ -408,6 +419,7 @@ impl Session {
                     flags,
                     preserve_residual,
                     residue_grace,
+                    keep_output,
                     cwd,
                     argv: request.argv.clone(),
                     env: request
@@ -1112,6 +1124,15 @@ fn native_exit_info(exit: process::NativeExit) -> ExitInfo {
         reason: exit.reason,
         code: exit.code,
         detail: exit.detail,
+        elided: exit.elided.map(|elided| {
+            elided.map(|elided| wire::OutputElision {
+                offset: elided.offset,
+                bytes: elided.bytes,
+                lines: elided.lines,
+                code_points: elided.code_points,
+                utf16_units: elided.utf16_units,
+            })
+        }),
     }
 }
 
@@ -1148,6 +1169,7 @@ mod tests {
                     reason: 0,
                     code: process_handle as i32,
                     detail: Vec::new(),
+                    elided: [None; 2],
                 },
             );
         }
