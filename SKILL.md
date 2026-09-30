@@ -21,7 +21,7 @@ description: >
 yas is a terminal multiplexer and experimental headless Wayland compositor. Every terminal can run both CLI programs (via PTYs) and GUI applications (via the built-in compositor). Surfaces are video-encoded and streamed to browsers; the CLI gives programmatic control over both terminals and graphical windows.
 
 Everything the CLI does works locally or against a remote over one wire —
-`--on ssh:host`, `--on share:passphrase`, or a named remote — including the
+`--on ssh:host`, `--on share:passphrase`, or a named remote from `yas remote` — including the
 filesystem, git, and language-server commands. Beyond terminals it can:
 
 - **Files** — `yas fs cat|find|grep|write|sync|mkdir|mv|rm|ln`. `grep`

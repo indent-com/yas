@@ -1,7 +1,7 @@
 /** YAS FS family v1 codecs and browser client. */
 
-import * as g from "./generated";
-import type { YasConnection } from "./session";
+import * as g from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -20,7 +20,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_MODE_MESSAGE,
@@ -35,7 +35,7 @@ import {
   type YasInlineOrTransfer,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -44,7 +44,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FAMILY_FS,
@@ -63,7 +63,7 @@ export {
   YAS_FS_UNWATCH,
   YAS_FS_VERSION,
   YAS_FS_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasFsPath {
   components: readonly Uint8Array[];
@@ -244,6 +244,11 @@ export type YasFsApplyItem =
       createParents?: boolean;
       mode: number;
       content: Uint8Array;
+      /**
+       * APPLY_ITEM_IN_PLACE (offered with CAPABILITY_APPLY_IN_PLACE): write
+       * through the file as open(2) would; never with createParents.
+       */
+      inPlace?: boolean;
     }
   | {
       kind: "mkdir";
@@ -1637,11 +1642,18 @@ export function decodeFsCommitResult(bytes: Uint8Array): YasFsCommitResult {
 function encodeFsApplyItem(value: YasFsApplyItem): Uint8Array {
   const body = new YasWriter();
   let kind: number;
-  const itemFlags =
+  let itemFlags =
     value.kind !== "remove" && value.createParents
       ? g.YAS_FS_APPLY_ITEM_CREATE_PARENTS
       : 0;
   if (value.kind === "write-inline") {
+    if (value.inPlace) {
+      if (value.createParents)
+        throw new YasProtocolError(
+          "FS APPLY in-place write cannot create parents",
+        );
+      itemFlags |= g.YAS_FS_APPLY_ITEM_IN_PLACE;
+    }
     if (value.content.length > g.YAS_FS_MAX_INLINE_BYTES)
       throw new YasProtocolError("FS inline apply content exceeds its limit");
     kind = g.YAS_FS_APPLY_WRITE_INLINE;
@@ -1708,9 +1720,17 @@ function decodeFsApplyItem(cursor: YasCursor): YasFsApplyItem {
   const item = new YasCursor(bytes);
   const kind = item.u16("FS APPLY item kind");
   const itemFlags = item.u16("FS APPLY item flags");
-  if (itemFlags & ~g.YAS_FS_APPLY_ITEM_FLAGS)
+  if (
+    itemFlags &
+    ~(g.YAS_FS_APPLY_ITEM_FLAGS | g.YAS_FS_APPLY_ITEM_EXTENDED_FLAGS)
+  )
     throw new YasProtocolError("FS APPLY item flags are invalid");
   const createParents = Boolean(itemFlags & g.YAS_FS_APPLY_ITEM_CREATE_PARENTS);
+  const inPlace = Boolean(itemFlags & g.YAS_FS_APPLY_ITEM_IN_PLACE);
+  if (inPlace && kind !== g.YAS_FS_APPLY_WRITE_INLINE)
+    throw new YasProtocolError(
+      "FS APPLY in-place flag on an item that writes no file",
+    );
   let value: YasFsApplyItem;
   if (kind === g.YAS_FS_APPLY_WRITE_INLINE)
     value = {
@@ -1720,6 +1740,7 @@ function decodeFsApplyItem(cursor: YasCursor): YasFsApplyItem {
       createParents,
       mode: item.u32("FS mode"),
       content: new Uint8Array(item.bytesU32("FS inline content")),
+      ...(inPlace ? { inPlace } : {}),
     };
   else if (kind === g.YAS_FS_APPLY_MKDIR)
     value = {

@@ -289,12 +289,14 @@ libc.symbols.close(channelTheirs);
 
 const [clientOurs, clientTheirs] = socketpair();
 sendFd(channelOurs, clientTheirs);
-libc.symbols.close(clientTheirs);
 
 try {
   writeAll(clientOurs, PREFACE);
   writeFrame(clientOurs, request(HELLO, 1, clientHello()));
   const hello = resultBody(readResult(clientOurs, HELLO, 1));
+  // The server has taken its end: close ours only now, or macOS may flush
+  // the socket while it waits in the channel (docs/transports.md).
+  libc.symbols.close(clientTheirs);
   assert(hello.length >= 56, "truncated YAS ServerHello");
   const helloView = new DataView(
     hello.buffer,

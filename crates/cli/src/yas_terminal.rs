@@ -6,10 +6,14 @@ pub(crate) mod stream;
 use std::time::Duration;
 
 use yas_wire::{
-    Class, Decode, Encode, Extension, Extensions, family,
+    Class, Decode, Encode, Extension, Extensions,
+    core::Status,
+    family,
     state::{Phase, RecordKind, StateAck, StateEvent, Watch, WatchResult},
     terminal,
 };
+
+use yas_client::format_result_detail;
 
 use crate::{terminal_args, yas_native::NativeClient};
 
@@ -19,8 +23,37 @@ const MAX_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const READ_PAGE_BYTES: u32 = 8 * 1024 * 1024;
 const STATE_CREDIT: u64 = 1024 * 1024;
 
+/// Like `println!`, but a closed stdout (`yas terminal list | head -1`) is
+/// not an error: the command still finishes and exits with its own status.
+macro_rules! outln {
+    () => {
+        write_stdout(b"\n")
+    };
+    ($($arg:tt)*) => {
+        write_stdout(format!("{}\n", format_args!($($arg)*)).as_bytes())
+    };
+}
+
+fn write_stdout(bytes: &[u8]) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(bytes).and_then(|()| stdout.flush())
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        eprintln!("yas: cannot write to stdout: {error}");
+    }
+}
+
+/// OutputResult framing around its text: the fixed fields plus the text length.
+const OUTPUT_RESULT_OVERHEAD: u64 = 36;
+
+/// Collection limit for an OUTPUT reply whose text is capped at `max_bytes`.
+fn output_collection_limit(max_bytes: u32) -> u64 {
+    (u64::from(max_bytes.max(1)) + OUTPUT_RESULT_OVERHEAD).min(MAX_QUERY_BYTES)
+}
+
 pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut terminals = client
         .snapshot(family::TERMINAL)
         .await?
@@ -30,7 +63,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
         .collect::<Vec<_>>();
     terminals.sort_by_key(|record| record.terminal_handle);
 
-    println!("ID\tTAG\tTITLE\tCOMMAND\tCWD\tSTATUS");
+    outln!("ID\tTAG\tTITLE\tCOMMAND\tCWD\tSTATUS");
     for record in terminals {
         let id = terminal_id(record.terminal_handle)?;
         let tag = text_extension(
@@ -55,7 +88,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
         .map(|value| String::from_utf8_lossy(value).into_owned())
         .unwrap_or_default();
         let status = terminal_status(&record)?;
-        println!("{id}\t{tag}\t{title}\t{command}\t{cwd}\t{status}");
+        outln!("{id}\t{tag}\t{title}\t{command}\t{cwd}\t{status}");
     }
     Ok(())
 }
@@ -81,7 +114,7 @@ pub(crate) async fn cmd_start(
         launch,
         extensions: Extensions(create_extensions),
     };
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let result: terminal::CreateResult = client
         .request_typed(
             family::TERMINAL,
@@ -91,7 +124,7 @@ pub(crate) async fn cmd_start(
         )
         .await?;
     let id = terminal_id(result.terminal_handle)?;
-    println!("{id}");
+    outln!("{id}");
     Ok(id)
 }
 
@@ -102,21 +135,36 @@ pub(crate) async fn cmd_send(
     text: String,
 ) -> Result<(), String> {
     let bytes = terminal_args::parse_escapes(&text);
+    let mut client = crate::yas_native::connect(on, hub).await?;
+    let record = find_terminal(&mut client, id).await?;
+    refuse_exited_send(id, &record)?;
     if bytes.is_empty() {
         return Ok(());
     }
-    let mut client = NativeClient::connect(on, hub).await?;
     client
         .send_typed_event(
             family::TERMINAL,
             terminal::event_kind::WRITE,
             &terminal::Write {
-                terminal_handle: terminal_handle(id)?,
+                terminal_handle: record.terminal_handle,
                 data: bytes,
             },
             true,
         )
         .await
+        .map_err(String::from)
+}
+
+/// WRITE is fire-and-forget, so input to an exited terminal would vanish.
+fn refuse_exited_send(id: u64, record: &terminal::TerminalRecord) -> Result<(), String> {
+    if record.lifecycle != terminal::Lifecycle::Exited {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot send to pty {id}: it is no longer running (status {}); \
+         `yas terminal restart {id}` re-runs it",
+        terminal_status(record)?
+    ))
 }
 
 pub(crate) async fn cmd_restart(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
@@ -128,7 +176,7 @@ pub(crate) async fn cmd_restart(on: Option<&str>, hub: &str, id: u64) -> Result<
         launch: None,
         extensions: Extensions::default(),
     };
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let _: terminal::RestartResult = client
         .request_typed(
             family::TERMINAL,
@@ -218,7 +266,7 @@ pub(crate) async fn cmd_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let _: terminal::ResizeResult = client
         .request_typed(
             family::TERMINAL,
@@ -245,7 +293,7 @@ pub(crate) async fn cmd_show(
     if rows.is_some() || cols.is_some() {
         cmd_resize(on, hub, id, cols.unwrap_or(80), rows.unwrap_or(24)).await?;
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let request = terminal::Read {
         terminal_handle: record.terminal_handle,
@@ -303,7 +351,7 @@ pub(crate) async fn cmd_history(
     if rows.is_some() || cols.is_some() {
         cmd_resize(on, hub, id, cols.unwrap_or(80), rows.unwrap_or(24)).await?;
     }
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let cursor_kind;
     let cursor_a;
@@ -360,7 +408,7 @@ pub(crate) async fn cmd_history(
 }
 
 pub(crate) async fn cmd_cwd(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let query = terminal_query(
         &mut client,
@@ -377,10 +425,9 @@ pub(crate) async fn cmd_cwd(on: Option<&str>, hub: &str, id: u64) -> Result<(), 
     .await?;
     expect_content(&query, yas_wire::schema::terminal::CONTENT_PATH as u8)?;
     let bytes = query_bytes(query).await?;
-    std::io::Write::write_all(&mut std::io::stdout(), &bytes)
-        .map_err(|error| format!("cannot write terminal cwd: {error}"))?;
+    write_stdout(&bytes);
     if !bytes.ends_with(b"\n") {
-        println!();
+        outln!();
     }
     Ok(())
 }
@@ -393,10 +440,10 @@ pub(crate) async fn cmd_journal(
     limit: u16,
     json: bool,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if !json {
-        println!("INDEX\tSTATUS\tEXIT\tMS\tSTART_SEQ\tEND_SEQ\tCOMMAND");
+        outln!("INDEX\tSTATUS\tEXIT\tMS\tSTART_SEQ\tEND_SEQ\tCOMMAND");
     }
     let mut cursor = from.unwrap_or(0);
     let mut tail = from.is_none();
@@ -429,7 +476,7 @@ pub(crate) async fn cmd_journal(
             terminal::JournalResult::decode(&query_bytes(query).await?).map_err(wire_error)?;
         for entry in &journal.records {
             if json {
-                println!("{}", journal_record_json(entry));
+                outln!("{}", journal_record_json(entry));
             } else {
                 print_journal_record(entry);
             }
@@ -469,7 +516,7 @@ pub(crate) async fn cmd_output(
     max_bytes: u32,
     json: bool,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let terminal_record = find_terminal(&mut client, id).await?;
     let waited = match wait {
         Some(timeout) => {
@@ -478,26 +525,43 @@ pub(crate) async fn cmd_output(
             } else {
                 yas_wire::schema::terminal::WAIT_LATEST_COMMAND as u8
             };
-            let query = terminal_query(
-                &mut client,
-                terminal::request_kind::WAIT,
-                &terminal::Wait {
-                    terminal_handle: terminal_record.terminal_handle,
-                    generation: terminal_record.generation,
-                    wait_kind,
-                    flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
-                    cursor_a: index.unwrap_or(0),
-                    cursor_b: 0,
-                    max_bytes,
-                    timeout_ns: timeout.saturating_mul(NS_PER_SECOND).max(1),
-                    needle: Vec::new(),
-                    initial_receive_credit: QUERY_CREDIT,
-                    extensions: Extensions::default(),
-                },
-                MAX_QUERY_BYTES,
-                Duration::from_secs(timeout.saturating_add(2)),
-            )
-            .await?;
+            let request = terminal::Wait {
+                terminal_handle: terminal_record.terminal_handle,
+                generation: terminal_record.generation,
+                wait_kind,
+                flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
+                cursor_a: index.unwrap_or(0),
+                cursor_b: 0,
+                max_bytes,
+                timeout_ns: timeout.saturating_mul(NS_PER_SECOND).max(1),
+                needle: Vec::new(),
+                initial_receive_credit: QUERY_CREDIT,
+                extensions: Extensions::default(),
+            };
+            let prefix = client
+                .request_result_with_timeout(
+                    family::TERMINAL,
+                    terminal::request_kind::WAIT,
+                    request.encode().map_err(wire_error)?,
+                    true,
+                    Duration::from_secs(timeout.saturating_add(2)),
+                )
+                .await?;
+            match prefix.status {
+                Status::Ok => {}
+                Status::Timeout => {
+                    eprintln!("yas: timed out waiting for a command in pty {id}");
+                    return Ok(124);
+                }
+                Status::NotFound => return Err(format!("pty {id}: no such command")),
+                status => {
+                    return Err(format!(
+                        "YAS Terminal WAIT failed with {status:?}: {}",
+                        format_result_detail(&prefix.detail)
+                    ));
+                }
+            }
+            let query = collect_query(&mut client, &prefix.body, MAX_QUERY_BYTES).await?;
             expect_content(&query, yas_wire::schema::terminal::CONTENT_JOURNAL as u8)?;
             let result =
                 terminal::JournalResult::decode(&query_bytes(query).await?).map_err(wire_error)?;
@@ -530,7 +594,7 @@ pub(crate) async fn cmd_output(
             initial_receive_credit: QUERY_CREDIT,
             extensions: Extensions::default(),
         },
-        u64::from(max_bytes).min(MAX_QUERY_BYTES),
+        output_collection_limit(max_bytes),
         Duration::from_secs(10),
     )
     .await?;
@@ -554,12 +618,11 @@ pub(crate) async fn cmd_output(
             "next_cursor".into(),
             format_cursor(output.next_seq, output.next_col).into(),
         );
-        println!("{value}");
+        outln!("{value}");
     } else {
-        std::io::Write::write_all(&mut std::io::stdout(), &output.text)
-            .map_err(|error| format!("cannot write terminal output: {error}"))?;
+        write_stdout(&output.text);
         if !output.text.is_empty() && !output.text.ends_with(b"\n") {
-            println!();
+            outln!();
         }
         if evicted {
             eprintln!("yas: output start had scrolled out of the backlog");
@@ -571,6 +634,15 @@ pub(crate) async fn cmd_output(
             );
         }
     }
+    if let Some(record) = waited.as_ref().filter(|record| {
+        journal_running(record)
+            && record.flags & yas_wire::schema::terminal::JOURNAL_PTY_EXITED as u16 == 0
+    }) {
+        eprintln!(
+            "yas: timed out waiting for command {} in pty {id}",
+            record.index
+        );
+    }
     Ok(waited.as_ref().map_or(0, journal_exit_code))
 }
 
@@ -581,7 +653,7 @@ pub(crate) async fn cmd_wait(
     timeout_secs: u64,
     pattern: Option<String>,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if record.lifecycle == terminal::Lifecycle::Exited {
         return print_terminal_exit(&record);
@@ -610,7 +682,7 @@ pub(crate) async fn cmd_mouse(
     row: u16,
     button: &str,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     if record.lifecycle == terminal::Lifecycle::Exited {
         return Err(format!("pty {id} has exited"));
@@ -658,7 +730,7 @@ pub(crate) async fn cmd_grep(
     hub: &str,
     opts: crate::grep::Opts,
 ) -> Result<i32, String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let records = client
         .snapshot(family::TERMINAL)
         .await?
@@ -752,7 +824,15 @@ async fn terminal_query<Request: Encode>(
             timeout,
         )
         .await?;
-    let query = terminal::QueryBody::decode(&body).map_err(wire_error)?;
+    collect_query(client, &body, maximum).await
+}
+
+async fn collect_query(
+    client: &mut NativeClient,
+    body: &[u8],
+    maximum: u64,
+) -> Result<CollectedQuery, String> {
+    let query = terminal::QueryBody::decode(body).map_err(wire_error)?;
     query
         .validate_receive_credit(QUERY_CREDIT)
         .map_err(wire_error)?;
@@ -911,7 +991,7 @@ fn print_query_rows_with_separator(
             .map_err(|_| "YAS Terminal returned non-UTF-8 text".to_string())?
     };
     if !*first && !text.is_empty() {
-        println!();
+        outln!();
     }
     print!("{text}");
     *first = false;
@@ -1130,7 +1210,7 @@ fn journal_record_json(record: &terminal::JournalRecord) -> serde_json::Value {
 fn print_journal_record(record: &terminal::JournalRecord) {
     let exit = journal_exit(record).map(|value| value.to_string());
     let duration = journal_duration(record).map(|value| value.to_string());
-    println!(
+    outln!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         record.index,
         journal_status(record),
@@ -1182,7 +1262,7 @@ async fn cmd_since(
     max_bytes: u32,
     json: bool,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_terminal(&mut client, id).await?;
     let parsed = parse_cursor(cursor)?;
     let (cursor_kind, sequence, column, request_max) = match parsed {
@@ -1213,7 +1293,7 @@ async fn cmd_since(
             initial_receive_credit: QUERY_CREDIT,
             extensions: Extensions::default(),
         },
-        u64::from(request_max.max(1)).min(MAX_QUERY_BYTES),
+        output_collection_limit(request_max),
         Duration::from_secs(10),
     )
     .await?;
@@ -1221,7 +1301,7 @@ async fn cmd_since(
     let output = terminal::OutputResult::decode(&query_bytes(query).await?).map_err(wire_error)?;
     let next = format_cursor(output.next_seq, output.next_col);
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "pty": id,
@@ -1234,10 +1314,9 @@ async fn cmd_since(
             })
         );
     } else {
-        std::io::Write::write_all(&mut std::io::stdout(), &output.text)
-            .map_err(|error| format!("cannot write terminal history: {error}"))?;
+        write_stdout(&output.text);
         if !output.text.is_empty() && !output.text.ends_with(b"\n") {
-            println!();
+            outln!();
         }
         eprintln!("cursor: {next}");
     }
@@ -1262,7 +1341,7 @@ async fn probe_output_cursor(
             initial_receive_credit: QUERY_CREDIT,
             extensions: Extensions::default(),
         },
-        1,
+        output_collection_limit(1),
         Duration::from_secs(10),
     )
     .await?;
@@ -1299,7 +1378,7 @@ async fn wait_for_pattern(
                 initial_receive_credit: QUERY_CREDIT,
                 extensions: Extensions::default(),
             },
-            u64::from(terminal_args::OUTPUT_MAX_BYTES),
+            output_collection_limit(terminal_args::OUTPUT_MAX_BYTES),
             Duration::from_secs(10),
         )
         .await?;
@@ -1308,7 +1387,7 @@ async fn wait_for_pattern(
         (sequence, column) = (output.next_seq, output.next_col);
         pending.push_str(&String::from_utf8_lossy(&output.text));
         if let Some(line) = first_matching_line(&mut pending, regex) {
-            println!("{line}");
+            outln!("{line}");
             return Ok(0);
         }
         if output.flags & yas_wire::schema::terminal::OUTPUT_TRUNCATED as u16 != 0 {
@@ -1346,7 +1425,7 @@ fn first_matching_line(pending: &mut String, regex: &regex::Regex) -> Option<Str
 }
 
 fn print_terminal_exit(record: &terminal::TerminalRecord) -> Result<i32, String> {
-    println!("{}", terminal_status(record)?);
+    outln!("{}", terminal_status(record)?);
     terminal_exit_code(record)
 }
 
@@ -1388,6 +1467,7 @@ pub(crate) async fn open_view(
             false,
         )
         .await
+        .map_err(String::from)
 }
 
 pub(crate) async fn close_view(client: &mut NativeClient, view_id: u32) -> Result<(), String> {
@@ -1466,7 +1546,8 @@ pub(crate) async fn send_mouse_actions(
                     },
                     true,
                 )
-                .await;
+                .await
+                .map_err(String::from);
         }
         return client
             .send_typed_event(
@@ -1481,7 +1562,8 @@ pub(crate) async fn send_mouse_actions(
                 },
                 true,
             )
-            .await;
+            .await
+            .map_err(String::from);
     }
     let actions: &[(u8, u8)] = match event {
         "down" | "press" => &[(yas_wire::schema::terminal::MOUSE_ACTION_DOWN as u8, button)],
@@ -1529,7 +1611,7 @@ async fn request_empty<Request: yas_wire::Encode>(
     request: &Request,
     sensitive: bool,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let body = client
         .request(
             family::TERMINAL,
@@ -1710,5 +1792,88 @@ mod tests {
         assert_eq!(launch.environment[0].key, b"A");
         assert_eq!(launch.environment[1].key, b"Z");
         assert_eq!(launch.extensions.0[0].value, 3_000_000_000u64.to_le_bytes());
+    }
+
+    fn record(
+        lifecycle: terminal::Lifecycle,
+        exit: Option<terminal::ExitRecord>,
+    ) -> terminal::TerminalRecord {
+        terminal::TerminalRecord {
+            terminal_handle: 7,
+            lifecycle,
+            rows: 24,
+            cols: 80,
+            generation: 1,
+            used_rows: 0,
+            extensions: Extensions(
+                exit.into_iter()
+                    .map(|exit| Extension {
+                        tag: yas_wire::schema::terminal::STATE_EXIT_EXTENSION as u16,
+                        required: false,
+                        value: exit.encode().unwrap(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn send_refuses_an_exited_terminal_whatever_ended_it() {
+        assert_eq!(
+            refuse_exited_send(7, &record(terminal::Lifecycle::Running, None)),
+            Ok(())
+        );
+        for (exit, status) in [
+            (None, "exited"),
+            (
+                Some(terminal::ExitRecord::Code {
+                    code: 2,
+                    detail: String::new(),
+                }),
+                "exited(2)",
+            ),
+            (
+                Some(terminal::ExitRecord::Signal {
+                    reason: terminal::ExitReason::Terminate,
+                    native_signal: 15,
+                    detail: String::new(),
+                }),
+                "signal(15, Terminate)",
+            ),
+            (
+                Some(terminal::ExitRecord::Other {
+                    detail: "exit status unavailable".into(),
+                }),
+                "exited: exit status unavailable",
+            ),
+        ] {
+            assert_eq!(
+                refuse_exited_send(7, &record(terminal::Lifecycle::Exited, exit)),
+                Err(format!(
+                    "cannot send to pty 7: it is no longer running (status {status}); \
+                     `yas terminal restart 7` re-runs it"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn output_collection_limit_covers_result_framing() {
+        for text_len in [0usize, 1, 4096] {
+            let encoded = terminal::OutputResult {
+                generation: 1,
+                flags: 0,
+                start_seq: u64::MAX / 2,
+                start_col: 7,
+                next_seq: u64::MAX / 2,
+                next_col: 7 + text_len as u32,
+                text: vec![b'x'; text_len],
+            }
+            .encode()
+            .unwrap();
+            let limit = output_collection_limit(text_len as u32);
+            assert!(encoded.len() as u64 <= limit, "{} > {limit}", encoded.len());
+        }
+        assert_eq!(output_collection_limit(u32::MAX), MAX_QUERY_BYTES);
     }
 }

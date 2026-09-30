@@ -1,4 +1,4 @@
-import { surface2DContext } from "./surfaceColor";
+import { surface2DContext } from "./surfaceColor.js";
 /**
  * Box-filtered minification for canvases the browser would otherwise shrink
  * on its own.

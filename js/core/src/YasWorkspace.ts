@@ -1,6 +1,6 @@
-import { YasUplinkTransport } from "./transports/uplink";
-import { YasNativeWorkspaceConnection } from "./YasNativeWorkspaceConnection";
-import type { AwaitSessionExitOptions } from "./workspaceConnectionTypes";
+import { YasUplinkTransport } from "./transports/uplink.js";
+import { YasNativeWorkspaceConnection } from "./YasNativeWorkspaceConnection.js";
+import type { AwaitSessionExitOptions } from "./workspaceConnectionTypes.js";
 import type {
   YasConnectionSnapshot,
   YasSearchResult,
@@ -11,35 +11,35 @@ import type {
   SessionId,
   SurfaceId,
   TransportConfig,
-} from "./types";
-import type { YasWasmModule } from "./TerminalStore";
-import type { FsFileIndex, FsGrepOptions, FsGrepResult } from "./fsModel";
+} from "./types.js";
+import type { YasWasmModule } from "./TerminalStore.js";
+import type { FsFileIndex, FsGrepOptions, FsGrepResult } from "./fsModel.js";
 import type {
   YasNativeFsSyncHandle,
   YasNativeFsSyncOptions,
-} from "./yas/nativeWorkspaceFs";
+} from "./yas/nativeWorkspaceFs.js";
 import type {
   YasNativeGitDiscoverOptions,
   YasNativeGitFoundRepo,
   YasNativeGitOpenOptions,
   YasNativeGitRepoHandle,
-} from "./yas/nativeWorkspaceGit";
+} from "./yas/nativeWorkspaceGit.js";
 import type {
   WorkspaceSessionKvDeleteOptions,
   WorkspaceSessionKvPutOptions,
   WorkspaceSessionKvWatch,
   WorkspaceSessionKvWatchOptions,
-} from "./workspaceSessionKv";
+} from "./workspaceSessionKv.js";
 import type {
   YasNativeLspHandle,
   YasNativeLspOpenOptions,
-} from "./yas/nativeWorkspaceLsp";
-import { createShareTransport } from "./transports/webrtc-share";
-import { YasActivityStore } from "./activity";
-import { YasConnection as NativeYasConnection } from "./yas/session";
-import { YasEdgeWebSocketTransport } from "./yas/edge";
-import { yasBrowserConnectionOptions } from "./yas/defaults";
-import { retainBrowserClipboardObserver } from "./clipboardAuthority";
+} from "./yas/nativeWorkspaceLsp.js";
+import { createShareTransport } from "./transports/webrtc-share.js";
+import { YasActivityStore } from "./activity.js";
+import { YasConnection as NativeYasConnection } from "./yas/session.js";
+import { YasEdgeWebSocketTransport } from "./yas/edge.js";
+import { yasBrowserConnectionOptions } from "./yas/defaults.js";
+import { retainBrowserClipboardObserver } from "./clipboardAuthority.js";
 
 export interface AddYasConnectionOptions {
   id: ConnectionId;
@@ -47,6 +47,10 @@ export interface AddYasConnectionOptions {
   wasm?: YasWasmModule | Promise<YasWasmModule>;
   autoConnect?: boolean;
   logger?: YasLogger;
+  /** What this connection reports as its identifier in the server's client
+   *  list (see {@link YasClientHelloOptions.clientIdentifier}). Ignored when
+   *  `connection` is supplied: that one's own options apply. */
+  clientIdentifier?: string;
   /** Prebuilt native product connection supplied by an embedding shell. */
   connection?: YasWorkspaceConnection;
 }
@@ -172,10 +176,10 @@ export class YasWorkspace {
       options.connection ??
       new YasNativeWorkspaceConnection(
         options.id,
-        new NativeYasConnection(
-          resolveNativeTransport(options.transport),
-          yasBrowserConnectionOptions(),
-        ),
+        new NativeYasConnection(resolveNativeTransport(options.transport), {
+          ...yasBrowserConnectionOptions(),
+          clientIdentifier: options.clientIdentifier,
+        }),
         options.wasm ?? this.defaultWasm,
         options.autoConnect,
       );

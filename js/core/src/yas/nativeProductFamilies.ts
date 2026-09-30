@@ -28,19 +28,19 @@ import {
   YAS_CHANNEL_VERSION,
   YAS_STATUS_UNAVAILABLE,
   YAS_STATUS_UNSUPPORTED,
-} from "./generated";
-import { YasChannelClient } from "./channel";
-import { YasEnvClient } from "./env";
-import { YasEventsClient } from "./events";
-import { YasExtensionClient } from "./extension";
-import { YasFsClient } from "./fs";
-import { YasGitClient } from "./git";
-import { YasKvClient } from "./kv";
-import { YasLspClient } from "./lsp";
-import { YasNetClient } from "./net";
-import { YasProcessClient } from "./process";
-import type { YasConnection } from "./session";
-import { YasProtocolError, YasResultError } from "./wire";
+} from "./generated.js";
+import { YasChannelClient } from "./channel.js";
+import { YasEnvClient } from "./env.js";
+import { YasEventsClient } from "./events.js";
+import { YasExtensionClient } from "./extension.js";
+import { YasFsClient } from "./fs.js";
+import { YasGitClient } from "./git.js";
+import { YasKvClient } from "./kv.js";
+import { YasLspClient } from "./lsp.js";
+import { YasNetClient } from "./net.js";
+import { YasProcessClient } from "./process.js";
+import type { YasConnection } from "./session.js";
+import { YasProtocolError, YasResultError } from "./wire.js";
 
 interface FamilyClientFactories {
   fs(connection: YasConnection): YasFsClient;

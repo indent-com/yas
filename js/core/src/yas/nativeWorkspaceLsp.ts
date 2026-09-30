@@ -15,11 +15,11 @@ import {
   LSP_STATUS_WARMING,
   LSP_STATUS_WRONG_TYPE,
   type LspOpenOptions,
-} from "../lspModel";
-import { Notifier } from "../reactive";
-import type { SessionId } from "../types";
-import * as g from "./generated";
-import type { YasFsPath } from "./fs";
+} from "../lspModel.js";
+import { Notifier } from "../reactive.js";
+import type { SessionId } from "../types.js";
+import * as g from "./generated.js";
+import type { YasFsPath } from "./fs.js";
 import {
   YasLspClient,
   decodeLspNoBackendDetail,
@@ -29,9 +29,9 @@ import {
   type YasLspQueryRecord,
   type YasLspSnapshot,
   type YasLspWorkspace,
-} from "./lsp";
-import type { YasConnection } from "./session";
-import { YasProtocolError } from "./wire";
+} from "./lsp.js";
+import type { YasConnection } from "./session.js";
+import { YasProtocolError } from "./wire.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });

@@ -1,3 +1,4 @@
 vendor/yas-alacritty-terminal/tests/ref/**/alacritty.recording binary
 protocol/yas/** text eol=lf
+crates/yas/src/generated.rs text eol=lf
 js/core/src/yas/generated.ts text eol=lf

@@ -14,8 +14,9 @@ It updates:
 
 - `protocol/yas/schema.json`, the language-neutral registry metadata;
 - `protocol/yas/vectors.json`, the shared golden wire vectors; and
-- `protocol/yas/generated.rs`, the `no_std` Rust constants, metadata, and
-  generated frame-header codec;
+- `crates/yas/src/generated.rs`, the `no_std` Rust constants, metadata, and
+  generated frame-header codec (inside the crate, so that the published
+  `yas-wire` builds without this directory);
 - `protocol/yas/wire.md`, the complete human-readable wire tables;
 - `protocol/yas/inspection.json`, class/family/kind lookup data for packet
   inspectors and sensitivity-aware diagnostics; and

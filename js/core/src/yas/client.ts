@@ -4,6 +4,7 @@ import {
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
+  YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
   YAS_CLIENT_MAX_PUBLISHED_CLIENTS,
   YAS_CLIENT_LIMIT_MAX_PUBLISHED_CLIENTS,
@@ -18,9 +19,10 @@ import {
   YAS_CLIENT_UNWATCH,
   YAS_CLIENT_VERSION,
   YAS_CLIENT_WATCH,
+  YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
   YAS_FAMILY_CLIENT,
-} from "./generated";
-import type { YasConnection } from "./session";
+} from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -38,7 +40,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -47,7 +49,7 @@ import {
   decodeTypedRecord,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
@@ -55,6 +57,7 @@ export {
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
+  YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
   YAS_CLIENT_ORIGIN_EDGE,
   YAS_CLIENT_ORIGIN_EXTENSION,
@@ -68,7 +71,7 @@ export {
   YAS_CLIENT_VERSION,
   YAS_CLIENT_WATCH,
   YAS_FAMILY_CLIENT,
-} from "./generated";
+} from "./generated.js";
 
 export type YasClientOrigin =
   | {
@@ -121,6 +124,10 @@ export interface YasClientRecord {
   auxiliarySubscriptionDetails: YasClientAuxiliarySubscriptionDetails | null;
   auxiliarySubscriptionTimings: YasClientAuxiliarySubscriptionTimings | null;
   bandwidthRates: YasClientBandwidthRates | null;
+  /** What the client reported for itself in HELLO or CLIENT_UPDATE: UTF-8,
+   *  otherwise unvalidated, and possibly shared with other clients; null
+   *  when it reported none. */
+  identifier: string | null;
 }
 
 export interface YasClientBandwidthRates {
@@ -276,6 +283,7 @@ export function decodeClientRecord(bytes: Uint8Array): YasClientRecord {
     auxiliarySubscriptionTimings:
       decodeClientAuxiliarySubscriptionTimings(extensions),
     bandwidthRates: decodeClientBandwidthRates(extensions),
+    identifier: decodeClientIdentifier(extensions),
   };
   cursor.end("Client record");
   requireNonzeroId(record.sessionId, "Client session ID");
@@ -480,6 +488,25 @@ export function decodeClientActiveSubscriptions(
   }
   cursor.end("Client active subscriptions");
   return { terminals, surfaces, auxiliary };
+}
+
+/** The identifier a Client record carries; one that is not UTF-8, or takes
+ *  more than `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES`, is a protocol error. */
+export function decodeClientIdentifier(
+  extensions: readonly YasExtension[],
+): string | null {
+  const extension = extensions.find(
+    (candidate) => candidate.tag === YAS_CLIENT_IDENTIFIER_EXTENSION,
+  );
+  if (!extension) return null;
+  if (extension.value.length > YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES)
+    throw new YasProtocolError(
+      `Client identifier takes ${extension.value.length} bytes, more than ${YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES}`,
+    );
+  const cursor = new YasCursor(extension.value);
+  const identifier = cursor.utf8(extension.value.length, "Client identifier");
+  cursor.end("Client identifier");
+  return identifier;
 }
 
 export function decodeClientBandwidthRates(
@@ -791,6 +818,7 @@ export class YasClientCatalog {
           auxiliarySubscriptionTimings:
             decodeClientAuxiliarySubscriptionTimings(mergedExtensions),
           bandwidthRates: decodeClientBandwidthRates(mergedExtensions),
+          identifier: decodeClientIdentifier(mergedExtensions),
         });
         retention.upsert(key, estimateStateRetainedBytes(next));
         target.set(key, next);

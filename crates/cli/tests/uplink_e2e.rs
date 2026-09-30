@@ -4,18 +4,64 @@
 #[path = "support/uplink.rs"]
 mod uplink;
 use std::{path::Path, time::Duration};
-use uplink::{Fixture, cli};
+use uplink::{Carrier, Fixture, cli};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uplink_cli_remote_execution_and_authentication() {
-    tokio::time::timeout(Duration::from_secs(45), exercise_uplink())
-        .await
-        .expect("uplink E2E stalled");
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        exercise_uplink(Carrier::WebTransport),
+    )
+    .await
+    .expect("uplink E2E stalled");
 }
 
-async fn exercise_uplink() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uplink_over_websockets_when_forced() {
+    tokio::time::timeout(Duration::from_secs(45), exercise_uplink(Carrier::WebSocket))
+        .await
+        .expect("uplink E2E over WebSockets stalled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uplink_falls_back_to_websockets_where_udp_goes_nowhere() {
+    tokio::time::timeout(Duration::from_secs(60), exercise_uplink(Carrier::Fallback))
+        .await
+        .expect("uplink E2E falling back to WebSockets stalled");
+}
+
+async fn exercise_uplink(carrier: Carrier) {
     let binary = Path::new(env!("CARGO_BIN_EXE_yas"));
-    let mut fixture = Fixture::start(binary).await;
+    let mut fixture = Fixture::start_with(binary, carrier).await;
+    {
+        // The relay sees the session before the producer's line about it is read.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let log = loop {
+            let log = fixture.producer_log.lock().unwrap().clone();
+            let connected = log
+                .iter()
+                .any(|line| line.starts_with("[uplink] connected to relay"));
+            if connected || std::time::Instant::now() > deadline {
+                assert!(connected, "producer log: {log:?}");
+                break log;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let over_websocket = log.iter().any(|line| {
+            line.starts_with("[uplink] connected to relay") && line.ends_with(" over WebSocket")
+        });
+        assert_eq!(
+            over_websocket,
+            carrier != Carrier::WebTransport,
+            "producer log: {log:?}"
+        );
+        let gave_up_on_udp = log.iter().any(|line| line.contains("(is UDP blocked?)"));
+        assert_eq!(
+            gave_up_on_udp,
+            carrier == Carrier::Fallback,
+            "producer log: {log:?}"
+        );
+    }
     let root = fixture.directory.path();
     let ca = &fixture.ca;
     let uri = &fixture.uri;

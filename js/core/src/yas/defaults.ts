@@ -39,8 +39,8 @@ import {
   YAS_FAMILY_SURFACE,
   YAS_FAMILY_TERMINAL,
   YAS_FAMILY_TRANSFER,
-} from "./generated";
-import type { YasConnectionOptions } from "./session";
+} from "./generated.js";
+import type { YasConnectionOptions } from "./session.js";
 
 /**
  * Browser receive inventory. Surface views keep a 16-frame window so a 120 Hz

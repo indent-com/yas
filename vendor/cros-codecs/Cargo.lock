@@ -230,28 +230,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cros-codecs"
-version = "0.0.6"
-dependencies = [
- "anyhow",
- "argh",
- "byteorder",
- "crc32fast",
- "cros-libva",
- "drm 0.15.0",
- "drm-fourcc",
- "env_logger",
- "gbm",
- "gbm-sys",
- "log",
- "nix 0.31.3",
- "serde_json",
- "thiserror 2.0.20",
- "v4l2r",
- "zerocopy",
-]
-
-[[package]]
 name = "cros-libva"
 version = "0.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -927,6 +905,28 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "yas-cros-codecs"
+version = "0.0.6-yas.1"
+dependencies = [
+ "anyhow",
+ "argh",
+ "byteorder",
+ "crc32fast",
+ "cros-libva",
+ "drm 0.15.0",
+ "drm-fourcc",
+ "env_logger",
+ "gbm",
+ "gbm-sys",
+ "log",
+ "nix 0.31.3",
+ "serde_json",
+ "thiserror 2.0.20",
+ "v4l2r",
+ "zerocopy",
+]
 
 [[package]]
 name = "zerocopy"

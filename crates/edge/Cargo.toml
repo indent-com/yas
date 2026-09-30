@@ -1,11 +1,13 @@
 [package]
 name = "yas-edge"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 description = "YAS browser edge service"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+# ui/ is the built web UI, which git ignores: see build.rs.
+include = ["/Cargo.toml", "/build.rs", "/src/**", "/ui/index.html.br", "/ui/sw.js.br"]
 
 [lib]
 name = "yas_edge"
@@ -15,9 +17,9 @@ path = "src/lib.rs"
 yas-wire = { workspace = true }
 yas-composite-transport = { workspace = true }
 yas-webserver = { workspace = true }
-yas-webrtc-forwarder = { workspace = true }
+yas-webrtc-forwarder = { workspace = true, features = ["ring"] }
 yas-ssh = { workspace = true }
-yas-proxy = { workspace = true }
+yas-proxy = { workspace = true, features = ["ring"] }
 yas-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }

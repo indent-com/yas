@@ -10,6 +10,13 @@ fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let workspace = manifest.join("../..");
     let schema_dir = workspace.join("protocol/yas");
+    if !schema_dir.join("registry.toml").is_file() {
+        // A packaged crate (crates.io, `cargo package`) has no repository around
+        // it: it builds from the checked-in src/generated.rs, which every build
+        // inside the repository regenerates from the schema and checks below.
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
     for name in [
         "registry.toml",
         "transport.toml",
@@ -48,7 +55,7 @@ fn main() {
     let update = env::var_os("YAS_UPDATE_SCHEMA").as_deref() == Some(std::ffi::OsStr::new("1"));
     check_or_update(&schema_dir.join("schema.json"), &generated.json, update);
     check_or_update(&schema_dir.join("vectors.json"), &generated.vectors, update);
-    check_or_update(&schema_dir.join("generated.rs"), &generated.rust, update);
+    check_or_update(&manifest.join("src/generated.rs"), &generated.rust, update);
     check_or_update(&schema_dir.join("wire.md"), &generated.markdown, update);
     check_or_update(
         &schema_dir.join("inspection.json"),

@@ -1,6 +1,6 @@
-import { lz4Compress } from "../lz4";
-import type { YasTerminalGridState } from "./terminal";
-import { YasWriter } from "./wire";
+import { lz4Compress } from "../lz4.js";
+import type { YasTerminalGridState } from "./terminal.js";
+import { YasWriter } from "./wire.js";
 
 // Browser renderer ingest codec. This is an internal WASM boundary, not a YAS
 // transport frame: native handles and family frames never enter this byte

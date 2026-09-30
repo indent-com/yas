@@ -2,8 +2,8 @@ import type {
   YasTransportEventMap,
   YasTransportMessage,
   ConnectionStatus,
-} from "../types";
-import { YAS_FAMILY_RELAY } from "./core";
+} from "../types.js";
+import { YAS_FAMILY_RELAY } from "./core.js";
 import {
   YAS_RELAY_AVAILABILITY_AVAILABLE,
   YAS_RELAY_AVAILABILITY_DEGRADED,
@@ -38,12 +38,12 @@ import {
   YAS_RELAY_UNWATCH,
   YAS_RELAY_VERSION,
   YAS_RELAY_WATCH,
-} from "./generated";
+} from "./generated.js";
 import {
   YasConnection,
   type YasConnectionOptions,
   type YasTransport,
-} from "./session";
+} from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -59,7 +59,7 @@ import {
   estimateStateRetainedBytes,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_RECEIVER_TO_SENDER,
@@ -67,7 +67,7 @@ import {
   decodeTransferDescriptor,
   transfersFor,
   type YasTransfer,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YAS_STATUS_CANCELLED,
   YAS_STATUS_RESOURCE_EXHAUSTED,
@@ -78,7 +78,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_RELAY_AVAILABILITY_AVAILABLE,
@@ -100,7 +100,7 @@ export {
   YAS_RELAY_UNWATCH,
   YAS_RELAY_VERSION,
   YAS_RELAY_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasRelayRoute {
   handle: bigint;

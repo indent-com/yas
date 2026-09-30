@@ -244,6 +244,27 @@ Surfaces created by the terminal appear in the connection's `surfaceStore`, keye
 - `setVisibleSessions(sessionIds)`
 - `addConnection(...)` / `removeConnection(connectionId)` / `reconnectConnection(connectionId)`
 
+### Client identifiers
+
+A connection can report an identifier of your choosing (a user, a device, your
+app's own session ID) to name it in the server's client list: `yas client
+list`, and Manage → Clients in the browser. That list shows each client's
+terminal and surface view sizes, and a shared terminal or window is sized to
+fit the smallest, so the identifier is how to tell whose view that is. YAS
+passes it on as is: it must be UTF-8 of at most 1 KiB and nothing else is
+checked, and several clients may report the same one.
+
+```ts
+new YasWorkspace({
+  wasm,
+  connections: [{ id: "default", transport, clientIdentifier: "alice@laptop" }],
+});
+```
+
+On a `YasConnection` of your own, pass `clientIdentifier` in its options, and
+call `updateClientIdentifier(text)` to replace it on the live session. The Rust
+client takes `HelloOptions::identifier` and `Client::set_identifier`.
+
 ### Transports
 
 All transports share a common set of options (`YasTransportOptions`):
@@ -286,13 +307,117 @@ interface YasTransport {
 }
 ```
 
+## Rust: `yas-client`
+
+`crates/client` (package `yas-client`) is the Rust client the `yas` CLI is
+built on. It is not on crates.io yet; depend on it by path or git:
+
+```toml
+yas-client = { path = "../yas/crates/client" }
+tokio = { version = "1", features = ["full"] }
+```
+
+Its TLS (`wss://`, TURN), QUIC (`wt://`) and uplink crypto run on ring by
+default. A program built on aws-lc-rs, rustls's own default, keeps ring out of
+its binary with
+`default-features = false, features = ["aws-lc-rs"]`. The TLS clients YAS
+makes use the program's process-wide rustls provider when it installed one
+(`CryptoProvider::install_default`), else the feature's (aws-lc-rs when both
+are on), so they don't panic in a program that has both.
+
+`Client::connect(target, &ConnectOptions)` accepts every target the CLI does
+(`local[:NAME]`, `socket:PATH`, `ssh:[USER@]HOST`, `tcp:`, `ws(s)://`,
+`wt://`, `uplink:`, `share:`, remote names); `Client::from_stream` speaks YAS
+over any byte stream you already have. A `Client` is one session, `Clone` and
+safe to use from many tasks at once: each process stream, file transfer and
+subscription is flow-controlled on its own.
+
+```rust
+use yas_client::{Client, ConnectOptions, process::Command};
+
+let client = Client::connect(Some("ssh:build@ci"), &ConnectOptions::named("my-app")).await?;
+let output = client.spawn(Command::new("cargo").args(["test", "--workspace"]).current_dir("/src/app"))
+    .await?
+    .output()
+    .await?;
+println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
+```
+
+- **Processes** (`process`): argv/env/cwd, piped or null stdin, merged stderr,
+  detachable, operation IDs for retries, wait/signal/kill, list/watch. Each
+  command gets its own process group; when the command exits the server
+  terminates the group (`SIGTERM`, then `SIGKILL` after
+  `YAS_PROCESS_KILL_GRACE`, 2 s), so background children die with it unless
+  they `setsid`. Ordinary processes die with their session; detachable ones
+  survive it. The module docs spell this out. A server admits 16 live
+  processes per session and 64 in total by default;
+  `yas server --process-max-per-session N` (and the other `--process-max*`
+  flags) raises that, and `Client::process_limits()` reports what the server
+  enforces.
+- **Files** (`fs`): open a root, read (whole, limited, ranged) with BLAKE3
+  hashes, stat (`lstat` semantics), list, write with preconditions (`Any`,
+  `Absent`, `Hash`) through a staged commit, mkdir -p, rename, remove, symlink.
+- **KV and environment** (`kv`): get/put/delete with preconditions, list,
+  watch; the server environment (`ENV_GET`).
+- **Terminals** (`terminal`): PTYs that belong to the server, not the
+  session, with the IDs `yas terminal list` shows. `start_terminal` with a
+  `TerminalCommand` (a program, a shell command line or the default shell;
+  cwd, env, size, tag, deadline), then type into it (`write_terminal`), read
+  its screen as text, resize, signal, restart, close, and wait for it to exit.
+  When its shell reports commands (OSC 133,
+  [docs/shell-integration.md](docs/shell-integration.md)):
+  `wait_terminal_command`, `terminal_commands` (exit codes, command lines)
+  and `terminal_output` (what one command printed); `terminal_cwd` with
+  OSC 7.
+- **Surfaces** (`surface`): the windows GUI programs map on the server's
+  compositor. List them, capture one as PNG or AVIF, click, scroll, press keys
+  (`key_combo("ctrl+c")`, `typed_keys("hello{enter}")`) or enter text,
+  resize, focus and close them: `yas surface`, for programs that drive GUIs.
+- **Errors** (`Error`): connection failures, lost sessions, server statuses
+  (`is_not_found`, `is_conflict`), timeouts, unsupported operations,
+  protocol violations.
+- **SSH** (`ssh`, re-exported `yas-ssh`): `SshOptions::in_memory(HostKeyPolicy::Pinned(keys))`
+  with `with_private_key(text, passphrase)` authenticates with keys held in
+  memory and trusts only pinned host keys, touching no `~/.ssh` file; pass
+  `SshPool::with_options(options)` as `ConnectOptions::ssh`. Hosts whose sshd
+  does not forward to sockets, or that have no POSIX shell (Windows), are
+  reached by running `yas connect --stdio` there: automatically in
+  `SshMode::Auto`, only that way in `SshMode::Exec` (`SshOptions::remote_command`
+  overrides the command). A refused host key is `ssh::Error::HostKey`, with the
+  presented key's `fingerprint`.
+- **Hosting** (`host`, Unix): `HostedServer::start(HostOptions::new("yas"))` runs
+  a private `yas server --fd-channel` child in a 0700 directory (own state,
+  cache and runtime directories by default); `connect()` hands it a fresh
+  socketpair per session, `socket_path()` exposes its private socket for
+  `YAS_SOCK`, and dropping it (or the host process dying) stops the server.
+- **Pipes**: `Transport::from_split(child_stdout, child_stdin)` and
+  `Client::from_transport` run a session over a child's pipes. Run
+  `yas connect --stdio` at the other end (an SSH exec channel, or
+  `docker exec -i CONTAINER yas connect --stdio`) and it relays them to that
+  side's server
+  ([docs/transports.md](docs/transports.md#standard-io-yas-connect---stdio)).
+- **Read-only viewers**: `wire::read_only::ReadOnlyIngress` turns the bytes a
+  client sends into a read-only session's (it rewrites the HELLO, then passes
+  everything through), for a relay that forwards clients to an ordinary
+  socket; `yas server --read-only-sock PATH` is a socket that does it for
+  every session
+  ([docs/transports.md](docs/transports.md#read-only-socket)).
+
+`cargo run -p yas-client --example run -- local -- uname -a` is a complete
+example; `crates/cli/tests/client_host.rs` exercises the API end to end.
+
 ## Server-side: a Node/Bun client over a unix socket
 
 You can also run a `@yas-run/core` client **server-side** (Node/Bun/Deno) to drive a
 local `yas server` over its unix-domain socket — e.g. to script terminals or run
 headless commands. The non-browser building blocks live under the
 `@yas-run/core/node` subpath (kept out of the package root so `node:net` and
-runtime globals never leak into browser bundles):
+runtime globals never leak into browser bundles). The packages are plain ES
+modules; install `@yas-run/core` with its matching `@yas-run/browser` peer:
+
+```bash
+npm install @yas-run/core @yas-run/browser
+```
 
 ```ts
 import { YasWorkspace, exitCodeFromStatus, nullLogger } from "@yas-run/core";
@@ -315,6 +440,17 @@ const workspace = new YasWorkspace({
   connections: [{ id: "default", transport }],
 });
 
+// Families are negotiated after the HELLO round trip; wait before creating.
+await new Promise<void>((resolve) => {
+  const check = () => {
+    if (!workspace.getSnapshot().ready) return;
+    unsubscribe();
+    resolve();
+  };
+  const unsubscribe = workspace.subscribe(check);
+  check();
+});
+
 const session = await workspace.createSession({
   connectionId: "default",
   rows: 24,
@@ -323,10 +459,11 @@ const session = await workspace.createSession({
 });
 ```
 
-The unix transport speaks yas's framing protocol (4-byte little-endian
-length-prefixed frames) for you — there is no need to re-implement the wire
-format. `BunUnixSocketTransport` and `DenoUnixSocketTransport` are the
-runtime-native equivalents.
+The unix transport carries the YAS byte stream (the preface, then 4-byte
+little-endian length-prefixed frames) for you; there is no need to
+re-implement the wire format. `BunUnixSocketTransport` and
+`DenoUnixSocketTransport` are the runtime-native equivalents; Deno needs
+`--allow-read --allow-write` for the socket path.
 
 ### Exit status
 
@@ -359,6 +496,7 @@ workspace.subscribe(() => {
 
 - [Python](examples/fd-channel-python.py)
 - [Bun](examples/fd-channel-bun.ts)
+- Rust: [`yas_client::host`](crates/client/src/host.rs) (see [above](#rust-yas-client))
 
 ## Uplink connections
 

@@ -199,9 +199,15 @@ yas terminal history ID --since CURSOR [--max-bytes N] [--json]
 
 `journal` prints the newest 20 records by default. `output` defaults to the
 newest command; `--wait` blocks server-side and exits with that command's
-status (124 on timeout). `history --since` takes `SEQ`, `SEQ:COL`, `now`, or
-`start`; the reply prints the next cursor so it can be fed back in. Default
-`--max-bytes` is 256 KiB.
+status (124 on timeout). Without an index, `--wait` targets the running command
+or, when none is running, the next one to start, so `send` followed by
+`output --wait` cannot race to the previous command. A command wait that times
+out before any such command starts answers `TIMEOUT`.
+
+`history --since` takes `SEQ`, `SEQ:COL`, `now`, or `start`; the reply prints
+the next cursor so it can be fed back in. A cursor past the end prints nothing
+and reports the current end as the next cursor. Default `--max-bytes` is
+256 KiB.
 
 `wait --pattern` probes the cursor first and then matches only subsequent
 `OUTPUT` text. The native client requires the selected Terminal v1 contract;

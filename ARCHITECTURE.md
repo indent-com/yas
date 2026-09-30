@@ -86,6 +86,7 @@ restartable; PTYs survive their restart.
 | `yas-edge`             | `crates/edge/`             | lib           | Authenticated fixed-home YAS WebSocket/WebTransport edge and web application host                                |
 | `yas-ssh`              | `crates/ssh/`              | lib           | Embedded SSH client (russh): ssh-agent auth, `~/.ssh/config`, `direct-streamlocal` channels                      |
 | `yas-proxy`            | `crates/proxy/`            | lib           | Native connection pool for socket, TCP, SSH, WebSocket, WebTransport, and WebRTC upstreams                       |
+| `yas-client`           | `crates/client/`           | lib           | Rust client: every CLI transport, typed errors, concurrent sessions, Process/FS/KV/Env, private hosted servers   |
 | `yas-uplink`           | `crates/uplink/`           | lib           | End-to-end Noise IK with pinned X25519 identities, AES-GCM, and authenticated datagrams                          |
 | `yas` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH/proxy/share transports, `remote` management, `server`/`share` subcommands |
 | `yas-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib           | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                    |
@@ -95,7 +96,7 @@ restartable; PTYs survive their restart.
 | `yas-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (wayland-server): surface multiplexing, input injection                 |
 | `yas-sd-notify`        | `crates/sd-notify/`        | lib           | Tiny pure-`libc` `sd_notify(3)` for daemon readiness; no `libsystemd` dependency                                 |
 
-Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`yas-server`, `yas-compositor`, `yas-cli`, `yas-webrtc-forwarder`) use a small number of sibling files in the same directory.
+Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`yas-server`, `yas-compositor`, `yas-cli`, `yas-client`, `yas-webrtc-forwarder`) use a small number of sibling files in the same directory.
 
 The uplink producer in `yas-cli` and consumer in `yas-proxy` share `yas-uplink`.
 The relay carries opaque Noise IK records. The producer requires a locally
@@ -124,6 +125,11 @@ graph TD
     ssh --> proxy[yas-proxy]
     forwarder --> proxy
     proxy --> server
+    wire --> client[yas-client]
+    ssh --> client
+    proxy --> client
+    forwarder --> client
+    client --> cli
 
     browser --> core[@yas-run/core]
     core --> react[@yas-run/react]
@@ -137,6 +143,7 @@ graph TD
 ```
 
 `yas-proxy` depends on `yas-ssh` and `yas-webrtc-forwarder` for upstream SSH and WebRTC transport support.
+`yas-client` holds the connectors and the native session the CLI uses (one implementation), plus the concurrent `Client` embedders use; see [EMBEDDING.md](EMBEDDING.md#rust-yas-client).
 
 ---
 
@@ -236,7 +243,8 @@ server's own KV store — see below.
 attached backend workspace; they are never transferred by the edge.
 
 Special key: `yas.target = <uri-or-name>` — sets the default for non-browser
-CLI commands. Browsers discover Relay routes from the home server and keep the
+CLI commands. A name is resolved against the home server's catalogue (below)
+on each connection. Browsers discover Relay routes from the home server and keep the
 active route set in the attached backend workspace.
 
 ### The Relay catalogue — the `remotes` KV key
@@ -252,11 +260,15 @@ two catalogues rather than one shared home-directory file; and KV already has
 watching, compare-and-swap and a client-facing family, so editing a remote
 needed no transport of its own.
 
-Managed with `yas remote add/remove/toggle/list`, which now reach the target
-server rather than this machine's home directory — `yas --on dev remote add`
-edits `dev`'s catalogue — and from the browser's Remotes panel. A server that
+Managed with `yas remote add/remove/toggle/list`, which now reach a server
+rather than this machine's home directory: the home server by default (not
+`yas.target`), or the `--on` server, so `yas --on dev remote add` edits `dev`'s
+catalogue. Also managed from the browser's Remotes panel. A server that
 finds no `remotes` key at startup imports a pre-KV `yas.remotes` file once, if
-there is one.
+there is one. The CLI resolves a bare target name (`--on NAME`, `YAS_TARGET`,
+`yas.target`) by reading this key from the home server (`YAS_SOCK`, else the
+default local instance) and dialing the stored URI itself; it no longer reads
+the file.
 
 **The stored URIs carry credentials, and every client of the server can read
 them**: a `share:` passphrase, an `ssh:` host reference. That is the trade for
@@ -318,7 +330,7 @@ All yas components share a common URI vocabulary for addressing yas server insta
 | `share:passphrase`          | CLI, `yas.remotes`            | Native read-only WebRTC share             |
 | `share:passphrase?hub=URL`  | `yas.remotes`                 | WebRTC via custom hub URL                 |
 | `proxy:uri`                 | CLI (`--on`)                  | Explicitly route through yas proxy-daemon |
-| `name`                      | CLI (`--on`), yas.conf        | Named remote from yas.remotes             |
+| `name`                      | CLI (`--on`), yas.conf        | Named remote on the home server           |
 
 Set `YAS_PROXY=0` to bypass proxy routing and connect directly for `ssh:`,
 `tcp:`, `ws:`, `wss:`, and `wt:` URIs.

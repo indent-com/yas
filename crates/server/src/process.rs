@@ -21,18 +21,22 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use yas_wire::process as wire;
 use yas_wire::schema::process as process_schema;
 
+use crate::output_keep::{Elision, KeptOutput};
 #[cfg(unix)]
 use crate::pty;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+use windows_sys::Win32::System::Console::{
+    AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleProcessList,
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -40,21 +44,248 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread,
+    THREAD_SUSPEND_RESUME,
 };
 
-const DEFAULT_MAX_PER_CLIENT: usize = 16;
-const DEFAULT_MAX_GLOBAL: usize = 64;
-const DEFAULT_MAX_SPAWNING: usize = 8;
 const DEFAULT_MAX_WATCHERS_PER_GENERATION: usize = 64;
 const DEFAULT_REQUEST_MAX_PER_CLIENT: usize = 16 * 1024 * 1024;
 const DEFAULT_REQUEST_MAX: usize = 64 * 1024 * 1024;
 const DEFAULT_BUFFER_MAX: usize = 192 * 1024 * 1024;
+/// Spawn-request bytes each process past the defaults adds to the retained
+/// request budgets, so raising the process maxima does not leave them
+/// binding first.
+const REQUEST_BYTES_PER_EXTRA_PROCESS: usize = 64 * 1024;
+/// Transfers a session may send besides its processes' stdout and stderr.
+const OUTBOUND_TRANSFERS_BASE: usize = 32;
+/// Operation replays a session retains at the default maxima.
+const OPERATION_REPLAYS_BASE: usize = 256;
+/// Native events (output, stdin progress, exits) a session's endpoint queues
+/// for its dispatcher at the default maxima: five for each of 16 processes.
+const ENDPOINT_EVENTS_BASE: usize = 80;
+
+/// Process family maxima a server enforces and advertises in HELLO.
+///
+/// [`ProcessMaxima::DEFAULT`] is what YAS has always enforced. Values above
+/// the Process family's original hard maxima (16 processes per session, 64
+/// server-wide, 8 pending spawns, 8 MiB stream buffers, 256 environment
+/// entries) are advertised through the family's optional extended limit
+/// tags, so clients that predate them keep seeing, and staying within, the
+/// original values. Per-session transfer, operation-replay and exit-replay
+/// capacities, and the server-wide stream-window and spawn-request budgets,
+/// grow with these values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessMaxima {
+    /// Live processes one session may own: pending spawns, attachments,
+    /// and unwatched owned processes (`YAS_PROCESS_MAX_PER_SESSION`).
+    pub per_session: usize,
+    /// Process generations server-wide (`YAS_PROCESS_MAX`).
+    pub total: usize,
+    /// Spawns one session may have in flight
+    /// (`YAS_PROCESS_MAX_PENDING_SPAWNS`).
+    pub pending_spawns: usize,
+    /// Largest stdin window a process gets, and the stream buffer the
+    /// family advertises (`YAS_PROCESS_STREAM_BUFFER_MAX`).
+    pub stream_buffer_bytes: u64,
+    /// Environment entries one SPAWN may carry (`YAS_PROCESS_MAX_ENV`).
+    pub envc: usize,
+    /// Pending `WAIT`s per session (`YAS_PROCESS_MAX_WAITS`).
+    pub pending_waits: usize,
+    /// Completion-held `ATTACH`/`CONTROL` operations per session
+    /// (`YAS_PROCESS_MAX_OPERATIONS`).
+    pub pending_operations: usize,
+}
+
+impl Default for ProcessMaxima {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl ProcessMaxima {
+    /// What YAS enforces unless configured otherwise.
+    pub const DEFAULT: Self = Self::of(wire::Limits::DEFAULT);
+
+    /// The largest values a server may be configured with.
+    pub const HARD: Self = Self::of(wire::Limits::HARD);
+
+    const fn of(limits: wire::Limits) -> Self {
+        Self {
+            per_session: limits.max_processes_per_session as usize,
+            total: limits.max_processes as usize,
+            pending_spawns: limits.max_pending_spawns as usize,
+            stream_buffer_bytes: limits.max_stream_buffer_bytes,
+            envc: limits.max_envc as usize,
+            pending_waits: limits.max_pending_waits as usize,
+            pending_operations: limits.max_pending_operations as usize,
+        }
+    }
+
+    /// [`ProcessMaxima::DEFAULT`] overridden by the `YAS_PROCESS_*`
+    /// variables that are set (`YAS_PROCESS_MAX_PER_CLIENT` is the older
+    /// name of `YAS_PROCESS_MAX_PER_SESSION`). Like the server's other
+    /// environment fallbacks this is lenient, so a stale export cannot make
+    /// the server unbootable: a variable that is not a whole number within
+    /// [`ProcessMaxima::HARD`] keeps its default and yields a warning.
+    pub fn from_env() -> (Self, Vec<String>) {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
+        let hard = Self::HARD;
+        let mut maxima = Self::DEFAULT;
+        let mut warnings = Vec::new();
+        let mut read = |names: &[&str], maximum: u64| -> Option<u64> {
+            let (name, value) = names
+                .iter()
+                .find_map(|name| lookup(name).map(|value| (*name, value)))?;
+            match value.trim().parse::<u64>() {
+                Ok(parsed) if (1..=maximum).contains(&parsed) => Some(parsed),
+                _ => {
+                    warnings.push(format!(
+                        "ignoring {name}={value:?}: expected a whole number from 1 to {maximum}"
+                    ));
+                    None
+                }
+            }
+        };
+        let count = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        if let Some(value) = read(
+            &["YAS_PROCESS_MAX_PER_SESSION", "YAS_PROCESS_MAX_PER_CLIENT"],
+            hard.per_session as u64,
+        ) {
+            maxima.per_session = count(value);
+        }
+        if let Some(value) = read(&["YAS_PROCESS_MAX"], hard.total as u64) {
+            maxima.total = count(value);
+        }
+        if let Some(value) = read(
+            &["YAS_PROCESS_MAX_PENDING_SPAWNS"],
+            hard.pending_spawns as u64,
+        ) {
+            maxima.pending_spawns = count(value);
+        }
+        if let Some(value) = read(&["YAS_PROCESS_STREAM_BUFFER_MAX"], hard.stream_buffer_bytes) {
+            maxima.stream_buffer_bytes = value;
+        }
+        if let Some(value) = read(&["YAS_PROCESS_MAX_ENV"], hard.envc as u64) {
+            maxima.envc = count(value);
+        }
+        if let Some(value) = read(&["YAS_PROCESS_MAX_WAITS"], hard.pending_waits as u64) {
+            maxima.pending_waits = count(value);
+        }
+        if let Some(value) = read(
+            &["YAS_PROCESS_MAX_OPERATIONS"],
+            hard.pending_operations as u64,
+        ) {
+            maxima.pending_operations = count(value);
+        }
+        (maxima, warnings)
+    }
+
+    /// Check every value is at least 1 and at most [`ProcessMaxima::HARD`].
+    pub fn validate(&self) -> Result<(), String> {
+        let hard = Self::HARD;
+        let checks: [(&str, u64, u64); 7] = [
+            (
+                "processes per session",
+                self.per_session as u64,
+                hard.per_session as u64,
+            ),
+            ("processes", self.total as u64, hard.total as u64),
+            (
+                "pending spawns",
+                self.pending_spawns as u64,
+                hard.pending_spawns as u64,
+            ),
+            (
+                "stream buffer bytes",
+                self.stream_buffer_bytes,
+                hard.stream_buffer_bytes,
+            ),
+            ("environment entries", self.envc as u64, hard.envc as u64),
+            (
+                "pending waits",
+                self.pending_waits as u64,
+                hard.pending_waits as u64,
+            ),
+            (
+                "pending operations",
+                self.pending_operations as u64,
+                hard.pending_operations as u64,
+            ),
+        ];
+        for (name, value, maximum) in checks {
+            if value == 0 || value > maximum {
+                return Err(format!(
+                    "the Process maximum for {name} must be between 1 and {maximum}, not {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Operation replays each session retains: enough that every live
+    /// process, pending spawn and pending operation can hold one.
+    pub(crate) fn operation_replays(&self) -> usize {
+        self.per_session
+            .saturating_mul(2)
+            .saturating_add(self.pending_spawns)
+            .saturating_add(self.pending_operations)
+            .max(OPERATION_REPLAYS_BASE)
+            .min(yas_wire::schema::process::MAX_MUTATION_REPLAYS as usize)
+    }
+
+    /// Transfers a session may have outbound: the base allowance plus two
+    /// (stdout, stderr) per process above the default per-session maximum.
+    pub(crate) fn outbound_transfers(&self) -> usize {
+        OUTBOUND_TRANSFERS_BASE.saturating_add(
+            self.per_session
+                .saturating_sub(Self::DEFAULT.per_session)
+                .saturating_mul(2),
+        )
+    }
+
+    /// Native events a session's endpoint queues for its dispatcher: the
+    /// base, plus the same five for each process above the default
+    /// per-session maximum. A full queue loses an exit, so a session that
+    /// owns more processes needs a queue that grows with them.
+    pub(crate) fn endpoint_events(&self) -> usize {
+        ENDPOINT_EVENTS_BASE.saturating_add(
+            self.per_session
+                .saturating_sub(Self::DEFAULT.per_session)
+                .saturating_mul(ENDPOINT_EVENTS_BASE / Self::DEFAULT.per_session),
+        )
+    }
+
+    /// Exit records each session retains for WAIT replies.
+    pub(crate) fn exit_replays(&self) -> usize {
+        self.total.max(Self::DEFAULT.total)
+    }
+
+    /// The limits a server with these maxima selects in HELLO.
+    pub(crate) fn limits(&self) -> wire::Limits {
+        let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        wire::Limits {
+            max_envc: clamp(self.envc),
+            max_processes_per_session: clamp(self.per_session),
+            max_processes: clamp(self.total),
+            max_pending_spawns: clamp(self.pending_spawns),
+            max_stream_buffer_bytes: self.stream_buffer_bytes,
+            max_mutation_replays: clamp(self.operation_replays()),
+            max_pending_waits: clamp(self.pending_waits),
+            max_pending_operations: clamp(self.pending_operations),
+            ..wire::Limits::DEFAULT
+        }
+    }
+}
 /// Keep one process frame from occupying an entire ordinary bulk-writer turn.
 /// The protocol accepts larger packets, but the server emits at most this much
 /// stdout or stderr data before the fair scheduler can choose another queue.
@@ -73,6 +304,22 @@ type ProcessRef = u64;
 // protocol.  The adapter maps this state to the public `yas.process` types.
 const PROCESS_SPAWN_MERGE_STDERR: u8 = process_schema::SPAWN_MERGE_STDERR as u8;
 const PROCESS_SPAWN_DETACHABLE: u8 = process_schema::SPAWN_DETACHABLE as u8;
+const PROCESS_SPAWN_LEAVE_RESIDUE: u8 = process_schema::SPAWN_LEAVE_RESIDUE as u8;
+const PROCESS_SPAWN_STDIN_NULL: u8 = process_schema::SPAWN_STDIN_NULL as u8;
+/// What a LEAVE_RESIDUE exit says when group members still held its streams.
+const RESIDUE_LEFT_RUNNING: &str = "residual process group left running";
+/// How long the final SIGKILL of a finished command's group waits for members
+/// that are already zombies to be reaped (see `kill_group_until_gone`).
+#[cfg(unix)]
+const RESIDUAL_ZOMBIE_WAIT: Duration = Duration::from_secs(1);
+/// Once nothing of a finished process's group is left, how long its streams may stay open with
+/// no reader waiting for the owner to take its window before the cleanup stops waiting for them
+/// (a holder outside the group keeps a pipe open with nothing coming): see `drain_paced`.
+const DRAIN_IDLE: Duration = Duration::from_millis(250);
+/// How much more a stream may give while the cleanup waits for its owner (`drain_paced`): more
+/// than a pipe holds (1 MiB at most unless root raised /proc/sys/fs/pipe-max-size), so it bounds
+/// only a holder outside the group that writes on.
+const DRAIN_BUDGET: u64 = 1024 * 1024;
 const PROCESS_STREAM_STDOUT: u8 = process_schema::STREAM_STDOUT_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDERR: u8 = process_schema::STREAM_STDERR_CONTENT_KIND as u8;
 const PROCESS_STREAM_STDIN_ACCEPTING: u8 = 1 << 0;
@@ -96,6 +343,10 @@ const PROCESS_KILL_TERMINATE_TIMEOUT: u8 = process_schema::EXIT_REASON_TERMINATE
 const PROCESS_KILL_SERVER_SHUTDOWN: u8 = process_schema::EXIT_REASON_SERVER_SHUTDOWN as u8;
 const PROCESS_MAX_UNACKED_PACKETS: usize = 1_024;
 const PROCESS_DEFAULT_STREAM_WINDOW: u64 = 1024 * 1024;
+/// Unacknowledged frames a process's owner may have on one stream: its window in whole frames,
+/// so a burst of small writes fits the adapter's queues (80 route events) as a full window does.
+const PROCESS_OWNER_UNACKED_FRAMES: usize =
+    (PROCESS_DEFAULT_STREAM_WINDOW / OUTPUT_FRAME_PAYLOAD as u64) as usize;
 
 pub(crate) const NATIVE_STREAM_STDOUT: u8 = PROCESS_STREAM_STDOUT;
 pub(crate) const NATIVE_STREAM_STDERR: u8 = PROCESS_STREAM_STDERR;
@@ -160,9 +411,16 @@ struct Policy {
 }
 
 impl Policy {
-    fn from_env(enabled: bool) -> Self {
-        let max_per_endpoint = env_usize("YAS_PROCESS_MAX_PER_CLIENT", DEFAULT_MAX_PER_CLIENT);
-        let max_generations = env_usize("YAS_PROCESS_MAX", DEFAULT_MAX_GLOBAL);
+    fn new(enabled: bool, maxima: &ProcessMaxima) -> Self {
+        let max_per_endpoint = maxima.per_session;
+        let max_generations = maxima.total;
+        let defaults = ProcessMaxima::DEFAULT;
+        let extra_per_endpoint = max_per_endpoint.saturating_sub(defaults.per_session);
+        let extra_generations = max_generations.saturating_sub(defaults.total);
+        // Admission reserves one default window per stream for every
+        // generation; keep room for all of them.
+        let default_max_buffer = DEFAULT_BUFFER_MAX
+            .max(max_generations.saturating_mul(3 * PROCESS_DEFAULT_STREAM_WINDOW as usize));
         let default_max_watchers = max_per_endpoint.saturating_mul(max_generations).max(1);
         Self {
             enabled,
@@ -176,24 +434,39 @@ impl Policy {
             .max(1),
             max_request_per_endpoint: env_usize(
                 "YAS_PROCESS_REQUEST_MAX_PER_CLIENT",
-                DEFAULT_REQUEST_MAX_PER_CLIENT,
+                DEFAULT_REQUEST_MAX_PER_CLIENT.saturating_add(
+                    extra_per_endpoint.saturating_mul(REQUEST_BYTES_PER_EXTRA_PROCESS),
+                ),
             ),
-            max_request: env_usize("YAS_PROCESS_REQUEST_MAX", DEFAULT_REQUEST_MAX),
-            max_buffer: env_usize("YAS_PROCESS_BUFFER_MAX", DEFAULT_BUFFER_MAX),
+            max_request: env_usize(
+                "YAS_PROCESS_REQUEST_MAX",
+                DEFAULT_REQUEST_MAX.saturating_add(
+                    extra_generations.saturating_mul(REQUEST_BYTES_PER_EXTRA_PROCESS),
+                ),
+            ),
+            max_buffer: env_usize("YAS_PROCESS_BUFFER_MAX", default_max_buffer),
             kill_grace: env_duration("YAS_PROCESS_KILL_GRACE", DEFAULT_KILL_GRACE),
             final_ttl: env_duration("YAS_PROCESS_DETACHED_RESULT_TTL", DEFAULT_FINAL_TTL),
         }
     }
 }
 
+/// Runs its action once, told whether the event it rides was dispatched: true after its
+/// dispatch, false when it is dropped without (its queue was full, or its reader gone).
 struct WriterGuard {
-    action: Option<Box<dyn FnOnce() + Send>>,
+    action: Option<Box<dyn FnOnce(bool) + Send>>,
 }
 
 impl WriterGuard {
-    fn new(f: impl FnOnce() + Send + 'static) -> Self {
+    fn new(f: impl FnOnce(bool) + Send + 'static) -> Self {
         Self {
             action: Some(Box::new(f)),
+        }
+    }
+
+    fn dispatched(mut self) {
+        if let Some(f) = self.action.take() {
+            f(true);
         }
     }
 }
@@ -201,7 +474,7 @@ impl WriterGuard {
 impl Drop for WriterGuard {
     fn drop(&mut self) {
         if let Some(f) = self.action.take() {
-            f();
+            f(false);
         }
     }
 }
@@ -237,6 +510,22 @@ struct FinalRecord {
     kill_cause: u8,
     code: u32,
     detail: &'static str,
+    /// KEEP_OUTPUT: what was dropped of stdout and of stderr.
+    elided: [Option<Elision>; 2],
+}
+
+impl FinalRecord {
+    fn exit(&self) -> NativeExit {
+        NativeExit {
+            elided: self.elided,
+            ..native_exit(
+                self.reason,
+                self.kill_cause,
+                self.code,
+                self.detail.as_bytes(),
+            )
+        }
+    }
 }
 
 /// Transport-neutral process catalogue snapshot used by the YAS adapter.
@@ -267,6 +556,8 @@ pub(crate) struct NativeExit {
     pub(crate) reason: u8,
     pub(crate) code: i32,
     pub(crate) detail: Vec<u8>,
+    /// KEEP_OUTPUT: what was dropped of stdout and of stderr.
+    pub(crate) elided: [Option<Elision>; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +568,12 @@ pub(crate) struct NativeSpawnRequest {
     /// process-group descendant. Keep that group alive and represent it as the
     /// running Process until the group is actually empty.
     pub(crate) preserve_residual: bool,
+    /// LEAVE_RESIDUE: how long the streams are forwarded after the direct child exits (None:
+    /// until they close). Only read with the flag.
+    pub(crate) residue_grace: Option<Duration>,
+    /// KEEP_OUTPUT: the bytes of each output stream's head and tail that are sent (the middle
+    /// is dropped, and counted).
+    pub(crate) keep_output: Option<(u64, usize)>,
     pub(crate) cwd: Option<Vec<u8>>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<(Vec<u8>, Vec<u8>)>,
@@ -330,13 +627,14 @@ pub(crate) enum NativeEvent {
     },
     Exit {
         process_id: u32,
+        process_handle: u64,
         exit: NativeExit,
     },
 }
 
 pub(crate) struct NativeEventEnvelope {
     pub(crate) event: NativeEvent,
-    _guard: Option<WriterGuard>,
+    guard: Option<WriterGuard>,
 }
 
 impl NativeEventEnvelope {
@@ -347,7 +645,9 @@ impl NativeEventEnvelope {
     /// before a concurrent final output acknowledgement observes retirement.
     pub(crate) fn dispatch<T>(self, dispatch: impl FnOnce(NativeEvent) -> T) -> T {
         let result = dispatch(self.event);
-        drop(self._guard);
+        if let Some(guard) = self.guard {
+            guard.dispatched();
+        }
         result
     }
 }
@@ -375,22 +675,40 @@ pub(crate) enum NativeControl {
 #[derive(Clone)]
 struct EndpointOutput {
     events: mpsc::Sender<NativeEventEnvelope>,
-    closed: watch::Sender<Option<String>>,
+    evictions: Arc<Evictions>,
+}
+
+/// The processes of one endpoint whose binding the output readers dropped: a watcher that fell
+/// a window behind, or one whose queue was full. Its adapter fails those attachments alone; the
+/// endpoint and its other processes go on.
+#[derive(Default)]
+pub(crate) struct Evictions {
+    process_ids: StdMutex<Vec<u32>>,
+    notify: Notify,
+}
+
+impl Evictions {
+    /// Waits for evictions (one waiter: the endpoint's adapter).
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// The process IDs evicted since the last call.
+    pub(crate) fn take(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.process_ids.lock().unwrap())
+    }
 }
 
 impl EndpointOutput {
-    fn kick(&self, reason: &str) {
-        if self.closed.borrow().is_none() {
-            let _ = self.closed.send(Some(reason.to_owned()));
-        }
+    fn evict(&self, process_id: u32) {
+        self.evictions.process_ids.lock().unwrap().push(process_id);
+        // A permit is kept when the adapter is not waiting yet.
+        self.evictions.notify.notify_one();
     }
 
     fn send_native(&self, event: NativeEvent, guard: Option<WriterGuard>) -> bool {
         self.events
-            .try_send(NativeEventEnvelope {
-                event,
-                _guard: guard,
-            })
+            .try_send(NativeEventEnvelope { event, guard })
             .is_ok()
     }
 
@@ -417,13 +735,27 @@ impl EndpointOutput {
         )
     }
 
-    fn send_exit(&self, process_id: u32, exit: NativeExit, guard: WriterGuard) -> bool {
-        self.send_native(NativeEvent::Exit { process_id, exit }, Some(guard))
+    fn send_exit(
+        &self,
+        process_id: u32,
+        process_handle: u64,
+        exit: NativeExit,
+        guard: WriterGuard,
+    ) -> bool {
+        self.send_native(
+            NativeEvent::Exit {
+                process_id,
+                process_handle,
+                exit,
+            },
+            Some(guard),
+        )
     }
 }
 
 struct ServerInner {
     policy: Policy,
+    maxima: ProcessMaxima,
     verbose: bool,
     next_generation: AtomicU64,
     next_endpoint: AtomicU64,
@@ -438,11 +770,18 @@ struct ServerInner {
 pub(crate) struct Server(Arc<ServerInner>);
 
 impl Server {
+    /// A server with the default maxima.
+    #[cfg(test)]
     pub(crate) fn new(verbose: bool, enabled: bool) -> Self {
-        let policy = Policy::from_env(enabled);
-        let max_spawning = env_usize("YAS_PROCESS_MAX_SPAWNING", DEFAULT_MAX_SPAWNING).max(1);
+        Self::with_maxima(verbose, enabled, ProcessMaxima::DEFAULT)
+    }
+
+    pub(crate) fn with_maxima(verbose: bool, enabled: bool, maxima: ProcessMaxima) -> Self {
+        let policy = Policy::new(enabled, &maxima);
+        let max_spawning = env_usize("YAS_PROCESS_MAX_SPAWNING", maxima.pending_spawns).max(1);
         Self(Arc::new(ServerInner {
             policy,
+            maxima,
             verbose,
             next_generation: AtomicU64::new(1),
             next_endpoint: AtomicU64::new(1),
@@ -464,6 +803,10 @@ impl Server {
         self.0.policy.enabled
     }
 
+    pub(crate) fn maxima(&self) -> ProcessMaxima {
+        self.0.maxima
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn active_terminate_timeout_tasks(&self) -> usize {
         self.0.terminate_timeout_tasks.load(Ordering::Acquire)
@@ -473,19 +816,22 @@ impl Server {
         &self,
         session_id: [u8; 16],
         event_capacity: usize,
-    ) -> (
-        Manager,
-        mpsc::Receiver<NativeEventEnvelope>,
-        watch::Receiver<Option<String>>,
-    ) {
+    ) -> (Manager, mpsc::Receiver<NativeEventEnvelope>, Arc<Evictions>) {
         debug_assert!(session_id.iter().any(|byte| *byte != 0));
         let id = self.0.next_endpoint.fetch_add(1, Ordering::Relaxed);
         let (events, receiver) = mpsc::channel(event_capacity.max(1));
-        let (closed, closed_receiver) = watch::channel(None);
+        let evictions = Arc::new(Evictions::default());
         (
-            self.endpoint_with_id(EndpointOutput { events, closed }, id, session_id),
+            self.endpoint_with_id(
+                EndpointOutput {
+                    events,
+                    evictions: evictions.clone(),
+                },
+                id,
+                session_id,
+            ),
             receiver,
-            closed_receiver,
+            evictions,
         )
     }
 
@@ -535,12 +881,7 @@ impl Server {
                 stdin_received: record.stdin_received,
                 stdout_produced: record.stdout_next,
                 stderr_produced: record.stderr_next,
-                exit: Some(native_exit(
-                    record.reason,
-                    record.kill_cause,
-                    record.code,
-                    record.detail.as_bytes(),
-                )),
+                exit: Some(record.exit()),
             });
         }
         records.sort_unstable_by_key(|record| record.process_handle);
@@ -567,6 +908,28 @@ impl Server {
             .finals
             .get(&process_handle)
             .map(|record| record.cwd.clone())
+    }
+
+    /// The catalogue's revision, which every change of it moves: what
+    /// [`Self::wait_native_catalogue_change`] waits past.
+    pub(crate) fn native_catalogue_revision(&self) -> u64 {
+        self.0.state.lock().unwrap().catalog_revision
+    }
+
+    /// Tests: until the child of `process_handle` is reaped (at once when it is not live).
+    #[cfg(all(test, unix))]
+    pub(crate) async fn wait_reaped(&self, process_handle: u64) {
+        let record = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .live
+            .get(&process_handle)
+            .and_then(Weak::upgrade);
+        if let Some(record) = record {
+            record.wait_reaped().await;
+        }
     }
 
     pub(crate) async fn wait_native_catalogue_change(&self, revision: u64) {
@@ -751,6 +1114,36 @@ struct EndpointState {
     slots: FxHashMap<u32, EndpointSlot>,
     /// Ordinary processes remain owned after their creator unsubscribes.
     owned: FxHashMap<u64, Weak<Record>>,
+    /// The finals of this endpoint's ordinary processes whose exits it missed: a WAIT of its
+    /// own finds them, as it finds the exits it took.
+    missed: MissedExits,
+}
+
+/// The newest finals of an endpoint's ordinary processes whose exits it missed: it had no
+/// binding to take the exit (its attachment went first), or the exit was dropped on its way
+/// (its queue was full). Nobody else sees them.
+#[derive(Default)]
+struct MissedExits {
+    values: FxHashMap<u64, Arc<FinalRecord>>,
+    order: VecDeque<u64>,
+}
+
+impl MissedExits {
+    fn insert(&mut self, final_record: Arc<FinalRecord>, capacity: usize) {
+        let generation = final_record.generation;
+        if self.values.insert(generation, final_record).is_none() {
+            self.order.push_back(generation);
+        }
+        while self.order.len() > capacity.max(1) {
+            if let Some(retired) = self.order.pop_front() {
+                self.values.remove(&retired);
+            }
+        }
+    }
+
+    fn get(&self, generation: u64) -> Option<&Arc<FinalRecord>> {
+        self.values.get(&generation)
+    }
 }
 
 enum EndpointSlot {
@@ -799,6 +1192,10 @@ struct Pending {
     process_id: u32,
     detachable: bool,
     preserve_residual: bool,
+    leave_residue: bool,
+    residue_grace: Option<Duration>,
+    keep_output: Option<(u64, usize)>,
+    stdin_null: bool,
     request_bytes: usize,
     endpoint: Weak<Endpoint>,
     server: Weak<ServerInner>,
@@ -843,6 +1240,17 @@ struct Binding {
 
 struct StreamState {
     next: u64,
+    /// KEEP_OUTPUT: the head and tail of this stream that are sent, the middle dropped.
+    kept: Option<KeptOutput>,
+}
+
+impl StreamState {
+    fn new(keep_output: Option<(u64, usize)>) -> Self {
+        Self {
+            next: 0,
+            kept: keep_output.map(|(head, tail)| KeptOutput::new(head, tail)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -887,6 +1295,10 @@ struct RecordInner {
     stderr: Option<StreamState>,
     stdout_readers: u8,
     stderr_readers: u8,
+    /// Output readers waiting for the owner to take its window (`owner_with_room`).
+    paced_readers: u8,
+    /// KEEP_OUTPUT streams are to send their tails now (`flush_kept`).
+    flush_kept: bool,
     child_outcome: Option<ChildOutcome>,
     tree_cleanup_done: bool,
     exit_override: Option<ExitOverride>,
@@ -901,6 +1313,9 @@ struct Record {
     generation: u64,
     detachable: bool,
     preserve_residual: bool,
+    /// LEAVE_RESIDUE: the direct child's exit leaves its group alone ([`abandon_residue`]).
+    leave_residue: bool,
+    residue_grace: Option<Duration>,
     pid: ProcessId,
     argv0: Vec<u8>,
     /// Absolute launch cwd. Linux PROCESS_CWD prefers the child's live cwd
@@ -975,7 +1390,12 @@ impl Manager {
         if request.process_id == 0
             || request.argv.is_empty()
             || request.argv[0].is_empty()
-            || request.flags & !(PROCESS_SPAWN_MERGE_STDERR | PROCESS_SPAWN_DETACHABLE) != 0
+            || request.flags
+                & !(PROCESS_SPAWN_MERGE_STDERR
+                    | PROCESS_SPAWN_DETACHABLE
+                    | PROCESS_SPAWN_LEAVE_RESIDUE
+                    | PROCESS_SPAWN_STDIN_NULL)
+                != 0
         {
             return Err(NativeError::Invalid("invalid Process spawn".to_owned()));
         }
@@ -1028,6 +1448,10 @@ impl Manager {
             process_id: owned.process_id,
             detachable,
             preserve_residual: request.preserve_residual,
+            leave_residue: owned.flags & PROCESS_SPAWN_LEAVE_RESIDUE != 0,
+            residue_grace: request.residue_grace,
+            keep_output: request.keep_output,
+            stdin_null: owned.flags & PROCESS_SPAWN_STDIN_NULL != 0,
             request_bytes,
             endpoint: Arc::downgrade(&self.endpoint),
             server: Arc::downgrade(&self.server.0),
@@ -1152,7 +1576,7 @@ impl Manager {
             #[cfg(windows)]
             job,
         } = spawned;
-        let stdin = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take();
         let stdout = (!merged).then(|| child.stdout.take().expect("piped stdout"));
         let stderr = (!merged).then(|| child.stderr.take().expect("piped stderr"));
         let (stdin_tx, stdin_rx) = mpsc::channel(PROCESS_MAX_UNACKED_PACKETS);
@@ -1177,6 +1601,8 @@ impl Manager {
             generation: pending.generation,
             detachable: pending.detachable,
             preserve_residual: pending.preserve_residual,
+            leave_residue: pending.leave_residue,
+            residue_grace: pending.residue_grace,
             pid,
             argv0: req.argv[0].to_vec(),
             cwd: process_cwd,
@@ -1193,17 +1619,23 @@ impl Manager {
             inner: StdMutex::new(RecordInner {
                 bindings,
                 stdin_controller,
-                stdin_tx: Some(stdin_tx),
+                stdin_tx: stdin.is_some().then_some(stdin_tx),
                 stdin_received: 0,
                 stdin_acked: 0,
                 stdin_frames: VecDeque::new(),
-                stdin_state: PROCESS_STDIN_ACCEPTING,
+                stdin_state: if stdin.is_some() {
+                    PROCESS_STDIN_ACCEPTING
+                } else {
+                    PROCESS_STDIN_CLOSED
+                },
                 stdin_closed_by_child: false,
-                stdin_writer_done: false,
-                stdout: StreamState { next: 0 },
-                stderr: (!merged).then_some(StreamState { next: 0 }),
+                stdin_writer_done: stdin.is_none(),
+                stdout: StreamState::new(pending.keep_output),
+                stderr: (!merged).then(|| StreamState::new(pending.keep_output)),
+                flush_kept: false,
                 stdout_readers: 1,
                 stderr_readers: if merged { 0 } else { 1 },
+                paced_readers: 0,
                 child_outcome: None,
                 tree_cleanup_done: false,
                 exit_override: None,
@@ -1227,13 +1659,16 @@ impl Manager {
         let task_start = Arc::new(Semaphore::new(0));
         let stdin_start = task_start.clone();
         let stdin_record = record.clone();
+        // STDIN_NULL: the child has the null device, and nothing writes to it.
         let stdin_task = tokio::spawn(async move {
             let permit = stdin_start
                 .acquire()
                 .await
                 .expect("spawn task gate remains open");
             permit.forget();
-            stdin_writer(stdin_record, stdin, stdin_rx).await;
+            if let Some(stdin) = stdin {
+                stdin_writer(stdin_record, stdin, stdin_rx).await;
+            }
         });
         let stdout_start = task_start.clone();
         let stdout_record = record.clone();
@@ -1303,7 +1738,7 @@ impl Manager {
             schedule_terminate_timeout(record.clone(), PROCESS_KILL_OWNER_LOST);
         }
         if installed_bound {
-            complete_spawn_success(&pending, record.generation, merged);
+            complete_spawn_success(&pending, record.generation, merged, pending.stdin_null);
         }
         task_start.add_permits(task_count);
         if self.server.0.verbose {
@@ -1444,10 +1879,13 @@ impl Manager {
             let Some(binding) = binding_index(&inner, self.endpoint.id, process_id) else {
                 return Err(NativeError::NotFound);
             };
-            let residual_running = record.preserve_residual
-                && inner.child_outcome.is_some()
-                && !inner.tree_cleanup_done;
-            if inner.terminal_queued || (inner.child_outcome.is_some() && !residual_running) {
+            let residual_running = residual_running(&record, &inner);
+            // Detach goes through until the exit is queued: its output may still be draining,
+            // and a binding nobody acknowledges would hold the readers the owner paces.
+            let detach = matches!(action, NativeControl::Detach);
+            if inner.terminal_queued
+                || (inner.child_outcome.is_some() && !residual_running && !detach)
+            {
                 return Err(NativeError::Conflict);
             }
             match action {
@@ -1459,9 +1897,27 @@ impl Manager {
                     }
                 }
                 NativeControl::Terminate => {
-                    graceful_terminate(&record)
-                        .map_err(|error| NativeError::Io(error.to_string()))?;
-                    timeout_cause = Some(PROCESS_KILL_TERMINATE_TIMEOUT);
+                    #[cfg(unix)]
+                    {
+                        graceful_terminate(&record)
+                            .map_err(|error| NativeError::Io(error.to_string()))?;
+                        timeout_cause = Some(PROCESS_KILL_TERMINATE_TIMEOUT);
+                    }
+                    // CTRL_BREAK reaches no process without a console, nor one that
+                    // detached from it: TERMINATE then ends the job at once rather than
+                    // leave it running.
+                    #[cfg(windows)]
+                    if graceful_terminate(&record).is_ok() {
+                        timeout_cause = Some(PROCESS_KILL_TERMINATE_TIMEOUT);
+                    } else {
+                        force_kill(&record).map_err(|error| NativeError::Io(error.to_string()))?;
+                        if inner.child_outcome.is_none() {
+                            inner.exit_override = Some(ExitOverride {
+                                reason: PROCESS_EXIT_KILLED,
+                                kill_cause: PROCESS_KILL_TERMINATE_TIMEOUT,
+                            });
+                        }
+                    }
                 }
                 NativeControl::Kill => {
                     force_kill(&record).map_err(|error| NativeError::Io(error.to_string()))?;
@@ -1471,7 +1927,12 @@ impl Manager {
                     });
                 }
                 NativeControl::Signal(signal) => {
-                    control_signal(&record, signal)?;
+                    if control_signal(&record, signal)? && inner.child_outcome.is_none() {
+                        inner.exit_override = Some(ExitOverride {
+                            reason: PROCESS_EXIT_KILLED,
+                            kill_cause: PROCESS_KILL_CLIENT,
+                        });
+                    }
                 }
                 NativeControl::Detach => {
                     inner.bindings.swap_remove(binding);
@@ -1578,7 +2039,11 @@ impl Manager {
             drop(server);
             record.changed.notify_waiters();
             Ok(watched)
-        } else if let Some(record) = server.finals.get(&process_handle) {
+        } else if let Some(record) = server
+            .finals
+            .get(&process_handle)
+            .or_else(|| endpoint.missed.get(process_handle))
+        {
             if endpoint_usage(&endpoint) >= self.server.0.policy.max_per_endpoint {
                 return Err(NativeError::ResourceExhausted);
             }
@@ -1595,15 +2060,49 @@ impl Manager {
                 stdout_next: record.stdout_next,
                 stderr_next: record.stderr_next,
                 stdin_window: 0,
-                exit: Some(native_exit(
-                    record.reason,
-                    record.kill_cause,
-                    record.code,
-                    record.detail.as_bytes(),
-                )),
+                exit: Some(record.exit()),
             })
         } else {
             Err(NativeError::NotFound)
+        }
+    }
+
+    /// Until a look at `process_handle` that WATCH refused as CONFLICT, with the catalogue at
+    /// `revision`, is worth another: the catalogue has moved on (the process's exit reached its
+    /// watchers and is final, or it left), or nothing refuses the look now (this endpoint's
+    /// own binding on it, a concurrent CONTROL's or a failed route's, has gone).
+    pub(crate) async fn wait_native_look(&self, process_handle: u64, revision: u64) {
+        let record = {
+            let state = self.server.0.state.lock().unwrap();
+            if state.catalog_revision != revision {
+                return;
+            }
+            state.live.get(&process_handle).and_then(Weak::upgrade)
+        };
+        let Some(record) = record else {
+            return;
+        };
+        loop {
+            // Both before the looks: notify_waiters reaches futures made before it.
+            let catalogue = self.server.0.catalog_changed.notified();
+            let changed = record.changed.notified();
+            if self.server.0.state.lock().unwrap().catalog_revision != revision {
+                return;
+            }
+            {
+                let inner = record.inner.lock().unwrap();
+                let own = inner
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.endpoint_id == self.endpoint.id);
+                if !inner.terminal_queued && !own {
+                    return;
+                }
+            }
+            tokio::select! {
+                () = catalogue => {}
+                () = changed => {}
+            }
         }
     }
 
@@ -1618,6 +2117,7 @@ impl Manager {
         let (slots, owned) = {
             let mut endpoint = self.endpoint.state.lock().unwrap();
             endpoint.accepting = false;
+            endpoint.missed = MissedExits::default();
             (
                 std::mem::take(&mut endpoint.slots),
                 std::mem::take(&mut endpoint.owned),
@@ -1713,7 +2213,9 @@ impl Manager {
         )
         .await;
         for record in &ordinary {
-            abort_pipes(record);
+            // The owner is gone: kept tails go to the watchers at once.
+            flush_kept(record).await;
+            finish_pipes(record);
         }
         // Pipe abortion makes terminal publication eligible. Keep shutdown
         // bounded, but leave any unusually slow record live so its own waiter
@@ -1847,7 +2349,12 @@ fn release_pending(pending: &Arc<Pending>, keep_generation: bool) {
     }
 }
 
-fn complete_spawn_success(pending: &Arc<Pending>, process_handle: u64, merged: bool) {
+fn complete_spawn_success(
+    pending: &Arc<Pending>,
+    process_handle: u64,
+    merged: bool,
+    stdin_null: bool,
+) {
     let Some(completion) = pending.completion.lock().unwrap().take() else {
         return;
     };
@@ -1855,7 +2362,12 @@ fn complete_spawn_success(pending: &Arc<Pending>, process_handle: u64, merged: b
     let _ = sender.send(Ok(NativeStarted {
         process_id: pending.process_id,
         process_handle,
-        stdin_window: PROCESS_DEFAULT_STREAM_WINDOW,
+        // No stdin Transfer for the null device.
+        stdin_window: if stdin_null {
+            0
+        } else {
+            PROCESS_DEFAULT_STREAM_WINDOW
+        },
         stdout_window: PROCESS_DEFAULT_STREAM_WINDOW,
         stderr_window: if merged {
             0
@@ -2020,7 +2532,11 @@ fn command_for(
         command.current_dir(PathBuf::from(OsString::from_vec(cwd.clone())));
     }
     command
-        .stdin(Stdio::piped())
+        .stdin(if req.flags & PROCESS_SPAWN_STDIN_NULL != 0 {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.as_std_mut().process_group(0);
@@ -2120,12 +2636,16 @@ fn command_for(
         command.current_dir(std::str::from_utf8(cwd).expect("Windows cwd validated UTF-8"));
     }
     command
-        .stdin(Stdio::piped())
+        .stdin(if req.flags & PROCESS_SPAWN_STDIN_NULL != 0 {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Suspension closes the otherwise unavoidable race between CreateProcess
     // and assigning the child to its kill-on-close job.
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+    command.creation_flags(console::creation_flags());
     command
 }
 
@@ -2314,6 +2834,148 @@ fn create_kill_on_close_job() -> io::Result<JobHandle> {
     }
 }
 
+/// Let what is left in a job outlive its handle: a LEAVE_RESIDUE process's residue survives the
+/// record, the session and the server, as setsid'd members do on Unix. TerminateJobObject
+/// still ends it while the handle is open.
+#[cfg(windows)]
+fn release_job_on_close(job: &JobHandle) -> io::Result<()> {
+    unsafe {
+        let limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        if SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Whether no process is left in the job (a failed query counts as "some are").
+#[cfg(windows)]
+fn job_empty(job: &JobHandle) -> bool {
+    unsafe {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+        QueryInformationJobObject(
+            job.0,
+            JobObjectBasicAccountingInformation,
+            (&raw mut info).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) != 0
+            && info.ActiveProcesses == 0
+    }
+}
+
+/// Up to 64 process IDs in the job.
+#[cfg(windows)]
+fn job_members(job: &JobHandle) -> io::Result<Vec<u32>> {
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST with room for 64 IDs (ULONG_PTR each).
+    #[repr(C)]
+    struct List {
+        assigned: u32,
+        listed: u32,
+        ids: [usize; 64],
+    }
+    unsafe {
+        let mut list: List = std::mem::zeroed();
+        if QueryInformationJobObject(
+            job.0,
+            JobObjectBasicProcessIdList,
+            (&raw mut list).cast(),
+            std::mem::size_of::<List>() as u32,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            let error = io::Error::last_os_error();
+            // A longer list still fills the first 64.
+            if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return Err(error);
+            }
+        }
+        let listed = (list.listed as usize).min(list.ids.len());
+        Ok(list.ids[..listed].iter().map(|id| *id as u32).collect())
+    }
+}
+
+/// Console control on Windows. CTRL_BREAK is the only console event that can be aimed at one
+/// process group (each child starts one), and it reaches only processes attached to the
+/// sender's console.
+///
+/// A server with a console (started from a terminal) lets its children share it and sends the
+/// event directly. A server without one (started detached, as `yas connect` and services do)
+/// gives each child a hidden console of its own (CREATE_NO_WINDOW, so no window opens on a
+/// desktop either) and, to send the event, attaches for a moment to the console of a live
+/// member of the child's job, one attachment at a time.
+#[cfg(windows)]
+mod console {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// Decided once, before any attachment could change the answer: the first spawn asks.
+    fn server_has_console() -> bool {
+        static HAS_CONSOLE: OnceLock<bool> = OnceLock::new();
+        *HAS_CONSOLE.get_or_init(|| {
+            let mut pids = [0u32; 1];
+            unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 1) != 0 }
+        })
+    }
+
+    pub(super) fn creation_flags() -> u32 {
+        let flags = CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED;
+        if server_has_console() {
+            flags
+        } else {
+            flags | CREATE_NO_WINDOW
+        }
+    }
+
+    static ATTACHED: StdMutex<()> = StdMutex::new(());
+
+    /// Send CTRL_BREAK to the process group `group` (the direct child's PID, which its
+    /// descendants keep after it exits), whose members are in `job`.
+    pub(super) fn ctrl_break(group: u32, job: &JobHandle) -> io::Result<()> {
+        if server_has_console() {
+            return if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) } != 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+        }
+        let mut members = job_members(job)?;
+        // The direct child first, while it runs; any member shares its console otherwise.
+        if let Some(index) = members.iter().position(|pid| *pid == group) {
+            members.swap(0, index);
+        }
+        let _attached = ATTACHED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Attaching may replace the standard handles of a process started without them.
+        let standard = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .map(|which| (which, unsafe { GetStdHandle(which) }));
+        let mut last = io::Error::other("no process of the group has a console");
+        for pid in members {
+            if unsafe { AttachConsole(pid) } == 0 {
+                last = io::Error::last_os_error();
+                continue;
+            }
+            let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) } != 0;
+            let error = io::Error::last_os_error();
+            unsafe {
+                FreeConsole();
+                for (which, handle) in standard {
+                    SetStdHandle(which, handle);
+                }
+            }
+            return if sent { Ok(()) } else { Err(error) };
+        }
+        Err(last)
+    }
+}
+
 fn send_stdin_ack(inner: &RecordInner, bytes: u64, stdin_state: u8) {
     for binding in &inner.bindings {
         binding
@@ -2383,77 +3045,375 @@ async fn stdin_writer(
 
 async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRead + Unpin) {
     let mut buffer = vec![0u8; OUTPUT_FRAME_PAYLOAD];
+    let kept = output_state(&mut record.inner.lock().unwrap(), stream)
+        .kept
+        .is_some();
+    // Whether the stream stopped for a flush (`flush_kept`) rather than at its end.
+    let mut flushed = false;
     loop {
-        match reader.read(&mut buffer).await {
+        // The process's owner takes all of its output: the pipe is read no further ahead of
+        // what the owner has taken than its window, so a writer faster than the owner's
+        // Transfer blocks on its pipe. (It used to be evicted, which closed the owner's whole
+        // Process endpoint.) Other watchers are still dropped when they fall a window behind.
+        // KEEP_OUTPUT: once the head is out, what the pipe gives is kept or dropped here, so it
+        // is read at the writer's speed; only what goes out waits for the owner.
+        let paced = !kept
+            || output_state(&mut record.inner.lock().unwrap(), stream)
+                .kept
+                .as_ref()
+                .is_some_and(KeptOutput::sends_now);
+        let owner = match (paced, kept) {
+            (false, _) => None,
+            (true, false) => owner_with_room(&record, stream).await,
+            (true, true) => tokio::select! {
+                owner = owner_with_room(&record, stream) => owner,
+                () = flush_requested(&record) => {
+                    flushed = true;
+                    break;
+                }
+            },
+        };
+        let read = if kept {
+            tokio::select! {
+                read = reader.read(&mut buffer) => read,
+                () = flush_requested(&record) => {
+                    flushed = true;
+                    break;
+                }
+            }
+        } else {
+            reader.read(&mut buffer).await
+        };
+        match read {
             Ok(0) => break,
             Err(_) => {
                 host_failure(&record, "process output pipe read failed");
                 break;
             }
             Ok(n) => {
-                let mut inner = record.inner.lock().unwrap();
-                let state = if stream == PROCESS_STREAM_STDOUT {
-                    &mut inner.stdout
-                } else {
-                    inner.stderr.as_mut().expect("separate stderr")
-                };
-                let offset = state.next;
-                let Some(next) = offset.checked_add(n as u64) else {
-                    drop(inner);
+                let owner = reserve(owner).await;
+                if deliver(&record, stream, Output::Read(&buffer[..n]), owner).is_err() {
                     protocol_violation(&record);
                     return;
-                };
-                state.next = next;
-                let mut evicted = Vec::new();
-                let mut index = 0;
-                while index < inner.bindings.len() {
-                    let has_credit = {
-                        let binding = &inner.bindings[index];
-                        let credit = if stream == PROCESS_STREAM_STDOUT {
-                            &binding.stdout
-                        } else {
-                            binding.stderr.as_ref().expect("separate stderr binding")
-                        };
-                        let available = offset
-                            .checked_sub(credit.acked)
-                            .and_then(|debt| PROCESS_DEFAULT_STREAM_WINDOW.checked_sub(debt));
-                        available.is_some_and(|bytes| bytes >= n as u64)
-                            && credit.frames.len() < PROCESS_MAX_UNACKED_PACKETS
-                    };
-                    if !has_credit {
-                        evicted.push(remove_binding_at(&mut inner, index));
-                        continue;
-                    }
-                    let process_id = inner.bindings[index].process_id;
-                    let sent = inner.bindings[index].out.send_output(
-                        process_id,
-                        stream,
-                        offset,
-                        &buffer[..n],
-                    );
-                    if sent {
-                        let binding = &mut inner.bindings[index];
-                        let credit = if stream == PROCESS_STREAM_STDOUT {
-                            &mut binding.stdout
-                        } else {
-                            binding.stderr.as_mut().expect("separate stderr binding")
-                        };
-                        credit.frames.push_back(next);
-                        index += 1;
-                    } else {
-                        evicted.push(remove_binding_at(&mut inner, index));
-                    }
-                }
-                drop(inner);
-                for binding in evicted {
-                    binding
-                        .out
-                        .kick("native process watcher exceeded its output window");
                 }
             }
         }
     }
+    if kept {
+        if send_kept_tail(&record, stream).await.is_err() {
+            protocol_violation(&record);
+            return;
+        }
+        // Flushed, the stream may go on (a residue holds it, or it is about to be aborted):
+        // what it gives now goes to nobody.
+        while flushed && matches!(reader.read(&mut buffer).await, Ok(1..)) {}
+    }
     stream_closed(&record, stream);
+}
+
+/// KEEP_OUTPUT: send what the stream kept of its end, a frame at a time as the owner takes them.
+/// The stream is finished: nothing more of it goes out.
+async fn send_kept_tail(record: &Arc<Record>, stream: u8) -> Result<(), ()> {
+    if let Some(kept) = output_state(&mut record.inner.lock().unwrap(), stream)
+        .kept
+        .as_mut()
+    {
+        kept.finish();
+    }
+    loop {
+        let owner = reserve(owner_with_room(record, stream).await).await;
+        if !deliver(record, stream, Output::Tail, owner)? {
+            break;
+        }
+    }
+    record.changed.notify_waiters();
+    Ok(())
+}
+
+/// Once the KEEP_OUTPUT streams are to send their tails now ([`flush_kept`]).
+async fn flush_requested(record: &Record) {
+    loop {
+        let changed = record.changed.notified();
+        if record.inner.lock().unwrap().flush_kept {
+            return;
+        }
+        changed.await;
+    }
+}
+
+/// KEEP_OUTPUT: have the streams send their tails now, as the exit is about to be reported or
+/// the streams stopped, and wait for them as [`drain_paced`] waits: while a reader waits for
+/// the owner to take its window, or until none has for `DRAIN_IDLE`. What a stream gives after
+/// its tail goes to nobody.
+async fn flush_kept(record: &Record) {
+    let tails_out = |inner: &RecordInner| {
+        let out = |state: Option<&StreamState>, readers: u8| {
+            state
+                .and_then(|state| state.kept.as_ref())
+                .is_none_or(|kept| kept.tail_out() || readers == 0)
+        };
+        out(Some(&inner.stdout), inner.stdout_readers)
+            && out(inner.stderr.as_ref(), inner.stderr_readers)
+    };
+    {
+        let mut inner = record.inner.lock().unwrap();
+        if tails_out(&inner) {
+            return;
+        }
+        inner.flush_kept = true;
+    }
+    record.changed.notify_waiters();
+    loop {
+        let changed = record.changed.notified();
+        let paced = {
+            let inner = record.inner.lock().unwrap();
+            if tails_out(&inner) {
+                return;
+            }
+            inner.paced_readers > 0
+        };
+        if paced {
+            changed.await;
+        } else if tokio::time::timeout(DRAIN_IDLE, changed).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// What an output reader sends: bytes it read (only their share of a KEEP_OUTPUT stream's head,
+/// when it keeps one), or the next frame of a kept tail.
+enum Output<'a> {
+    Read(&'a [u8]),
+    Tail,
+}
+
+/// The owner's Process events, with room for one frame of output reserved.
+type OwnerPermit = (u64, u32, mpsc::OwnedPermit<NativeEventEnvelope>);
+
+/// Reserve room in the owner's event queue ([`owner_with_room`]'s answer), before the record's
+/// lock is taken: its frame never finds the queue full.
+async fn reserve(
+    owner: Option<(u64, u32, mpsc::Sender<NativeEventEnvelope>)>,
+) -> Option<OwnerPermit> {
+    let (endpoint_id, process_id, events) = owner?;
+    let permit = events.reserve_owned().await.ok()?;
+    Some((endpoint_id, process_id, permit))
+}
+
+fn output_state(inner: &mut RecordInner, stream: u8) -> &mut StreamState {
+    if stream == PROCESS_STREAM_STDOUT {
+        &mut inner.stdout
+    } else {
+        inner.stderr.as_mut().expect("separate stderr")
+    }
+}
+
+/// Send output of `stream` to the process's bindings: to the owner through `owner`, reserved
+/// when it had room, and to each watcher that keeps up (the others are dropped). False when
+/// there was no tail left to send; Err past a u64 of offset (a protocol violation).
+fn deliver(
+    record: &Arc<Record>,
+    stream: u8,
+    output: Output<'_>,
+    owner: Option<OwnerPermit>,
+) -> Result<bool, ()> {
+    let mut owner = owner;
+    let mut inner = record.inner.lock().unwrap();
+    let tail;
+    let state = output_state(&mut inner, stream);
+    let data: &[u8] = match (output, state.kept.as_mut()) {
+        (Output::Read(data), None) => data,
+        (Output::Read(data), Some(kept)) => kept.feed(data),
+        (Output::Tail, Some(kept)) => match kept.next_tail_chunk(OUTPUT_FRAME_PAYLOAD) {
+            Some(chunk) => {
+                tail = chunk;
+                &tail
+            }
+            None => return Ok(false),
+        },
+        (Output::Tail, None) => return Ok(false),
+    };
+    if data.is_empty() {
+        return Ok(true);
+    }
+    let offset = state.next;
+    let Some(next) = offset.checked_add(data.len() as u64) else {
+        return Err(());
+    };
+    state.next = next;
+    let mut evicted = Vec::new();
+    let mut index = 0;
+    while index < inner.bindings.len() {
+        if let Some((endpoint_id, process_id, _)) = owner
+            && inner.bindings[index].endpoint_id == endpoint_id
+            && inner.bindings[index].process_id == process_id
+        {
+            let (_, _, permit) = owner.take().expect("owner permit");
+            permit.send(NativeEventEnvelope {
+                event: NativeEvent::Output {
+                    process_id,
+                    stream,
+                    offset,
+                    data: data.to_vec(),
+                },
+                guard: None,
+            });
+            let binding = &mut inner.bindings[index];
+            let credit = if stream == PROCESS_STREAM_STDOUT {
+                &mut binding.stdout
+            } else {
+                binding.stderr.as_mut().expect("separate stderr binding")
+            };
+            credit.frames.push_back(next);
+            index += 1;
+            continue;
+        }
+        let has_credit = {
+            let binding = &inner.bindings[index];
+            let credit = if stream == PROCESS_STREAM_STDOUT {
+                &binding.stdout
+            } else {
+                binding.stderr.as_ref().expect("separate stderr binding")
+            };
+            let available = offset
+                .checked_sub(credit.acked)
+                .and_then(|debt| PROCESS_DEFAULT_STREAM_WINDOW.checked_sub(debt));
+            available.is_some_and(|bytes| bytes >= data.len() as u64)
+                && credit.frames.len() < PROCESS_MAX_UNACKED_PACKETS
+        };
+        if !has_credit {
+            evicted.push(remove_binding_at(&mut inner, index));
+            continue;
+        }
+        let process_id = inner.bindings[index].process_id;
+        let sent = inner.bindings[index]
+            .out
+            .send_output(process_id, stream, offset, data);
+        if sent {
+            let binding = &mut inner.bindings[index];
+            let credit = if stream == PROCESS_STREAM_STDOUT {
+                &mut binding.stdout
+            } else {
+                binding.stderr.as_mut().expect("separate stderr binding")
+            };
+            credit.frames.push_back(next);
+            index += 1;
+        } else {
+            evicted.push(remove_binding_at(&mut inner, index));
+        }
+    }
+    drop(inner);
+    for binding in evicted {
+        // Its endpoint goes on: free the slot, or the process holds one for good.
+        if let Some(endpoint) = binding.endpoint.upgrade() {
+            remove_bound_slot(&endpoint, binding.process_id, record);
+        }
+        binding.out.evict(binding.process_id);
+    }
+    Ok(true)
+}
+
+/// Waits until the process's owner, while it is bound, can take another whole frame of
+/// `stream` (its window and unacknowledged frames); answers where to send it. None when the
+/// owner is not bound (it left, or detached): the output then goes to the watchers alone.
+async fn owner_with_room(
+    record: &Record,
+    stream: u8,
+) -> Option<(u64, u32, mpsc::Sender<NativeEventEnvelope>)> {
+    // Counted in `paced_readers` while it waits, however it stops (an abort drops it).
+    let mut paced = Paced {
+        record,
+        counted: false,
+    };
+    loop {
+        // Created before the check: an acknowledgement in between still wakes it.
+        let changed = record.changed.notified();
+        {
+            let mut inner = record.inner.lock().unwrap();
+            let owner = inner
+                .bindings
+                .iter()
+                .find(|binding| Weak::ptr_eq(&binding.endpoint, &record.owner))?;
+            let (next, credit) = if stream == PROCESS_STREAM_STDOUT {
+                (inner.stdout.next, &owner.stdout)
+            } else {
+                match (inner.stderr.as_ref(), owner.stderr.as_ref()) {
+                    (Some(state), Some(credit)) => (state.next, credit),
+                    _ => return None,
+                }
+            };
+            let debt = next.saturating_sub(credit.acked);
+            if debt.saturating_add(OUTPUT_FRAME_PAYLOAD as u64) <= PROCESS_DEFAULT_STREAM_WINDOW
+                && credit.frames.len() < PROCESS_OWNER_UNACKED_FRAMES
+            {
+                return Some((
+                    owner.endpoint_id,
+                    owner.process_id,
+                    owner.out.events.clone(),
+                ));
+            }
+            if !paced.counted {
+                paced.counted = true;
+                inner.paced_readers += 1;
+                drop(inner);
+                record.changed.notify_waiters();
+            }
+        }
+        changed.await;
+    }
+}
+
+/// An output reader waiting for its owner (`owner_with_room`), as `paced_readers` counts it.
+struct Paced<'a> {
+    record: &'a Record,
+    counted: bool,
+}
+
+impl Drop for Paced<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.record.inner.lock().unwrap().paced_readers -= 1;
+            self.record.changed.notify_waiters();
+        }
+    }
+}
+
+/// The cleanup of a finished process whose streams are still open once nothing of its group is
+/// left: what holds them is the child's own output that its owner has not taken yet (it paces
+/// the readers), so they go on until the pipes close, however slowly the owner takes its window.
+/// It stops waiting when no reader has waited for the owner for `DRAIN_IDLE` (a holder outside
+/// the group keeps a pipe open with nothing coming) or a stream has given `DRAIN_BUDGET` more (one
+/// that writes on). True when the streams closed.
+async fn drain_paced(record: &Record) -> bool {
+    let next = |inner: &RecordInner| {
+        (
+            inner.stdout.next,
+            inner.stderr.as_ref().map_or(0, |state| state.next),
+        )
+    };
+    let start = next(&record.inner.lock().unwrap());
+    loop {
+        let changed = record.changed.notified();
+        let paced = {
+            let inner = record.inner.lock().unwrap();
+            if io_tasks_done(&inner) {
+                return true;
+            }
+            let (stdout, stderr) = next(&inner);
+            if inner.tree_cleanup_done
+                || stdout - start.0 > DRAIN_BUDGET
+                || stderr - start.1 > DRAIN_BUDGET
+            {
+                return false;
+            }
+            inner.paced_readers > 0
+        };
+        if paced {
+            changed.await;
+        } else if tokio::time::timeout(DRAIN_IDLE, changed).await.is_err() {
+            return false;
+        }
+    }
 }
 
 fn stream_closed(record: &Arc<Record>, stream: u8) {
@@ -2509,8 +3469,14 @@ async fn wait_child(record: Arc<Record>, mut child: Child) {
     }
     record.mark_reaped();
     #[cfg(unix)]
-    if !record.preserve_residual {
+    if !record.preserve_residual && !record.leave_residue {
         let _ = graceful_terminate(&record);
+    }
+    // What a LEAVE_RESIDUE command leaves running is not the job's to kill when its handle
+    // closes; TERMINATE still ends it (escalate_residue).
+    #[cfg(windows)]
+    if record.leave_residue {
+        let _ = release_job_on_close(&record.job);
     }
     schedule_residual_cleanup(record.clone());
     try_queue_terminal(&record);
@@ -2518,6 +3484,51 @@ async fn wait_child(record: Arc<Record>, mut child: Child) {
 
 fn schedule_residual_cleanup(record: Arc<Record>) {
     tokio::spawn(async move {
+        // LEAVE_RESIDUE: forward output until the streams close or the grace passes, and signal
+        // nobody.
+        if record.leave_residue {
+            let deadline = async {
+                match record.residue_grace {
+                    Some(grace) => tokio::time::sleep(grace).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(deadline);
+            let closed = loop {
+                let changed = record.changed.notified();
+                {
+                    let inner = record.inner.lock().unwrap();
+                    if inner.tree_cleanup_done {
+                        return;
+                    }
+                    if io_tasks_done(&inner) {
+                        break true;
+                    }
+                }
+                tokio::select! {
+                    _ = changed => {}
+                    _ = &mut deadline => break false,
+                }
+            };
+            // The grace is for the group's residue: with none left, the streams hold the
+            // child's own output, which its owner takes at its own pace.
+            let closed = closed || (process_group_absent(&record) && drain_paced(&record).await);
+            if closed {
+                {
+                    let mut inner = record.inner.lock().unwrap();
+                    if inner.tree_cleanup_done {
+                        return;
+                    }
+                    inner.tree_cleanup_done = true;
+                }
+                record.changed.notify_waiters();
+                try_queue_terminal(&record);
+            } else {
+                flush_kept(&record).await;
+                abandon_residue(&record);
+            }
+            return;
+        }
         #[cfg(unix)]
         if record.preserve_residual {
             let mut poll = tokio::time::interval(Duration::from_millis(50));
@@ -2562,9 +3573,20 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
         // The direct child is already reaped, so this targets only residual
         // group/job members. Running it as soon as their inherited pipes close
         // also avoids a Unix process-group-ID reuse window.
+        #[cfg(unix)]
+        let cleanup_failed = !kill_group_until_gone(record.pid, RESIDUAL_ZOMBIE_WAIT).await;
+        #[cfg(windows)]
         let cleanup_failed = force_kill(&record)
             .err()
             .is_some_and(|error| !process_tree_already_absent(&error));
+        // Nothing of the group writes any more: what the pipes still hold is the child's own
+        // output, which its owner takes at its own pace. (Only a holder outside the group, or a
+        // group that could not be killed, stops the readers.)
+        if !cleanup_failed {
+            drain_paced(&record).await;
+        }
+        // What the streams kept of their ends goes out before they are stopped.
+        flush_kept(&record).await;
         let (stdin_abort, output_aborts) = {
             let mut inner = record.inner.lock().unwrap();
             if inner.tree_cleanup_done {
@@ -2614,11 +3636,54 @@ fn io_tasks_done(inner: &RecordInner) -> bool {
     inner.stdin_writer_done && inner.stdout_readers == 0 && inner.stderr_readers == 0
 }
 
+/// A LEAVE_RESIDUE process whose direct child is gone stops waiting for its streams: the exit
+/// is reported, the group members still holding them keep running untracked, and the readers
+/// drain what they write to nobody (bindings leave with the exit), so a writer never blocks on a
+/// full pipe or dies of a closed one. Nothing is aborted or signalled.
+fn abandon_residue(record: &Arc<Record>) {
+    let stdin_abort = {
+        let mut inner = record.inner.lock().unwrap();
+        if inner.tree_cleanup_done {
+            return;
+        }
+        inner.tree_cleanup_done = true;
+        inner.terminate_timeout_armed = false;
+        if io_tasks_done(&inner) {
+            None
+        } else {
+            inner.cleanup_detail = RESIDUE_LEFT_RUNNING;
+            let stdin_changed = inner.stdin_state != PROCESS_STDIN_CLOSED;
+            inner.stdin_tx.take();
+            inner.stdin_state = PROCESS_STDIN_CLOSED;
+            inner.stdin_writer_done = true;
+            inner.stdout_readers = 0;
+            inner.stderr_readers = 0;
+            inner.output_aborts.clear();
+            if stdin_changed {
+                send_stdin_ack(&inner, inner.stdin_acked, PROCESS_STDIN_CLOSED);
+            }
+            inner.stdin_abort.take()
+        }
+    };
+    if let Some(abort) = stdin_abort {
+        abort.abort();
+    }
+    record.changed.notify_waiters();
+    try_queue_terminal(record);
+}
+
+/// Whether the group of a LEAVE_RESIDUE (or surface) process may still be running after its
+/// direct child exited: CONTROL still reaches it.
+fn residual_running(record: &Record, inner: &RecordInner) -> bool {
+    (record.preserve_residual || record.leave_residue)
+        && inner.child_outcome.is_some()
+        && !inner.tree_cleanup_done
+}
+
 fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
     {
         let mut inner = record.inner.lock().unwrap();
-        let residual_running =
-            record.preserve_residual && inner.child_outcome.is_some() && !inner.tree_cleanup_done;
+        let residual_running = residual_running(&record, &inner);
         if (inner.child_outcome.is_some() && !residual_running)
             || inner.terminal_queued
             || inner.terminate_timeout_armed
@@ -2633,6 +3698,10 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
         .0
         .terminate_timeout_tasks
         .fetch_add(1, Ordering::AcqRel);
+    if record.leave_residue {
+        tokio::spawn(escalate_residue(record, cause));
+        return;
+    }
     tokio::spawn(async move {
         let finished = tokio::select! {
             _ = async {
@@ -2671,6 +3740,42 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
             .terminate_timeout_tasks
             .fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+/// TERMINATE's escalation for a LEAVE_RESIDUE process, as a shell stops a job: whatever became
+/// of the direct child, the group gets SIGKILL (on Windows, the job is terminated) after the
+/// kill grace unless it is gone already, and nobody waits for streams that members which left
+/// the group (or broke away from the job) still hold.
+async fn escalate_residue(record: Arc<Record>, cause: u8) {
+    tokio::time::sleep(record.server.0.policy.kill_grace).await;
+    if !process_group_absent(&record) && force_kill(&record).is_ok() {
+        let mut inner = record.inner.lock().unwrap();
+        if inner.child_outcome.is_none() && !inner.terminal_queued {
+            inner.exit_override = Some(ExitOverride {
+                reason: PROCESS_EXIT_KILLED,
+                kill_cause: cause,
+            });
+        }
+    }
+    record.wait_reaped().await;
+    // Killed members close their ends at once; only escapees keep the streams open.
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let changed = record.changed.notified();
+            if io_tasks_done(&record.inner.lock().unwrap()) {
+                return;
+            }
+            changed.await;
+        }
+    })
+    .await;
+    abandon_residue(&record);
+    #[cfg(test)]
+    record
+        .server
+        .0
+        .terminate_timeout_tasks
+        .fetch_sub(1, Ordering::AcqRel);
 }
 
 fn outcome_fields(outcome: ChildOutcome, override_: Option<ExitOverride>) -> (u8, u8, u32) {
@@ -2722,6 +3827,16 @@ fn try_queue_terminal(record: &Arc<Record>) {
         }
         inner.terminal_queued = true;
         let (reason, kill_cause, code) = outcome_fields(outcome, inner.exit_override);
+        // A kept tail that never went out (its reader was stopped first) counts as dropped.
+        let elided = |state: Option<&mut StreamState>| {
+            let kept = state?.kept.as_mut()?;
+            kept.drop_rest();
+            kept.elision()
+        };
+        let elided = [
+            elided(Some(&mut inner.stdout)),
+            elided(inner.stderr.as_mut()),
+        ];
         let final_record = Arc::new(FinalRecord {
             generation: record.generation,
             pid: record.pid,
@@ -2739,6 +3854,7 @@ fn try_queue_terminal(record: &Arc<Record>) {
             kill_cause,
             code,
             detail: inner.cleanup_detail,
+            elided,
         });
         inner.stdin_controller = None;
         (std::mem::take(&mut inner.bindings), final_record)
@@ -2746,50 +3862,71 @@ fn try_queue_terminal(record: &Arc<Record>) {
     record.terminal_notify.notify_waiters();
     let (bindings, final_record) = terminal;
     if bindings.is_empty() {
-        finish_terminal(record.clone(), final_record);
+        // Nobody takes the exit, its owner included.
+        finish_terminal(record.clone(), final_record, true);
         return;
     }
+    // Whether the owner misses the exit: it has no binding to take it (its attachment went
+    // first), or the exit is dropped on its way to it.
+    let owner = record.owner.upgrade().map(|owner| owner.id);
+    let owner_missed = Arc::new(AtomicBool::new(
+        !bindings
+            .iter()
+            .any(|binding| Some(binding.endpoint_id) == owner),
+    ));
     let remaining = Arc::new(AtomicUsize::new(bindings.len()));
     for binding in bindings {
         let endpoint = binding.endpoint.upgrade();
         let record_for_guard = record.clone();
         let final_for_guard = final_record.clone();
         let remaining_for_guard = remaining.clone();
+        let owner_missed = owner_missed.clone();
+        let owners = Some(binding.endpoint_id) == owner;
         let process_id = binding.process_id;
-        let guard = WriterGuard::new(move || {
+        let guard = WriterGuard::new(move |dispatched| {
+            if owners && !dispatched {
+                owner_missed.store(true, Ordering::Release);
+            }
             if let Some(endpoint) = endpoint {
                 remove_bound_slot(&endpoint, process_id, &record_for_guard);
             }
             if remaining_for_guard.fetch_sub(1, Ordering::AcqRel) == 1 {
-                finish_terminal(record_for_guard, final_for_guard);
+                let owner_missed = owner_missed.load(Ordering::Acquire);
+                finish_terminal(record_for_guard, final_for_guard, owner_missed);
             }
         });
-        let _ = binding.out.send_exit(
+        if !binding.out.send_exit(
             binding.process_id,
-            native_exit(
-                final_record.reason,
-                final_record.kill_cause,
-                final_record.code,
-                final_record.detail.as_bytes(),
-            ),
+            record.generation,
+            final_record.exit(),
             guard,
-        );
+        ) {
+            // Its queue is full, and the exit lost to it: its attachment fails, as one that
+            // falls behind does, and its client WAITs.
+            binding.out.evict(binding.process_id);
+        }
     }
 }
 
+/// The exit record's `code` keeps the native code bit for bit: a Windows exit
+/// code is a DWORD, and the NTSTATUS ones (0xC0000005 for an access violation,
+/// 0xC000013A after Ctrl+C) are negative as an `i32`. POSIX exit codes and
+/// signal numbers are small.
 fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeExit {
     match reason {
         PROCESS_EXIT_RETURNED => NativeExit {
             kind: wire::ExitKind::Code,
             reason: process_schema::EXIT_REASON_UNKNOWN as u8,
-            code: i32::try_from(code).unwrap_or(i32::MAX),
+            code: code as i32,
             detail: detail.to_vec(),
+            elided: [None; 2],
         },
         PROCESS_EXIT_SIGNALLED => NativeExit {
             kind: wire::ExitKind::Signal,
             reason: portable_signal_reason(code),
-            code: i32::try_from(code).unwrap_or(i32::MAX),
+            code: code as i32,
             detail: detail.to_vec(),
+            elided: [None; 2],
         },
         PROCESS_EXIT_KILLED => NativeExit {
             kind: wire::ExitKind::Killed,
@@ -2802,6 +3939,7 @@ fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeEx
             },
             code: 0,
             detail: detail.to_vec(),
+            elided: [None; 2],
         },
         _ => NativeExit {
             kind: wire::ExitKind::Other,
@@ -2812,6 +3950,7 @@ fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeEx
             } else {
                 detail.to_vec()
             },
+            elided: [None; 2],
         },
     }
 }
@@ -2837,11 +3976,21 @@ fn portable_signal_reason(signal: u32) -> u8 {
     }
 }
 
-fn finish_terminal(record: Arc<Record>, final_record: Arc<FinalRecord>) {
+/// `owner_missed`: the exit did not reach the owner. An ordinary process's final is then kept
+/// for it, before the release moves the catalogue: a WAIT of its that found the exit on its way
+/// looks again at that change.
+fn finish_terminal(record: Arc<Record>, final_record: Arc<FinalRecord>, owner_missed: bool) {
     if record.detachable {
         let server = record.server.clone();
         server.finish_detached(record, final_record);
     } else {
+        if owner_missed && let Some(owner) = record.owner.upgrade() {
+            let mut state = owner.state.lock().unwrap();
+            if state.accepting {
+                let capacity = record.server.0.maxima.exit_replays();
+                state.missed.insert(final_record, capacity);
+            }
+        }
         record.server.release_record(&record);
     }
 }
@@ -2918,7 +4067,8 @@ async fn terminate_record(record: &Arc<Record>, cause: u8, grace: Duration) {
         };
         let _ = tokio::time::timeout(grace.max(Duration::from_millis(100)), forced).await;
     }
-    abort_pipes(record);
+    flush_kept(record).await;
+    finish_pipes(record);
     let _ = tokio::time::timeout(
         grace.max(Duration::from_millis(100)),
         record.wait_tree_cleanup(),
@@ -2950,6 +4100,16 @@ async fn wait_and_force(records: &[Arc<Record>], cause: u8, grace: Duration) {
             }
         };
         let _ = tokio::time::timeout(grace.max(Duration::from_millis(100)), forced).await;
+    }
+}
+
+/// Stop waiting for a stopped record's streams: a LEAVE_RESIDUE process whose direct child is
+/// gone leaves them to its residue ([`abandon_residue`]); any other aborts them.
+fn finish_pipes(record: &Arc<Record>) {
+    if record.leave_residue && record.reaped.load(Ordering::Acquire) {
+        abandon_residue(record);
+    } else {
+        abort_pipes(record);
     }
 }
 
@@ -2993,11 +4153,7 @@ fn graceful_terminate(record: &Record) -> io::Result<()> {
 
 #[cfg(windows)]
 fn graceful_terminate(record: &Record) -> io::Result<()> {
-    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, record.pid) } != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    console::ctrl_break(record.pid, &record.job)
 }
 
 #[cfg(unix)]
@@ -3019,6 +4175,31 @@ fn process_tree_already_absent(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
+/// SIGKILL a process group; true once nothing is left of it.
+///
+/// macOS answers EPERM, not ESRCH, for a group whose remaining members are
+/// all zombies: XNU's killpg1 skips zombies, then has found nobody to signal.
+/// Orphans are reaped by init at once, so on EPERM this retries for up to
+/// `wait` for the group to disappear before it counts as a failure (a member
+/// this user may not signal, as on Linux).
+#[cfg(unix)]
+async fn kill_group_until_gone(pid: ProcessId, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match signal_group(pid, libc::SIGKILL) {
+            Ok(()) => return true,
+            Err(error) if process_tree_already_absent(&error) => return true,
+            Err(error)
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn process_group_absent(record: &Record) -> bool {
     signal_group(record.pid, 0)
@@ -3031,6 +4212,11 @@ fn process_tree_already_absent(_error: &io::Error) -> bool {
     false
 }
 
+#[cfg(windows)]
+fn process_group_absent(record: &Record) -> bool {
+    job_empty(&record.job)
+}
+
 #[cfg(unix)]
 fn cleanup_terminate(record: &Record) -> io::Result<()> {
     graceful_terminate(record)
@@ -3041,30 +4227,51 @@ fn cleanup_terminate(record: &Record) -> io::Result<()> {
     force_kill(record)
 }
 
+/// Signal the group; true when that killed it outright (so the exit says KILLED, as KILL's does).
 #[cfg(unix)]
-fn control_signal(record: &Record, value: u32) -> Result<(), NativeError> {
+fn control_signal(record: &Record, value: u32) -> Result<bool, NativeError> {
     let signal = i32::try_from(value).ok().filter(|signal| *signal > 0);
     match signal {
-        Some(signal) => signal_group(record.pid, signal).map_err(|error| {
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                NativeError::Invalid("invalid signal".to_owned())
-            } else {
-                NativeError::Io(os_error_detail(error).to_owned())
-            }
-        }),
+        Some(signal) => signal_group(record.pid, signal)
+            .map(|()| false)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    NativeError::Invalid("invalid signal".to_owned())
+                } else {
+                    NativeError::Io(os_error_detail(error).to_owned())
+                }
+            }),
         None => Err(NativeError::Invalid("invalid signal".to_owned())),
     }
 }
 
+/// The portable signals as Windows can deliver them: CTRL_BREAK is the only console event that
+/// reaches one process group, so INTERRUPT, TERMINATE and HANGUP send it; KILL ends the job.
+/// True when that killed the group outright.
 #[cfg(windows)]
-fn control_signal(record: &Record, value: u32) -> Result<(), NativeError> {
-    if value != CTRL_BREAK_EVENT {
-        return Err(NativeError::Invalid(
+fn control_signal(record: &Record, value: u32) -> Result<bool, NativeError> {
+    match value {
+        windows_signal::KILL => force_kill(record)
+            .map(|()| true)
+            .map_err(|error| NativeError::Io(error.to_string())),
+        windows_signal::INTERRUPT | windows_signal::TERMINATE | windows_signal::HANGUP => {
+            graceful_terminate(record)
+                .map(|()| false)
+                .map_err(|_| NativeError::Io("console control is unavailable".to_owned()))
+        }
+        _ => Err(NativeError::Invalid(
             "signal is unsupported on Windows".to_owned(),
-        ));
+        )),
     }
-    graceful_terminate(record)
-        .map_err(|_| NativeError::Io("console control is unavailable".to_owned()))
+}
+
+/// What [`control_signal`] takes on Windows for the portable signals (their Unix numbers).
+#[cfg(windows)]
+pub(crate) mod windows_signal {
+    pub(crate) const HANGUP: u32 = 1;
+    pub(crate) const INTERRUPT: u32 = 2;
+    pub(crate) const KILL: u32 = 9;
+    pub(crate) const TERMINATE: u32 = 15;
 }
 
 #[cfg(unix)]
@@ -3074,5 +4281,192 @@ fn os_error_detail(error: io::Error) -> &'static str {
         Some(libc::EPERM) => "permission denied signaling process group",
         Some(libc::EINVAL) => "invalid signal",
         _ => "process control failed",
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    #[test]
+    fn an_exit_code_keeps_its_bits() {
+        for code in [
+            0u32,
+            1,
+            255,
+            0x7FFF_FFFF,
+            0xC000_0005,
+            0xC000_013A,
+            u32::MAX,
+        ] {
+            let exit = native_exit(PROCESS_EXIT_RETURNED, 0, code, b"");
+            assert_eq!(exit.kind, wire::ExitKind::Code);
+            assert_eq!(exit.code as u32, code);
+        }
+        assert_eq!(
+            native_exit(PROCESS_EXIT_RETURNED, 0, 0xC000_0005, b"").code,
+            -1_073_741_819
+        );
+        let signalled = native_exit(PROCESS_EXIT_SIGNALLED, 0, 9, b"");
+        assert_eq!(
+            (signalled.kind, signalled.code),
+            (wire::ExitKind::Signal, 9)
+        );
+    }
+}
+
+#[cfg(test)]
+mod maxima_tests {
+    use super::ProcessMaxima;
+    use std::collections::HashMap;
+
+    fn from(vars: &[(&str, &str)]) -> (ProcessMaxima, Vec<String>) {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        ProcessMaxima::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn defaults_keep_every_historical_capacity() {
+        let defaults = ProcessMaxima::DEFAULT;
+        assert_eq!(
+            (
+                defaults.per_session,
+                defaults.total,
+                defaults.pending_spawns,
+                defaults.stream_buffer_bytes,
+                defaults.envc,
+                defaults.pending_waits,
+                defaults.pending_operations,
+            ),
+            (16, 64, 8, 8 * 1024 * 1024, 256, 32, 16)
+        );
+        assert_eq!(defaults.outbound_transfers(), 32);
+        assert_eq!(defaults.operation_replays(), 256);
+        assert_eq!(defaults.exit_replays(), 64);
+        assert_eq!(defaults.endpoint_events(), 80);
+        assert_eq!(defaults.limits(), {
+            let mut limits = yas_wire::process::Limits::DEFAULT;
+            limits.max_mutation_replays = 256;
+            limits
+        });
+        assert_eq!(from(&[]), (defaults, Vec::new()));
+        defaults.validate().unwrap();
+        ProcessMaxima::HARD.validate().unwrap();
+    }
+
+    #[test]
+    fn environment_raises_maxima_and_the_capacities_that_follow_them() {
+        let (maxima, warnings) = from(&[
+            ("YAS_PROCESS_MAX_PER_SESSION", "1024"),
+            ("YAS_PROCESS_MAX", "4096"),
+            ("YAS_PROCESS_MAX_PENDING_SPAWNS", "64"),
+            ("YAS_PROCESS_STREAM_BUFFER_MAX", "67108864"),
+            ("YAS_PROCESS_MAX_ENV", "4096"),
+            ("YAS_PROCESS_MAX_WAITS", "1024"),
+            ("YAS_PROCESS_MAX_OPERATIONS", "256"),
+        ]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(maxima.per_session, 1024);
+        assert_eq!(maxima.total, 4096);
+        assert_eq!(maxima.stream_buffer_bytes, 64 * 1024 * 1024);
+        assert_eq!(maxima.outbound_transfers(), 32 + 2 * (1024 - 16));
+        assert_eq!(maxima.operation_replays(), 2 * 1024 + 64 + 256);
+        assert_eq!(maxima.exit_replays(), 4096);
+        assert_eq!(maxima.endpoint_events(), 80 + 5 * (1024 - 16));
+        let limits = maxima.limits();
+        assert_eq!(limits.max_processes_per_session, 1024);
+        assert_eq!(limits.max_pending_waits, 1024);
+        assert_eq!(
+            yas_wire::process::Limits::from_extensions(&limits.to_extensions().unwrap()).unwrap(),
+            limits
+        );
+    }
+
+    #[test]
+    fn environment_is_lenient_and_honours_the_older_per_client_name() {
+        let (maxima, warnings) = from(&[("YAS_PROCESS_MAX_PER_CLIENT", "4")]);
+        assert_eq!(maxima.per_session, 4);
+        assert!(warnings.is_empty());
+        let (maxima, _) = from(&[
+            ("YAS_PROCESS_MAX_PER_SESSION", "32"),
+            ("YAS_PROCESS_MAX_PER_CLIENT", "4"),
+        ]);
+        assert_eq!(maxima.per_session, 32);
+        let (maxima, warnings) = from(&[
+            ("YAS_PROCESS_MAX", "lots"),
+            ("YAS_PROCESS_MAX_WAITS", "0"),
+            ("YAS_PROCESS_MAX_PER_SESSION", "1000000"),
+        ]);
+        assert_eq!(maxima, ProcessMaxima::DEFAULT);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("YAS_PROCESS_MAX=\"lots\""))
+        );
+    }
+
+    #[test]
+    fn validation_bounds_every_field() {
+        let mut maxima = ProcessMaxima::DEFAULT;
+        maxima.pending_waits = 0;
+        assert!(maxima.validate().is_err());
+        let mut maxima = ProcessMaxima::DEFAULT;
+        maxima.per_session = ProcessMaxima::HARD.per_session + 1;
+        assert!(
+            maxima
+                .validate()
+                .unwrap_err()
+                .contains("processes per session")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod residual_tests {
+    use super::*;
+
+    /// A group whose members are all zombies waiting for their reaper is gone
+    /// as far as cleanup goes. macOS answers `kill(-pgid)` with EPERM, not
+    /// ESRCH, when only zombies are left (XNU's killpg1 skips them). The
+    /// background child that the group SIGTERM had just killed, and launchd
+    /// had not reaped yet, made the final SIGKILL of a finished command "fail",
+    /// and its exit turned into a host failure.
+    #[tokio::test]
+    async fn a_group_of_zombies_waiting_for_their_reaper_counts_as_gone() {
+        let pid = crate::pty::fork_child();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::setpgid(pid, pid) };
+        // The child is a zombie now, still unreaped: its group is only a zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
+        // Reap it a moment later, as init reaps an orphan.
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        });
+        let gone = kill_group_until_gone(pid as ProcessId, Duration::from_secs(5)).await;
+        reaper.join().unwrap();
+        assert!(
+            gone,
+            "the SIGKILL of a zombie-only group counted as a failure"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "yas-proxy"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 description = "yas connection pool and protocol-transparent proxy"
 license.workspace = true
@@ -11,18 +11,37 @@ homepage.workspace = true
 name = "yas_proxy"
 path = "src/lib.rs"
 
+[features]
+default = ["ring"]
+# The crypto provider for TLS, QUIC and the uplink: one of them is needed; with
+# both, aws-lc-rs is used unless the program installed a process-wide rustls
+# default.
+ring = [
+    "rustls/ring",
+    "web-transport-quinn/ring",
+    "yas-webrtc-forwarder/ring",
+    "yas-uplink/ring",
+]
+aws-lc-rs = [
+    "rustls/aws_lc_rs",
+    "web-transport-quinn/aws-lc-rs",
+    "yas-webrtc-forwarder/aws-lc-rs",
+    "yas-uplink/aws-lc-rs",
+]
+
 [dependencies]
 rustls-native-certs = "0.8"
 tokio = { version = "1", features = ["full"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
-web-transport-quinn = { version = "0.12", features = ["ring"] }
+web-transport-quinn = { version = "0.12", default-features = false }
 futures-util = "0.3"
 bytes = "1"
 rand = "0.10"
 url = "2"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json = "1"
+socket2 = "0.6"
 yas-webrtc-forwarder = { workspace = true }
 yas-composite-transport = { workspace = true }
 yas-uplink = { workspace = true }
@@ -35,3 +54,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }

@@ -709,6 +709,9 @@ mod stub {
         ) -> Result<(), mpsc::SendError<CompositorCommand>> {
             self.command_tx.send(command)
         }
+
+        /// Wake the compositor event loop immediately.
+        pub fn wake(&self) {}
     }
 
     impl CompositorHandle {

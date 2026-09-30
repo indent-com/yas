@@ -1,4 +1,4 @@
-import type { SessionId } from "./types";
+import type { SessionId } from "./types.js";
 
 /** Presentation flags shared by the native FS client and Workspace UI. */
 export const FS_ENTRY_TYPE_MASK = 0b11;

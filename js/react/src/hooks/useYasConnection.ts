@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { YasConnectionSnapshot, ConnectionId } from "@yas-run/core";
-import { useRequiredYasWorkspace } from "../YasContext";
+import { useRequiredYasWorkspace } from "../YasContext.js";
 
 export function useYasConnection(
   connectionId?: ConnectionId,

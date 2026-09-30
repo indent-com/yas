@@ -12228,6 +12228,13 @@ impl CompositorCommandSender {
     ) -> Result<(), mpsc::SendError<CompositorCommand>> {
         send_command_with_wake(&self.command_tx, command, || self.loop_signal.wakeup())
     }
+
+    /// Wake the compositor loop, after a command admitted on the raw channel
+    /// (`try_send`): an idle loop otherwise sees it only at its next dispatch
+    /// timeout, up to a second later.
+    pub fn wake(&self) {
+        self.loop_signal.wakeup();
+    }
 }
 
 fn send_command_with_wake(

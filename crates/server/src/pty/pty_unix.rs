@@ -789,15 +789,67 @@ fn child_spawn_lock() -> &'static Mutex<()> {
 
 /// Fork while excluding `Command::spawn` error-pipe creation.
 ///
+/// Signals stay blocked across `fork()` until the child has put every
+/// signal the server catches back to its default action. Until `execve` the
+/// child would otherwise run the server's handlers: a SIGTERM sent to a
+/// terminal that had just started ran the server's shutdown handler in the
+/// child and was lost, and the program the child became kept running. A
+/// signal sent in that window now waits, then takes its default action, as
+/// it would after exec.
+///
 /// The child deliberately leaks its copied guard: unlocking a pthread mutex
 /// after fork is not async-signal-safe, and exec/_exit will discard it.
 pub(crate) fn fork_child() -> libc::pid_t {
     let guard = child_spawn_lock().lock().unwrap();
+    // SAFETY: plain sigset_t values; this thread's mask is restored on both
+    // sides of the fork below.
+    let mut all: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+    }
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         std::mem::forget(guard);
+        // SAFETY: the forked child has one thread and only makes
+        // async-signal-safe calls here.
+        unsafe {
+            reset_caught_signals();
+            libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        }
+    } else {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        }
     }
     pid
+}
+
+/// Put every signal this process catches back to its default action, as
+/// `execve` does. Ignored signals stay ignored, as they would across exec.
+///
+/// # Safety
+///
+/// For a freshly forked child: only calls `sigaction`, which is
+/// async-signal-safe.
+unsafe fn reset_caught_signals() {
+    // Past the last signal, sigaction fails with EINVAL and is skipped.
+    for signal in 1..=64 {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } != 0 {
+            continue;
+        }
+        if current.sa_sigaction == libc::SIG_DFL || current.sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
+        let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
+        default.sa_sigaction = libc::SIG_DFL;
+        unsafe { libc::sigaction(signal, &default, std::ptr::null_mut()) };
+    }
 }
 
 /// Register a pid as a live PTY child (backstop-parkable).
@@ -1689,6 +1741,61 @@ mod tests {
             }
         }
         assert!(reaped, "group kill missed the pre-setsid child");
+    }
+
+    /// A signal that reaches a forked child before `execve` takes its
+    /// default action. Until exec the child carries the server's handlers,
+    /// and the server catches SIGTERM (its own shutdown): a SIGTERM that a
+    /// client sent right after starting or restarting a terminal ran that
+    /// handler in the child and was lost, and the program the child became
+    /// kept running.
+    #[test]
+    fn a_signal_before_exec_takes_its_default_action() {
+        extern "C" fn caught(_: libc::c_int) {}
+        // Catch SIGTERM as the server does, for as long as the test runs.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = caught as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGTERM, &action, &mut previous) },
+            0
+        );
+
+        let pid = super::fork_child();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Where a PTY child would still be setting up.
+            unsafe {
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let mut status = 0;
+        let mut reaped = false;
+        for _ in 0..500 {
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !reaped {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        unsafe { libc::sigaction(libc::SIGTERM, &previous, std::ptr::null_mut()) };
+        assert!(
+            reaped,
+            "the child swallowed SIGTERM with the parent's handler"
+        );
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM,
+            "status {status:#x}"
+        );
     }
 
     /// Exit detection must not depend on the master fd reaching EOF: a

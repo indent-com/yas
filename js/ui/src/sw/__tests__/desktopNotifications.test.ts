@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { EMBED_DOCUMENT_PATH } from "@yas-run/core/preview";
 import {
+  appWindow,
   desktopNotificationIdentity,
   desktopNotificationImage,
   desktopNotificationSourceClientId,
@@ -17,6 +19,35 @@ describe("desktop notification worker boundary", () => {
     expect(
       topLevelDesktopSender({ type: "worker", frameType: "top-level" }, false),
     ).toBe(false);
+  });
+
+  it("brokers Net through the top-level app or the app a host frames", () => {
+    const top = { type: "window", frameType: "top-level", url: "https://h/" };
+    expect(appWindow(top, false)).toBe(true);
+    expect(appWindow(top, true)).toBe(false);
+    const embedded = {
+      type: "window",
+      frameType: "nested",
+      url: `https://h${EMBED_DOCUMENT_PATH}#workspace=x`,
+    };
+    expect(appWindow(embedded, false)).toBe(true);
+    // A pane is never the app, wherever it sits.
+    expect(appWindow(embedded, true)).toBe(false);
+    expect(
+      appWindow(
+        { type: "window", frameType: "nested", url: "https://h/" },
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      appWindow(
+        { type: "worker", frameType: "nested", url: embedded.url },
+        false,
+      ),
+    ).toBe(false);
+    expect(appWindow({ type: "window", frameType: "nested" }, false)).toBe(
+      false,
+    );
   });
 
   it("bounds and validates click identities", () => {

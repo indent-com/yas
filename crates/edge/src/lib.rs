@@ -78,8 +78,11 @@ const _: () = assert!(
         && yas_wire::schema::transport::STREAM_LENGTH_BYTES == size_of::<u32>()
 );
 
-const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
-const SW_JS_BR: &[u8] = include_bytes!("../../../js/ui/dist/sw.js.br");
+/// The web UI's page, Brotli-compressed (see build.rs for where it comes
+/// from). The `yas` CLI serves the same bytes.
+pub const INDEX_HTML_BR: &[u8] = include_bytes!(concat!(env!("YAS_UI_DIST"), "/index.html.br"));
+/// The web UI's service worker, Brotli-compressed.
+pub const SW_JS_BR: &[u8] = include_bytes!(concat!(env!("YAS_UI_DIST"), "/sw.js.br"));
 
 static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| yas_webserver::html_etag(INDEX_HTML_BR));
 static SW_ETAG: LazyLock<String> = LazyLock::new(|| yas_webserver::html_etag(SW_JS_BR));

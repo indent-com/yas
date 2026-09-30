@@ -11,13 +11,20 @@
 
 [package]
 edition = "2021"
-name = "cros-codecs"
-version = "0.0.6"
+name = "yas-cros-codecs"
+version = "0.0.6-yas.1"
 authors = ["The ChromiumOS Authors"]
-description = "Hardware-accelerated codecs for Linux"
+publish = ["crates-io"]
+exclude = [".cargo-ok", ".cargo_vcs_info.json", "Cargo.toml.orig", "/target"]
+description = "ChromeOS cros-codecs with the YAS stateless decoder changes"
+homepage = "https://github.com/chromeos/cros-codecs"
 readme = "README.md"
 license = "BSD-3-Clause"
-repository = "https://github.com/chromeos/cros-codecs"
+repository = "https://github.com/yas-run/yas"
+
+[lib]
+name = "cros_codecs"
+path = "src/lib.rs"
 
 [[example]]
 name = "ccdec"

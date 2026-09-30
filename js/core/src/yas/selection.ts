@@ -40,8 +40,8 @@ import {
   YAS_SELECTION_WATCH,
   YAS_STATUS_NOT_FOUND,
   YAS_TRANSFER_SENSITIVE_CONTENT_EXTENSION,
-} from "./generated";
-import type { YasConnection } from "./session";
+} from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -58,7 +58,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_RECEIVER_TO_SENDER,
@@ -70,7 +70,7 @@ import {
   transfersFor,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -81,7 +81,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FAMILY_SELECTION,
@@ -119,7 +119,7 @@ export {
   YAS_SELECTION_UNWATCH,
   YAS_SELECTION_VERSION,
   YAS_SELECTION_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasSelectionInlineItem {
   mime: string;

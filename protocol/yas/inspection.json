@@ -5600,6 +5600,23 @@
       "sensitive": "allowed"
     },
     {
+      "class": "event",
+      "class_id": 0,
+      "compression": "allowed",
+      "correlated": false,
+      "datagram": "forbidden",
+      "direction": "server_to_client",
+      "family": 64,
+      "family_name": "yas.process",
+      "family_version": 1,
+      "header_bytes": 5,
+      "key": "64/0/2",
+      "kind": 2,
+      "layout": "ExitReport",
+      "name": "EXIT",
+      "sensitive": "required"
+    },
+    {
       "class": "request",
       "class_id": 1,
       "compression": "allowed",

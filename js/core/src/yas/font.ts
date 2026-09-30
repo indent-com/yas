@@ -1,4 +1,4 @@
-import { YAS_FAMILY_FONT } from "./core";
+import { YAS_FAMILY_FONT } from "./core.js";
 import {
   YAS_FONT_DESCRIBE,
   YAS_FONT_DELIVERY_INLINE,
@@ -39,8 +39,8 @@ import {
   YAS_FONT_UNWATCH,
   YAS_FONT_VERSION,
   YAS_FONT_WATCH,
-} from "./generated";
-import type { YasConnection } from "./session";
+} from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -56,13 +56,13 @@ import {
   estimateStateRetainedBytes,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_SENDER_TO_RECEIVER,
   decodeTransferDescriptor,
   transfersFor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   equalBytes,
   YasCursor,
@@ -72,7 +72,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FONT_DESCRIBE,
@@ -94,7 +94,7 @@ export {
   YAS_FONT_UNWATCH,
   YAS_FONT_VERSION,
   YAS_FONT_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export const YAS_FONT_FORMAT_TRUETYPE = YAS_FONT_FORMAT_SFNT_TRUETYPE;
 export const YAS_FONT_FORMAT_CFF = YAS_FONT_FORMAT_SFNT_CFF;

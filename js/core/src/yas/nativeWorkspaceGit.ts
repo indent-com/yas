@@ -1,10 +1,10 @@
 /** Workspace-facing Git operations backed directly by typed YAS Git. */
 
-import * as model from "../gitModel";
-import { Notifier } from "../reactive";
-import type { SessionId } from "../types";
-import * as g from "./generated";
-import { decodeFsPath, type YasFsPath } from "./fs";
+import * as model from "../gitModel.js";
+import { Notifier } from "../reactive.js";
+import type { SessionId } from "../types.js";
+import * as g from "./generated.js";
+import { decodeFsPath, type YasFsPath } from "./fs.js";
 import {
   YasGitClient,
   type YasGitContentRecord,
@@ -17,9 +17,9 @@ import {
   type YasGitRepositorySource,
   type YasGitSnapshot,
   type YasGitWatchedQuery,
-} from "./git";
-import type { YasConnection } from "./session";
-import { YasProtocolError, YasResultError } from "./wire";
+} from "./git.js";
+import type { YasConnection } from "./session.js";
+import { YasProtocolError, YasResultError } from "./wire.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
@@ -772,7 +772,7 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
   }
 
   private async deliver(
-    update: import("./git").YasGitWatchedQueryUpdate,
+    update: import("./git.js").YasGitWatchedQueryUpdate,
   ): Promise<void> {
     if (this.closed) return;
     if (!update.page) {

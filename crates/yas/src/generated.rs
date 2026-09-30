@@ -349,6 +349,8 @@ pub const CLIENT_HELLO_IDLE_TIMEOUT_EXTENSION: u64 = 1;
 pub const CLIENT_HELLO_PLATFORM_EXTENSION: u64 = 2;
 pub const CLIENT_HELLO_INITIAL_WATCHES_EXTENSION: u64 = 3;
 pub const CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION: u64 = 4;
+pub const CLIENT_HELLO_IDENTIFIER_EXTENSION: u64 = 5;
+pub const MAX_CLIENT_IDENTIFIER_BYTES: u64 = 1024;
 pub const SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION: u64 = 1;
 pub const SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION: u64 = 2;
 pub const SERVER_HELLO_PLATFORM_EXTENSION: u64 = 3;
@@ -381,6 +383,7 @@ super::TypeMetadata { name: "session_info", layout: "session_id:[u8;16],catalog_
 super::TypeMetadata { name: "server_diagnostics_extension", layout: "active_sessions:u32,relay_active:u32,relay_pending:u32,reserved:u32=0,aggregate_receive_limit:u64,aggregate_receive_buffered:u64; buffered<=limit" },
 super::TypeMetadata { name: "session_update", layout: "catalog_revision:u64 nonzero,ReceiveLimits,Extensions; max_frame and max_decoded cannot decrease within a session" },
 super::TypeMetadata { name: "family_update", layout: "catalog_revision:u64 nonzero,FamilyDescriptor; family_id and version match the selected descriptor" },
+super::TypeMetadata { name: "client_identifier_extension", layout: "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:utf8 remaining, at most MAX_CLIENT_IDENTIFIER_BYTES bytes; the client's own text for people to recognize it by; invalid UTF-8 or a longer one fails HELLO or CLIENT_UPDATE with INVALID, and nothing else is validated or deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION" },
 super::TypeMetadata { name: "initial_watches_extension", layout: "count:u16,repeated family_id:u16,family_version:u16,watch_payload:bytes_u32" },
 super::TypeMetadata { name: "initial_watch_results_extension", layout: "count:u16,repeated embedded_watch_result:bytes_u32" },
 super::TypeMetadata { name: "negotiated_codecs_extension", layout: "count:u8,repeated codec:u16; nonzero,unique,ascending,subset of ClientHello codecs" },
@@ -397,6 +400,8 @@ super::ConstantMetadata { name: "CLIENT_HELLO_IDLE_TIMEOUT_EXTENSION", value: 1 
 super::ConstantMetadata { name: "CLIENT_HELLO_PLATFORM_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "CLIENT_HELLO_INITIAL_WATCHES_EXTENSION", value: 3 },
 super::ConstantMetadata { name: "CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "CLIENT_HELLO_IDENTIFIER_EXTENSION", value: 5 },
+super::ConstantMetadata { name: "MAX_CLIENT_IDENTIFIER_BYTES", value: 1024 },
 super::ConstantMetadata { name: "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "SERVER_HELLO_PLATFORM_EXTENSION", value: 3 },
@@ -1026,6 +1031,7 @@ pub const ACTIVE_SUBSCRIPTIONS_EXTENSION: u64 = 1;
 pub const BANDWIDTH_RATES_EXTENSION: u64 = 2;
 pub const AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION: u64 = 3;
 pub const AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION: u64 = 4;
+pub const IDENTIFIER_EXTENSION: u64 = 5;
 pub const GIT_WATCH_UNTRACKED: u64 = 65536;
 pub const GIT_WATCH_IGNORED: u64 = 131072;
 pub const GIT_QUERY_WATCH: u64 = 2147483648;
@@ -1053,6 +1059,7 @@ super::TypeMetadata { name: "active_subscriptions", layout: "terminal_count:u16,
 super::TypeMetadata { name: "bandwidth_rates", layout: "ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord" },
 super::TypeMetadata { name: "auxiliary_subscription_details", layout: "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the namespace prefix for KV or canonical worktree/gitdir path for Git; Git state-watch request_flags contain datasets in bits 0..15 plus GIT_WATCH_UNTRACKED/GIT_WATCH_IGNORED effective selection; Git query-watch request_flags contain GIT_QUERY_WATCH, query kind shifted by GIT_QUERY_KIND_SHIFT, and query flags in bits 0..15; state_watch_flags use StateWatch flags" },
 super::TypeMetadata { name: "auxiliary_subscription_timings", layout: "ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS" },
+super::TypeMetadata { name: "client_identifier", layout: "ClientRecord/ClientPatch optional extension tag 5 exact value identifier:utf8 remaining, at most Core MAX_CLIENT_IDENTIFIER_BYTES bytes; the text the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unchanged and possibly shared by other sessions; absent when it reported none" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[
@@ -1070,6 +1077,7 @@ super::ConstantMetadata { name: "ACTIVE_SUBSCRIPTIONS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "BANDWIDTH_RATES_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION", value: 3 },
 super::ConstantMetadata { name: "AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "IDENTIFIER_EXTENSION", value: 5 },
 super::ConstantMetadata { name: "GIT_WATCH_UNTRACKED", value: 65536 },
 super::ConstantMetadata { name: "GIT_WATCH_IGNORED", value: 131072 },
 super::ConstantMetadata { name: "GIT_QUERY_WATCH", value: 2147483648 },
@@ -2268,6 +2276,7 @@ pub const WATCH_FLAGS: u64 = 63;
 pub const ENTRY_FILE: u64 = 0;
 pub const ENTRY_DIRECTORY: u64 = 1;
 pub const ENTRY_SYMLINK: u64 = 2;
+pub const ENTRY_OTHER: u64 = 3;
 pub const ENTRY_EXECUTABLE: u64 = 1;
 pub const ENTRY_READ_ONLY: u64 = 2;
 pub const ENTRY_HIDDEN: u64 = 4;
@@ -2280,6 +2289,9 @@ pub const CONTENT_NONE: u64 = 0;
 pub const CONTENT_INLINE: u64 = 1;
 pub const ENTRY_OPERATION_ID_EXTENSION: u64 = 1;
 pub const RESULT_CONFLICT_DETAIL_EXTENSION: u64 = 1;
+pub const RESULT_OS_ERROR_EXTENSION: u64 = 2;
+pub const APPLY_RESULT_OS_ERRORS_EXTENSION: u64 = 1;
+pub const MAX_OS_ERROR_TEXT_BYTES: u64 = 32;
 pub const PATCH_MODE: u64 = 1;
 pub const PATCH_MODIFIED_TIME: u64 = 2;
 pub const PATCH_CONTENT: u64 = 4;
@@ -2290,6 +2302,9 @@ pub const READ_STAT: u64 = 0;
 pub const READ_HASH: u64 = 1;
 pub const READ_LINK_TARGET: u64 = 2;
 pub const READ_CONTENT: u64 = 3;
+pub const READ_LIST: u64 = 4;
+pub const READ_REALPATH: u64 = 5;
+pub const READ_STAT_ONLY: u64 = 6;
 pub const READ_NO_FOLLOW: u64 = 1;
 pub const READ_FLAGS: u64 = 1;
 pub const SEARCH_CASE_SENSITIVE: u64 = 1;
@@ -2327,6 +2342,8 @@ pub const COMMIT_SYNC_DIRECTORY: u64 = 2;
 pub const COMMIT_FLAGS: u64 = 3;
 pub const STAGE_CREATE_PARENTS: u64 = 1;
 pub const STAGE_FLAGS: u64 = 1;
+pub const STAGE_IN_PLACE: u64 = 2;
+pub const STAGE_EXTENDED_FLAGS: u64 = 2;
 pub const APPLY_ALL_OR_NONE: u64 = 1;
 pub const APPLY_FLAGS: u64 = 1;
 pub const APPLY_WRITE_INLINE: u64 = 0;
@@ -2337,6 +2354,8 @@ pub const APPLY_SYMLINK: u64 = 4;
 pub const APPLY_HARDLINK: u64 = 5;
 pub const APPLY_ITEM_CREATE_PARENTS: u64 = 1;
 pub const APPLY_ITEM_FLAGS: u64 = 1;
+pub const APPLY_ITEM_IN_PLACE: u64 = 2;
+pub const APPLY_ITEM_EXTENDED_FLAGS: u64 = 2;
 pub const REMOVE_RECURSIVE: u64 = 1;
 pub const REMOVE_FLAGS: u64 = 1;
 pub const FILE_CONTENT_KIND: u64 = 0;
@@ -2373,6 +2392,14 @@ pub const LIMIT_MAX_STAGED_BYTES: u64 = 10;
 pub const LIMIT_MAX_BATCH_ITEMS: u64 = 11;
 pub const LIMIT_MAX_QUERY_CONCURRENCY: u64 = 12;
 pub const LIMIT_MAX_CATALOG_ENTRIES: u64 = 13;
+pub const LIMIT_CAPABILITIES: u64 = 14;
+pub const CAPABILITY_OS_ERROR: u64 = 1;
+pub const CAPABILITY_READ_LIST: u64 = 2;
+pub const CAPABILITY_READ_REALPATH: u64 = 4;
+pub const CAPABILITY_READ_STAT_ONLY: u64 = 8;
+pub const CAPABILITY_STAGE_IN_PLACE: u64 = 16;
+pub const CAPABILITY_APPLY_IN_PLACE: u64 = 32;
+pub const CAPABILITY_FLAGS: u64 = 63;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "OPEN", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "flags:u16,reserved:u16=0,source:bytes_u32 containing RootSource,Extensions; ResultPrefix + root_handle:u64,root_revision:u64,path_model:u8,case_behavior:u8,reserved:u16=0,canonical_path:bytes_u32,Extensions" },
 super::OperationMetadata { name: "CLOSE", class: 1, kind: 1, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,Extensions; ResultPrefix; idempotent and invalidates root-scoped watches/stages" },
@@ -2409,6 +2436,14 @@ super::TypeMetadata { name: "apply_item_result", layout: "index:u16,status:u16,e
 super::TypeMetadata { name: "conflict_detail", layout: "path:bytes_u32 containing WirePath,current_present:u8,hash_present:u8,reserved:u16=0,current_entry_revision:u64,modified_unix_ns:i64,optional content_hash:[u8;32]; exact value of optional Core ResultPrefix detail extension tag RESULT_CONFLICT_DETAIL_EXTENSION for STAGE_WRITE or COMMIT status CONFLICT" },
 super::TypeMetadata { name: "entry_operation_id_extension", layout: "EntryRecord extension tag 1 exact value operation_id:[u8;16], nonzero; lets watchers recognize mutation echoes without suppressing them" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tags 1..12 encode max roots/session:u32,watches/root:u32,path components:u32,component bytes:u32,path bytes:u32,inline bytes:u32,query records:u32,query bytes:u32,stages/session:u32,staged bytes:u64,batch items:u32,query concurrency:u32" },
+super::TypeMetadata { name: "family_capabilities", layout: "optional family limit extension tag LIMIT_CAPABILITIES exact value capabilities:u32; bitmask of CAPABILITY_* values the server implements; absent means zero; receivers ignore unknown bits; a client uses an opt-in value only when its capability bit is set" },
+super::TypeMetadata { name: "os_error", layout: "code:i32,name:bytes_u16,operation:bytes_u16; code is the raw server-platform OS error number, name its symbolic errno name or UNKNOWN (1..=32 bytes of ASCII A-Z 0-9 _), operation the operation the server was performing (1..=32 bytes of ASCII a-z 0-9 _); exact value of optional Core ResultPrefix detail extension tag RESULT_OS_ERROR_EXTENSION on a failed top-level FS Result caused by an OS error, the whole content of a non-OK READ record answering READ_LIST, READ_REALPATH or READ_STAT_ONLY when the failure came from an OS error, and an entry of ApplyOsErrors" },
+super::TypeMetadata { name: "apply_os_errors", layout: "repeated index:u16,OsError; exact value of optional ApplyResult extension tag APPLY_RESULT_OS_ERRORS_EXTENSION, present only when at least one item failed because of an OS error; one entry per such item, indices strictly ascending and naming non-OK items of the same Result; offered with CAPABILITY_OS_ERROR" },
+super::TypeMetadata { name: "query_read_extended_record", layout: "QueryReadRecord answering the opt-in question kinds: OK content READ_LIST QueryListEntries, READ_REALPATH raw absolute canonical platform path bytes, READ_STAT_ONLY QueryStatOnly; non-OK content is empty or exactly one OsError; READ_NO_FOLLOW is valid only with READ_STAT_ONLY among these kinds" },
+super::TypeMetadata { name: "query_list_entries", layout: "repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash" },
+super::TypeMetadata { name: "query_stat_only", layout: "kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed" },
+super::TypeMetadata { name: "stage_in_place", layout: "STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID" },
+super::TypeMetadata { name: "apply_in_place", layout: "APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[
 super::LimitMetadata { name: "MAX_ROOTS_PER_SESSION", tag: 1, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 64 },
@@ -2424,6 +2459,7 @@ super::LimitMetadata { name: "MAX_STAGED_BYTES", tag: 10, value_type: super::Lim
 super::LimitMetadata { name: "MAX_BATCH_ITEMS", tag: 11, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 256 },
 super::LimitMetadata { name: "MAX_QUERY_CONCURRENCY", tag: 12, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 8 },
 super::LimitMetadata { name: "MAX_CATALOG_ENTRIES", tag: 13, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 1000000 },
+super::LimitMetadata { name: "CAPABILITIES", tag: 14, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 4294967295 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SOURCE_PLATFORM_PATH", value: 0 },
@@ -2448,6 +2484,7 @@ super::ConstantMetadata { name: "WATCH_FLAGS", value: 63 },
 super::ConstantMetadata { name: "ENTRY_FILE", value: 0 },
 super::ConstantMetadata { name: "ENTRY_DIRECTORY", value: 1 },
 super::ConstantMetadata { name: "ENTRY_SYMLINK", value: 2 },
+super::ConstantMetadata { name: "ENTRY_OTHER", value: 3 },
 super::ConstantMetadata { name: "ENTRY_EXECUTABLE", value: 1 },
 super::ConstantMetadata { name: "ENTRY_READ_ONLY", value: 2 },
 super::ConstantMetadata { name: "ENTRY_HIDDEN", value: 4 },
@@ -2460,6 +2497,9 @@ super::ConstantMetadata { name: "CONTENT_NONE", value: 0 },
 super::ConstantMetadata { name: "CONTENT_INLINE", value: 1 },
 super::ConstantMetadata { name: "ENTRY_OPERATION_ID_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "RESULT_CONFLICT_DETAIL_EXTENSION", value: 1 },
+super::ConstantMetadata { name: "RESULT_OS_ERROR_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "APPLY_RESULT_OS_ERRORS_EXTENSION", value: 1 },
+super::ConstantMetadata { name: "MAX_OS_ERROR_TEXT_BYTES", value: 32 },
 super::ConstantMetadata { name: "PATCH_MODE", value: 1 },
 super::ConstantMetadata { name: "PATCH_MODIFIED_TIME", value: 2 },
 super::ConstantMetadata { name: "PATCH_CONTENT", value: 4 },
@@ -2470,6 +2510,9 @@ super::ConstantMetadata { name: "READ_STAT", value: 0 },
 super::ConstantMetadata { name: "READ_HASH", value: 1 },
 super::ConstantMetadata { name: "READ_LINK_TARGET", value: 2 },
 super::ConstantMetadata { name: "READ_CONTENT", value: 3 },
+super::ConstantMetadata { name: "READ_LIST", value: 4 },
+super::ConstantMetadata { name: "READ_REALPATH", value: 5 },
+super::ConstantMetadata { name: "READ_STAT_ONLY", value: 6 },
 super::ConstantMetadata { name: "READ_NO_FOLLOW", value: 1 },
 super::ConstantMetadata { name: "READ_FLAGS", value: 1 },
 super::ConstantMetadata { name: "SEARCH_CASE_SENSITIVE", value: 1 },
@@ -2507,6 +2550,8 @@ super::ConstantMetadata { name: "COMMIT_SYNC_DIRECTORY", value: 2 },
 super::ConstantMetadata { name: "COMMIT_FLAGS", value: 3 },
 super::ConstantMetadata { name: "STAGE_CREATE_PARENTS", value: 1 },
 super::ConstantMetadata { name: "STAGE_FLAGS", value: 1 },
+super::ConstantMetadata { name: "STAGE_IN_PLACE", value: 2 },
+super::ConstantMetadata { name: "STAGE_EXTENDED_FLAGS", value: 2 },
 super::ConstantMetadata { name: "APPLY_ALL_OR_NONE", value: 1 },
 super::ConstantMetadata { name: "APPLY_FLAGS", value: 1 },
 super::ConstantMetadata { name: "APPLY_WRITE_INLINE", value: 0 },
@@ -2517,6 +2562,8 @@ super::ConstantMetadata { name: "APPLY_SYMLINK", value: 4 },
 super::ConstantMetadata { name: "APPLY_HARDLINK", value: 5 },
 super::ConstantMetadata { name: "APPLY_ITEM_CREATE_PARENTS", value: 1 },
 super::ConstantMetadata { name: "APPLY_ITEM_FLAGS", value: 1 },
+super::ConstantMetadata { name: "APPLY_ITEM_IN_PLACE", value: 2 },
+super::ConstantMetadata { name: "APPLY_ITEM_EXTENDED_FLAGS", value: 2 },
 super::ConstantMetadata { name: "REMOVE_RECURSIVE", value: 1 },
 super::ConstantMetadata { name: "REMOVE_FLAGS", value: 1 },
 super::ConstantMetadata { name: "FILE_CONTENT_KIND", value: 0 },
@@ -2553,6 +2600,14 @@ super::ConstantMetadata { name: "LIMIT_MAX_STAGED_BYTES", value: 10 },
 super::ConstantMetadata { name: "LIMIT_MAX_BATCH_ITEMS", value: 11 },
 super::ConstantMetadata { name: "LIMIT_MAX_QUERY_CONCURRENCY", value: 12 },
 super::ConstantMetadata { name: "LIMIT_MAX_CATALOG_ENTRIES", value: 13 },
+super::ConstantMetadata { name: "LIMIT_CAPABILITIES", value: 14 },
+super::ConstantMetadata { name: "CAPABILITY_OS_ERROR", value: 1 },
+super::ConstantMetadata { name: "CAPABILITY_READ_LIST", value: 2 },
+super::ConstantMetadata { name: "CAPABILITY_READ_REALPATH", value: 4 },
+super::ConstantMetadata { name: "CAPABILITY_READ_STAT_ONLY", value: 8 },
+super::ConstantMetadata { name: "CAPABILITY_STAGE_IN_PLACE", value: 16 },
+super::ConstantMetadata { name: "CAPABILITY_APPLY_IN_PLACE", value: 32 },
+super::ConstantMetadata { name: "CAPABILITY_FLAGS", value: 63 },
 ];
 }
 pub mod git {
@@ -3744,10 +3799,17 @@ pub const WAIT: u16 = 0x0005;
 pub mod event {
 pub const STATE: u16 = 0x0000;
 pub const STATE_ACK: u16 = 0x0001;
+pub const EXIT: u16 = 0x0002;
 }
 pub const SPAWN_MERGE_STDERR: u64 = 1;
 pub const SPAWN_DETACHABLE: u64 = 2;
+pub const SPAWN_LEAVE_RESIDUE: u64 = 4;
+pub const SPAWN_STDIN_NULL: u64 = 8;
 pub const SPAWN_FLAGS: u64 = 3;
+pub const SPAWN_LAUNCHER_FLAGS: u64 = 12;
+pub const SPAWN_REPORT_EXIT: u64 = 16;
+pub const SPAWN_KEEP_OUTPUT: u64 = 32;
+pub const SPAWN_LAUNCHER_FLAGS_EXTENDED: u64 = 60;
 pub const ENV_EMPTY: u64 = 0;
 pub const ENV_SESSION: u64 = 1;
 pub const CWD_SERVER_DEFAULT: u64 = 0;
@@ -3793,6 +3855,11 @@ pub const STREAM_STDOUT_CONTENT_KIND: u64 = 1;
 pub const STREAM_STDERR_CONTENT_KIND: u64 = 2;
 pub const SPAWN_SURFACE_APP_EXTENSION: u64 = 1;
 pub const SPAWN_RESOURCE_TAG_EXTENSION: u64 = 2;
+pub const SPAWN_RESIDUE_GRACE_EXTENSION: u64 = 3;
+pub const SPAWN_KEEP_OUTPUT_EXTENSION: u64 = 4;
+pub const MAX_KEEP_OUTPUT_TAIL_BYTES: u64 = 1048576;
+pub const EXIT_STDOUT_ELIDED_EXTENSION: u64 = 1;
+pub const EXIT_STDERR_ELIDED_EXTENSION: u64 = 2;
 pub const MAX_ARGC: u64 = 1024;
 pub const MAX_ARG_BYTES: u64 = 1048576;
 pub const MAX_ARG_LEN: u64 = 65536;
@@ -3807,6 +3874,22 @@ pub const MAX_PROCESSES: u64 = 64;
 pub const MAX_PENDING_SPAWNS: u64 = 8;
 pub const MAX_STREAM_BUFFER_BYTES: u64 = 8388608;
 pub const MAX_DETACHED_RETENTION_NS: u64 = 300000000000;
+pub const MAX_PROCESSES_PER_SESSION_EXTENDED: u64 = 16384;
+pub const MAX_PROCESSES_EXTENDED: u64 = 65536;
+pub const MAX_PENDING_SPAWNS_EXTENDED: u64 = 4096;
+pub const MAX_STREAM_BUFFER_BYTES_EXTENDED: u64 = 1073741824;
+pub const MAX_ENVC_EXTENDED: u64 = 16384;
+pub const MAX_PENDING_WAITS: u64 = 65536;
+pub const MAX_PENDING_OPERATIONS: u64 = 16384;
+pub const LEGACY_PENDING_WAITS: u64 = 32;
+pub const LEGACY_PENDING_OPERATIONS: u64 = 16;
+pub const LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED: u64 = 12;
+pub const LIMIT_MAX_PROCESSES_EXTENDED: u64 = 13;
+pub const LIMIT_MAX_PENDING_SPAWNS_EXTENDED: u64 = 14;
+pub const LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED: u64 = 15;
+pub const LIMIT_MAX_ENVC_EXTENDED: u64 = 16;
+pub const LIMIT_MAX_PENDING_WAITS: u64 = 17;
+pub const LIMIT_MAX_PENDING_OPERATIONS: u64 = 18;
 pub const LIMIT_MAX_ARGC: u64 = 1;
 pub const LIMIT_MAX_ARG_BYTES: u64 = 2;
 pub const LIMIT_MAX_ENVC: u64 = 3;
@@ -3818,6 +3901,8 @@ pub const LIMIT_MAX_STREAM_BUFFER_BYTES: u64 = 8;
 pub const LIMIT_MAX_DETACHED_RETENTION_NS: u64 = 9;
 pub const MAX_MUTATION_REPLAYS: u64 = 65536;
 pub const LIMIT_MAX_MUTATION_REPLAYS: u64 = 10;
+pub const LIMIT_LAUNCHER_FLAGS: u64 = 11;
+pub const LIMIT_LAUNCHER_FLAGS_EXTENDED: u64 = 19;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "WATCH", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "StateWatch; ResultPrefix + StateWatchResult" },
 super::OperationMetadata { name: "UNWATCH", class: 1, kind: 1, direction: 0, sensitive: 0, compression: 0, datagram: 0, layout: "subscription_id:u32; ResultPrefix" },
@@ -3827,11 +3912,15 @@ super::OperationMetadata { name: "CONTROL", class: 1, kind: 4, direction: 0, sen
 super::OperationMetadata { name: "WAIT", class: 1, kind: 5, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "process_handle:u64,timeout_ns:u64,Extensions; ResultPrefix + ExitRecord" },
 super::OperationMetadata { name: "STATE", class: 0, kind: 0, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "StateEvent<ProcessRecord>" },
 super::OperationMetadata { name: "STATE_ACK", class: 0, kind: 1, direction: 0, sensitive: 0, compression: 0, datagram: 0, layout: "StateAck" },
+super::OperationMetadata { name: "EXIT", class: 0, kind: 2, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "ExitReport" },
 ];
 pub static TYPES: &[super::TypeMetadata] = &[
 super::TypeMetadata { name: "cwd", layout: "kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16" },
 super::TypeMetadata { name: "process_record", layout: "process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u64,owner_session:[u8;16],argv0:bytes_u32,stdin_received:u64,stdout_produced:u64,stderr_produced:u64,retention_deadline_server_ns:u64,exit_present:u8,reserved:[u8;7]=0,optional exit:bytes_u32 containing ExitRecord,Extensions" },
 super::TypeMetadata { name: "remove_record", layout: "process_handle:u64" },
+super::TypeMetadata { name: "exit_report", layout: "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream" },
+super::TypeMetadata { name: "keep_output_extension", layout: "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES" },
+super::TypeMetadata { name: "output_elision", layout: "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream" },
 super::TypeMetadata { name: "exit_record", layout: "kind:u8,reason:u8,reserved:u16=0,code:i32,exited_server_ns:u64,detail:bytes_u32" },
 super::TypeMetadata { name: "stream_bundle", layout: "process_handle:u64,flags:u16,reserved:u16=0,stdout_lifetime_offset:u64,stderr_lifetime_offset:u64,optional stdin/stdout/stderr descriptor:bytes_u32 containing sensitive BYTE TransferDescriptor,Extensions" },
 super::TypeMetadata { name: "state_entity_body", layout: "ADD/REPLACE complete ProcessRecord; REMOVE process_handle:u64" },
@@ -3848,11 +3937,26 @@ super::LimitMetadata { name: "MAX_PENDING_SPAWNS", tag: 7, value_type: super::Li
 super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES", tag: 8, value_type: super::LimitValueType::U64, required: true, hard_min: 1, hard_max: 8388608 },
 super::LimitMetadata { name: "MAX_DETACHED_RETENTION_NS", tag: 9, value_type: super::LimitValueType::U64, required: true, hard_min: 1, hard_max: 300000000000 },
 super::LimitMetadata { name: "MAX_MUTATION_REPLAYS", tag: 10, value_type: super::LimitValueType::U32, required: true, hard_min: 1, hard_max: 65536 },
+super::LimitMetadata { name: "LAUNCHER_FLAGS", tag: 11, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 12 },
+super::LimitMetadata { name: "MAX_PROCESSES_PER_SESSION_EXTENDED", tag: 12, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
+super::LimitMetadata { name: "MAX_PROCESSES_EXTENDED", tag: 13, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 65536 },
+super::LimitMetadata { name: "MAX_PENDING_SPAWNS_EXTENDED", tag: 14, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 4096 },
+super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES_EXTENDED", tag: 15, value_type: super::LimitValueType::U64, required: false, hard_min: 1, hard_max: 1073741824 },
+super::LimitMetadata { name: "MAX_ENVC_EXTENDED", tag: 16, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
+super::LimitMetadata { name: "MAX_PENDING_WAITS", tag: 17, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 65536 },
+super::LimitMetadata { name: "MAX_PENDING_OPERATIONS", tag: 18, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
+super::LimitMetadata { name: "LAUNCHER_FLAGS_EXTENDED", tag: 19, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 65535 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SPAWN_MERGE_STDERR", value: 1 },
 super::ConstantMetadata { name: "SPAWN_DETACHABLE", value: 2 },
+super::ConstantMetadata { name: "SPAWN_LEAVE_RESIDUE", value: 4 },
+super::ConstantMetadata { name: "SPAWN_STDIN_NULL", value: 8 },
 super::ConstantMetadata { name: "SPAWN_FLAGS", value: 3 },
+super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS", value: 12 },
+super::ConstantMetadata { name: "SPAWN_REPORT_EXIT", value: 16 },
+super::ConstantMetadata { name: "SPAWN_KEEP_OUTPUT", value: 32 },
+super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS_EXTENDED", value: 60 },
 super::ConstantMetadata { name: "ENV_EMPTY", value: 0 },
 super::ConstantMetadata { name: "ENV_SESSION", value: 1 },
 super::ConstantMetadata { name: "CWD_SERVER_DEFAULT", value: 0 },
@@ -3898,6 +4002,11 @@ super::ConstantMetadata { name: "STREAM_STDOUT_CONTENT_KIND", value: 1 },
 super::ConstantMetadata { name: "STREAM_STDERR_CONTENT_KIND", value: 2 },
 super::ConstantMetadata { name: "SPAWN_SURFACE_APP_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "SPAWN_RESOURCE_TAG_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "SPAWN_RESIDUE_GRACE_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "SPAWN_KEEP_OUTPUT_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "MAX_KEEP_OUTPUT_TAIL_BYTES", value: 1048576 },
+super::ConstantMetadata { name: "EXIT_STDOUT_ELIDED_EXTENSION", value: 1 },
+super::ConstantMetadata { name: "EXIT_STDERR_ELIDED_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "MAX_ARGC", value: 1024 },
 super::ConstantMetadata { name: "MAX_ARG_BYTES", value: 1048576 },
 super::ConstantMetadata { name: "MAX_ARG_LEN", value: 65536 },
@@ -3912,6 +4021,22 @@ super::ConstantMetadata { name: "MAX_PROCESSES", value: 64 },
 super::ConstantMetadata { name: "MAX_PENDING_SPAWNS", value: 8 },
 super::ConstantMetadata { name: "MAX_STREAM_BUFFER_BYTES", value: 8388608 },
 super::ConstantMetadata { name: "MAX_DETACHED_RETENTION_NS", value: 300000000000 },
+super::ConstantMetadata { name: "MAX_PROCESSES_PER_SESSION_EXTENDED", value: 16384 },
+super::ConstantMetadata { name: "MAX_PROCESSES_EXTENDED", value: 65536 },
+super::ConstantMetadata { name: "MAX_PENDING_SPAWNS_EXTENDED", value: 4096 },
+super::ConstantMetadata { name: "MAX_STREAM_BUFFER_BYTES_EXTENDED", value: 1073741824 },
+super::ConstantMetadata { name: "MAX_ENVC_EXTENDED", value: 16384 },
+super::ConstantMetadata { name: "MAX_PENDING_WAITS", value: 65536 },
+super::ConstantMetadata { name: "MAX_PENDING_OPERATIONS", value: 16384 },
+super::ConstantMetadata { name: "LEGACY_PENDING_WAITS", value: 32 },
+super::ConstantMetadata { name: "LEGACY_PENDING_OPERATIONS", value: 16 },
+super::ConstantMetadata { name: "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED", value: 12 },
+super::ConstantMetadata { name: "LIMIT_MAX_PROCESSES_EXTENDED", value: 13 },
+super::ConstantMetadata { name: "LIMIT_MAX_PENDING_SPAWNS_EXTENDED", value: 14 },
+super::ConstantMetadata { name: "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED", value: 15 },
+super::ConstantMetadata { name: "LIMIT_MAX_ENVC_EXTENDED", value: 16 },
+super::ConstantMetadata { name: "LIMIT_MAX_PENDING_WAITS", value: 17 },
+super::ConstantMetadata { name: "LIMIT_MAX_PENDING_OPERATIONS", value: 18 },
 super::ConstantMetadata { name: "LIMIT_MAX_ARGC", value: 1 },
 super::ConstantMetadata { name: "LIMIT_MAX_ARG_BYTES", value: 2 },
 super::ConstantMetadata { name: "LIMIT_MAX_ENVC", value: 3 },
@@ -3923,6 +4048,8 @@ super::ConstantMetadata { name: "LIMIT_MAX_STREAM_BUFFER_BYTES", value: 8 },
 super::ConstantMetadata { name: "LIMIT_MAX_DETACHED_RETENTION_NS", value: 9 },
 super::ConstantMetadata { name: "MAX_MUTATION_REPLAYS", value: 65536 },
 super::ConstantMetadata { name: "LIMIT_MAX_MUTATION_REPLAYS", value: 10 },
+super::ConstantMetadata { name: "LIMIT_LAUNCHER_FLAGS", value: 11 },
+super::ConstantMetadata { name: "LIMIT_LAUNCHER_FLAGS_EXTENDED", value: 19 },
 ];
 }
 pub mod net {
@@ -4936,6 +5063,7 @@ GoldenVector { name: "yas.process.request.control.header", hex: "400004000901000
 GoldenVector { name: "yas.process.request.wait.header", hex: "400005000901000000" },
 GoldenVector { name: "yas.process.event.state.header", hex: "4000000008" },
 GoldenVector { name: "yas.process.event.state_ack.header", hex: "4000010000" },
+GoldenVector { name: "yas.process.event.exit.header", hex: "4000020008" },
 GoldenVector { name: "yas.net.request.open.header", hex: "410000000901000000" },
 GoldenVector { name: "yas.net.request.close.header", hex: "410001000901000000" },
 GoldenVector { name: "yas.net.event.datagram.header", hex: "4100000008" },
@@ -5070,6 +5198,7 @@ GoldenVector { name: "fs.grep.payload", hex: "0100000000000000020014000500000009
 GoldenVector { name: "fs.stage_write.payload", hex: "0100000000000000050000000100010061040000000100000001000000a401000003000000000000000303030303030303030303030303030303030303030303030303030303030303000400000000000000000000" },
 GoldenVector { name: "fs.commit.payload", hex: "0200000000000000040404040404040404040404040404040100000000000000" },
 GoldenVector { name: "fs.apply.payload", hex: "0100000000000000050505050505050505050505050505050100010020000000000000000500000001000100610400000001000000a40100000300000079617300000000" },
+GoldenVector { name: "fs.apply.in_place.payload", hex: "0100000000000000050505050505050505050505050505050000010020000000000002000500000001000100610400000001000000a40100000300000079617300000000" },
 GoldenVector { name: "fs.entry.inline.payload", hex: "050000000100010061010000000000000000000000a4010000010000000000000003000000000000000606060606060606060606060606060606060606060606060606060606060606010000000300000079617300000000" },
 GoldenVector { name: "fs.query.path_record.payload", hex: "05000000010001006100000000" },
 GoldenVector { name: "fs.query.read_record.payload", hex: "000000000100000005000000010001006103000000796173" },

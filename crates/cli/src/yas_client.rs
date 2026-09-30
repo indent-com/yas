@@ -3,7 +3,6 @@
 use yas_wire::{Encode, client, family};
 
 use crate::cli::{ClientCommand, SessionId};
-use crate::yas_native::NativeClient;
 
 pub(crate) async fn dispatch(
     on: Option<&str>,
@@ -19,7 +18,7 @@ pub(crate) async fn dispatch(
 }
 
 async fn list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let self_id = client.hello().session_id;
     let server_now = client.hello().server_monotonic_ns;
     let records = client
@@ -40,7 +39,12 @@ async fn list(on: Option<&str>, hub: &str) -> Result<(), String> {
             client.hello().server_release,
         );
     }
-    println!("ID\tAGE_S\tOUT_BYTES_S\tIN_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES\tORIGIN");
+    // IDENTIFIER is whatever each client reported for itself, if anything: it
+    // is what says whose TERMINALS and SURFACES views set a size. Last, so
+    // scripts that index the other columns keep working.
+    println!(
+        "ID\tAGE_S\tOUT_BYTES_S\tIN_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES\tORIGIN\tIDENTIFIER"
+    );
     for state in records {
         let record = client::client_from_state_record(&state)
             .map_err(|error| format!("invalid Client state record: {error}"))?;
@@ -113,10 +117,15 @@ async fn list(on: Option<&str>, hub: &str) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{}\t{}\t{out_rate}\t{in_rate}\t{auxiliary}\t{terminals}\t{surfaces}\t{}",
+            "{}\t{}\t{out_rate}\t{in_rate}\t{auxiliary}\t{terminals}\t{surfaces}\t{}\t{}",
             format_session_id(record.session_id),
             server_now.saturating_sub(record.connected_server_ns) / 1_000_000_000,
             format_origin(&record.origin),
+            format_identifier(
+                record
+                    .identifier()
+                    .map_err(|error| format!("invalid Client identifier: {error}"))?
+            ),
         );
     }
     Ok(())
@@ -128,7 +137,7 @@ async fn disconnect(
     id: SessionId,
     reason: String,
 ) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let request = client::Disconnect {
         session_id: id.into_bytes(),
         operation_id: operation_id(),
@@ -200,6 +209,12 @@ fn format_origin(origin: &client::Origin) -> String {
     }
 }
 
+/// A client's reported identifier as one TSV field: controls escaped, and none
+/// at all as an empty field.
+fn format_identifier(identifier: Option<&str>) -> String {
+    identifier.map_or_else(String::new, escape_field)
+}
+
 fn escape_field(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for character in value.chars() {
@@ -237,5 +252,15 @@ mod tests {
     #[test]
     fn tsv_fields_escape_controls() {
         assert_eq!(escape_field("a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+    }
+
+    #[test]
+    fn identifiers_are_one_field_whatever_they_hold() {
+        assert_eq!(format_identifier(None), "");
+        assert_eq!(format_identifier(Some("")), "");
+        assert_eq!(
+            format_identifier(Some("pierre's\tlaptop 🖥")),
+            "pierre's\\tlaptop 🖥"
+        );
     }
 }

@@ -16,7 +16,7 @@ import type {
   SurfaceId,
   SurfaceTouchMode,
 } from "@yas-run/core";
-import { useRequiredYasWorkspace } from "./YasContext";
+import { useRequiredYasWorkspace } from "./YasContext.js";
 
 export interface YasSurfaceViewProps {
   connectionId: ConnectionId;
@@ -25,7 +25,9 @@ export interface YasSurfaceViewProps {
   style?: React.CSSProperties;
   /** Render cached frames without owning a server stream when false. */
   live?: boolean;
-  /** How touchscreen contacts are delivered. Defaults to pointer emulation. */
+  /** How touchscreen contacts are delivered. Defaults to `"direct"`, which
+   * forwards every contact to the Wayland client's `wl_touch`; `"pointer"`
+   * opts into single-finger click/scroll emulation. */
   touchMode?: SurfaceTouchMode;
   /**
    * Whether this view owns its surface's size, resizing it to fill the

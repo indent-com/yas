@@ -1,5 +1,5 @@
-import type { CellMetrics } from "./measure";
-import { rgbLuma, type GlRenderer } from "./gl-renderer";
+import type { CellMetrics } from "./measure.js";
+import { rgbLuma, type GlRenderer } from "./gl-renderer.js";
 
 // ---------------------------------------------------------------------------
 // WGSL shaders

@@ -172,12 +172,14 @@ def main():
         [b"\x00"],
         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", client_theirs.fileno()))],
     )
-    client_theirs.close()
 
     try:
         client_ours.sendall(PREFACE)
         write_frame(client_ours, request(HELLO, 1, client_hello()))
         hello = decode_result_prefix(read_result(client_ours, HELLO, 1))
+        # The server has taken its end: close ours only now, or macOS may
+        # flush the socket while it waits in the channel (docs/transports.md).
+        client_theirs.close()
         minor, boot, session, receive = decode_server_hello(hello)
         print(
             "HELLO:",

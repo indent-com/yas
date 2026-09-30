@@ -31,7 +31,7 @@ struct Root {
 
 impl Root {
     async fn open(on: Option<&str>, hub: &str, path: &str, writable: bool) -> Result<Self, String> {
-        let mut client = NativeClient::connect(on, hub).await?;
+        let mut client = crate::yas_native::connect(on, hub).await?;
         let opened: OpenResult = client
             .request_typed(
                 family::FS,
@@ -69,6 +69,7 @@ impl Root {
             )
             .await
             .map(|_| ())
+            .map_err(String::from)
     }
 }
 
@@ -461,6 +462,7 @@ async fn cmd_write(
                 create_parents: parents,
                 mode,
                 content,
+                in_place: false,
             },
             json,
         )
@@ -1240,6 +1242,7 @@ mod tests {
                 create_parents: false,
                 mode: 0,
                 content: b"contents".to_vec(),
+                in_place: false,
             },
             ApplyItem::Mkdir {
                 path: wire_path("directory").unwrap(),

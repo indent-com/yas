@@ -13,8 +13,6 @@ use str0m::net::Receive;
 use str0m::{Candidate, Event, Input, Output, Rtc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
-use yas_wire::core::ClientHello;
-use yas_wire::{Decode, Encode, Extension, FrameCodec, PREFACE};
 
 const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_NATIVE_CHANNELS_PER_PEER: usize = 64;
@@ -103,112 +101,31 @@ enum PeerIngress {
 
 /// Client-to-server ingress for one native YAS byte stream.
 ///
-/// Read-write shares are byte-transparent. Read-only shares buffer exactly
-/// the preface and first Core HELLO, inject the required read-only-session
-/// extension, and then become byte-transparent. The server, not this relay,
-/// advertises and enforces the restricted descriptor catalogue; therefore a
-/// forged later frame cannot acquire authority merely by confusing a relay
-/// parser.
+/// Read-write shares are byte-transparent. Read-only shares go through
+/// [`yas_wire::read_only::ReadOnlyIngress`]: it buffers exactly the preface
+/// and first Core HELLO, injects the required read-only-session extension, and
+/// then becomes byte-transparent. The server, not this relay, advertises and
+/// enforces the restricted descriptor catalogue; therefore a forged later
+/// frame cannot acquire authority merely by confusing a relay parser.
 enum ClientIngress {
     ReadWrite,
-    ReadOnly { pending: Vec<u8>, negotiated: bool },
+    ReadOnly(yas_wire::read_only::ReadOnlyIngress),
 }
 
 impl ClientIngress {
     fn new(access: crate::Access) -> Self {
         match access {
             crate::Access::ReadWrite => Self::ReadWrite,
-            crate::Access::ReadOnly => Self::ReadOnly {
-                pending: Vec::new(),
-                negotiated: false,
-            },
+            crate::Access::ReadOnly => Self::ReadOnly(yas_wire::read_only::ReadOnlyIngress::new()),
         }
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
         match self {
             Self::ReadWrite => Ok((!bytes.is_empty()).then(|| bytes.to_vec())),
-            Self::ReadOnly {
-                pending,
-                negotiated,
-            } if *negotiated => Ok((!bytes.is_empty()).then(|| bytes.to_vec())),
-            Self::ReadOnly {
-                pending,
-                negotiated,
-            } => {
-                pending.extend_from_slice(bytes);
-                let compared = pending.len().min(PREFACE.len());
-                if pending[..compared] != PREFACE[..compared] {
-                    return Err("read-only share received an invalid YAS preface".into());
-                }
-                if pending.len() < PREFACE.len() + 4 {
-                    return Ok(None);
-                }
-
-                let length_offset = PREFACE.len();
-                let frame_len = u32::from_le_bytes(
-                    pending[length_offset..length_offset + 4]
-                        .try_into()
-                        .expect("bounded length prefix"),
-                );
-                if frame_len > yas_wire::FrameLimits::pre_hello().max_wire_frame {
-                    return Err("read-only share HELLO exceeds the pre-negotiation limit".into());
-                }
-                let hello_end = PREFACE
-                    .len()
-                    .checked_add(4)
-                    .and_then(|value| value.checked_add(frame_len as usize))
-                    .ok_or_else(|| "read-only share HELLO length overflow".to_string())?;
-                if pending.len() < hello_end {
-                    return Ok(None);
-                }
-
-                let codec = FrameCodec::pre_hello();
-                let (mut frame, consumed) = codec
-                    .decode_stream(&pending[PREFACE.len()..hello_end])
-                    .map_err(|error| format!("invalid read-only share HELLO: {error}"))?;
-                if consumed != hello_end - PREFACE.len() {
-                    return Err("read-only share HELLO has trailing frame bytes".into());
-                }
-                let mut hello = ClientHello::decode(&frame.payload)
-                    .map_err(|error| format!("invalid read-only share HELLO body: {error}"))?;
-                let read_only_tag =
-                    yas_wire::schema::core::CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION as u16;
-                if !hello
-                    .extensions
-                    .0
-                    .iter()
-                    .any(|extension| extension.tag == read_only_tag)
-                {
-                    let position = hello
-                        .extensions
-                        .0
-                        .partition_point(|extension| extension.tag < read_only_tag);
-                    hello.extensions.0.insert(
-                        position,
-                        Extension {
-                            tag: read_only_tag,
-                            required: true,
-                            value: Vec::new(),
-                        },
-                    );
-                }
-                frame.payload = hello
-                    .encode()
-                    .map_err(|error| format!("cannot encode read-only share HELLO: {error}"))?;
-
-                let mut output = Vec::with_capacity(pending.len() + 8);
-                output.extend_from_slice(&PREFACE);
-                output.extend_from_slice(
-                    &codec
-                        .encode_stream(&frame)
-                        .map_err(|error| format!("cannot encode read-only share frame: {error}"))?,
-                );
-                output.extend_from_slice(&pending[hello_end..]);
-                pending.clear();
-                *negotiated = true;
-                Ok(Some(output))
-            }
+            Self::ReadOnly(ingress) => ingress
+                .push(bytes)
+                .map_err(|error| format!("read-only share: {error}")),
         }
     }
 }
@@ -1280,8 +1197,10 @@ pub async fn handle_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yas_wire::core::{FamilyOffer, ReceiveLimits};
-    use yas_wire::{Extensions, Frame, FrameHeader};
+    use yas_wire::core::{ClientHello, FamilyOffer, ReceiveLimits};
+    use yas_wire::{
+        Decode, Encode, Extension, Extensions, Frame, FrameCodec, FrameHeader, PREFACE,
+    };
 
     #[cfg(unix)]
     #[tokio::test]

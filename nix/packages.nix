@@ -570,6 +570,8 @@
           website
           ;
         inherit pnpmDeps;
+        # The web UI's build; publish-crates packages it into yas-edge.
+        yas-ui = webAppDist;
         default = yas;
       }
       // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

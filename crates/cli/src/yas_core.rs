@@ -2,10 +2,8 @@
 
 use yas_wire::{Encode, core, family};
 
-use crate::yas_native::NativeClient;
-
 pub(crate) async fn cmd_quit(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let request = core::Shutdown {
         operation_id: operation_id(),
         grace_ns: 0,

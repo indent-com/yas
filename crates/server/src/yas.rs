@@ -101,7 +101,6 @@ const BASE_WATCH_LIMIT: usize = NATIVE_APP_BASELINE_WATCHES + DYNAMIC_WATCH_HEAD
 const MAX_WATCHES: usize = 64;
 const MAX_RELAYS: usize = 32;
 const MAX_PENDING_CONNECTS: usize = 8;
-const MAX_OUTBOUND_TRANSFERS: usize = 32;
 const TRANSFER_CHUNK: usize = 64 * 1024;
 const RELAY_INPUT_WINDOW: u64 = 256 * 1024;
 const RELAY_OUTPUT_WINDOW: u64 = 256 * 1024;
@@ -248,10 +247,18 @@ const MAX_GIT_QUERY_STATE_DETAIL_BYTES: usize = 4096;
 const NATIVE_CATALOGUE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const NATIVE_SURFACE_SCALE_120: u16 = 120;
 const PROCESS_STREAM_QUEUE: usize = 64;
-pub(super) const MAX_PROCESS_OPERATION_REPLAYS: usize = 256;
+/// A session's stdin windows leave 1/4 of its receive budget to other frames.
+const PROCESS_STDIN_RESERVE_DIVISOR: u64 = 4;
+/// The smallest stdin window a process gets while the budget allows.
+const PROCESS_STDIN_MIN_WINDOW: u64 = 4 * 1024;
+// Process admissions scale with the server's configured ProcessMaxima; these
+// are their values at the defaults, which the tests exercise.
+#[cfg(test)]
+const MAX_PROCESS_OPERATION_REPLAYS: usize = 256;
+#[cfg(test)]
 const MAX_PENDING_PROCESS_WAITS: usize = 32;
-const MAX_PENDING_PROCESS_SEMANTIC_OPERATIONS: usize =
-    yas_process_wire::Limits::HARD.max_processes_per_session as usize;
+#[cfg(test)]
+const MAX_PENDING_PROCESS_SEMANTIC_OPERATIONS: usize = 16;
 const MAX_PENDING_FS_SEMANTIC_OPERATIONS: usize =
     yas_fs_wire::Limits::HARD.max_query_concurrency as usize;
 
@@ -1233,6 +1240,10 @@ impl Services {
                     )
                 }
             })
+            // Windows keeps each drive's current directory in the block as `=C:=C:\…`, which
+            // std lists as a variable named `=C:`: no ENV entry can carry a name with `=`, and
+            // one such entry would fail the whole snapshot.
+            .filter(|(key, _)| !key.is_empty() && !key.contains(&b'=') && !key.contains(&0))
             .collect::<BTreeMap<_, _>>();
         // This is the effective configured identity, not merely the value the
         // parent process happened to export before configuration was loaded.
@@ -2027,6 +2038,11 @@ async fn serve_registered<S>(
         client_instance: hello.client_instance,
         name: hello.client_name.clone(),
         release: hello.client_release.clone(),
+        // ClientHello::decode has refused a non-UTF-8 identifier already.
+        identifier: yas_wire::core::client_identifier(&hello.extensions)
+            .ok()
+            .flatten()
+            .map(str::to_owned),
     };
     // An embedded extension attempt is what it is regardless of the socket it
     // came in on; everything else is described by its transport.
@@ -2766,6 +2782,9 @@ struct Session {
     inbound_credit: Arc<CreditBudget>,
     inbound_transfers: Arc<InboundTransferRegistry>,
     outbound: HashMap<u32, Arc<FlowControl>>,
+    /// Outbound Transfers this session may hold at once; grows with the
+    /// configured processes per session (two streams each).
+    max_outbound_transfers: usize,
     outbound_sensitive: BTreeSet<u32>,
     surface_capture_transfers: HashMap<u32, u64>,
     relay_transfers: HashMap<u32, RelayTransfer>,
@@ -2982,6 +3001,8 @@ struct ProcessRuntime {
     transfer_to_attachment: HashMap<u32, (u32, ProcessTransferKind)>,
     operations: HashMap<[u8; 16], ProcessReplay>,
     operation_order: VecDeque<[u8; 16]>,
+    /// Replay capacity from the server's ProcessMaxima.
+    operation_replays: usize,
 }
 
 struct ProcessAttachment {
@@ -3005,6 +3026,8 @@ struct ProcessInputTransfer {
     granted: u64,
     target_window: u64,
     open: bool,
+    /// The peer sent its `CLOSE`; a second one is a protocol violation.
+    peer_closed: bool,
     receive_credit: CreditLease,
 }
 
@@ -3029,6 +3052,8 @@ enum ProcessOperationOutcome {
         fingerprint: [u8; 32],
         stdout_receive_credit: u64,
         stderr_receive_credit: u64,
+        /// SPAWN_REPORT_EXIT: send the exit to this session as an EXIT event.
+        report_exit: bool,
         outcome: Result<super::yas_process::Attachment, super::yas_process::Error>,
     },
     Attach {
@@ -3055,9 +3080,11 @@ impl ProcessRuntime {
         session_env: Option<super::app_env::SessionEnv>,
     ) -> Option<Self> {
         let session = service.session(session_id, session_env).ok()?;
+        let operation_replays = service.maxima().operation_replays();
         Some(Self {
             service,
             session,
+            operation_replays,
             attachments: HashMap::new(),
             transfer_to_attachment: HashMap::new(),
             operations: HashMap::new(),
@@ -3070,7 +3097,7 @@ impl ProcessRuntime {
         make_operation_replay_room(
             &mut self.operations,
             &mut self.operation_order,
-            MAX_PROCESS_OPERATION_REPLAYS,
+            self.operation_replays,
             reserved,
             |replay| {
                 replay.attachment_id.is_some_and(|attachment_id| {
@@ -5284,6 +5311,14 @@ async fn client_catalogue_snapshot(
         }
         .extension()
         .expect("fixed Client bandwidth window is valid");
+        let mut extensions = vec![rates];
+        if let Some(identifier) = client
+            .native_identity
+            .as_ref()
+            .and_then(|identity| identity.identifier.as_deref())
+        {
+            extensions.push(yas_client::identifier_extension(identifier));
+        }
         records.insert(
             session_id,
             yas_client::ClientRecord {
@@ -5297,7 +5332,7 @@ async fn client_catalogue_snapshot(
                 release,
                 label: client.origin.label().to_owned(),
                 origin: typed_client_origin(&client.origin),
-                extensions: Extensions(vec![rates]),
+                extensions: Extensions(extensions),
             },
         );
     }
@@ -5326,6 +5361,10 @@ async fn client_catalogue_snapshot(
                     .extension()
                     .expect("validated native Client watch timings"),
             );
+        }
+        // Tag 5 sorts after the subscription extensions above.
+        if let Some(identifier) = &client.identity.identifier {
+            subscription_extensions.push(yas_client::identifier_extension(identifier));
         }
         let extensions = Extensions(subscription_extensions);
         records.insert(
@@ -6066,6 +6105,7 @@ const fn terminal_query_status(error: &super::yas_terminal_queries::Error) -> St
         super::yas_terminal_queries::Error::NotFound => Status::NotFound,
         super::yas_terminal_queries::Error::Stale => Status::Stale,
         super::yas_terminal_queries::Error::TooLarge => Status::ResourceExhausted,
+        super::yas_terminal_queries::Error::Timeout => Status::Timeout,
         super::yas_terminal_queries::Error::Internal => Status::Internal,
     }
 }
@@ -6635,10 +6675,24 @@ impl CreditBudget {
         }
     }
 
+    /// Like [`Self::lease`], but never takes the budget below `keep`
+    /// unreserved bytes.
+    fn lease_keeping(self: &Arc<Self>, requested: u64, keep: u64) -> CreditLease {
+        let bytes = self.reserve_keeping(requested, keep);
+        CreditLease {
+            budget: Arc::clone(self),
+            bytes: AtomicU64::new(bytes),
+        }
+    }
+
     fn reserve(&self, requested: u64) -> u64 {
+        self.reserve_keeping(requested, 0)
+    }
+
+    fn reserve_keeping(&self, requested: u64, keep: u64) -> u64 {
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
-            let available = self.maximum.saturating_sub(current);
+            let available = self.maximum.saturating_sub(current).saturating_sub(keep);
             let allocated = requested.min(available);
             if allocated == 0 {
                 return 0;
@@ -7111,6 +7165,11 @@ impl Session {
             .flatten()
             .and_then(|service| ProcessRuntime::new(service, negotiated.session_id, None));
         spawn_upload_stage_gc(internal.clone(), cancellation.clone());
+        let process_maxima = services
+            .process
+            .as_ref()
+            .map(|service| service.maxima())
+            .unwrap_or_default();
         Self {
             services,
             negotiated,
@@ -7133,16 +7192,15 @@ impl Session {
             inbound_credit,
             inbound_transfers,
             outbound: HashMap::new(),
+            max_outbound_transfers: process_maxima.outbound_transfers(),
             outbound_sensitive: BTreeSet::new(),
             surface_capture_transfers: HashMap::new(),
             relay_transfers: HashMap::new(),
             relay_handles: HashMap::new(),
             pending_requests: HashMap::new(),
             next_process_semantic_id: 1,
-            process_semantic_slots: Arc::new(Semaphore::new(
-                MAX_PENDING_PROCESS_SEMANTIC_OPERATIONS,
-            )),
-            process_wait_slots: Arc::new(Semaphore::new(MAX_PENDING_PROCESS_WAITS)),
+            process_semantic_slots: Arc::new(Semaphore::new(process_maxima.pending_operations)),
+            process_wait_slots: Arc::new(Semaphore::new(process_maxima.pending_waits)),
             next_events_semantic_id: 1,
             events_dump_slots: Arc::new(Semaphore::new(
                 yas_wire::schema::events::MAX_PENDING_DUMPS as usize,
@@ -8031,10 +8089,21 @@ impl Session {
                             return self.send_result(&frame, Status::Invalid, Vec::new()).await;
                         }
                     };
-                    if has_unknown_required(&extensions, &[]) {
+                    if has_unknown_required(&extensions, &[CLIENT_IDENTIFIER_EXTENSION]) {
                         return self
                             .send_result(&frame, Status::Unsupported, Vec::new())
                             .await;
+                    }
+                    match yas_wire::core::client_identifier(&extensions) {
+                        Ok(Some(identifier)) => {
+                            self.replace_client_identifier(identifier.to_owned()).await;
+                        }
+                        Ok(None) => {}
+                        // Not UTF-8, or longer than MAX_CLIENT_IDENTIFIER_BYTES:
+                        // the only two rules an identifier has.
+                        Err(_) => {
+                            return self.send_result(&frame, Status::Invalid, Vec::new()).await;
+                        }
                     }
                     self.send_result(&frame, Status::Ok, Vec::new()).await
                 }
@@ -8916,7 +8985,16 @@ impl Session {
         let name = format!("yas-app-{instance_id}");
         let path = runtime_dir.join(&name);
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).map_err(|_| Status::Io)?;
+        let listener = UnixListener::bind(&path).map_err(|error| {
+            // The client only sees Io; say which socket, and why (a runtime
+            // directory too long for a socket path, typically).
+            eprintln!(
+                "[surface] cannot bind the app socket {} ({} bytes): {error}",
+                path.display(),
+                path.as_os_str().len()
+            );
+            Status::Io
+        })?;
         let (reply, applied) = std::sync::mpsc::sync_channel(1);
         let submission = submit_app_socket_add_command(
             command_sender,
@@ -9705,16 +9783,19 @@ impl Session {
                     .max_by_key(|(_, pixels)| u64::from(pixels.width) * u64::from(pixels.height))
                     .map(|(_, pixels)| (pixels.width, pixels.height, pixels.pixels.clone()))
             });
-            let command_tx = shared
-                .compositor
-                .as_ref()
-                .map(|compositor| compositor.handle.command_tx.clone());
+            let command_tx = shared.compositor.as_ref().map(|compositor| {
+                (
+                    compositor.handle.command_tx.clone(),
+                    compositor.handle.command_sender(),
+                )
+            });
             (snapshot, command_tx)
         };
         let mut captured = match command_tx {
-            Some(command_tx) => {
+            Some((command_tx, loop_waker)) => {
                 super::request_surface_capture_with_timeout(
                     command_tx,
+                    move || loop_waker.wake(),
                     surface_id,
                     0,
                     Duration::from_secs(5),
@@ -16918,7 +16999,7 @@ impl Session {
         content_kind: u16,
         sensitive: bool,
     ) -> Option<(Descriptor, Arc<FlowControl>)> {
-        if self.outbound.len() >= MAX_OUTBOUND_TRANSFERS {
+        if self.outbound.len() >= self.max_outbound_transfers {
             return None;
         }
         let transfer_id = self.alloc_transfer_id()?;
@@ -16967,7 +17048,7 @@ impl Session {
         max_item_bytes: u64,
         sensitive: bool,
     ) -> Option<(Descriptor, Arc<FlowControl>)> {
-        if self.outbound.len() >= MAX_OUTBOUND_TRANSFERS {
+        if self.outbound.len() >= self.max_outbound_transfers {
             return None;
         }
         let transfer_id = self.alloc_transfer_id()?;
@@ -18058,6 +18139,17 @@ impl Session {
                     .await;
             }
         };
+        // The wire admits up to the extended hard maximum; this server admits
+        // what it advertised, and more entries fail as decoding did before.
+        if self
+            .process
+            .as_ref()
+            .is_some_and(|process| request.env.len() > process.service.maxima().envc)
+        {
+            return self
+                .send_sensitive_result(&frame, Status::Invalid, Vec::new())
+                .await;
+        }
         let fingerprint = *blake3::hash(&frame.payload).as_bytes();
         if let Some((status, body)) = self.process_replay(
             yas_process_wire::request_kind::SPAWN,
@@ -18099,7 +18191,7 @@ impl Session {
             || self.process.as_ref().is_some_and(|process| {
                 process.attachments.len() >= limits.max_processes_per_session as usize
             })
-            || self.outbound.len().saturating_add(2) > MAX_OUTBOUND_TRANSFERS
+            || self.outbound.len().saturating_add(2) > self.max_outbound_transfers
             || self
                 .process
                 .as_mut()
@@ -18149,6 +18241,7 @@ impl Session {
         let operation_id = request.operation_id;
         let stdout_receive_credit = request.stdout_receive_credit;
         let stderr_receive_credit = request.stderr_receive_credit;
+        let report_exit = request.flags & yas_wire::schema::process::SPAWN_REPORT_EXIT as u16 != 0;
         let session = self.process.as_ref().ok_or(())?.session.clone();
         let internal = self.internal.clone();
         let cancellation = self.cancellation.clone();
@@ -18166,6 +18259,7 @@ impl Session {
                         fingerprint,
                         stdout_receive_credit,
                         stderr_receive_credit,
+                        report_exit,
                         outcome,
                     },
                     _slot: None,
@@ -18204,7 +18298,7 @@ impl Session {
         let limits = self.process.as_ref().ok_or(())?.service.limits();
         if self.process.as_ref().is_some_and(|process| {
             process.attachments.len() >= limits.max_processes_per_session as usize
-        }) || self.outbound.len().saturating_add(2) > MAX_OUTBOUND_TRANSFERS
+        }) || self.outbound.len().saturating_add(2) > self.max_outbound_transfers
         {
             return self
                 .send_sensitive_result(&frame, Status::ResourceExhausted, Vec::new())
@@ -19042,10 +19136,14 @@ impl Session {
         request_id: u32,
         error: super::yas_fs::Error,
     ) -> Result<(), ()> {
-        let detail = match &error {
+        let mut detail = match error.kind() {
             super::yas_fs::Error::Conflict(conflict) => conflict.result_detail().map_err(|_| ())?,
             _ => Extensions::default(),
         };
+        // Optional, so clients that predate it skip it; the status is unchanged.
+        if let Some(os) = error.os_error() {
+            detail.0.push(os.result_extension().map_err(|_| ())?);
+        }
         let payload = ResultPrefix {
             status: fs_error_status(&error),
             detail,
@@ -23124,17 +23222,26 @@ impl Session {
                             .ok_or(())?;
                         let input = attachment.stdin.as_mut().ok_or(())?;
                         if !frame.header.sensitive
-                            || !input.open
+                            || input.peer_closed
                             || close.status != Status::Ok.code()
                             || close.final_data_bytes != input.received
                         {
                             None
+                        } else if !input.open {
+                            // The child closed its stdin (typically by
+                            // exiting) while this CLOSE was in flight. The
+                            // input already ended; a clean CLOSE crossing
+                            // that is not a violation, and nothing is left
+                            // to close.
+                            input.peer_closed = true;
+                            Some(None)
                         } else {
                             input.open = false;
+                            input.peer_closed = true;
                             attachment
                                 .stream_bundle_replayable
                                 .store(false, Ordering::Release);
-                            Some(attachment.control.clone())
+                            Some(Some(attachment.control.clone()))
                         }
                     };
                     let Some(control) = control else {
@@ -23146,6 +23253,9 @@ impl Session {
                         .await?;
                         return Ok(());
                     };
+                    let Some(control) = control else {
+                        return Ok(());
+                    };
                     let internal = self.internal.clone();
                     let connection = self.cancellation.clone();
                     tokio::spawn(async move {
@@ -23153,6 +23263,16 @@ impl Session {
                             result = control.close_stdin() => result,
                             _ = connection.cancelled() => return,
                         };
+                        // A process that exited (Conflict) or was reaped
+                        // (NotFound) while the CLOSE was in flight has no
+                        // stdin left to close: not a failure of its output.
+                        if let Err(
+                            super::yas_process::Error::NotFound
+                            | super::yas_process::Error::Conflict,
+                        ) = result
+                        {
+                            return;
+                        }
                         if let Err(error) = result {
                             let _ = internal
                                 .send(Internal::ProcessFailed {
@@ -23553,7 +23673,7 @@ impl Session {
                             .await;
                     }
                 };
-                if self.outbound.len() >= MAX_OUTBOUND_TRANSFERS {
+                if self.outbound.len() >= self.max_outbound_transfers {
                     return self
                         .send_result_parts(
                             family::RELAY,
@@ -25223,7 +25343,7 @@ impl Session {
                 let consume_stage = match &outcome {
                     Ok(_) => true,
                     Err(error) => !matches!(
-                        error,
+                        error.kind(),
                         super::yas_fs::Error::Invalid(_) | super::yas_fs::Error::NotFound
                     ),
                 };
@@ -25297,6 +25417,7 @@ impl Session {
                 fingerprint,
                 stdout_receive_credit,
                 stderr_receive_credit,
+                report_exit,
                 outcome,
             } => {
                 if kind != yas_process_wire::request_kind::SPAWN {
@@ -25354,6 +25475,7 @@ impl Session {
                     }
                 };
                 let body = bundle.encode().map_err(|_| ())?;
+                let report_exit = report_exit.then_some(bundle.process_handle);
                 self.record_process_replay(
                     operation_id,
                     kind,
@@ -25377,7 +25499,7 @@ impl Session {
                     self.remove_process_attachment(attachment_id, true);
                     return Err(());
                 }
-                self.activate_process_attachment(attachment_id, events)?;
+                self.activate_process_attachment(attachment_id, events, report_exit)?;
                 Ok(())
             }
             ProcessOperationOutcome::Attach {
@@ -25438,7 +25560,7 @@ impl Session {
                     self.remove_process_attachment(attachment_id, true);
                     return Err(());
                 }
-                self.activate_process_attachment(attachment_id, events)?;
+                self.activate_process_attachment(attachment_id, events, None)?;
                 Ok(())
             }
             ProcessOperationOutcome::Control {
@@ -25597,10 +25719,25 @@ impl Session {
         let stdin = if control.stdin_window == 0 {
             None
         } else {
+            let maxima = self
+                .process
+                .as_ref()
+                .map(|process| process.service.maxima())
+                .unwrap_or_default();
+            // Stdin windows share the session's receive budget with every
+            // other frame the peer sends. They never take the last quarter of
+            // it, so a session full of idle stdin pipes can still read
+            // requests, credit and PING results, and each gets a fair share
+            // of the rest at the configured processes per session.
+            let reserve = self.inbound_credit.maximum / PROCESS_STDIN_RESERVE_DIVISOR;
+            let fair_share = ((self.inbound_credit.maximum - reserve)
+                / maxima.per_session.max(1) as u64)
+                .max(PROCESS_STDIN_MIN_WINDOW);
             let target_window = control
                 .stdin_window
-                .min(yas_process_wire::MAX_STREAM_BUFFER_BYTES);
-            let receive_credit = self.inbound_credit.lease(target_window);
+                .min(maxima.stream_buffer_bytes)
+                .min(fair_share);
+            let receive_credit = self.inbound_credit.lease_keeping(target_window, reserve);
             let granted = receive_credit.bytes();
             let Some(transfer_id) = self.alloc_transfer_id() else {
                 self.abort_transfer(stdout.transfer_id);
@@ -25648,6 +25785,7 @@ impl Session {
                     granted,
                     target_window,
                     open: true,
+                    peer_closed: false,
                     receive_credit,
                 },
             ))
@@ -25697,10 +25835,13 @@ impl Session {
         ))
     }
 
+    /// Start forwarding an installed attachment's streams; with `report_exit` (the handle of a
+    /// process spawned with SPAWN_REPORT_EXIT), its exit is sent as an EXIT event too.
     fn activate_process_attachment(
         &mut self,
         attachment_id: u32,
         events: super::yas_process::AttachmentEvents,
+        report_exit: Option<u64>,
     ) -> Result<(), ()> {
         let attachment = self
             .process
@@ -25724,6 +25865,7 @@ impl Session {
             attachment.stdout_transfer,
             stdout_flow,
             attachment.stderr_transfer.zip(stderr_flow),
+            report_exit,
             self.out.clone(),
             self.internal.clone(),
             self.cancellation.clone(),
@@ -25979,6 +26121,8 @@ impl Session {
                 self.outbound_sensitive.remove(&transfer_id);
             }
         }
+        // A SPAWN_REPORT_EXIT process whose attachment goes before its exit reports none: the
+        // client knows (it dropped a stream, detached, or saw its streams reset) and WAITs.
         if detach {
             tokio::spawn(async move {
                 let _ = attachment.control.detach().await;
@@ -27068,6 +27212,22 @@ impl Session {
                 }
             }
             Ok(changed)
+        }
+    }
+
+    /// Replace what this session reported as its identifier. Client catalogue
+    /// watchers pick it up at their next refresh, as they do any other change
+    /// to the record.
+    async fn replace_client_identifier(&mut self, identifier: String) {
+        let Some(state) = self.native.as_ref().map(|native| native.state.clone()) else {
+            return;
+        };
+        let mut shared = state.session.lock().await;
+        if let Some(client) = shared
+            .native_yas_clients
+            .get_mut(&self.negotiated.session_id)
+        {
+            client.identity.identifier = Some(identifier);
         }
     }
 
@@ -28737,7 +28897,10 @@ fn negotiate(
     }
     const READ_ONLY_SESSION_EXTENSION: u16 =
         yas_wire::schema::core::CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION as u16;
-    if has_unknown_required(&hello.extensions, &[READ_ONLY_SESSION_EXTENSION]) {
+    if has_unknown_required(
+        &hello.extensions,
+        &[READ_ONLY_SESSION_EXTENSION, CLIENT_IDENTIFIER_EXTENSION],
+    ) {
         return Err(Status::Unsupported);
     }
     let read_only = hello
@@ -30899,6 +31062,36 @@ struct ProcessOutputChunk {
     data: Vec<u8>,
 }
 
+/// A SPAWN_REPORT_EXIT process's exit, as the EXIT event its session gets unasked.
+async fn send_exit_report(
+    out: &FrameSender,
+    process_handle: u64,
+    exit: super::yas_process::ExitInfo,
+    connection: &ConnectionCancellation,
+) {
+    // KEEP_OUTPUT: what was dropped of each stream.
+    let elided = exit
+        .elided
+        .iter()
+        .zip([false, true])
+        .filter_map(|(elided, stderr)| elided.map(|elided| elided.extension(stderr)))
+        .collect();
+    let report = yas_process_wire::ExitReport {
+        process_handle,
+        exit: exit.into_record(monotonic_ns()),
+        extensions: Extensions(elided),
+    };
+    let _ = send_event_with_sensitivity(
+        out,
+        family::PROCESS,
+        yas_process_wire::event_kind::EXIT,
+        &report,
+        connection,
+        true,
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_process_attachment(
     attachment_id: u32,
@@ -30908,12 +31101,14 @@ fn spawn_process_attachment(
     stdout_transfer: u32,
     stdout_flow: Arc<FlowControl>,
     stderr: Option<(u32, Arc<FlowControl>)>,
+    report_exit: Option<u64>,
     out: FrameSender,
     internal: mpsc::Sender<Internal>,
     connection: ConnectionCancellation,
     cancellation: ConnectionCancellation,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let exit_out = out.clone();
         let (stdout_tx, stdout_rx) = mpsc::channel(PROCESS_STREAM_QUEUE);
         let stdout_task = tokio::spawn(run_process_output(
             attachment_id,
@@ -31009,14 +31204,40 @@ fn spawn_process_attachment(
                         return;
                     }
                 }
-                Some(super::yas_process::Event::Exit(_)) => {
+                Some(super::yas_process::Event::Exit(exit)) => {
                     exited = true;
+                    // As a WAIT would answer it, at once: the streams go on with what
+                    // the process wrote before, at the pace of their credit.
+                    // In a task of its own: removing the attachment meanwhile aborts this
+                    // one, and the exit is already this attachment's to report.
+                    if let Some(process_handle) = report_exit {
+                        let (out, connection) = (exit_out.clone(), connection.clone());
+                        tokio::spawn(async move {
+                            send_exit_report(&out, process_handle, exit, &connection).await;
+                        });
+                    }
                     let _ = internal
                         .send(Internal::ProcessExited { attachment_id })
                         .await;
                     break;
                 }
-                None => break,
+                None => {
+                    // The route failed (its output fell a window behind): the session resets
+                    // this attachment's Transfers with why, rather than end them cleanly
+                    // short, and cancels this task and its streams meanwhile.
+                    if let Some(detail) = events.failure() {
+                        let _ = internal
+                            .send(Internal::ProcessFailed {
+                                attachment_id,
+                                status: Status::ResourceExhausted,
+                                detail,
+                            })
+                            .await;
+                        cancellation.cancelled().await;
+                        return;
+                    }
+                    break;
+                }
             }
         }
         drop(stdout_tx);
@@ -31061,16 +31282,29 @@ async fn run_process_output(
                     "non-contiguous Process lifetime output offset".to_owned(),
                 ));
             }
-            for bytes in chunk.data.chunks(TRANSFER_CHUNK) {
+            // Send as much as the receiver's credit allows, not whole
+            // chunks: a window smaller than one chunk still makes progress.
+            let mut rest = &chunk.data[..];
+            while !rest.is_empty() {
+                let Some(room) = flow
+                    .available(
+                        offset,
+                        TRANSFER_CHUNK.min(rest.len()),
+                        &connection,
+                        &connection,
+                    )
+                    .await
+                else {
+                    return Err((Status::Cancelled, "Process output cancelled".to_owned()));
+                };
+                let (bytes, tail) = rest.split_at(room);
+                rest = tail;
                 let end = offset.checked_add(bytes.len() as u64).ok_or_else(|| {
                     (
                         Status::Internal,
                         "Process output offset overflow".to_owned(),
                     )
                 })?;
-                if !flow.wait_through(end, &connection).await {
-                    return Err((Status::Cancelled, "Process output cancelled".to_owned()));
-                }
                 send_event_with_sensitivity(
                     &out,
                     family::TRANSFER,
@@ -31368,8 +31602,8 @@ const fn extension_error_status(error: &super::yas_extension::Error) -> Status {
     }
 }
 
-const fn fs_error_status(error: &super::yas_fs::Error) -> Status {
-    match error {
+fn fs_error_status(error: &super::yas_fs::Error) -> Status {
+    match error.kind() {
         super::yas_fs::Error::Unavailable | super::yas_fs::Error::Closed => Status::Unavailable,
         super::yas_fs::Error::NotFound => Status::NotFound,
         super::yas_fs::Error::Permission | super::yas_fs::Error::Io(_) => Status::Io,
@@ -31380,6 +31614,7 @@ const fn fs_error_status(error: &super::yas_fs::Error) -> Status {
         super::yas_fs::Error::Unsupported => Status::Unsupported,
         super::yas_fs::Error::Invalid(_) => Status::Invalid,
         super::yas_fs::Error::Internal => Status::Internal,
+        super::yas_fs::Error::Os(failure) => fs_error_status(&failure.error),
     }
 }
 
@@ -32588,15 +32823,28 @@ fn spawn_byte_transfer_with_sensitivity(
     tokio::spawn(async move {
         let _permit = permit;
         let mut offset = 0u64;
-        for chunk in bytes.chunks(TRANSFER_CHUNK) {
+        // Chunks follow the receiver's credit, so a window smaller than
+        // TRANSFER_CHUNK still makes progress.
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let Some(room) = control
+                .available(
+                    offset,
+                    TRANSFER_CHUNK.min(rest.len()),
+                    &cancellation,
+                    &cancellation,
+                )
+                .await
+            else {
+                let _ = internal.send(Internal::TransferFinished(transfer_id)).await;
+                return;
+            };
+            let (chunk, tail) = rest.split_at(room);
+            rest = tail;
             let end = match offset.checked_add(chunk.len() as u64) {
                 Some(end) => end,
                 None => break,
             };
-            if !control.wait_through(end, &cancellation).await {
-                let _ = internal.send(Internal::TransferFinished(transfer_id)).await;
-                return;
-            }
             let data = ByteData {
                 transfer_id,
                 offset,
@@ -35173,6 +35421,10 @@ fn has_unknown_required(extensions: &Extensions, supported: &[u16]) -> bool {
         .any(|extension| extension.required && !supported.contains(&extension.tag))
 }
 
+/// The HELLO and CLIENT_UPDATE extension carrying a client's own identifier.
+const CLIENT_IDENTIFIER_EXTENSION: u16 =
+    yas_wire::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION as u16;
+
 const fn channel_status(error: ChannelError) -> Status {
     match error {
         ChannelError::Unavailable => Status::Unavailable,
@@ -37446,7 +37698,7 @@ mod tests {
     fn maximal_process_delta_falls_back_to_bounded_snapshot_records() {
         let records = vec![
             maximal_process_state_record();
-            yas_process_wire::Limits::HARD.max_processes_per_session as usize
+            yas_process_wire::Limits::DEFAULT.max_processes_per_session as usize
         ];
         assert_oversized_delta_has_bounded_reset_snapshot(BoundedStateFamily::Process, records);
     }
@@ -39010,7 +39262,14 @@ mod tests {
             (
                 "Process",
                 MAX_PROCESS_OPERATION_REPLAYS,
-                yas_process_wire::Limits::HARD.max_processes_per_session as usize,
+                yas_process_wire::Limits::DEFAULT.max_processes_per_session as usize,
+            ),
+            (
+                "Process at its hard maxima",
+                super::super::process::ProcessMaxima::HARD.operation_replays(),
+                super::super::process::ProcessMaxima::HARD.per_session
+                    + super::super::process::ProcessMaxima::HARD.pending_spawns
+                    + super::super::process::ProcessMaxima::HARD.pending_operations,
             ),
             (
                 "Selection",
@@ -40293,6 +40552,27 @@ mod tests {
         ServerHello,
         tokio::task::JoinHandle<()>,
     ) {
+        start_registered_session_with_hello_extensions(
+            state,
+            family_ids,
+            max_buffered,
+            Extensions::default(),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn start_registered_session_with_hello_extensions(
+        state: AppState,
+        family_ids: &[u16],
+        max_buffered: u64,
+        extensions: Extensions,
+    ) -> (
+        DuplexStream,
+        FrameCodec,
+        ServerHello,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (mut client, server) = tokio::io::duplex(4 * 1024 * 1024);
         let cancellation = ConnectionCancellation::default();
         let registration = state
@@ -40310,8 +40590,13 @@ mod tests {
             None,
             ConnectionOrigin::Network,
         ));
-        let (codec, server_hello) =
-            handshake_with_receive(&mut client, family_ids, max_buffered).await;
+        let (codec, server_hello) = handshake_with_receive_and_extensions(
+            &mut client,
+            family_ids,
+            max_buffered,
+            extensions,
+        )
+        .await;
         (client, codec, server_hello, task)
     }
 
@@ -45972,6 +46257,184 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn client_catalogue_republishes_reported_utf8_identifiers() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        // Controls and all, and reported by two sessions: the server passes it
+        // on regardless, for whoever reads the list to make sense of.
+        let odd = "pierre's\tlaptop 🖥";
+        let reporting = || {
+            Extensions(vec![
+                yas_wire::core::client_identifier_extension(odd).unwrap(),
+            ])
+        };
+        let (mut watcher, watcher_codec, watcher_hello, watcher_task) =
+            start_registered_session_with_hello_extensions(
+                state.clone(),
+                &[family::CLIENT],
+                TEST_PEER_MAX_BUFFERED,
+                reporting(),
+            )
+            .await;
+        let (mut target, target_codec, target_hello, target_task) =
+            start_registered_session_with_hello_extensions(
+                state.clone(),
+                &[family::TERMINAL],
+                TEST_PEER_MAX_BUFFERED,
+                reporting(),
+            )
+            .await;
+        let (silent, _silent_codec, silent_hello, silent_task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        timeout(TEST_TIMEOUT, async {
+            while state.session.lock().await.native_yas_clients.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native clients registered directly");
+
+        write_request(
+            &mut watcher,
+            &watcher_codec,
+            family::CLIENT,
+            yas_wire::schema::client::request::WATCH,
+            1,
+            &Watch {
+                initial_credit: 1024 * 1024,
+                resume: None,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let watched = next_result(
+            &mut watcher,
+            &watcher_codec,
+            family::CLIENT,
+            yas_wire::schema::client::request::WATCH,
+            1,
+        )
+        .await;
+        assert_eq!(watched.status, Status::Ok);
+        let mut records = BTreeMap::new();
+        loop {
+            let frame = next_frame(&mut watcher, &watcher_codec).await;
+            if frame.header.family != family::CLIENT || frame.header.class != Class::Event {
+                continue;
+            }
+            let event = StateEvent::decode(&frame.payload).unwrap();
+            for state_record in event.records {
+                if let Ok(record) = yas_client::client_from_state_record(&state_record) {
+                    records.insert(record.session_id, record);
+                }
+            }
+            if event.phase == Phase::SnapshotEnd {
+                break;
+            }
+        }
+        for session_id in [watcher_hello.session_id, target_hello.session_id] {
+            assert_eq!(records[&session_id].identifier().unwrap(), Some(odd));
+        }
+        assert_eq!(
+            records[&silent_hello.session_id].identifier().unwrap(),
+            None
+        );
+
+        // Not UTF-8, or longer than 1 KiB: refused, and the identifier stays.
+        let reported = yas_wire::core::client_identifier_extension("").unwrap();
+        let too_long = vec![b'a'; yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES + 1];
+        for (request_id, value) in [(2, vec![0xff]), (3, too_long)] {
+            write_request(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                request_id,
+                &Extensions(vec![Extension {
+                    value,
+                    ..reported.clone()
+                }]),
+            )
+            .await;
+            assert_eq!(
+                next_result(
+                    &mut target,
+                    &target_codec,
+                    family::CORE,
+                    yas_wire::core::request_kind::CLIENT_UPDATE,
+                    request_id,
+                )
+                .await
+                .status,
+                Status::Invalid,
+            );
+            assert_eq!(
+                state
+                    .session
+                    .lock()
+                    .await
+                    .native_yas_clients
+                    .get(&target_hello.session_id)
+                    .and_then(|client| client.identity.identifier.clone())
+                    .as_deref(),
+                Some(odd),
+            );
+        }
+
+        // CLIENT_UPDATE replaces it, and watchers see the record change.
+        write_request(
+            &mut target,
+            &target_codec,
+            family::CORE,
+            yas_wire::core::request_kind::CLIENT_UPDATE,
+            4,
+            &Extensions(vec![
+                yas_wire::core::client_identifier_extension("pierre's laptop").unwrap(),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            next_result(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                4,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let frame = next_frame(&mut watcher, &watcher_codec).await;
+                if frame.header.family != family::CLIENT || frame.header.class != Class::Event {
+                    continue;
+                }
+                let event = StateEvent::decode(&frame.payload).unwrap();
+                if event.records.iter().any(|state_record| {
+                    yas_client::client_from_state_record(state_record).is_ok_and(|record| {
+                        record.session_id == target_hello.session_id
+                            && record.identifier() == Ok(Some("pierre's laptop"))
+                    })
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the watcher saw the replaced identifier");
+
+        drop((target, silent));
+        timeout(TEST_TIMEOUT, target_task).await.unwrap().unwrap();
+        timeout(TEST_TIMEOUT, silent_task).await.unwrap().unwrap();
+        drop(watcher);
+        timeout(TEST_TIMEOUT, watcher_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn client_watch_disconnect_and_operation_replay_use_typed_yas() {
         let process_server = super::super::tests::process_transport::test_state;
         let state = process_server(super::super::process::Server::new(false, true));
@@ -50360,6 +50823,11 @@ mod tests {
             yas_fs_wire::Limits::from_extensions(&descriptor.limits).unwrap(),
             yas_fs_wire::Limits::HARD,
         );
+        assert!(
+            yas_fs_wire::Limits::from_extensions(&descriptor.limits)
+                .unwrap()
+                .supports(yas_wire::schema::fs::CAPABILITY_FLAGS)
+        );
         for kind in [
             yas_wire::schema::fs::request::OPEN,
             yas_wire::schema::fs::request::WATCH,
@@ -50484,6 +50952,74 @@ mod tests {
             .await
             .status,
             Status::Ok,
+        );
+
+        // A failed FETCH keeps its status and carries the OS error as an
+        // optional detail extension.
+        write_request(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            90,
+            &yas_fs_wire::Fetch {
+                root_handle: opened.root_handle,
+                path: yas_fs_wire::Path {
+                    components: vec![b"missing.txt".to_vec()],
+                },
+                expected_hash: None,
+                initial_receive_credit: 0,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let missing = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            90,
+        )
+        .await;
+        assert_eq!(missing.status, Status::NotFound);
+        let os = yas_fs_wire::OsError::from_result_detail(&missing.detail)
+            .unwrap()
+            .expect("FS OS error detail");
+        assert_eq!(
+            (os.name.as_str(), os.operation.as_str()),
+            ("ENOENT", "open")
+        );
+        assert_eq!(os.code, libc::ENOENT);
+        write_request(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            91,
+            &yas_fs_wire::Fetch {
+                root_handle: opened.root_handle,
+                path: yas_fs_wire::Path::default(),
+                expected_hash: None,
+                initial_receive_credit: 0,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let directory = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::FETCH,
+            91,
+        )
+        .await;
+        assert_eq!(directory.status, Status::Invalid);
+        let os = yas_fs_wire::OsError::from_result_detail(&directory.detail)
+            .unwrap()
+            .expect("FS OS error detail");
+        assert_eq!(
+            (os.name.as_str(), os.operation.as_str()),
+            ("EISDIR", "read")
         );
 
         write_request(
@@ -50851,6 +51387,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn path_env() -> Vec<yas_process_wire::EnvEntry> {
+        vec![yas_process_wire::EnvEntry {
+            key: b"PATH".to_vec(),
+            value: std::env::var("PATH").unwrap_or_default().into_bytes(),
+        }]
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn process_attach_control_tasks_are_bounded_and_terminate_timer_is_idempotent() {
         let server = super::super::process::Server::new(false, true);
@@ -50880,7 +51424,9 @@ mod tests {
                     b"-c".to_vec(),
                     b"trap '' TERM; printf R; while :; do sleep 1; done".to_vec(),
                 ],
-                env: Vec::new(),
+                // An empty environment has no PATH: without it the loop
+                // spins on "sleep: command not found" and fills stderr.
+                env: path_env(),
                 stdout_receive_credit: 1,
                 stderr_receive_credit: 1,
                 extensions: Extensions::default(),
@@ -50927,7 +51473,9 @@ mod tests {
                     b"-c".to_vec(),
                     b"trap '' TERM; printf R; while :; do sleep 1; done".to_vec(),
                 ],
-                env: Vec::new(),
+                // An empty environment has no PATH: without it the loop
+                // spins on "sleep: command not found" and fills stderr.
+                env: path_env(),
                 stdout_receive_credit: 1,
                 stderr_receive_credit: 1,
                 extensions: Extensions::default(),
@@ -51183,6 +51731,85 @@ mod tests {
         timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
         drop(foreign);
         timeout(TEST_TIMEOUT, foreign_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_output_follows_credit_smaller_than_one_chunk() {
+        let server = super::super::process::Server::new(false, true);
+        let runtime = super::super::yas_process::Runtime::new(server.clone());
+        let mut services = test_services(None, unavailable_connector(), None);
+        services.process = Some(runtime);
+        let (mut client, codec, _, server_task) =
+            start_session(services, &[family::TRANSFER, family::PROCESS]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            900,
+            &yas_process_wire::Spawn {
+                operation_id: [0xd1; 16],
+                flags: 0,
+                environment_kind: yas_process_wire::EnvironmentKind::Empty,
+                cwd: yas_process_wire::Cwd::ServerDefault,
+                argv: vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"printf ABC".to_vec()],
+                env: Vec::new(),
+                stdout_receive_credit: 1,
+                stderr_receive_credit: 1,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let spawned = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            900,
+        )
+        .await;
+        assert_eq!(spawned.status, Status::Ok);
+        let stdout = yas_process_wire::StreamBundle::decode(&spawned.body)
+            .unwrap()
+            .stdout
+            .transfer_id;
+
+        // "ABC" is one read and one chunk. Each byte of credit lets one byte
+        // through; the server does not wait for credit through the chunk.
+        for (offset, byte) in b"ABC".iter().enumerate() {
+            let data = timeout(TEST_TIMEOUT, async {
+                loop {
+                    let frame = next_frame(&mut client, &codec).await;
+                    if frame.header.family == family::TRANSFER
+                        && frame.header.kind == yas_wire::schema::transfer::event::BYTE_DATA
+                    {
+                        let data = ByteData::decode(&frame.payload).unwrap();
+                        if data.transfer_id == stdout {
+                            break data;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("output within the credit granted");
+            assert_eq!(data.offset, offset as u64);
+            assert_eq!(data.data, [*byte]);
+            write_event(
+                &mut client,
+                &codec,
+                family::TRANSFER,
+                yas_wire::schema::transfer::event::CREDIT,
+                &Credit {
+                    transfer_id: stdout,
+                    cumulative_limit: offset as u64 + 2,
+                },
+            )
+            .await;
+        }
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -51486,7 +52113,12 @@ mod tests {
             yas_process_wire::Limits::from_extensions(&descriptor.limits).unwrap(),
             yas_process_wire::Limits {
                 max_mutation_replays: MAX_PROCESS_OPERATION_REPLAYS as u32,
-                ..yas_process_wire::Limits::HARD
+                launcher_flags: if cfg!(unix) {
+                    yas_wire::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32
+                } else {
+                    yas_wire::schema::process::SPAWN_STDIN_NULL as u32
+                },
+                ..yas_process_wire::Limits::DEFAULT
             },
         );
         for kind in [
@@ -51849,6 +52481,142 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn process_spawn_with_report_exit_is_sent_its_exit_without_a_wait() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let sh = std::env::split_paths(&std::env::var_os("PATH").expect("test PATH is set"))
+            .map(|directory| directory.join("sh"))
+            .find(|path| path.is_file())
+            .expect("sh is on PATH")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, hello, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::PROCESS]).await;
+        let descriptor = hello
+            .families
+            .iter()
+            .find(|descriptor| descriptor.family_id == family::PROCESS)
+            .expect("Process negotiated");
+        let limits = yas_process_wire::Limits::from_extensions(&descriptor.limits).unwrap();
+        assert_ne!(
+            limits.launcher_flags & yas_wire::schema::process::SPAWN_REPORT_EXIT as u32,
+            0
+        );
+
+        let spawn = yas_process_wire::Spawn {
+            operation_id: [0x72; 16],
+            flags: (yas_wire::schema::process::SPAWN_REPORT_EXIT
+                | yas_wire::schema::process::SPAWN_STDIN_NULL) as u16,
+            environment_kind: yas_process_wire::EnvironmentKind::Empty,
+            cwd: yas_process_wire::Cwd::ServerDefault,
+            argv: vec![
+                sh,
+                b"-c".to_vec(),
+                b"printf out; printf err >&2; exit 3".to_vec(),
+            ],
+            env: Vec::new(),
+            stdout_receive_credit: 1024 * 1024,
+            stderr_receive_credit: 1024 * 1024,
+            extensions: Extensions::default(),
+        };
+        write_request(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            11,
+            &spawn,
+        )
+        .await;
+        let (spawned, _) = next_process_result_collecting_state(
+            &mut client,
+            &codec,
+            yas_process_wire::request_kind::SPAWN,
+            11,
+        )
+        .await;
+        assert_eq!(spawned.status, Status::Ok);
+        let streams = yas_process_wire::StreamBundle::decode(&spawned.body).unwrap();
+        assert!(streams.stdin.is_none());
+        let stderr = streams.stderr.as_ref().expect("separate stderr Transfer");
+
+        // No WAIT is sent: the exit comes on its own, next to the streams.
+        let mut stdout = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_closed = false;
+        let mut stderr_closed = false;
+        let mut exit = None;
+        while !stdout_closed || !stderr_closed || exit.is_none() {
+            let frame = next_frame(&mut client, &codec).await;
+            match (frame.header.family, frame.header.kind) {
+                (family::PROCESS, yas_process_wire::event_kind::EXIT) => {
+                    assert_eq!(
+                        frame.header,
+                        FrameHeader {
+                            sensitive: true,
+                            ..FrameHeader::event(
+                                family::PROCESS,
+                                yas_process_wire::event_kind::EXIT,
+                            )
+                        }
+                    );
+                    assert!(exit.is_none(), "a second EXIT");
+                    let report = yas_process_wire::ExitReport::decode(&frame.payload).unwrap();
+                    assert_eq!(report.process_handle, streams.process_handle);
+                    assert_eq!(
+                        yas_process_wire::ExitReport::handle_of(&frame.payload),
+                        Some(streams.process_handle)
+                    );
+                    exit = Some(report.exit);
+                }
+                (family::TRANSFER, yas_wire::schema::transfer::event::BYTE_DATA) => {
+                    let data = ByteData::decode(&frame.payload).unwrap();
+                    let target = if data.transfer_id == streams.stdout.transfer_id {
+                        &mut stdout
+                    } else if data.transfer_id == stderr.transfer_id {
+                        &mut stderr_bytes
+                    } else {
+                        panic!("bytes for unknown Process Transfer")
+                    };
+                    assert_eq!(data.offset, target.len() as u64);
+                    target.extend_from_slice(&data.data);
+                }
+                (family::TRANSFER, yas_wire::schema::transfer::event::CLOSE) => {
+                    let close = Close::decode(&frame.payload).unwrap();
+                    assert_eq!(close.status, Status::Ok.code());
+                    if close.transfer_id == streams.stdout.transfer_id {
+                        assert_eq!(close.final_data_bytes, stdout.len() as u64);
+                        stdout_closed = true;
+                    } else if close.transfer_id == stderr.transfer_id {
+                        assert_eq!(close.final_data_bytes, stderr_bytes.len() as u64);
+                        stderr_closed = true;
+                    } else {
+                        panic!("CLOSE for unknown Process Transfer")
+                    }
+                }
+                _ => panic!(
+                    "unexpected native frame from a reported Process: {:?}",
+                    frame.header
+                ),
+            }
+        }
+        let exit = exit.unwrap();
+        assert_eq!(exit.kind, yas_process_wire::ExitKind::Code);
+        assert_eq!(exit.code, 3);
+        assert_ne!(exit.exited_server_ns, 0);
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr_bytes, b"err");
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn terminal_query_transfer_and_cancel_are_native_and_correlated() {
         let state = super::super::tests::process_transport::test_state(
             super::super::process::Server::new(false, true),
@@ -52080,6 +52848,143 @@ mod tests {
             .await
             .status,
             Status::Cancelled,
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+        delivery.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_output_past_end_is_empty_and_command_wait_times_out() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let delivery_state = state.clone();
+        let delivery = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_state.delivery_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                let _ = super::super::tick(&delivery_state).await;
+            }
+        });
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::TERMINAL]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x43; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"/bin/sh".to_vec(),
+                        b"-c".to_vec(),
+                        b"printf 'ready\\n'; exec cat".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let mut frames = Vec::new();
+        let created = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &mut frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OUTPUT,
+            11,
+            &yas_terminal::Output {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                cursor_kind: yas_wire::schema::terminal::OUTPUT_CURSOR_SEQUENCE as u8,
+                flags: yas_wire::schema::terminal::OUTPUT_REQUEST_FLAGS as u8,
+                cursor_a: 1_000_000,
+                cursor_b: 0,
+                max_bytes: 64 * 1024,
+                initial_receive_credit: 64 * 1024,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let output = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OUTPUT,
+            11,
+        )
+        .await;
+        assert_eq!(output.status, Status::Ok);
+        let yas_terminal::QueryDelivery::Inline(bytes) =
+            yas_terminal::QueryBody::decode(&output.body)
+                .unwrap()
+                .delivery
+        else {
+            panic!("an empty OUTPUT answer is inline");
+        };
+        let output = yas_terminal::OutputResult::decode(&bytes).unwrap();
+        assert!(output.text.is_empty());
+        assert!(output.next_seq < 1_000_000);
+        assert_eq!(
+            (output.start_seq, output.start_col),
+            (output.next_seq, output.next_col)
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::WAIT,
+            12,
+            &yas_terminal::Wait {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                wait_kind: yas_wire::schema::terminal::WAIT_LATEST_COMMAND as u8,
+                flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
+                cursor_a: 0,
+                cursor_b: 0,
+                max_bytes: 64 * 1024,
+                timeout_ns: 200_000_000,
+                needle: Vec::new(),
+                initial_receive_credit: 64 * 1024,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_sensitive_result(
+                &mut client,
+                &codec,
+                family::TERMINAL,
+                yas_wire::schema::terminal::request::WAIT,
+                12,
+            )
+            .await
+            .status,
+            Status::Timeout,
         );
 
         drop(client);
@@ -55777,10 +56682,20 @@ mod tests {
         let (mut client, codec, _, server_task) =
             start_session(services, &[family::TRANSFER, family::EVENTS]).await;
         let maximum = yas_wire::schema::events::MAX_PENDING_DUMPS as usize;
+        async fn next_non_transfer_frame(client: &mut DuplexStream, codec: &FrameCodec) -> Frame {
+            loop {
+                let frame = next_frame(client, codec).await;
+                if frame.header.family != family::TRANSFER {
+                    return frame;
+                }
+            }
+        }
         const FIRST_DUMP: u32 = 500;
         let request = yas_events_wire::Dump {
-            // Keep successful transfers effectively dormant so only their
-            // Results are relevant to admission ordering in this test.
+            // One byte of credit (the least there is) holds each successful
+            // DUMP's transfer to a single one-byte chunk, which the server
+            // sends as soon as the credit allows; next_non_transfer_frame
+            // skips those, so only Results decide admission ordering here.
             initial_receive_credit: 1,
             extensions: Extensions::default(),
         };
@@ -55886,7 +56801,7 @@ mod tests {
         gate.release(maximum);
         let mut completed = BTreeSet::new();
         while completed.len() < maximum - 1 {
-            let frame = timeout(TEST_TIMEOUT, next_frame(&mut client, &codec))
+            let frame = timeout(TEST_TIMEOUT, next_non_transfer_frame(&mut client, &codec))
                 .await
                 .expect("uncancelled Events DUMP completion");
             assert_eq!(frame.header.family, family::EVENTS);
@@ -55916,17 +56831,23 @@ mod tests {
             .await
             .expect("Events DUMP slot released after actual completion");
         gate.release(1);
-        assert_eq!(
-            next_sensitive_result(
-                &mut client,
-                &codec,
-                family::EVENTS,
-                yas_wire::schema::events::request::DUMP,
-                AFTER_COMPLETION_DUMP,
-            )
+        let frame = timeout(TEST_TIMEOUT, next_non_transfer_frame(&mut client, &codec))
             .await
-            .status,
-            Status::Ok,
+            .expect("Events DUMP after completion");
+        assert_eq!(
+            frame.header,
+            FrameHeader {
+                sensitive: true,
+                ..FrameHeader::result(
+                    family::EVENTS,
+                    yas_wire::schema::events::request::DUMP,
+                    AFTER_COMPLETION_DUMP,
+                )
+            }
+        );
+        assert_eq!(
+            ResultPrefix::decode(&frame.payload).unwrap().status,
+            Status::Ok
         );
 
         drop(client);

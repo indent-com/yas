@@ -1,7 +1,7 @@
 /** YAS Process family v1 codecs and browser client. */
 
-import * as g from "./generated";
-import type { YasConnection, YasReceiveBudgetLease } from "./session";
+import * as g from "./generated.js";
+import type { YasConnection, YasReceiveBudgetLease } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -18,7 +18,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_BYTE,
   YAS_TRANSFER_RECEIVER_TO_SENDER,
@@ -28,7 +28,7 @@ import {
   transfersFor,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YasCursor,
   YasProtocolError,
@@ -37,7 +37,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_FAMILY_PROCESS,
@@ -50,7 +50,7 @@ export {
   YAS_PROCESS_VERSION,
   YAS_PROCESS_WAIT,
   YAS_PROCESS_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export type YasProcessCwd =
   | { kind: "server-default" }
@@ -169,7 +169,27 @@ export interface YasProcessLimits {
   maxStreamBufferBytes: bigint;
   maxDetachedRetentionNs: bigint;
   maxMutationReplays: number;
+  /** Pending WAITs one session may hold. */
+  maxPendingWaits: number;
+  /** Completion-held ATTACH/CONTROL operations one session may hold. */
+  maxPendingOperations: number;
 }
+
+/** What a server enforces unless configured otherwise; the most a client from before the extended tags accepts. */
+export const YAS_PROCESS_DEFAULT_LIMITS: Readonly<YasProcessLimits> = {
+  maxArgc: g.YAS_PROCESS_MAX_ARGC,
+  maxArgBytes: g.YAS_PROCESS_MAX_ARG_BYTES,
+  maxEnvc: g.YAS_PROCESS_MAX_ENVC,
+  maxEnvBytes: g.YAS_PROCESS_MAX_ENV_BYTES,
+  maxProcessesPerSession: g.YAS_PROCESS_MAX_PROCESSES_PER_SESSION,
+  maxProcesses: g.YAS_PROCESS_MAX_PROCESSES,
+  maxPendingSpawns: g.YAS_PROCESS_MAX_PENDING_SPAWNS,
+  maxStreamBufferBytes: BigInt(g.YAS_PROCESS_MAX_STREAM_BUFFER_BYTES),
+  maxDetachedRetentionNs: BigInt(g.YAS_PROCESS_MAX_DETACHED_RETENTION_NS),
+  maxMutationReplays: g.YAS_PROCESS_MAX_MUTATION_REPLAYS,
+  maxPendingWaits: g.YAS_PROCESS_LEGACY_PENDING_WAITS,
+  maxPendingOperations: g.YAS_PROCESS_LEGACY_PENDING_OPERATIONS,
+};
 
 export function encodeProcessCwd(value: YasProcessCwd): Uint8Array {
   validateCwd(value);
@@ -271,7 +291,10 @@ export function decodeProcessSpawn(bytes: Uint8Array): YasProcessSpawn {
   for (let index = 0; index < argc; index++)
     argv.push(new Uint8Array(cursor.bytesU32("Process argument")));
   const envc = cursor.u16("Process environment count");
-  if (envc > g.YAS_PROCESS_MAX_ENVC || envc > Math.floor(cursor.remaining / 6))
+  if (
+    envc > g.YAS_PROCESS_MAX_ENVC_EXTENDED ||
+    envc > Math.floor(cursor.remaining / 6)
+  )
     throw new YasProtocolError("invalid Process environment count");
   const environment: YasProcessEnvironmentEntry[] = [];
   for (let index = 0; index < envc; index++)
@@ -542,6 +565,11 @@ export function encodeProcessRecord(value: YasProcessRecord): Uint8Array {
   return writer.bytes(encodeExtensions(value.extensions)).finish();
 }
 
+/**
+ * Process limits a server advertised. Tags 12–16 carry values above the
+ * original hard maxima (the legacy tags 3 and 5–8 then say the clamped value);
+ * tags 17 and 18 default to what servers enforced before advertising them.
+ */
 export function processLimitsFromExtensions(
   extensions: readonly YasExtension[],
 ): YasProcessLimits {
@@ -556,28 +584,62 @@ export function processLimitsFromExtensions(
     g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES,
     g.YAS_PROCESS_LIMIT_MAX_DETACHED_RETENTION_NS,
     g.YAS_PROCESS_LIMIT_MAX_MUTATION_REPLAYS,
+    g.YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED,
+    g.YAS_PROCESS_LIMIT_MAX_PROCESSES_EXTENDED,
+    g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS_EXTENDED,
+    g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED,
+    g.YAS_PROCESS_LIMIT_MAX_ENVC_EXTENDED,
+    g.YAS_PROCESS_LIMIT_MAX_PENDING_WAITS,
+    g.YAS_PROCESS_LIMIT_MAX_PENDING_OPERATIONS,
   ]);
   for (const extension of extensions)
     if (extension.required && !tags.has(extension.tag))
       throw new YasProtocolError("unknown required Process limit extension");
-  const value = {
+  const legacy = YAS_PROCESS_DEFAULT_LIMITS;
+  const maxEnvc = extensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_ENVC);
+  const maxProcessesPerSession = extensionU32(
+    extensions,
+    g.YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION,
+  );
+  const maxProcesses = extensionU32(
+    extensions,
+    g.YAS_PROCESS_LIMIT_MAX_PROCESSES,
+  );
+  const maxPendingSpawns = extensionU32(
+    extensions,
+    g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS,
+  );
+  const maxStreamBufferBytes = extensionU64(
+    extensions,
+    g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES,
+  );
+  const value: YasProcessLimits = {
     maxArgc: extensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_ARGC),
     maxArgBytes: extensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_ARG_BYTES),
-    maxEnvc: extensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_ENVC),
+    maxEnvc:
+      optionalExtensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_ENVC_EXTENDED) ??
+      maxEnvc,
     maxEnvBytes: extensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_ENV_BYTES),
-    maxProcessesPerSession: extensionU32(
-      extensions,
-      g.YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION,
-    ),
-    maxProcesses: extensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_PROCESSES),
-    maxPendingSpawns: extensionU32(
-      extensions,
-      g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS,
-    ),
-    maxStreamBufferBytes: extensionU64(
-      extensions,
-      g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES,
-    ),
+    maxProcessesPerSession:
+      optionalExtensionU32(
+        extensions,
+        g.YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED,
+      ) ?? maxProcessesPerSession,
+    maxProcesses:
+      optionalExtensionU32(
+        extensions,
+        g.YAS_PROCESS_LIMIT_MAX_PROCESSES_EXTENDED,
+      ) ?? maxProcesses,
+    maxPendingSpawns:
+      optionalExtensionU32(
+        extensions,
+        g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS_EXTENDED,
+      ) ?? maxPendingSpawns,
+    maxStreamBufferBytes:
+      optionalExtensionU64(
+        extensions,
+        g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED,
+      ) ?? maxStreamBufferBytes,
     maxDetachedRetentionNs: extensionU64(
       extensions,
       g.YAS_PROCESS_LIMIT_MAX_DETACHED_RETENTION_NS,
@@ -586,29 +648,64 @@ export function processLimitsFromExtensions(
       extensions,
       g.YAS_PROCESS_LIMIT_MAX_MUTATION_REPLAYS,
     ),
+    maxPendingWaits:
+      optionalExtensionU32(extensions, g.YAS_PROCESS_LIMIT_MAX_PENDING_WAITS) ??
+      legacy.maxPendingWaits,
+    maxPendingOperations:
+      optionalExtensionU32(
+        extensions,
+        g.YAS_PROCESS_LIMIT_MAX_PENDING_OPERATIONS,
+      ) ?? legacy.maxPendingOperations,
   };
+  if (
+    maxEnvc > legacy.maxEnvc ||
+    maxProcessesPerSession > legacy.maxProcessesPerSession ||
+    maxProcesses > legacy.maxProcesses ||
+    maxPendingSpawns > legacy.maxPendingSpawns ||
+    maxStreamBufferBytes > legacy.maxStreamBufferBytes ||
+    value.maxEnvc < maxEnvc ||
+    value.maxProcessesPerSession < maxProcessesPerSession ||
+    value.maxProcesses < maxProcesses ||
+    value.maxPendingSpawns < maxPendingSpawns ||
+    value.maxStreamBufferBytes < maxStreamBufferBytes
+  )
+    throw new YasProtocolError("invalid Process family limit");
   validateLimits(value);
   return value;
 }
 
+/** Encode limits as a server advertises them (legacy tags clamped, extended tags only when needed). */
 export function processLimitsExtensions(
   value: YasProcessLimits,
 ): YasExtension[] {
   validateLimits(value);
-  return [
+  const legacy = YAS_PROCESS_DEFAULT_LIMITS;
+  const min = (a: number, b: number) => Math.min(a, b);
+  const extensions = [
     extension32(g.YAS_PROCESS_LIMIT_MAX_ARGC, value.maxArgc),
     extension32(g.YAS_PROCESS_LIMIT_MAX_ARG_BYTES, value.maxArgBytes),
-    extension32(g.YAS_PROCESS_LIMIT_MAX_ENVC, value.maxEnvc),
+    extension32(
+      g.YAS_PROCESS_LIMIT_MAX_ENVC,
+      min(value.maxEnvc, legacy.maxEnvc),
+    ),
     extension32(g.YAS_PROCESS_LIMIT_MAX_ENV_BYTES, value.maxEnvBytes),
     extension32(
       g.YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION,
-      value.maxProcessesPerSession,
+      min(value.maxProcessesPerSession, legacy.maxProcessesPerSession),
     ),
-    extension32(g.YAS_PROCESS_LIMIT_MAX_PROCESSES, value.maxProcesses),
-    extension32(g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS, value.maxPendingSpawns),
+    extension32(
+      g.YAS_PROCESS_LIMIT_MAX_PROCESSES,
+      min(value.maxProcesses, legacy.maxProcesses),
+    ),
+    extension32(
+      g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS,
+      min(value.maxPendingSpawns, legacy.maxPendingSpawns),
+    ),
     extension64(
       g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES,
-      value.maxStreamBufferBytes,
+      value.maxStreamBufferBytes < legacy.maxStreamBufferBytes
+        ? value.maxStreamBufferBytes
+        : legacy.maxStreamBufferBytes,
     ),
     extension64(
       g.YAS_PROCESS_LIMIT_MAX_DETACHED_RETENTION_NS,
@@ -619,6 +716,50 @@ export function processLimitsExtensions(
       value.maxMutationReplays,
     ),
   ];
+  if (value.maxProcessesPerSession > legacy.maxProcessesPerSession)
+    extensions.push(
+      extension32(
+        g.YAS_PROCESS_LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED,
+        value.maxProcessesPerSession,
+      ),
+    );
+  if (value.maxProcesses > legacy.maxProcesses)
+    extensions.push(
+      extension32(
+        g.YAS_PROCESS_LIMIT_MAX_PROCESSES_EXTENDED,
+        value.maxProcesses,
+      ),
+    );
+  if (value.maxPendingSpawns > legacy.maxPendingSpawns)
+    extensions.push(
+      extension32(
+        g.YAS_PROCESS_LIMIT_MAX_PENDING_SPAWNS_EXTENDED,
+        value.maxPendingSpawns,
+      ),
+    );
+  if (value.maxStreamBufferBytes > legacy.maxStreamBufferBytes)
+    extensions.push(
+      extension64(
+        g.YAS_PROCESS_LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED,
+        value.maxStreamBufferBytes,
+      ),
+    );
+  if (value.maxEnvc > legacy.maxEnvc)
+    extensions.push(
+      extension32(g.YAS_PROCESS_LIMIT_MAX_ENVC_EXTENDED, value.maxEnvc),
+    );
+  if (value.maxPendingWaits !== legacy.maxPendingWaits)
+    extensions.push(
+      extension32(g.YAS_PROCESS_LIMIT_MAX_PENDING_WAITS, value.maxPendingWaits),
+    );
+  if (value.maxPendingOperations !== legacy.maxPendingOperations)
+    extensions.push(
+      extension32(
+        g.YAS_PROCESS_LIMIT_MAX_PENDING_OPERATIONS,
+        value.maxPendingOperations,
+      ),
+    );
+  return extensions;
 }
 
 export class YasProcessCatalog {
@@ -1822,7 +1963,7 @@ function validateArg(value: Uint8Array): void {
 }
 
 function validateEnvironment(env: readonly YasProcessEnvironmentEntry[]): void {
-  if (env.length > g.YAS_PROCESS_MAX_ENVC)
+  if (env.length > g.YAS_PROCESS_MAX_ENVC_EXTENDED)
     throw new YasProtocolError("too many Process environment entries");
   let total = 0;
   let previous: Uint8Array | undefined;
@@ -1888,21 +2029,23 @@ function validateLimits(value: YasProcessLimits): void {
   const valid =
     within(value.maxArgc, g.YAS_PROCESS_MAX_ARGC) &&
     within(value.maxArgBytes, g.YAS_PROCESS_MAX_ARG_BYTES) &&
-    within(value.maxEnvc, g.YAS_PROCESS_MAX_ENVC) &&
+    within(value.maxEnvc, g.YAS_PROCESS_MAX_ENVC_EXTENDED) &&
     within(value.maxEnvBytes, g.YAS_PROCESS_MAX_ENV_BYTES) &&
     within(
       value.maxProcessesPerSession,
-      g.YAS_PROCESS_MAX_PROCESSES_PER_SESSION,
+      g.YAS_PROCESS_MAX_PROCESSES_PER_SESSION_EXTENDED,
     ) &&
-    within(value.maxProcesses, g.YAS_PROCESS_MAX_PROCESSES) &&
-    within(value.maxPendingSpawns, g.YAS_PROCESS_MAX_PENDING_SPAWNS) &&
+    within(value.maxProcesses, g.YAS_PROCESS_MAX_PROCESSES_EXTENDED) &&
+    within(value.maxPendingSpawns, g.YAS_PROCESS_MAX_PENDING_SPAWNS_EXTENDED) &&
     value.maxStreamBufferBytes > 0n &&
     value.maxStreamBufferBytes <=
-      BigInt(g.YAS_PROCESS_MAX_STREAM_BUFFER_BYTES) &&
+      BigInt(g.YAS_PROCESS_MAX_STREAM_BUFFER_BYTES_EXTENDED) &&
     value.maxDetachedRetentionNs > 0n &&
     value.maxDetachedRetentionNs <=
       BigInt(g.YAS_PROCESS_MAX_DETACHED_RETENTION_NS) &&
-    within(value.maxMutationReplays, g.YAS_PROCESS_MAX_MUTATION_REPLAYS);
+    within(value.maxMutationReplays, g.YAS_PROCESS_MAX_MUTATION_REPLAYS) &&
+    within(value.maxPendingWaits, g.YAS_PROCESS_MAX_PENDING_WAITS) &&
+    within(value.maxPendingOperations, g.YAS_PROCESS_MAX_PENDING_OPERATIONS);
   if (!valid) throw new YasProtocolError("invalid Process family limit");
 }
 
@@ -1962,6 +2105,24 @@ function extensionU32(
   const result = cursor.u32("Process family limit");
   cursor.end("Process family limit");
   return result;
+}
+
+function optionalExtensionU32(
+  extensions: readonly YasExtension[],
+  tag: number,
+): number | undefined {
+  return extensions.some((extension) => extension.tag === tag)
+    ? extensionU32(extensions, tag)
+    : undefined;
+}
+
+function optionalExtensionU64(
+  extensions: readonly YasExtension[],
+  tag: number,
+): bigint | undefined {
+  return extensions.some((extension) => extension.tag === tag)
+    ? extensionU64(extensions, tag)
+    : undefined;
 }
 
 function extensionU64(

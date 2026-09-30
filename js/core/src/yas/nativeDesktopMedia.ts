@@ -15,8 +15,8 @@ import {
   type DesktopRevision,
   type NativeDesktopController,
   type TrayItem,
-} from "../desktopModel";
-import { AudioPlayer } from "../AudioPlayer";
+} from "../desktopModel.js";
+import { AudioPlayer } from "../AudioPlayer.js";
 import {
   ACTIVE_CAMERA,
   ACTIVE_MICROPHONE,
@@ -50,26 +50,26 @@ import {
   type NativeMprisController,
   type PortalRequest,
   type PortalChoiceValue,
-} from "../mediaModel";
+} from "../mediaModel.js";
 import type {
   YasClientAuxSubscription,
   YasClientInfo,
   YasClientList,
   YasClientOrigin as ProductClientOrigin,
-} from "../types";
-import * as g from "./generated";
+} from "../types.js";
+import * as g from "./generated.js";
 import {
   YasClientClient,
   type YasClientOrigin,
   type YasClientRecord,
   type YasClientSnapshot,
-} from "./client";
+} from "./client.js";
 import {
   YasDesktopClient,
   type YasDesktopNotificationRecord,
   type YasDesktopSnapshot,
   type YasDesktopTrayRecord,
-} from "./desktop";
+} from "./desktop.js";
 import {
   YasMediaClient,
   mediaPlayerActive,
@@ -82,9 +82,14 @@ import {
   type YasMediaPortalRequest,
   type YasMediaSnapshot,
   type YasMediaStreamStatus,
-} from "./media";
-import type { YasConnection } from "./session";
-import { YasCursor, YasProtocolError, YasResultError, YasWriter } from "./wire";
+} from "./media.js";
+import type { YasConnection } from "./session.js";
+import {
+  YasCursor,
+  YasProtocolError,
+  YasResultError,
+  YasWriter,
+} from "./wire.js";
 
 const EMPTY_IMAGE: DesktopImage = {
   width: 0,
@@ -2113,6 +2118,7 @@ function productClient(
       scale120: entry.scale120 || null,
     })),
     origin: productOrigin(record.origin),
+    identifier: record.identifier,
   };
 }
 

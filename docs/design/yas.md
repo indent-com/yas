@@ -532,6 +532,7 @@ HELLO extension tags are:
 |   2 | `client_platform`   | typed records                  |
 |   3 | `initial_watches`   | repeated family WATCH requests |
 |   4 | `read_only_session` | REQUIRED, empty marker         |
+|   5 | `client_identifier` | UTF-8, at most 1 KiB           |
 
 `read_only_session` requests a server-enforced least-authority catalogue. It
 is REQUIRED so a server that does not understand the restriction rejects the
@@ -558,6 +559,15 @@ including terminal creation/input/resizing, surface input/focus/resizing,
 media acquisition or consent, CLIENT_UPDATE, and SHUTDOWN, is unadvertised and
 rejected. A read-only WebRTC producer injects this marker into the first HELLO;
 it never attempts to reproduce the policy by filtering operation bytes.
+
+`client_identifier` is whatever UTF-8 text the client chooses to be known by
+in Client records: a person, a device, an embedding application's own
+session. Its whole value is the identifier, at most
+`MAX_CLIENT_IDENTIFIER_BYTES` (1024) bytes so that its Client record always
+fits one State event. Invalid UTF-8 or a longer value makes HELLO (or
+CLIENT_UPDATE) fail with INVALID; beyond that the server neither validates nor
+deduplicates it, and republishes it unchanged as Client record extension tag
+5; CLIENT_UPDATE may replace it. It is optional and authorizes nothing.
 
 The `initial_watches` value is:
 
@@ -804,8 +814,11 @@ The counts and budget are server-wide diagnostic snapshots.
 `aggregate_receive_buffered` never exceeds `aggregate_receive_limit`.
 
 CLIENT_UPDATE changes non-authoritative connection presentation metadata such
-as a label. Display size, frame rate, decoder support, and queue depth belong
-to their actual Terminal or Surface view, not this connection-wide message.
+as a label. Its extensions use the HELLO extension tags; `client_identifier`
+(tag 5) replaces the identifier the session reported, and Client catalogue
+watchers observe the change as an ordinary record replacement. Display size,
+frame rate, decoder support, and queue depth belong to their actual Terminal or
+Surface view, not this connection-wide message.
 
 SHUTDOWN payload is:
 
@@ -2010,13 +2023,18 @@ index; with it, `from_index` is the number of records skipped back from
 and PROBE 3. COMMAND uses `a=command_index,b=column`, LATEST_COMMAND requires
 `a=0`, and SEQUENCE/PROBE use `a=sequence,b=column`; OUTPUT flags are zero.
 Every OUTPUT next cursor is normalized to SEQUENCE with `a=next_seq` and
-`b=next_col`, including COMMAND, LATEST_COMMAND, and PROBE results.
+`b=next_col`, including COMMAND, LATEST_COMMAND, and PROBE results. A SEQUENCE
+cursor past the end of the output returns empty text whose start and next
+cursor are both the current end.
 
 WAIT kinds are OUTPUT 0, COMMAND 1, and LATEST_COMMAND 2, with zero flags.
 OUTPUT uses `a=sequence,b=column`, requires a nonempty needle, and returns an
 OutputResult. COMMAND uses `a=command_index,b=0` and an empty needle;
-LATEST_COMMAND requires `a=b=0` and an empty needle. Both command waits return
-a JournalResult containing exactly one command record. Timeouts and byte
+LATEST_COMMAND requires `a=b=0` and an empty needle; it selects the running
+command, or the next command to start when none is running. Both command waits
+return a JournalResult containing exactly one command record. A command wait
+whose timeout expires before its command exists fails with `TIMEOUT`; one whose
+terminal has exited without it fails with `NOT_FOUND`. Timeouts and byte
 limits are nonzero.
 
 COPY_RANGE rows are inclusive, oldest-retained-relative when nonnegative, and
@@ -2124,6 +2142,15 @@ exceeds it, the server keeps the deterministic sorted prefix in wire section
 order (Terminal, then Surface, then auxiliary). A catalogue refresh observes
 the snapshot transition as an ordinary Client record replacement. The active
 snapshot does not replace or suppress the independent bandwidth extension.
+
+Optional ClientRecord/ClientPatch extension tag 5 is the identifier the session
+last reported in its HELLO or CLIENT_UPDATE `client_identifier` extension,
+exactly as sent, and is absent when it reported none. It is UTF-8 of at most
+Core `MAX_CLIENT_IDENTIFIER_BYTES`, which decoders enforce; nothing else about
+it is checked, and several sessions may carry the same one. Read next to the
+active-subscription snapshot, it says whose Terminal rows and columns or
+Surface extent a shared terminal or surface is being sized to, since the
+smallest viewer bounds each.
 
 Client family-limit tags 1 and 2 are the nonzero `u32` maximum published client
 records and maximum active subscriptions represented per client. Both are
@@ -2851,6 +2878,83 @@ entry revision and modification time, then the optional current 32-byte hash.
 Unknown optional detail extensions are skipped; required Result detail
 extensions remain forbidden by Core.
 
+### Opt-in FS additions
+
+Optional family limit `CAPABILITIES` (tag `LIMIT_CAPABILITIES` = 14, `u32`)
+advertises the opt-in values a server implements: `CAPABILITY_OS_ERROR` (1),
+`CAPABILITY_READ_LIST` (2), `CAPABILITY_READ_REALPATH` (4),
+`CAPABILITY_READ_STAT_ONLY` (8), `CAPABILITY_STAGE_IN_PLACE` (16), and
+`CAPABILITY_APPLY_IN_PLACE` (32); `CAPABILITY_FLAGS` (63) is their union.
+Absent means zero and receivers ignore unknown bits. A client sends an opt-in
+question kind or flag only when its bit is set; an older server rejects them as
+INVALID. Nothing changes for a client that sends none of them.
+
+A failed top-level FS Result whose failure came from an OS error adds optional
+ResultPrefix `detail` tag `RESULT_OS_ERROR_EXTENSION` (2), whose exact value is
+OsError: `code:i32` (the raw server-platform errno), `name:bytes_u16` (its
+symbolic name, such as ENOENT, ENOTDIR, EISDIR, EACCES, EPERM, ELOOP,
+ENAMETOOLONG, EEXIST, ENOSPC, EROFS, or UNKNOWN; 1 to 32 bytes of ASCII
+`A-Z0-9_`), and `operation:bytes_u16` (the operation the server was
+performing: open, read, write, readdir, realpath, stat, lstat, mkdir, unlink,
+rmdir, rename, link, symlink, readlink, chmod, or fsync; 1 to 32 bytes of ASCII
+`a-z0-9_`). Errors resolving a request's path, parents included, carry the
+request's operation: open for FETCH and COMMIT, readdir for READ_LIST,
+realpath for READ_REALPATH, stat or lstat for READ_STAT_ONLY. The status is
+unchanged: ENOENT is NOT_FOUND, other OS errors are IO. FETCH of a directory
+stays INVALID with `{EISDIR, read}`; COMMIT onto a directory stays CONFLICT
+with both ConflictDetail and `{EISDIR, open}`. Escaping the root is IO without
+an OsError. A Windows server's `code` is the Win32 or Winsock error code, and
+its name the one libuv gives that code (which Node reports), or UNKNOWN where
+libuv has none; ERROR_DIRECTORY (267) is ENOTDIR for readdir and ENOENT
+otherwise, and FETCH or COMMIT of a directory is `{1, EISDIR}`
+(ERROR_INVALID_FUNCTION, what reading a directory fails with). APPLY item
+details keep their text; an APPLY Result whose items failed because of OS errors
+adds optional ApplyResult extension `APPLY_RESULT_OS_ERRORS_EXTENSION` (1),
+whose value is `repeated index:u16,OsError`, one entry per such item in
+ascending index order (part of `CAPABILITY_OS_ERROR`). A MKDIR under a file is
+`{ENOTDIR, mkdir}`, a REMOVE of nothing `{ENOENT, unlink}`.
+
+READ question kinds `READ_LIST` (4), `READ_REALPATH` (5), and
+`READ_STAT_ONLY` (6) read no content and hash nothing. READ_LIST lists one
+directory level, following a final symlink to the directory; its OK content is
+`repeated kind:u8,name:bytes_u16` without dot and dot-dot, hidden names
+included, in no defined order. Each kind describes the entry itself, as a Node
+Dirent does: a symlink to a directory is ENTRY_SYMLINK. ENTRY_OTHER (3) names
+FIFOs, sockets, and devices; EntryRecord never uses it. A name is one raw
+platform component and may contain a POSIX backslash that no WirePath
+component can. A listing above the query-byte limit fails RESOURCE_EXHAUSTED.
+READ_REALPATH answers the absolute canonical platform path with every symlink
+resolved, confined like every other path. READ_STAT_ONLY answers
+`kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64`,
+with `mode` the platform mode as in EntryRecord (POSIX file-type bits
+included), following the final symlink unless READ_NO_FOLLOW, which is invalid
+with the other two. The empty path names the root for all three. A non-OK record for
+these kinds carries exactly one OsError as its content when the failure came
+from an OS error, otherwise empty content; older kinds keep empty failure
+content.
+
+STAGE_WRITE flag `STAGE_IN_PLACE` (2) makes COMMIT write like Node's
+`writeFile`: it opens the target write-only with create and truncate,
+following a final symlink (a dangling one creates the file it names), writes
+the staged bytes, and syncs them when COMMIT asks. An existing file keeps its
+inode, owner, links, and mode; a new file gets `mode`, or 0o666 when `mode` is
+zero, less the server umask. There is no temporary file and no rename, so a
+failed write can leave the file truncated or partial. The destination is
+confined to the root. Preconditions are checked against the named entry as
+before. COMMIT's result describes the file written, which is the link's
+destination entry when that lies inside the root. STAGE_CREATE_PARENTS with
+STAGE_IN_PLACE is INVALID. `STAGE_EXTENDED_FLAGS` (2) lists the stage flags
+added after the v1 baseline `STAGE_FLAGS`.
+
+APPLY item flag `APPLY_ITEM_IN_PLACE` (2) on a `WRITE_INLINE` item writes
+its content in place in the same way, in one round trip: open with create and
+truncate through a final symlink, and no temporary file or rename. APPLY
+carries no sync flags. The item result's revision, time, and hash describe the
+file written. A directory at the destination is CONFLICT, and its
+ApplyOsErrors entry is `{EISDIR, open}`. The flag on another item kind, or
+with `APPLY_ITEM_CREATE_PARENTS`, is INVALID. `APPLY_ITEM_EXTENDED_FLAGS`
+(2) lists the item flags added after the v1 baseline `APPLY_ITEM_FLAGS`.
+
 ## Git family
 
 Git is family `0x0031`, version 1. It preserves the useful split between small
@@ -3160,7 +3264,7 @@ of defining separate data and ACK messages.
 | Class   | Kinds                                        |
 | ------- | -------------------------------------------- |
 | Request | WATCH, UNWATCH, SPAWN, ATTACH, CONTROL, WAIT |
-| Event   | STATE, STATE_ACK                             |
+| Event   | STATE, STATE_ACK, EXIT                       |
 
 SPAWN executes exact argv and environment bytes without an implicit shell. It
 accepts explicit cwd, inherited terminal cwd, FS root/path, session environment,
@@ -3169,18 +3273,89 @@ boot-scoped `process_handle`, stdin BYTE Transfer, stdout BYTE Transfer, and
 either stderr BYTE Transfer or a merged-stream indication. The operation ID
 prevents a lost Result from spawning the child twice.
 
+SPAWN flags: `MERGE_STDERR` (1) puts stderr on stdout's pipe; `DETACHABLE` (2)
+keeps the child past its session. `STDIN_NULL` (8) gives the child the null
+device as stdin: the Result carries no stdin descriptor, so a program sees
+what a detached command sees (tools that read a piped stdin, such as ripgrep
+without a path, act as they would outside a pipe). `LEAVE_RESIDUE` (4) is for
+launchers of shell commands: when the direct child exits, its process group is
+not signalled (on Windows, its job is neither terminated nor killed when its
+handle closes). Output is forwarded
+until the streams close or the residue grace passes after that exit (SPAWN
+extension tag 3 `residue_grace_ns: u64`; absent, until the streams close),
+then the exit is reported; members still holding the streams are left
+running, untracked, and what they write is drained and discarded. TERMINATE,
+owner loss and shutdown still signal the group while the direct child runs;
+TERMINATE's escalation SIGKILLs members left after the kill grace (terminates
+the job on Windows) and stops waiting for their streams. The exit's detail says `residual process group left
+running` when members held the streams.
+
+`REPORT_EXIT` (16) sends the spawning session the exit as it becomes final,
+without a WAIT: one EXIT Event (`0x0002`, sensitive), `[process_handle: u64,
+exit: bytes_u32 containing ExitRecord, Extensions]`, the record a WAIT would
+return at that moment. The streams go on with what the process wrote before its
+exit, at the pace of their credit, so the event can arrive before their last
+bytes and their CLOSE. The spawning session's attachment sends it: when that
+attachment goes before the exit (a Transfer RESET on any of its streams, stdin
+included, from either side, or a DETACH), no EXIT is sent and the client WAITs
+for the exit instead, as it would without the flag. yas-client does so on its
+own. The report takes none of the session's pending WAITs, and
+nothing changes for other sessions: they, and sessions that ATTACH, still WAIT.
+A SPAWN retried under its operation ID shares the original attachment, whose
+exit is reported once.
+
+`KEEP_OUTPUT` (32), with `REPORT_EXIT` and SPAWN extension tag 4
+`head_bytes: u64, tail_bytes: u64` (the tail at most
+`MAX_KEEP_OUTPUT_TAIL_BYTES`, 1 MiB), sends only the head and the tail of each
+output stream: what comes between is dropped as the server reads it, never
+held for the client's credit, so the pipe drains at the writer's speed. The
+head is at least `head_bytes` and ends between characters, as a WHATWG UTF-8
+decoder with replacement reads the whole stream: where it is between
+characters, or where the next byte cannot continue the character it is in. The
+tail is at most `tail_bytes`, starts between characters, and once anything was
+dropped never starts with a continuation byte. Decoding the head and the tail,
+apart or one after the other, gives exactly the characters they have within the
+whole. The Transfer carries the head then the tail, contiguous; the EXIT event
+says what was dropped of each stream in extension tag 1 (stdout) and 2
+(stderr), present only when something was: `OutputElision`
+`[offset: u64, bytes: u64, lines: u64, code_points: u64, utf16_units: u64]`,
+where `offset` is the head's length and the counts are the dropped bytes as
+that decoder reads them within the whole stream. A client can then say how
+much it did not get in the units it counts. The tail goes out when the stream
+ends, or before the exit is reported when the stream outlives it (a residue
+past its grace, a TERMINATE, a lost owner, a forced cleanup): what is written
+after that goes to nobody. A tail cut short by an aborted stream is not counted
+in the elision; that stream does not end cleanly.
+
+Servers advertise the opt-in flags they honour in two optional family limits:
+tag 11 `LAUNCHER_FLAGS` carries those of v1 (`LEAVE_RESIDUE`, `STDIN_NULL`),
+at most 12, which is all clients from before `REPORT_EXIT` accept; tag 19
+`LAUNCHER_FLAGS_EXTENDED` carries every flag the server honours, when that is
+more. Tag 19 names each flag tag 11 does and adds none of v1's. It is a set of
+SPAWN flags, any u16: a client ignores the flags it does not know, so later
+flags need no new tag. A client sets `REPORT_EXIT` only when tag 19 offers it,
+and otherwise WAITs, so either side may be older.
+
 Catalog records contain argv0, native PID for diagnostics, lifecycle, owner
 session, detachable flag, stream offsets, exit record, and retention deadline.
 An ordinary process is owned by its spawning session and terminated when that
-session disappears. A detachable process survives without watchers and remains
-discoverable until its retained exit result expires.
+session disappears. That session's WAIT answers with its exit even after it has
+gone, when no attachment of the session's took the exit (one went first, or the
+exit came as it failed): the server keeps such exits for the session alone, as
+many as `MAX_PROCESSES` (never fewer than 64), until the session ends. A
+detachable process survives without watchers and remains discoverable until its
+retained exit result expires.
 
 ATTACH returns new stdout/stderr Transfers beginning at the process's current
 lifetime offsets; earlier output is explicitly reported as a gap and is not
 replayed. At most one attachment owns the stdin Transfer at a time, while any
-number may observe output. CONTROL provides portable signal, terminate, kill,
+number may observe output. The spawning session's credit paces the child (its
+pipe is read at most a window ahead); an attachment of another session that falls
+a window behind has its Transfers reset `RESOURCE_EXHAUSTED`, and nothing else
+changes. CONTROL provides portable signal, terminate, kill,
 and detach actions with operation IDs. Closing the stdin Transfer half-closes
-stdin. WAIT returns the final exit record or TIMEOUT.
+stdin. WAIT returns the final exit record or TIMEOUT; a process spawned with
+`REPORT_EXIT` needs none, its EXIT Event carries the same record.
 
 The canonical v1 payloads are generated from
 `protocol/yas/families/process.toml`. SPAWN carries `[operation_id, flags,
@@ -3196,9 +3371,11 @@ stderr stream has no stderr descriptor or credit.
 
 Process STATE ADD/REPLACE records are complete `ProcessRecord` values; REMOVE
 identifies handle and generation. Exit is a portable kind/reason plus native
-code and UTF-8 detail. Every mutating request uses a nonzero 128-bit operation
-ID. Spawned children are therefore deduplicated independently of frame request
-IDs, which are only connection-local.
+code and UTF-8 detail. The code keeps its bits: a Windows exit code is a DWORD,
+so an NTSTATUS such as 0xC0000005 is negative as the `i32`. Every mutating
+request uses a nonzero 128-bit operation ID. Spawned children are therefore
+deduplicated independently of frame request IDs, which are only
+connection-local.
 
 Required Process family-limit tag 10 is the nonzero `u32`
 `max_mutation_replays` bound. An identical SPAWN replays its byte-identical
@@ -3210,6 +3387,33 @@ records are pinned; retired records are evicted oldest first as later distinct
 settlements enter the bounded table, whose size never exceeds the advertised
 limit. Outside that horizon the client must WATCH to reconcile the catalogue
 and use a fresh operation ID instead of retrying the expired SPAWN ID.
+
+The capacity limits are server policy. An unconfigured server advertises tags
+1–10 at their v1 hard maxima (16 processes per session, 64 server-wide, 8
+pending spawns, 8 MiB stream buffer, 256 environment entries). A server
+configured above them (`yas server --process-max*`, `YAS_PROCESS_MAX*`; see
+[processes.md](processes.md#capacity-and-backpressure)) keeps each v1 tag at
+its hard maximum, which v1 clients accept and stay within. It adds the optional
+tag that carries the real value:
+
+| Tag | Name                               | Type | Hard max | Replaces tag |
+| --- | ---------------------------------- | ---- | -------- | ------------ |
+| 12  | MAX_PROCESSES_PER_SESSION_EXTENDED | u32  | 16384    | 5            |
+| 13  | MAX_PROCESSES_EXTENDED             | u32  | 65536    | 6            |
+| 14  | MAX_PENDING_SPAWNS_EXTENDED        | u32  | 4096     | 7            |
+| 15  | MAX_STREAM_BUFFER_BYTES_EXTENDED   | u64  | 1 GiB    | 8            |
+| 16  | MAX_ENVC_EXTENDED                  | u32  | 16384    | 3            |
+
+A client that knows these tags uses them. An extended value below its v1 tag
+contradicts it and fails HELLO. SPAWN's environment count may therefore reach
+16384 on the wire, but a server refuses more entries than it advertised with
+INVALID, as v1 decoding did. Tags 17 `MAX_PENDING_WAITS` (u32, at most 65536)
+and 18 `MAX_PENDING_OPERATIONS` (u32, completion-held ATTACH/CONTROL, at
+most 16384) advertise per-session admissions that v1 servers enforced silently. A
+server sends them only when they differ from those fixed values, 32 and 16
+(`LEGACY_PENDING_WAITS`, `LEGACY_PENDING_OPERATIONS`), which a client assumes
+when a tag is absent. Tag 10 grows with the configuration so that every live
+process, pending spawn and pending operation can hold a replay.
 
 ## Network family
 

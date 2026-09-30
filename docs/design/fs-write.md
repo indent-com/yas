@@ -120,6 +120,47 @@ semantics on three platforms" is genuinely hard; it is kept at the
 **wire** level (identical statuses) while the server absorbs the
 per-platform divergence.
 
+### In-place writes (opt-in)
+
+A caller that must behave like Node's `writeFile` sets STAGE_WRITE flag
+`STAGE_IN_PLACE` (2), advertised by `CAPABILITY_STAGE_IN_PLACE`. COMMIT then
+opens the target with `O_WRONLY|O_CREAT|O_TRUNC`, following a final symlink,
+writes the staged bytes, and applies `COMMIT_SYNC_DATA` and
+`COMMIT_SYNC_DIRECTORY` as usual. There is no temporary file and no rename: an
+existing file keeps its inode, owner, hardlinks, and mode (`mode` applies only
+to a file the write creates, less the umask; zero means 0o666), a symlink stays
+a symlink, and a dangling symlink creates the file it names. The price is the
+atomicity above: a reader can see a truncated or partial file, and a failed
+write can leave one. The destination must lie inside the root.
+
+Preconditions evaluate the named entry as for replacement writes, so a HASH
+precondition on a symlink compares the link target's hash. COMMIT reports the
+entry written without reading it back (a write-only file succeeds), which is
+the link's destination entry when it lies inside the root, and marks that
+entry with the operation ID. A directory at the
+destination is `CONFLICT` carrying OsError `{EISDIR, open}`. Other failures
+carry OsError with operation `open` (resolving or opening the target) or
+`write`. `STAGE_CREATE_PARENTS` with `STAGE_IN_PLACE` is `INVALID`.
+
+Content that fits inline can be written in place in one round trip rather than
+two: an APPLY `WRITE_INLINE` item with item flag `APPLY_ITEM_IN_PLACE` (2),
+advertised by `CAPABILITY_APPLY_IN_PLACE`, writes exactly as COMMIT of an
+in-place stage does, with no sync flags. Its item result describes the file
+written, and a directory at the destination is `CONFLICT` whose
+ApplyOsErrors entry is `{EISDIR, open}`. The flag is `INVALID` on other
+item kinds and with `APPLY_ITEM_CREATE_PARENTS`. yas-client's
+`write_in_place` sends it for content within the server's inline limit and
+stages the rest.
+
+## OS error detail
+
+Every failed top-level FS Result caused by an OS error carries the optional
+ResultPrefix detail tag `RESULT_OS_ERROR_EXTENSION` with an OsError (errno
+code, symbolic name, operation) beside any ConflictDetail; see
+[yas.md](yas.md#opt-in-fs-additions). The status mapping is unchanged, so
+clients that predate it only skip an optional tag. APPLY item results keep
+their `detail` text.
+
 ## Echo and attribution
 
 A successful mutation is reconciled back through FS `STATE` for every watcher,

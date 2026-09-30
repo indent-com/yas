@@ -1,10 +1,10 @@
 import {
   releaseRecordingAudioSession,
   retainRecordingAudioSession,
-} from "./audioSession";
-import { Notifier, type ReactiveStore } from "./reactive";
-import type { SurfaceId } from "./types";
-import { av1LevelString } from "./videoCodec";
+} from "./audioSession.js";
+import { Notifier, type ReactiveStore } from "./reactive.js";
+import type { SurfaceId } from "./types.js";
+import { av1LevelString } from "./videoCodec.js";
 
 export const RUNTIME_PIPEWIRE = 1 << 0;
 export const RUNTIME_MICROPHONE = 1 << 1;

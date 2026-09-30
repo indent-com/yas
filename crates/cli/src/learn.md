@@ -15,6 +15,18 @@ yas run --in /src/yas --env RUST_LOG=debug -- cargo test
 Options precede the program. The program is executed directly with no shell;
 run a shell explicitly for pipes, redirects, globs, or other shell syntax.
 
+A server runs at most 16 such processes per client session and 64 in total
+by default. Raise that for heavy fan-out, such as an agent running many
+commands at once:
+
+```bash
+yas server --process-max-per-session 1024 --process-max 4096 --process-max-pending-spawns 64
+```
+
+`yas server --help` lists the other `--process-max*` flags (stream buffer,
+environment entries, pending WAITs and ATTACH/CONTROL operations). Each flag
+has a `YAS_PROCESS_*` environment variable.
+
 ## Running commands
 
 ```bash
@@ -59,6 +71,8 @@ yas terminal send "$ID" "\x03"     # Ctrl+C
 ```
 
 Supports C-style escapes: `\n`, `\t`, `\r`, `\\`, `\0`, `\xHH`. Use `-` to read from stdin.
+Sending to an unknown or exited terminal fails with a nonzero exit instead of
+dropping the input, even when the input is empty.
 
 `\n` sends CR (0x0D), which is what a real terminal sends for Enter. This works
 regardless of whether the program is in canonical or raw mode. `\r` also sends
@@ -142,6 +156,8 @@ yas terminal journal "$ID" --json
 ```
 
 `--wait` blocks server-side until the command finishes (exit 124 on timeout).
+Without an index it waits for the running command, or the next one to start if
+none is running, so a finished command is never mistaken for the one just sent.
 `wait --pattern` matches only output produced after the wait began.
 
 ## Terminal lifecycle
@@ -159,6 +175,12 @@ yas quit                     # shut down the server
 ```
 
 Terminals persist until closed or the daemon exits. Clean up when done.
+
+A terminal shared by several viewers is sized to the smallest of them.
+`yas client list` shows each client's views and sizes, and ends each row with
+the identifier that client reported, if any; set `YAS_CLIENT_IDENTIFIER` to
+name your own connections that way. Identifiers are passed on as is: UTF-8 of
+at most 1 KiB, otherwise unchecked, not unique.
 
 `attach` needs a real tty on stdin and repaints the remote grid in the
 alternate screen, so your scrollback survives. It exits with the remote
@@ -225,6 +247,14 @@ yas --on local:work terminal list         # named local server (auto-starts)
 yas remote add prod ssh:alice@prod.co
 yas remote set-default prod
 ```
+
+A bare name (from `--on`, `YAS_TARGET`, or `yas.target` in `yas.conf`) is
+looked up in the home server's remotes catalogue, the one `yas remote add`
+edits: the server at `YAS_SOCK`, else the default local instance, started if
+needed. A name may point at another name. Disabled remotes
+(`yas remote toggle`) and unknown names fail with an error. `yas remote`
+verbs edit the home server too unless `--on` names another server; the
+default target does not redirect them.
 
 ## Files
 
@@ -404,6 +434,20 @@ takes a URL wherever it takes a command, so `localhost:3000` or
 what marks it as a location; a bare word stays a command). Locations are
 remembered per server in its KV store, and the focused pane takes over the
 status bar with back/forward/reload and its title.
+
+## A session over pipes
+
+`yas connect --stdio` relays one native YAS session over its stdin and stdout
+to the server `--on` names (the local one by default, started unless
+`--no-start`). Use it where only a command with pipes gets through:
+
+```bash
+ssh host yas connect --stdio                  # SSH exec, no socket forwarding
+docker exec -i sandbox yas connect --stdio    # into a container's server
+```
+
+Stdout carries only the session; errors go to stderr and exit 1. It ends when
+the server closes, which it does after stdin ends. It refuses a terminal.
 
 ## Port forwarding
 

@@ -335,6 +335,14 @@ impl ClientRecord {
     pub fn bandwidth_rates(&self) -> Result<Option<BandwidthRates>> {
         decode_bandwidth_rates(&self.extensions)
     }
+
+    /// The identifier the client reported for itself in HELLO or
+    /// CLIENT_UPDATE, unchanged and possibly shared with other clients.
+    /// `None` when it reported none; an error when it is not UTF-8 or longer
+    /// than [`crate::core::MAX_CLIENT_IDENTIFIER_BYTES`].
+    pub fn identifier(&self) -> Result<Option<&str>> {
+        find_identifier(&self.extensions)
+    }
 }
 
 impl Encode for ClientRecord {
@@ -412,6 +420,30 @@ impl ClientPatch {
     pub fn bandwidth_rates(&self) -> Result<Option<BandwidthRates>> {
         decode_bandwidth_rates(&self.extensions)
     }
+
+    /// An updated client-reported identifier, when this patch carries one.
+    pub fn identifier(&self) -> Result<Option<&str>> {
+        find_identifier(&self.extensions)
+    }
+}
+
+/// The Client record extension that republishes a client's reported
+/// identifier ([`crate::core::client_identifier_extension`]) unchanged.
+pub fn identifier_extension(identifier: &str) -> Extension {
+    Extension {
+        tag: crate::schema::client::IDENTIFIER_EXTENSION as u16,
+        required: false,
+        value: identifier.as_bytes().to_vec(),
+    }
+}
+
+fn find_identifier(extensions: &Extensions) -> Result<Option<&str>> {
+    extensions
+        .0
+        .iter()
+        .find(|extension| extension.tag == crate::schema::client::IDENTIFIER_EXTENSION as u16)
+        .map(|extension| crate::core::check_client_identifier(&extension.value))
+        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -932,6 +964,10 @@ fn validate_record_extensions(extensions: &Extensions) -> Result<()> {
             {
                 AuxiliarySubscriptionTimings::decode(&extension.value)?;
             }
+            // UTF-8 and at most 1 KiB, and otherwise whatever the client reported.
+            tag if tag == crate::schema::client::IDENTIFIER_EXTENSION as u16 => {
+                crate::core::check_client_identifier(&extension.value)?;
+            }
             _ if extension.required => {
                 return Err(Error::Invalid("unknown required Client record extension"));
             }
@@ -1228,5 +1264,76 @@ mod tests {
             .encode()
             .is_err()
         );
+    }
+
+    #[test]
+    fn identifiers_are_utf8_republished_unchanged() {
+        // Not unique, not charset-checked: whatever the client said, as long
+        // as it is UTF-8 and at most 1 KiB.
+        let odd = "pierre's\tlaptop\0 🖥";
+        let mut record = ClientRecord {
+            session_id: [1; 16],
+            client_instance: [2; 16],
+            connected_server_ns: 3,
+            idle_ns: 4,
+            bytes_received: 5,
+            bytes_sent: 6,
+            name: "yas-cli".into(),
+            release: "1".into(),
+            label: "local client".into(),
+            origin: Origin::WebRtc {
+                peer_id: "peer".into(),
+            },
+            extensions: Extensions(vec![identifier_extension(odd)]),
+        };
+        let decoded = ClientRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier().unwrap(), Some(odd));
+
+        record.extensions = Extensions(vec![identifier_extension("")]);
+        let decoded = ClientRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier().unwrap(), Some(""));
+
+        record.extensions = Extensions::default();
+        assert_eq!(record.identifier().unwrap(), None);
+
+        // Not UTF-8: refused on both sides of the wire.
+        let invalid = Extension {
+            value: vec![b'a', 0xff],
+            ..identifier_extension("")
+        };
+        record.extensions = Extensions(vec![invalid.clone()]);
+        assert_eq!(record.identifier(), Err(Error::InvalidUtf8));
+        assert_eq!(record.encode(), Err(Error::InvalidUtf8));
+        // The identifier is the encoding's last bytes: spoil the valid one.
+        record.extensions = Extensions(vec![identifier_extension("ab")]);
+        let mut bytes = record.encode().unwrap();
+        *bytes.last_mut().unwrap() = 0xff;
+        assert_eq!(ClientRecord::decode(&bytes), Err(Error::InvalidUtf8));
+
+        // At most 1 KiB, so the record always fits a State event.
+        let longest = "é".repeat(crate::core::MAX_CLIENT_IDENTIFIER_BYTES / 2);
+        record.extensions = Extensions(vec![identifier_extension(&longest)]);
+        let decoded = ClientRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier().unwrap(), Some(longest.as_str()));
+        let too_long = format!("{longest}a");
+        record.extensions = Extensions(vec![identifier_extension(&too_long)]);
+        assert!(matches!(
+            record.identifier(),
+            Err(Error::LimitExceeded { .. })
+        ));
+        assert!(matches!(record.encode(), Err(Error::LimitExceeded { .. })));
+
+        let patch = ClientPatch {
+            session_id: [1; 16],
+            extensions: Extensions(vec![Extension {
+                required: true,
+                ..identifier_extension("pierre's laptop")
+            }]),
+        };
+        let decoded = ClientPatch::decode(&patch.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier().unwrap(), Some("pierre's laptop"));
+        let mut invalid_patch = patch;
+        invalid_patch.extensions = Extensions(vec![invalid]);
+        assert_eq!(invalid_patch.encode(), Err(Error::InvalidUtf8));
     }
 }

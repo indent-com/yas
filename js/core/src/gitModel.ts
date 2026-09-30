@@ -1,4 +1,4 @@
-import type { SessionId } from "./types";
+import type { SessionId } from "./types.js";
 
 export const GIT_STATUS_OK = 0;
 export const GIT_STATUS_UNKNOWN_ID = 1;

@@ -74,6 +74,34 @@ non-file node can satisfy readiness without an arbitrary delay. The session
 supervisor uses ordered questions for icon search paths and reads only the
 chosen file.
 
+### Directory, realpath, and stat-only questions (opt-in)
+
+Three question kinds read no file content and hash nothing. A client asks them
+only when the matching `CAPABILITY_*` bit is in the FS family limits.
+
+- `READ_LIST` (4) lists one directory level. A final symlink to a directory is
+  followed, as readdir(3) follows it. The OK content is packed
+  `repeated kind:u8,name:bytes_u16` in no defined order, without `.` and `..`
+  and with hidden names. Each kind comes from the entry itself, as in a Node
+  Dirent: `ENTRY_FILE`, `ENTRY_DIRECTORY`, `ENTRY_SYMLINK` (also for a link to
+  a directory), or `ENTRY_OTHER` (FIFO, socket, device). A listing above the
+  query-byte limit is `RESOURCE_EXHAUSTED`.
+- `READ_REALPATH` (5) answers the absolute canonical platform path with every
+  symlink resolved. A result outside the root is `IO`, as for any other
+  confined path.
+- `READ_STAT_ONLY` (6) answers
+  `kind:u8,reserved:u8,reserved:u16,mode:u32,size:u64,modified_unix_ns:i64`
+  from stat(2), or lstat(2) with `READ_NO_FOLLOW`. The size of a large file
+  costs no read, and an unreadable file still answers.
+
+`READ_NO_FOLLOW` is invalid with `READ_LIST` and `READ_REALPATH`. The empty path
+names the root. When one of these questions fails because of an OS error, its
+record keeps the usual status and its content is the encoded OsError
+(`code:i32,name:bytes_u16,operation:bytes_u16`, for example `{20, ENOTDIR,
+readdir}`); otherwise failure content is empty, as it always is for the older
+kinds. Errors resolving the path carry the question's operation: `readdir`,
+`realpath`, or `stat`/`lstat`.
+
 ## `INDEX` behavior used by readers
 
 `INDEX_INCLUDE_FILES` and `INDEX_INCLUDE_DIRECTORIES` independently select the
@@ -90,5 +118,5 @@ this keeps a recursive index from silently escaping its root.
 
 - **No byte ranges.** Every caller so far wants whole files, and a range needs an
   offset, a length, and a rule for a file that changed under it.
-- **No directory content reads.** That is `INDEX`, and conflating them would make one
-  message answer two shapes.
+- **No directory content reads** for the v1 kinds. `INDEX` walks a subtree;
+  one level without content is the opt-in `READ_LIST`.

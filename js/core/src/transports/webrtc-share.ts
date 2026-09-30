@@ -8,14 +8,14 @@
  */
 
 import nacl from "tweetnacl";
-import { createWebRtcDataChannelTransport } from "./webrtc";
+import { createWebRtcDataChannelTransport } from "./webrtc.js";
 import {
   noopDebug,
   type YasDebug,
   type YasTransport,
   type YasTransportMessage,
   type ConnectionStatus,
-} from "../types";
+} from "../types.js";
 
 const PBKDF2_ROUNDS = 100_000;
 // The producer gathers its non-trickle candidates before answering (up to

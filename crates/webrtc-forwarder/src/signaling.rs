@@ -131,7 +131,13 @@ async fn try_connect(
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_SIGNAL_TEXT_BYTES))
         .max_frame_size(Some(MAX_SIGNAL_TEXT_BYTES));
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(url, Some(ws_config), false).await?;
+    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+        url,
+        Some(ws_config),
+        false,
+        Some(crate::tls::websocket_connector()),
+    )
+    .await?;
     let (mut write, mut read) = ws.split();
 
     loop {

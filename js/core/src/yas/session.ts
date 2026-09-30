@@ -2,9 +2,10 @@ import type {
   YasTransport as BaseYasTransport,
   YasTransportMessage,
   ConnectionStatus,
-} from "../types";
+} from "../types.js";
 import {
   YAS_CORE_CANCEL,
+  YAS_CORE_CLIENT_UPDATE,
   YAS_CORE_FAMILY_UPDATE,
   YAS_CORE_GOAWAY,
   YAS_CORE_HELLO,
@@ -24,8 +25,10 @@ import {
   decodeServerHello,
   decodeSessionUpdate,
   decodeSessionInfo,
+  clientIdentifierExtension,
   encodeCancel,
   encodeClientHello,
+  encodeClientUpdate,
   encodePing,
   encodePingResult,
   encodeShutdown,
@@ -35,10 +38,10 @@ import {
   type YasFamilyDescriptor,
   type YasGoAway,
   type YasServerHello,
-} from "./core";
-import type { YasExtension } from "./wire";
-import { YAS_FAMILY_DEPENDENCIES } from "./generated";
-import { validateYasDatagramFrame } from "./datagram";
+} from "./core.js";
+import type { YasExtension } from "./wire.js";
+import { YAS_FAMILY_DEPENDENCIES } from "./generated.js";
+import { validateYasDatagramFrame } from "./datagram.js";
 import {
   YAS_CLASS_EVENT,
   YAS_CLASS_REQUEST,
@@ -64,7 +67,7 @@ import {
   encodeYasFrame,
   frameForByteStream,
   type YasFrame,
-} from "./wire";
+} from "./wire.js";
 
 export interface YasTransport extends BaseYasTransport {
   /** Browser transports use messages; Relay tunnels expose a raw byte stream. */
@@ -359,6 +362,9 @@ export class YasConnection {
     readonly transport: YasTransport,
     options: YasConnectionOptions = {},
   ) {
+    // Refused here: thrown while encoding HELLO, it would stall the handshake.
+    if (options.clientIdentifier !== undefined)
+      clientIdentifierExtension(options.clientIdentifier);
     const clientInstance = options.clientInstance ?? randomUuidBytes();
     this.requestedReceiveMaxDatagram = options.receiveMaxDatagram;
     this.options = {
@@ -710,6 +716,19 @@ export class YasConnection {
     return decodeSessionInfo(
       await this.request(YAS_FAMILY_CORE, YAS_CORE_SESSION_INFO),
     );
+  }
+
+  /**
+   * Replace the identifier this session reported in HELLO
+   * ({@link YasClientHelloOptions.clientIdentifier}) with Core CLIENT_UPDATE.
+   * Client catalogue watchers see it at their next refresh. The next HELLO,
+   * after a reconnect, reports it too, even when this Request fails.
+   */
+  async updateClientIdentifier(identifier: string): Promise<void> {
+    // Encoded first: one too long to report throws before it is kept.
+    const update = encodeClientUpdate({ clientIdentifier: identifier });
+    this.options.clientIdentifier = identifier;
+    await this.request(YAS_FAMILY_CORE, YAS_CORE_CLIENT_UPDATE, update);
   }
 
   async cancel(targetRequestId: number): Promise<void> {

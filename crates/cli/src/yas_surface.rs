@@ -16,7 +16,7 @@ const MAX_SURFACE_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 const WHEEL_DETENT_PIXELS: f64 = 120.0;
 
 pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut records = surface_records(&mut client).await?;
     records.sort_by_key(|record| record.surface_handle);
 
@@ -36,7 +36,7 @@ pub(crate) async fn cmd_list(on: Option<&str>, hub: &str) -> Result<(), String> 
 }
 
 pub(crate) async fn cmd_close(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     request_empty(
         &mut client,
         surface::request_kind::CLOSE,
@@ -70,7 +70,7 @@ pub(crate) async fn cmd_capture(
         return Err("YAS Surface v1 CAPTURE does not expose an output scale".to_string());
     }
     let (format, extension) = capture_format(format_arg.as_deref(), output.as_deref())?;
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut record = find_surface(&mut client, id).await?;
 
     if width.is_some() || height.is_some() {
@@ -196,13 +196,14 @@ pub(crate) async fn cmd_scroll(
                     true,
                 )
                 .await
+                .map_err(String::from)
         })
     })
     .await
 }
 
 pub(crate) async fn cmd_focus(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let _: surface::RevisionResult = client
         .request_typed(
             family::SURFACE,
@@ -241,13 +242,14 @@ pub(crate) async fn cmd_text(
                     true,
                 )
                 .await
+                .map_err(String::from)
         })
     })
     .await
 }
 
 pub(crate) async fn cmd_key(on: Option<&str>, hub: &str, id: u64, key: &str) -> Result<(), String> {
-    let events = parse_key_combo(key)?;
+    let events = yas_client::surface::key_combo(key)?;
     send_key_events(on, hub, id, events).await
 }
 
@@ -257,7 +259,7 @@ pub(crate) async fn cmd_type(
     id: u64,
     text: &str,
 ) -> Result<(), String> {
-    let events = parse_type_string(text)?;
+    let events = yas_client::surface::typed_keys(text)?;
     send_key_events(on, hub, id, events).await
 }
 
@@ -286,7 +288,7 @@ pub(crate) async fn cmd_record(
     let encoded_size = parse_record_encode_size(encode_size.as_deref())?;
     let codec_versions = parse_record_codecs(&codecs)?;
 
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let mut record = find_surface(&mut client, id).await?;
     if let Some((width, height, scale_120)) = requested_size {
         let _: surface::RevisionResult = client
@@ -464,7 +466,7 @@ async fn send_key_events(
     on: Option<&str>,
     hub: &str,
     id: u64,
-    events: Vec<KeyEvent>,
+    events: Vec<yas_client::surface::KeyEvent>,
 ) -> Result<(), String> {
     with_input_view(on, hub, id, |client, view| {
         Box::pin(async move {
@@ -478,7 +480,11 @@ async fn send_key_events(
                             feedback: view.feedback(),
                             client_monotonic_ns: client.monotonic_ns(),
                             key_code: key.code,
-                            state: key.state,
+                            state: if key.pressed {
+                                yas_wire::schema::surface::KEY_STATE_PRESSED
+                            } else {
+                                yas_wire::schema::surface::KEY_STATE_RELEASED
+                            } as u8,
                             modifiers: key.modifiers,
                         },
                         true,
@@ -499,7 +505,7 @@ where
     F: for<'a> FnOnce(&'a mut NativeClient, &'a InputView) -> InputFuture<'a>,
 {
     let id = surface_handle(id)?;
-    let mut client = NativeClient::connect(on, hub).await?;
+    let mut client = crate::yas_native::connect(on, hub).await?;
     let record = find_surface(&mut client, id).await?;
     let view = open_input_view(&mut client, &record).await?;
     let result = action(&mut client, &view).await;
@@ -682,216 +688,6 @@ fn rounded_i32(value: f64, name: &str) -> Result<i32, String> {
         return Err(format!("{name} are out of range"));
     }
     Ok(value as i32)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KeyEvent {
-    code: u16,
-    state: u8,
-    modifiers: u32,
-}
-
-fn parse_key_combo(value: &str) -> Result<Vec<KeyEvent>, String> {
-    let parts = value.split('+').collect::<Vec<_>>();
-    let main = parts
-        .last()
-        .copied()
-        .filter(|part| !part.is_empty())
-        .ok_or("empty key")?;
-    let mut modifiers = Vec::new();
-    let mut seen = BTreeSet::new();
-    for part in &parts[..parts.len().saturating_sub(1)] {
-        let modifier = modifier_key(part).ok_or_else(|| format!("unknown modifier: {part}"))?;
-        if !seen.insert(modifier.1) {
-            return Err(format!("modifier {part:?} appears more than once"));
-        }
-        modifiers.push(modifier);
-    }
-    let main = key_name(main).ok_or_else(|| format!("unknown key: {main}"))?;
-    Ok(key_chord(&modifiers, main))
-}
-
-fn key_chord(modifiers: &[(u16, u32)], main: u16) -> Vec<KeyEvent> {
-    let pressed = yas_wire::schema::surface::KEY_STATE_PRESSED as u8;
-    let released = yas_wire::schema::surface::KEY_STATE_RELEASED as u8;
-    let mut mask = 0u32;
-    let mut events = Vec::with_capacity(2 + modifiers.len() * 2);
-    for &(code, bit) in modifiers {
-        mask |= bit;
-        events.push(KeyEvent {
-            code,
-            state: pressed,
-            modifiers: mask,
-        });
-    }
-    events.push(KeyEvent {
-        code: main,
-        state: pressed,
-        modifiers: mask,
-    });
-    events.push(KeyEvent {
-        code: main,
-        state: released,
-        modifiers: mask,
-    });
-    for &(code, bit) in modifiers.iter().rev() {
-        events.push(KeyEvent {
-            code,
-            state: released,
-            modifiers: mask,
-        });
-        mask &= !bit;
-    }
-    events
-}
-
-fn parse_type_string(text: &str) -> Result<Vec<KeyEvent>, String> {
-    let chars = text.chars().collect::<Vec<_>>();
-    let mut events = Vec::new();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] == '{' {
-            let end = chars[index..]
-                .iter()
-                .position(|character| *character == '}')
-                .ok_or_else(|| "unclosed { in type string".to_string())?;
-            let inner = chars[index + 1..index + end].iter().collect::<String>();
-            events.extend(parse_key_combo(&inner)?);
-            index += end + 1;
-            continue;
-        }
-        let (code, shift) = character_key(chars[index])
-            .ok_or_else(|| format!("unsupported character: {}", chars[index]))?;
-        let modifiers = if shift {
-            vec![modifier_key("shift").expect("known Shift modifier")]
-        } else {
-            Vec::new()
-        };
-        events.extend(key_chord(&modifiers, code));
-        index += 1;
-    }
-    Ok(events)
-}
-
-fn modifier_key(name: &str) -> Option<(u16, u32)> {
-    match name.to_ascii_lowercase().as_str() {
-        "ctrl" | "control" => Some((
-            yas_wire::schema::surface::KEY_CONTROL_LEFT as u16,
-            yas_wire::schema::surface::MODIFIER_CONTROL as u32,
-        )),
-        "shift" => Some((
-            yas_wire::schema::surface::KEY_SHIFT_LEFT as u16,
-            yas_wire::schema::surface::MODIFIER_SHIFT as u32,
-        )),
-        "alt" => Some((
-            yas_wire::schema::surface::KEY_ALT_LEFT as u16,
-            yas_wire::schema::surface::MODIFIER_ALT as u32,
-        )),
-        "super" | "meta" => Some((
-            yas_wire::schema::surface::KEY_SUPER_LEFT as u16,
-            yas_wire::schema::surface::MODIFIER_SUPER as u32,
-        )),
-        _ => None,
-    }
-}
-
-fn key_name(name: &str) -> Option<u16> {
-    let name = name.to_ascii_lowercase();
-    if name.len() == 1 {
-        return character_key(name.chars().next()?).map(|(code, _)| code);
-    }
-    let value = match name.as_str() {
-        "return" | "enter" => yas_wire::schema::surface::KEY_ENTER,
-        "escape" | "esc" => yas_wire::schema::surface::KEY_ESCAPE,
-        "tab" => yas_wire::schema::surface::KEY_TAB,
-        "backspace" | "bs" => yas_wire::schema::surface::KEY_BACKSPACE,
-        "space" => yas_wire::schema::surface::KEY_SPACE,
-        "up" => yas_wire::schema::surface::KEY_ARROW_UP,
-        "down" => yas_wire::schema::surface::KEY_ARROW_DOWN,
-        "left" => yas_wire::schema::surface::KEY_ARROW_LEFT,
-        "right" => yas_wire::schema::surface::KEY_ARROW_RIGHT,
-        "home" => yas_wire::schema::surface::KEY_HOME,
-        "end" => yas_wire::schema::surface::KEY_END,
-        "pageup" | "page_up" => yas_wire::schema::surface::KEY_PAGE_UP,
-        "pagedown" | "page_down" => yas_wire::schema::surface::KEY_PAGE_DOWN,
-        "insert" => yas_wire::schema::surface::KEY_INSERT,
-        "delete" | "del" => yas_wire::schema::surface::KEY_DELETE,
-        "f1" => yas_wire::schema::surface::KEY_F1,
-        "f2" => yas_wire::schema::surface::KEY_F2,
-        "f3" => yas_wire::schema::surface::KEY_F3,
-        "f4" => yas_wire::schema::surface::KEY_F4,
-        "f5" => yas_wire::schema::surface::KEY_F5,
-        "f6" => yas_wire::schema::surface::KEY_F6,
-        "f7" => yas_wire::schema::surface::KEY_F7,
-        "f8" => yas_wire::schema::surface::KEY_F8,
-        "f9" => yas_wire::schema::surface::KEY_F9,
-        "f10" => yas_wire::schema::surface::KEY_F10,
-        "f11" => yas_wire::schema::surface::KEY_F11,
-        "f12" => yas_wire::schema::surface::KEY_F12,
-        "minus" => yas_wire::schema::surface::KEY_MINUS,
-        "equal" => yas_wire::schema::surface::KEY_EQUAL,
-        "ctrl" | "control" => yas_wire::schema::surface::KEY_CONTROL_LEFT,
-        "shift" => yas_wire::schema::surface::KEY_SHIFT_LEFT,
-        "alt" => yas_wire::schema::surface::KEY_ALT_LEFT,
-        "super" | "meta" => yas_wire::schema::surface::KEY_SUPER_LEFT,
-        _ => return None,
-    };
-    Some(value as u16)
-}
-
-fn character_key(character: char) -> Option<(u16, bool)> {
-    let (code, shift) = match character {
-        'a'..='z' => (
-            yas_wire::schema::surface::KEY_A as u16 + (character as u16 - 'a' as u16),
-            false,
-        ),
-        'A'..='Z' => (
-            yas_wire::schema::surface::KEY_A as u16 + (character as u16 - 'A' as u16),
-            true,
-        ),
-        '1'..='9' => (
-            yas_wire::schema::surface::KEY_1 as u16 + (character as u16 - '1' as u16),
-            false,
-        ),
-        '0' => (yas_wire::schema::surface::KEY_0 as u16, false),
-        ' ' => (yas_wire::schema::surface::KEY_SPACE as u16, false),
-        '-' => (yas_wire::schema::surface::KEY_MINUS as u16, false),
-        '=' => (yas_wire::schema::surface::KEY_EQUAL as u16, false),
-        '[' => (yas_wire::schema::surface::KEY_BRACKET_LEFT as u16, false),
-        ']' => (yas_wire::schema::surface::KEY_BRACKET_RIGHT as u16, false),
-        '\\' => (yas_wire::schema::surface::KEY_BACKSLASH as u16, false),
-        ';' => (yas_wire::schema::surface::KEY_SEMICOLON as u16, false),
-        '\'' => (yas_wire::schema::surface::KEY_QUOTE as u16, false),
-        '`' => (yas_wire::schema::surface::KEY_BACKQUOTE as u16, false),
-        ',' => (yas_wire::schema::surface::KEY_COMMA as u16, false),
-        '.' => (yas_wire::schema::surface::KEY_PERIOD as u16, false),
-        '/' => (yas_wire::schema::surface::KEY_SLASH as u16, false),
-        '\t' => (yas_wire::schema::surface::KEY_TAB as u16, false),
-        '\n' => (yas_wire::schema::surface::KEY_ENTER as u16, false),
-        '!' => (yas_wire::schema::surface::KEY_1 as u16, true),
-        '@' => (yas_wire::schema::surface::KEY_2 as u16, true),
-        '#' => (yas_wire::schema::surface::KEY_3 as u16, true),
-        '$' => (yas_wire::schema::surface::KEY_4 as u16, true),
-        '%' => (yas_wire::schema::surface::KEY_5 as u16, true),
-        '^' => (yas_wire::schema::surface::KEY_6 as u16, true),
-        '&' => (yas_wire::schema::surface::KEY_7 as u16, true),
-        '*' => (yas_wire::schema::surface::KEY_8 as u16, true),
-        '(' => (yas_wire::schema::surface::KEY_9 as u16, true),
-        ')' => (yas_wire::schema::surface::KEY_0 as u16, true),
-        '_' => (yas_wire::schema::surface::KEY_MINUS as u16, true),
-        '+' => (yas_wire::schema::surface::KEY_EQUAL as u16, true),
-        '{' => (yas_wire::schema::surface::KEY_BRACKET_LEFT as u16, true),
-        '}' => (yas_wire::schema::surface::KEY_BRACKET_RIGHT as u16, true),
-        '|' => (yas_wire::schema::surface::KEY_BACKSLASH as u16, true),
-        ':' => (yas_wire::schema::surface::KEY_SEMICOLON as u16, true),
-        '"' => (yas_wire::schema::surface::KEY_QUOTE as u16, true),
-        '~' => (yas_wire::schema::surface::KEY_BACKQUOTE as u16, true),
-        '<' => (yas_wire::schema::surface::KEY_COMMA as u16, true),
-        '>' => (yas_wire::schema::surface::KEY_PERIOD as u16, true),
-        '?' => (yas_wire::schema::surface::KEY_SLASH as u16, true),
-        _ => return None,
-    };
-    Some((code, shift))
 }
 
 fn parse_record_size(value: Option<&str>) -> Result<Option<(u16, u16, u16)>, String> {
@@ -1266,21 +1062,6 @@ mod tests {
         assert_eq!(
             elementary_stream(&[0, 0, 0, 0, 0, 0, 1, 0x65]).unwrap(),
             &[0, 0, 1, 0x65]
-        );
-    }
-
-    #[test]
-    fn key_combos_use_native_hid_codes_and_modifier_bits() {
-        let events = parse_key_combo("ctrl+a").unwrap();
-        assert_eq!(events.len(), 4);
-        assert_eq!(
-            events[0].code,
-            yas_wire::schema::surface::KEY_CONTROL_LEFT as u16
-        );
-        assert_eq!(events[1].code, yas_wire::schema::surface::KEY_A as u16);
-        assert_eq!(
-            events[1].modifiers,
-            yas_wire::schema::surface::MODIFIER_CONTROL as u32
         );
     }
 

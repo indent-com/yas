@@ -1,4 +1,4 @@
-import type { SessionId } from "./types";
+import type { SessionId } from "./types.js";
 
 export interface CreateSessionOptions {
   rows: number;

@@ -12,6 +12,16 @@ limits = [
   { name = "MAX_STREAM_BUFFER_BYTES", tag = 8, type = "u64", required = true, hard_min = 1, hard_max = 8388608 },
   { name = "MAX_DETACHED_RETENTION_NS", tag = 9, type = "u64", required = true, hard_min = 1, hard_max = 300000000000 },
   { name = "MAX_MUTATION_REPLAYS", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+  { name = "LAUNCHER_FLAGS", tag = 11, type = "u32", required = false, hard_min = 0, hard_max = 12 },
+  { name = "MAX_PROCESSES_PER_SESSION_EXTENDED", tag = 12, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_PROCESSES_EXTENDED", tag = 13, type = "u32", required = false, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_PENDING_SPAWNS_EXTENDED", tag = 14, type = "u32", required = false, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_STREAM_BUFFER_BYTES_EXTENDED", tag = 15, type = "u64", required = false, hard_min = 1, hard_max = 1073741824 },
+  { name = "MAX_ENVC_EXTENDED", tag = 16, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_PENDING_WAITS", tag = 17, type = "u32", required = false, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_PENDING_OPERATIONS", tag = 18, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
+  # A set of SPAWN flags (u16): bits a client does not know are ignored, so later flags need no new tag.
+  { name = "LAUNCHER_FLAGS_EXTENDED", tag = 19, type = "u32", required = false, hard_min = 0, hard_max = 65535 },
 ]
 
 [[constant]]
@@ -21,8 +31,33 @@ value = 1
 name = "SPAWN_DETACHABLE"
 value = 2
 [[constant]]
+name = "SPAWN_LEAVE_RESIDUE"
+value = 4
+[[constant]]
+name = "SPAWN_STDIN_NULL"
+value = 8
+[[constant]]
 name = "SPAWN_FLAGS"
 value = 3
+[[constant]]
+name = "SPAWN_LAUNCHER_FLAGS"
+value = 12
+# The spawning session is sent an EXIT event once the exit is final, so it
+# learns it without a WAIT. Advertised by LAUNCHER_FLAGS_EXTENDED (tag 19),
+# which old clients ignore: LAUNCHER_FLAGS (tag 11) keeps its v1 maximum.
+[[constant]]
+name = "SPAWN_REPORT_EXIT"
+value = 16
+# Only the head and the tail of each output stream are sent, as the
+# KEEP_OUTPUT extension sizes them: the middle is dropped as it is read, cut
+# between UTF-8 characters, and counted in the EXIT event. Needs REPORT_EXIT.
+# Advertised by LAUNCHER_FLAGS_EXTENDED (tag 19).
+[[constant]]
+name = "SPAWN_KEEP_OUTPUT"
+value = 32
+[[constant]]
+name = "SPAWN_LAUNCHER_FLAGS_EXTENDED"
+value = 60
 
 [[constant]]
 name = "ENV_EMPTY"
@@ -170,6 +205,21 @@ value = 1
 [[constant]]
 name = "SPAWN_RESOURCE_TAG_EXTENSION"
 value = 2
+[[constant]]
+name = "SPAWN_RESIDUE_GRACE_EXTENSION"
+value = 3
+[[constant]]
+name = "SPAWN_KEEP_OUTPUT_EXTENSION"
+value = 4
+[[constant]]
+name = "MAX_KEEP_OUTPUT_TAIL_BYTES"
+value = 1048576
+[[constant]]
+name = "EXIT_STDOUT_ELIDED_EXTENSION"
+value = 1
+[[constant]]
+name = "EXIT_STDERR_ELIDED_EXTENSION"
+value = 2
 
 [[constant]]
 name = "MAX_ARGC"
@@ -214,6 +264,61 @@ value = 8388608
 name = "MAX_DETACHED_RETENTION_NS"
 value = 300000000000
 
+# Optional extended maxima (tags 12-18). A server configured above a
+# legacy hard maximum advertises the legacy tag clamped to it and the
+# extended tag with the real value; clients that know the extended tag use it.
+# Per-session processes and pending operations stay low enough that a session
+# can retain an operation replay for each of them within MAX_MUTATION_REPLAYS.
+[[constant]]
+name = "MAX_PROCESSES_PER_SESSION_EXTENDED"
+value = 16384
+[[constant]]
+name = "MAX_PROCESSES_EXTENDED"
+value = 65536
+[[constant]]
+name = "MAX_PENDING_SPAWNS_EXTENDED"
+value = 4096
+[[constant]]
+name = "MAX_STREAM_BUFFER_BYTES_EXTENDED"
+value = 1073741824
+[[constant]]
+name = "MAX_ENVC_EXTENDED"
+value = 16384
+[[constant]]
+name = "MAX_PENDING_WAITS"
+value = 65536
+[[constant]]
+name = "MAX_PENDING_OPERATIONS"
+value = 16384
+# What a server that does not advertise MAX_PENDING_WAITS / MAX_PENDING_OPERATIONS admits.
+[[constant]]
+name = "LEGACY_PENDING_WAITS"
+value = 32
+[[constant]]
+name = "LEGACY_PENDING_OPERATIONS"
+value = 16
+[[constant]]
+name = "LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED"
+value = 12
+[[constant]]
+name = "LIMIT_MAX_PROCESSES_EXTENDED"
+value = 13
+[[constant]]
+name = "LIMIT_MAX_PENDING_SPAWNS_EXTENDED"
+value = 14
+[[constant]]
+name = "LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED"
+value = 15
+[[constant]]
+name = "LIMIT_MAX_ENVC_EXTENDED"
+value = 16
+[[constant]]
+name = "LIMIT_MAX_PENDING_WAITS"
+value = 17
+[[constant]]
+name = "LIMIT_MAX_PENDING_OPERATIONS"
+value = 18
+
 [[constant]]
 name = "LIMIT_MAX_ARGC"
 value = 1
@@ -247,6 +352,12 @@ value = 65536
 [[constant]]
 name = "LIMIT_MAX_MUTATION_REPLAYS"
 value = 10
+[[constant]]
+name = "LIMIT_LAUNCHER_FLAGS"
+value = 11
+[[constant]]
+name = "LIMIT_LAUNCHER_FLAGS_EXTENDED"
+value = 19
 
 [[request]]
 name = "WATCH"
@@ -320,6 +431,15 @@ compression = "allowed"
 datagram = "forbidden"
 layout = "StateAck"
 
+[[event]]
+name = "EXIT"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ExitReport"
+
 [[type]]
 name = "cwd"
 layout = "kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16"
@@ -331,6 +451,18 @@ layout = "process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u
 [[type]]
 name = "remove_record"
 layout = "process_handle:u64"
+
+[[type]]
+name = "exit_report"
+layout = "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream"
+
+[[type]]
+name = "keep_output_extension"
+layout = "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES"
+
+[[type]]
+name = "output_elision"
+layout = "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream"
 
 [[type]]
 name = "exit_record"

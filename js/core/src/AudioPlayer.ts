@@ -21,7 +21,7 @@
  * from a Blob URL — no external file needed.
  */
 
-import { claimPlaybackAudioSession } from "./audioSession";
+import { claimPlaybackAudioSession } from "./audioSession.js";
 
 /**
  * Maximum pre-worklet staging depth in decoded frames (~20 ms each).

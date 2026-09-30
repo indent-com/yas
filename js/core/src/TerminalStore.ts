@@ -1,12 +1,12 @@
 import type { Terminal } from "@yas-run/browser";
-import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
-import type { ConnectionStatus, TerminalId, TerminalPalette } from "./types";
+import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types.js";
+import type { ConnectionStatus, TerminalId, TerminalPalette } from "./types.js";
 import {
   createGlRenderer,
   createCanvas2dRenderer,
   type GlRenderer,
-} from "./gl-renderer";
-import { createWebGpuRenderer } from "./webgpu-renderer";
+} from "./gl-renderer.js";
+import { createWebGpuRenderer } from "./webgpu-renderer.js";
 
 const DISPLAY_FPS_SAMPLE_COUNT = 120;
 

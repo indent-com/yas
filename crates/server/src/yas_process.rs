@@ -24,7 +24,6 @@ use super::app_env::SessionEnv;
 use super::process::{self, NativeRecord, Server};
 
 const ROUTE_EVENTS: usize = 80;
-pub(crate) const MAX_EXIT_REPLAYS_PER_SESSION: usize = schema::process::MAX_PROCESSES as usize;
 
 #[derive(Clone)]
 pub(crate) struct Runtime {
@@ -140,6 +139,8 @@ pub(crate) struct ExitInfo {
     pub(crate) reason: u8,
     pub(crate) code: i32,
     pub(crate) detail: Vec<u8>,
+    /// KEEP_OUTPUT: what was dropped of stdout and of stderr (in the EXIT event only).
+    pub(crate) elided: [Option<wire::OutputElision>; 2],
 }
 
 impl ExitInfo {
@@ -187,6 +188,7 @@ pub(crate) struct AttachmentControl {
 
 pub(crate) struct AttachmentEvents {
     events: mpsc::Receiver<Event>,
+    failed: watch::Receiver<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -210,13 +212,21 @@ struct SessionInner {
     operation_gate: Option<Arc<TestOperationGate>>,
 }
 
-#[derive(Default)]
 struct ExitReplays {
     values: HashMap<u64, ExitInfo>,
     order: VecDeque<u64>,
+    capacity: usize,
 }
 
 impl ExitReplays {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
     fn get(&self, process_handle: u64) -> Option<&ExitInfo> {
         self.values.get(&process_handle)
     }
@@ -225,7 +235,7 @@ impl ExitReplays {
         if self.values.insert(process_handle, exit).is_none() {
             self.order.push_back(process_handle);
         }
-        while self.order.len() > MAX_EXIT_REPLAYS_PER_SESSION {
+        while self.order.len() > self.capacity {
             if let Some(retired) = self.order.pop_front() {
                 self.values.remove(&retired);
             }
@@ -244,7 +254,13 @@ struct Route {
     auto_ack_output: bool,
     events: mpsc::Sender<Event>,
     exit: watch::Sender<Option<ExitInfo>>,
+    /// Why the process's output left this route: its native binding fell a window behind or
+    /// its queue filled. Only this attachment fails; the session and its other processes go on.
+    failed: watch::Sender<Option<String>>,
 }
+
+/// What a route dropped for falling behind tells its attachment and its WAITs.
+const ROUTE_EVICTED: &str = "Process output fell a window behind its reader and was dropped";
 
 enum WatchOutcome {
     Running(Attachment),
@@ -279,10 +295,16 @@ impl Runtime {
     }
 
     pub(crate) fn limits(&self) -> wire::Limits {
+        // LEAVE_RESIDUE works with Unix process groups and Windows jobs alike; REPORT_EXIT is
+        // the YAS connection's own.
         wire::Limits {
-            max_mutation_replays: super::yas::MAX_PROCESS_OPERATION_REPLAYS as u32,
-            ..wire::Limits::HARD
+            launcher_flags: schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32,
+            ..self.server.maxima().limits()
         }
+    }
+
+    pub(crate) fn maxima(&self) -> process::ProcessMaxima {
+        self.server.maxima()
     }
 
     pub(crate) fn session(
@@ -296,9 +318,9 @@ impl Runtime {
         if owner_session.iter().all(|byte| *byte == 0) {
             return Err(Error::Invalid("zero Process owner session".to_owned()));
         }
-        let (manager, events, endpoint_closed) = self
+        let (manager, events, evictions) = self
             .server
-            .native_endpoint_with_session(owner_session, ROUTE_EVENTS);
+            .native_endpoint_with_session(owner_session, self.server.maxima().endpoint_events());
         let (closed, _) = watch::channel(None);
         let inner = Arc::new(SessionInner {
             server: self.server.clone(),
@@ -306,17 +328,13 @@ impl Runtime {
             session_env: StdMutex::new(session_env),
             next_process_id: AtomicU32::new(1),
             routes: StdMutex::new(HashMap::new()),
-            exits: StdMutex::new(ExitReplays::default()),
+            exits: StdMutex::new(ExitReplays::new(self.server.maxima().exit_replays())),
             closed,
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
             operation_gate: self.operation_gate.clone(),
         });
-        tokio::spawn(route_outbound(
-            Arc::downgrade(&inner),
-            events,
-            endpoint_closed,
-        ));
+        tokio::spawn(route_outbound(Arc::downgrade(&inner), events, evictions));
         Ok(Session { inner })
     }
 
@@ -366,8 +384,18 @@ impl Session {
         resolved_cwd: Option<Vec<u8>>,
     ) -> Result<Attachment, Error> {
         let cwd = resolve_cwd(&request.cwd, resolved_cwd)?;
-        let flags = u8::try_from(request.flags)
-            .map_err(|_| Error::Invalid("Process SPAWN flags do not fit v1".to_owned()))?;
+        // REPORT_EXIT asks the YAS connection for an EXIT event, and KEEP_OUTPUT (with it) the
+        // output's head and tail alone: the process is the same.
+        let flags = u8::try_from(
+            request.flags
+                & !((schema::process::SPAWN_REPORT_EXIT | schema::process::SPAWN_KEEP_OUTPUT)
+                    as u16),
+        )
+        .map_err(|_| Error::Invalid("Process SPAWN flags do not fit v1".to_owned()))?;
+        let keep_output = request
+            .keep_output()
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .map(|(head, tail)| (head, tail as usize));
         let process_id = self.allocate_process_id()?;
         let (route, events) = self.install_route(process_id, false)?;
         let session_env = (request.environment_kind == wire::EnvironmentKind::Session)
@@ -378,6 +406,10 @@ impl Session {
             .surface_app_handle()
             .map_err(|error| Error::Invalid(error.to_string()))?
             .is_some();
+        let residue_grace = request
+            .residue_grace_ns()
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .map(std::time::Duration::from_nanos);
         let started = self
             .inner
             .manager
@@ -386,6 +418,8 @@ impl Session {
                     process_id,
                     flags,
                     preserve_residual,
+                    residue_grace,
+                    keep_output,
                     cwd,
                     argv: request.argv.clone(),
                     env: request
@@ -410,9 +444,23 @@ impl Session {
             self.remove_route(process_id);
             return Err(Error::Closed("mismatched Process SPAWN reply".to_owned()));
         }
-        route
-            .process_handle
-            .store(started.process_handle, Ordering::Release);
+        {
+            // Under the routes lock, like the Exit handler: either it sees
+            // this handle and records the exit replay, or this sees the
+            // exit it already published (a process that exits before SPAWN
+            // returns) and records it here. A WAIT never misses both.
+            let _routes = self.inner.routes.lock().unwrap();
+            route
+                .process_handle
+                .store(started.process_handle, Ordering::Release);
+            if let Some(exit) = route.exit.borrow().clone() {
+                self.inner
+                    .exits
+                    .lock()
+                    .unwrap()
+                    .insert(started.process_handle, exit);
+            }
+        }
         Ok(Attachment {
             session: self.clone(),
             route,
@@ -481,6 +529,26 @@ impl Session {
     }
 
     pub(crate) async fn wait(&self, request: &wire::Wait) -> Result<ExitInfo, Error> {
+        let deadline = (request.timeout_ns != 0)
+            .then(|| tokio::time::Instant::now() + Duration::from_nanos(request.timeout_ns));
+        // The route waited on can leave first (its stream was dropped, or it fell behind and
+        // was failed): the process goes on, so the wait looks again.
+        loop {
+            if let Some(exit) = self.wait_route(request, deadline).await? {
+                return Ok(exit);
+            }
+            if let Some(error) = self.inner.closed.borrow().clone() {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Waits on the process's route of now; None when the route left before the exit.
+    async fn wait_route(
+        &self,
+        request: &wire::Wait,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<ExitInfo>, Error> {
         if let Some(exit) = self
             .inner
             .exits
@@ -489,40 +557,76 @@ impl Session {
             .get(request.process_handle)
             .cloned()
         {
-            return Ok(exit);
+            return Ok(Some(exit));
         }
-        let (mut exit, temporary) =
+        let (mut exit, mut failed, temporary) =
             if let Some(route) = self.route_by_handle(request.process_handle) {
-                (route.exit.subscribe(), None)
+                (route.exit.subscribe(), route.failed.subscribe(), None)
+            } else if let Some(exit) = self
+                .inner
+                .exits
+                .lock()
+                .unwrap()
+                .get(request.process_handle)
+                .cloned()
+            {
+                // It exited between the first look and the route lookup; the
+                // replay is recorded before the route is removed.
+                return Ok(Some(exit));
             } else {
+                // A look refused as CONFLICT is one that comes too soon: the process's exit is
+                // on its way to its watchers (it is final once they have it), or this session's
+                // own look at it is still bound (a concurrent CONTROL's, or a route that failed
+                // and has yet to detach). The WAIT waits for that to settle, then looks again.
+                let revision = self.inner.server.native_catalogue_revision();
                 match self
                     .watch_process(request.process_handle, false, true)
-                    .await?
+                    .await
                 {
-                    WatchOutcome::Exited(exit) => return Ok(exit),
-                    WatchOutcome::Running(attachment) => {
+                    Ok(WatchOutcome::Exited(exit)) => return Ok(Some(exit)),
+                    Ok(WatchOutcome::Running(attachment)) => {
                         let exit = attachment.route.exit.subscribe();
-                        (exit, Some(attachment))
+                        let failed = attachment.route.failed.subscribe();
+                        (exit, failed, Some(attachment))
                     }
+                    Err(Error::Conflict) => {
+                        let settled = self
+                            .inner
+                            .manager
+                            .wait_native_look(request.process_handle, revision);
+                        match deadline {
+                            None => settled.await,
+                            Some(deadline) => tokio::time::timeout_at(deadline, settled)
+                                .await
+                                .map_err(|_| Error::Timeout)?,
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
                 }
             };
         let wait = async {
             loop {
                 if let Some(exit) = exit.borrow().clone() {
-                    return Ok(exit);
+                    return Some(exit);
                 }
-                exit.changed()
-                    .await
-                    .map_err(|_| Error::Closed("Process attachment closed".to_owned()))?;
+                if failed.borrow().is_some() {
+                    return None;
+                }
+                tokio::select! {
+                    changed = exit.changed() => if changed.is_err() {
+                        // The route is gone: with its exit, or before it.
+                        return exit.borrow().clone();
+                    },
+                    _ = failed.changed() => {}
+                }
             }
         };
-        let result = if request.timeout_ns == 0 {
-            wait.await
-        } else {
-            match tokio::time::timeout(Duration::from_nanos(request.timeout_ns), wait).await {
-                Ok(result) => result,
-                Err(_) => Err(Error::Timeout),
-            }
+        let result = match deadline {
+            None => Ok(wait.await),
+            Some(deadline) => tokio::time::timeout_at(deadline, wait)
+                .await
+                .map_err(|_| Error::Timeout),
         };
         if let Some(attachment) = temporary {
             let _ = self
@@ -649,12 +753,14 @@ impl Session {
     ) -> Result<(Arc<Route>, mpsc::Receiver<Event>), Error> {
         let (events, receiver) = mpsc::channel(ROUTE_EVENTS);
         let (exit, _) = watch::channel(None);
+        let (failed, _) = watch::channel(None);
         let route = Arc::new(Route {
             process_id,
             process_handle: AtomicU64::new(0),
             auto_ack_output,
             events,
             exit,
+            failed,
         });
         if self
             .inner
@@ -701,20 +807,22 @@ impl Attachment {
             stdin_window: self.stdin_window,
             merged_stderr: self.merged_stderr,
         };
+        let failed = control.route.failed.subscribe();
         (
             control,
             AttachmentEvents {
                 events: self.events,
+                failed,
             },
         )
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) async fn next(&mut self) -> Option<Event> {
         self.events.recv().await
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn acknowledge_output(
         &self,
         stream: Stream,
@@ -726,8 +834,21 @@ impl Attachment {
 }
 
 impl AttachmentEvents {
+    /// The next event; None once the route is closed or failed ([`AttachmentEvents::failure`]).
     pub(crate) async fn next(&mut self) -> Option<Event> {
-        self.events.recv().await
+        if self.failed.borrow().is_some() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.failed.changed() => None,
+            event = self.events.recv() => event,
+        }
+    }
+
+    /// Why the route failed, when it did.
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.failed.borrow().clone()
     }
 }
 
@@ -772,26 +893,19 @@ impl AttachmentControl {
 async fn route_outbound(
     inner: std::sync::Weak<SessionInner>,
     mut events: mpsc::Receiver<process::NativeEventEnvelope>,
-    mut endpoint_closed: watch::Receiver<Option<String>>,
+    evictions: Arc<process::Evictions>,
 ) {
     loop {
         let event = tokio::select! {
             event = events.recv() => event,
-            changed = endpoint_closed.changed() => {
-                let detail = if changed.is_ok() {
-                    endpoint_closed.borrow().clone()
-                } else {
-                    None
+            () = evictions.notified() => {
+                let Some(inner) = inner.upgrade() else {
+                    return;
                 };
-                if let Some(inner) = inner.upgrade() {
-                    close_session(
-                        &inner,
-                        Error::Closed(detail.unwrap_or_else(|| {
-                            "Process endpoint writer closed".to_owned()
-                        })),
-                    );
+                for process_id in evictions.take() {
+                    fail_route(&inner, process_id, ROUTE_EVICTED);
                 }
-                return;
+                continue;
             }
         };
         let Some(event) = event else {
@@ -821,13 +935,10 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
             offset,
             data,
         } => {
-            let route = inner
-                .routes
-                .lock()
-                .unwrap()
-                .get(&process_id)
-                .cloned()
-                .ok_or_else(|| Error::Closed("output for unknown Process binding".to_owned()))?;
+            // Queued before its route failed or detached: nobody takes it now.
+            let Some(route) = inner.routes.lock().unwrap().get(&process_id).cloned() else {
+                return Ok(());
+            };
             let semantic_stream = match stream {
                 process::NATIVE_STREAM_STDOUT => Stream::Stdout,
                 process::NATIVE_STREAM_STDERR => Stream::Stderr,
@@ -843,52 +954,78 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                     .map_err(backend_error)?;
                 return Ok(());
             }
-            route
+            if route
                 .events
                 .try_send(Event::Output {
                     stream: semantic_stream,
                     lifetime_offset: offset,
                     data,
                 })
-                .map_err(|_| Error::Closed("Process semantic stream queue overflowed".to_owned()))
+                .is_err()
+            {
+                // This attachment's reader fell behind: it alone fails.
+                fail_route(inner, process_id, ROUTE_EVICTED);
+                let _ = inner
+                    .manager
+                    .control_native(process_id, process::NativeControl::Detach);
+            }
+            Ok(())
         }
         process::NativeEvent::StdinProgress {
             process_id,
             consumed,
             open,
         } => {
-            let route = inner
-                .routes
-                .lock()
-                .unwrap()
-                .get(&process_id)
-                .cloned()
-                .ok_or_else(|| Error::Closed("stdin ACK for unknown Process binding".to_owned()))?;
-            route
+            let Some(route) = inner.routes.lock().unwrap().get(&process_id).cloned() else {
+                return Ok(());
+            };
+            if route
                 .events
                 .try_send(Event::StdinProgress { consumed, open })
-                .map_err(|_| Error::Closed("Process semantic stream queue overflowed".to_owned()))
+                .is_err()
+            {
+                fail_route(inner, process_id, ROUTE_EVICTED);
+                let _ = inner
+                    .manager
+                    .control_native(process_id, process::NativeControl::Detach);
+            }
+            Ok(())
         }
-        process::NativeEvent::Exit { process_id, exit } => {
-            let route = inner
-                .routes
+        process::NativeEvent::Exit {
+            process_id,
+            process_handle,
+            exit,
+        } => {
+            let exit = native_exit_info(exit);
+            // The replay goes first, and whether the route is there or not: a WAIT in this
+            // session that no longer finds the route (it left, or failed as the exit was queued)
+            // must find the exit.
+            inner
+                .exits
                 .lock()
                 .unwrap()
-                .remove(&process_id)
-                .ok_or_else(|| Error::Closed("exit for unknown Process binding".to_owned()))?;
-            let exit = native_exit_info(exit);
-            let process_handle = route.process_handle.load(Ordering::Acquire);
-            if process_handle != 0 {
-                inner
-                    .exits
-                    .lock()
-                    .unwrap()
-                    .insert(process_handle, exit.clone());
-            }
-            route.exit.send_replace(Some(exit.clone()));
+                .insert(process_handle, exit.clone());
+            let route = {
+                let mut routes = inner.routes.lock().unwrap();
+                let Some(route) = routes.get(&process_id).cloned() else {
+                    return Ok(());
+                };
+                routes.remove(&process_id);
+                route.exit.send_replace(Some(exit.clone()));
+                route
+            };
             let _ = route.events.try_send(Event::Exit(exit));
             Ok(())
         }
+    }
+}
+
+/// The route of `process_id` leaves the session and its attachment and WAITs fail with
+/// `reason`; the session and its other processes go on.
+fn fail_route(inner: &SessionInner, process_id: u32, reason: &str) {
+    let route = inner.routes.lock().unwrap().remove(&process_id);
+    if let Some(route) = route {
+        route.failed.send_replace(Some(reason.to_owned()));
     }
 }
 
@@ -896,7 +1033,8 @@ fn close_session(inner: &SessionInner, error: Error) {
     if inner.closed.borrow().is_some() {
         return;
     }
-    let _ = inner.closed.send(Some(error));
+    // send_replace: nobody subscribes, and send would drop the value.
+    inner.closed.send_replace(Some(error));
     inner.routes.lock().unwrap().clear();
     inner.exits.lock().unwrap().clear();
 }
@@ -937,11 +1075,12 @@ fn native_signal(value: u16) -> Result<u32, Error> {
 
 #[cfg(windows)]
 fn native_signal(value: u16) -> Result<u32, Error> {
+    use process::windows_signal;
     match value {
-        value if value == schema::process::SIGNAL_INTERRUPT as u16 => Ok(2),
-        value if value == schema::process::SIGNAL_TERMINATE as u16 => Ok(15),
-        value if value == schema::process::SIGNAL_KILL as u16 => Ok(9),
-        value if value == schema::process::SIGNAL_HANGUP as u16 => Ok(1),
+        value if value == schema::process::SIGNAL_INTERRUPT as u16 => Ok(windows_signal::INTERRUPT),
+        value if value == schema::process::SIGNAL_TERMINATE as u16 => Ok(windows_signal::TERMINATE),
+        value if value == schema::process::SIGNAL_KILL as u16 => Ok(windows_signal::KILL),
+        value if value == schema::process::SIGNAL_HANGUP as u16 => Ok(windows_signal::HANGUP),
         _ => Err(Error::Invalid("unknown portable Process signal".to_owned())),
     }
 }
@@ -1003,6 +1142,15 @@ fn native_exit_info(exit: process::NativeExit) -> ExitInfo {
         reason: exit.reason,
         code: exit.code,
         detail: exit.detail,
+        elided: exit.elided.map(|elided| {
+            elided.map(|elided| wire::OutputElision {
+                offset: elided.offset,
+                bytes: elided.bytes,
+                lines: elided.lines,
+                code_points: elided.code_points,
+                utf16_units: elided.utf16_units,
+            })
+        }),
     }
 }
 
@@ -1025,7 +1173,12 @@ mod tests {
 
     #[test]
     fn exit_replays_are_bounded_retryable_and_fifo_evicted() {
-        let mut exits = ExitReplays::default();
+        const MAX_EXIT_REPLAYS_PER_SESSION: usize = schema::process::MAX_PROCESSES as usize;
+        assert_eq!(
+            process::ProcessMaxima::DEFAULT.exit_replays(),
+            MAX_EXIT_REPLAYS_PER_SESSION
+        );
+        let mut exits = ExitReplays::new(MAX_EXIT_REPLAYS_PER_SESSION);
         for process_handle in 1..=MAX_EXIT_REPLAYS_PER_SESSION as u64 + 1 {
             exits.insert(
                 process_handle,
@@ -1034,6 +1187,7 @@ mod tests {
                     reason: 0,
                     code: process_handle as i32,
                     detail: Vec::new(),
+                    elided: [None; 2],
                 },
             );
         }
@@ -1045,6 +1199,13 @@ mod tests {
         // WAIT has no operation ID, so successful delivery remains retryable
         // until ordinary FIFO churn evicts the replay.
         assert_eq!(exits.get(newest).unwrap().code, newest as i32);
+    }
+
+    /// FUTURE, which must end within 5 s.
+    async fn within_5s<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("within 5 s")
     }
 
     fn spawn_request(argv: Vec<Vec<u8>>, env: Vec<EnvEntry>) -> wire::Spawn {
@@ -1110,6 +1271,680 @@ mod tests {
         };
         assert_eq!(output, b"survived");
         assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 0);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// Output and the exit of a spawned attachment, crediting output as it comes.
+    async fn output_and_exit(
+        attachment: &mut Attachment,
+        within: Duration,
+        mut acked: u64,
+    ) -> (Vec<u8>, ExitInfo) {
+        let mut output = Vec::new();
+        loop {
+            match tokio::time::timeout(within, attachment.next())
+                .await
+                .expect("an event in time")
+                .expect("the attachment is open")
+            {
+                Event::Output { stream, data, .. } => {
+                    output.extend_from_slice(&data);
+                    acked += data.len() as u64;
+                    attachment.acknowledge_output(stream, acked).unwrap();
+                }
+                Event::Exit(exit) => return (output, exit),
+                Event::StdinProgress { .. } => {}
+            }
+        }
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn residue_request(script: String, grace: Option<Duration>) -> wire::Spawn {
+        let mut request = spawn_request(
+            vec![executable("sh"), b"-c".to_vec(), script.into_bytes()],
+            Vec::new(),
+        );
+        request.flags = (schema::process::SPAWN_LEAVE_RESIDUE
+            | schema::process::SPAWN_MERGE_STDERR
+            | schema::process::SPAWN_STDIN_NULL) as u16;
+        request.stderr_receive_credit = 0;
+        if let Some(grace) = grace {
+            request.extensions = Extensions(vec![Extension {
+                tag: schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+                required: true,
+                value: (grace.as_nanos() as u64).to_le_bytes().to_vec(),
+            }]);
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn leave_residue_reports_the_exit_after_its_grace_and_leaves_the_group_running() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([11; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let started = std::time::Instant::now();
+        let mut attachment = session
+            .spawn(
+                &residue_request(
+                    format!("{sleep} 30 & echo $!; echo started; exit 3"),
+                    Some(Duration::from_millis(300)),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            attachment.stdin_window, 0,
+            "the null device has no stdin Transfer"
+        );
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        let elapsed = started.elapsed();
+        let text = String::from_utf8(output).unwrap();
+        let mut lines = text.lines();
+        let pid: i32 = lines.next().unwrap().parse().unwrap();
+        assert_eq!(lines.next(), Some("started"));
+        assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 3);
+        assert_eq!(exit.detail, b"residual process group left running");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "waited for the grace: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "did not wait for the residue: {elapsed:?}"
+        );
+        // Neither the exit, nor the session's end, nor the server's stops what was left running.
+        assert!(alive(pid), "the residue runs after the exit");
+        session.shutdown().await;
+        server.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(alive(pid), "the residue outlives its session and server");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[tokio::test]
+    async fn leave_residue_without_a_grace_forwards_output_until_the_streams_close() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([12; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let mut attachment = session
+            .spawn(
+                &residue_request(format!("({sleep} 0.4; printf later) & printf now"), None),
+                None,
+            )
+            .await
+            .unwrap();
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output, b"nowlater");
+        assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 0);
+        assert!(
+            exit.detail.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&exit.detail)
+        );
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn leave_residue_terminate_kills_the_whole_group_after_the_kill_grace() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([13; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let sh = String::from_utf8(executable("sh")).unwrap();
+        // A member that ignores SIGTERM (it reports its pid once the trap is set), and a leader
+        // waiting on a foreground child.
+        let mut attachment = session
+            .spawn(
+                &residue_request(
+                    format!("{sh} -c \"trap \\\"\\\" TERM; echo \\$\\$; {sleep} 30\" & {sleep} 30"),
+                    Some(Duration::from_millis(100)),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let (pid, acked) = loop {
+            match tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Event::Output { stream, data, .. } => {
+                    let acked = data.len() as u64;
+                    attachment.acknowledge_output(stream, acked).unwrap();
+                    let pid = String::from_utf8(data)
+                        .unwrap()
+                        .trim()
+                        .parse::<i32>()
+                        .unwrap();
+                    break (pid, acked);
+                }
+                Event::Exit(exit) => panic!("exited early: {exit:?}"),
+                Event::StdinProgress { .. } => {}
+            }
+        };
+        let started = std::time::Instant::now();
+        session
+            .control(&wire::Control {
+                process_handle: attachment.process_handle,
+                operation_id: [14; 16],
+                action: wire::ControlAction::Terminate,
+                value: 0,
+                extensions: Extensions::default(),
+            })
+            .await
+            .unwrap();
+        let (_, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), acked).await;
+        assert_eq!(exit.kind, wire::ExitKind::Signal);
+        assert_eq!(exit.code, libc::SIGTERM);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the exit waits for no residue"
+        );
+        assert!(alive(pid), "the member ignoring SIGTERM outlives it");
+        tokio::time::sleep(Duration::from_millis(2_500).saturating_sub(started.elapsed())).await;
+        assert!(!alive(pid), "the escalation killed the group");
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    fn watch_request(handle: u64) -> wire::Attach {
+        wire::Attach {
+            process_handle: handle,
+            flags: 0,
+            stdout_receive_credit: 1 << 20,
+            stderr_receive_credit: 1 << 20,
+            extensions: Extensions::default(),
+        }
+    }
+
+    /// `sh -c SCRIPT`, SCRIPT's programs named by absolute path (spawn_request's environment is
+    /// empty).
+    fn sh(script: &str) -> Vec<Vec<u8>> {
+        let mut script = script.to_owned();
+        for name in ["head", "sleep", "yes"] {
+            let path = String::from_utf8(executable(name)).unwrap();
+            script = script.replace(&format!("{{{name}}}"), &path);
+        }
+        vec![executable("sh"), b"-c".to_vec(), script.into_bytes()]
+    }
+
+    /// What a command a session starts then says: its output and exit.
+    async fn runs_a_command(session: &Session) -> (Vec<u8>, i32) {
+        let mut after = session
+            .spawn(
+                &spawn_request(vec![executable("echo"), b"after".to_vec()], Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        let (output, exit) = output_and_exit(&mut after, Duration::from_secs(5), 0).await;
+        (output, exit.code)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_evicted_watcher_gives_back_its_process_slot() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([4; 16], None).unwrap();
+        let watcher = runtime.session([5; 16], None).unwrap();
+        // More rounds than a session has process slots (16).
+        for round in 0..20 {
+            let mut attachment = owner
+                .spawn(
+                    &spawn_request(sh("{sleep} 0.2; {head} -c 3145728 /dev/zero"), Vec::new()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let watched = watcher
+                .attach(&watch_request(attachment.process_handle))
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+            let (control, mut events) = watched.split();
+            let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(10), 0).await;
+            assert_eq!((output.len(), exit.code), (3145728, 0), "round {round}");
+            // The watcher never acknowledges: it falls a window behind and is dropped.
+            while tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .unwrap()
+                .is_some()
+            {}
+            assert!(events.failure().is_some(), "round {round}");
+            // What the adapter does next.
+            let _ = control.detach().await;
+        }
+        assert_eq!(runs_a_command(&watcher).await, (b"after\n".to_vec(), 0));
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_watcher_whose_queue_fills_after_the_exit_fails_alone() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([6; 16], None).unwrap();
+        let watcher = runtime.session([7; 16], None).unwrap();
+        // The child writes its next line once the test has the last one, as a FIFO says: one
+        // line a frame, however slow the machine.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("go");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut request = spawn_request(
+            sh(&format!(
+                "exec 3<'{}'; i=0; while [ $i -lt 80 ]; do echo x; read -r go <&3; \
+                i=$((i+1)); done; printf z; exit 0",
+                fifo.display()
+            )),
+            Vec::new(),
+        );
+        // No stdin, so no stdin events: the watcher's queue takes output alone.
+        request.flags = schema::process::SPAWN_STDIN_NULL as u16;
+        let mut attachment = owner.spawn(&request, None).await.unwrap();
+        // Never read: its route queue (80 events) fills with the 80 lines, and the next frame
+        // comes after the child exits.
+        let (_watch, watched) = watcher
+            .attach(&watch_request(attachment.process_handle))
+            .await
+            .unwrap()
+            .split();
+        // The child's first line waits for this: the watcher sees every line.
+        let mut go = within_5s(tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(fifo)
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+        // The owner acknowledges its first 48 frames only: with 32 unacknowledged, the reader
+        // waits for it, and `z` stays in the pipe as the child exits.
+        let (mut frames, mut end) = (0, 0u64);
+        while frames < 80 {
+            match within_5s(attachment.next()).await.unwrap() {
+                Event::Output {
+                    stream,
+                    lifetime_offset,
+                    data,
+                } => {
+                    frames += 1;
+                    assert_eq!(
+                        (lifetime_offset, data.as_slice()),
+                        (end, &b"x\n"[..]),
+                        "frame {frames}"
+                    );
+                    end += data.len() as u64;
+                    if frames <= 48 {
+                        attachment.acknowledge_output(stream, end).unwrap();
+                    }
+                    go.write_all(b"\n").unwrap();
+                }
+                Event::StdinProgress { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        // `z` is in the pipe once the child is gone.
+        within_5s(server.wait_reaped(attachment.process_handle)).await;
+        attachment.acknowledge_output(Stream::Stdout, end).unwrap();
+        let (rest, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), end).await;
+        assert_eq!((rest, exit.code), (b"z".to_vec(), 0));
+        // `z` found the watcher's queue full: its attachment alone failed.
+        let mut failed = watched.failed.clone();
+        within_5s(failed.wait_for(Option::is_some)).await.unwrap();
+        assert_eq!(watched.failure().as_deref(), Some(ROUTE_EVICTED));
+        assert!(watcher.inner.closed.borrow().is_none());
+        assert_eq!(runs_a_command(&watcher).await, (b"after\n".to_vec(), 0));
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_that_drops_its_stream_after_the_exit_still_waits_for_it() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([10; 16], None).unwrap();
+        // The reader takes a window (1 MiB) and waits for the owner; the last 32 KiB stay in
+        // the pipe as the child exits. (Or a loaded reader's small reads reach the frames the
+        // owner may leave unacknowledged first, and the child exits after the detach, with no
+        // look of its owner's to take the exit. Its WAIT gets it all the same: the server keeps
+        // it for the owner.)
+        let attachment = owner
+            .spawn(
+                &spawn_request(sh("{head} -c 1081344 /dev/zero; exit 4"), Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let (control, _events) = attachment.split();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        // What the adapter does when its client drops the stream.
+        control.detach().await.unwrap();
+        let wait = wire::Wait {
+            process_handle: handle,
+            timeout_ns: 5_000_000_000,
+            extensions: Extensions::default(),
+        };
+        let exit = owner.wait(&wait).await.unwrap();
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    fn wait_request(process_handle: u64) -> wire::Wait {
+        wire::Wait {
+            process_handle,
+            timeout_ns: 5_000_000_000,
+            extensions: Extensions::default(),
+        }
+    }
+
+    /// Until `handle` has left the catalogue: its exit is final and its record released.
+    async fn left_the_catalogue(server: &Server, handle: u64) {
+        loop {
+            let revision = server.native_catalogue_revision();
+            let snapshot = server.native_snapshot();
+            if !snapshot
+                .records
+                .iter()
+                .any(|record| record.process_handle == handle)
+            {
+                return;
+            }
+            server.wait_native_catalogue_change(revision).await;
+        }
+    }
+
+    /// The owner's look at its process went before the exit (its client dropped the streams),
+    /// so no route took the exit, and the process left the catalogue: the owner's WAIT still
+    /// answers with the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_whose_look_went_before_the_exit_still_waits_for_it() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([16; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 0.3; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let (control, _events) = attachment.split();
+        control.detach().await.unwrap();
+        within_5s(left_the_catalogue(&server, handle)).await;
+        let exit = owner.wait(&wait_request(handle)).await.unwrap();
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// The owner's route failed as its process's exit came (an eviction fails the route before
+    /// it detaches the binding): the exit reached the session with no route to take it. The
+    /// owner's WAIT still answers with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_whose_route_failed_as_the_exit_came_still_waits_for_it() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([17; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 0.3; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        fail_route(&owner.inner, attachment.route.process_id, ROUTE_EVICTED);
+        within_5s(left_the_catalogue(&server, handle)).await;
+        let exit = owner.wait(&wait_request(handle)).await.unwrap();
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        drop(attachment);
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// The owner's queue was full as its process's exit came, so the exit never reached the
+    /// session: its binding is evicted (its attachment fails, and its client WAITs), and a
+    /// look at the process still finds the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_whose_queue_was_full_as_the_exit_came_still_finds_it() {
+        let server = Server::new(false, true);
+        // Room for one event, never taken: the output takes it, and the exit finds it full.
+        let (manager, _events, evictions) = server.native_endpoint_with_session([18; 16], 1);
+        let started = manager
+            .spawn_native(
+                process::NativeSpawnRequest {
+                    process_id: 1,
+                    flags: schema::process::SPAWN_STDIN_NULL as u8,
+                    preserve_residual: false,
+                    residue_grace: None,
+                    keep_output: None,
+                    cwd: None,
+                    argv: sh("printf x; exit 4"),
+                    env: Vec::new(),
+                    clear_environment: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = started.process_handle;
+        within_5s(left_the_catalogue(&server, handle)).await;
+        let watched = manager
+            .watch_native(2, handle, false)
+            .expect("the exit is kept for its owner");
+        assert!(!watched.running);
+        assert_eq!(watched.exit.map(|exit| exit.code), Some(4));
+        // The eviction follows the release that `left_the_catalogue` saw: wait for it (a permit
+        // is kept when it came first).
+        within_5s(evictions.notified()).await;
+        assert_eq!(evictions.take(), vec![1]);
+        manager.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// WAIT on a detached process right after this session KILLed it: the CONTROL's own look at
+    /// the process may still be leaving, or its exit still on its way to its watchers, when the
+    /// WAIT looks. The WAIT waits for that to settle and answers with the exit, never CONFLICT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_right_after_a_kill_of_a_detached_process_gets_its_exit() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([12; 16], None).unwrap();
+        for round in 1..=64u8 {
+            let mut request = spawn_request(sh("exec {sleep} 30"), Vec::new());
+            request.flags = schema::process::SPAWN_DETACHABLE as u16;
+            let attachment = session.spawn(&request, None).await.unwrap();
+            let handle = attachment.process_handle;
+            let (control_half, _events) = attachment.split();
+            control_half.detach().await.unwrap();
+            session
+                .control(&wire::Control {
+                    process_handle: handle,
+                    operation_id: [round; 16],
+                    action: wire::ControlAction::Kill,
+                    value: 0,
+                    extensions: Extensions::default(),
+                })
+                .await
+                .unwrap();
+            let wait = wire::Wait {
+                process_handle: handle,
+                timeout_ns: 5_000_000_000,
+                extensions: Extensions::default(),
+            };
+            let exit = tokio::time::timeout(Duration::from_secs(10), session.wait(&wait))
+                .await
+                .expect("the WAIT answers")
+                .expect("with the exit");
+            assert!(
+                matches!(exit.kind, wire::ExitKind::Killed | wire::ExitKind::Signal),
+                "{exit:?}"
+            );
+        }
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// WAIT while this session's own look at the process is still bound: an eviction fails the
+    /// route first and detaches its binding next, and the WAIT looks between the two. The
+    /// Detach settles it: the WAIT looks again, attaches and answers with the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_that_finds_its_own_look_still_bound_answers_once_it_goes() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([14; 16], None).unwrap();
+        let watcher = runtime.session([15; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 1; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let look = watcher.attach(&watch_request(handle)).await.unwrap();
+        let process_id = look.route.process_id;
+        // What an eviction does first.
+        fail_route(&watcher.inner, process_id, ROUTE_EVICTED);
+        let wait = tokio::spawn({
+            let watcher = watcher.clone();
+            async move {
+                watcher
+                    .wait(&wire::Wait {
+                        process_handle: handle,
+                        timeout_ns: 5_000_000_000,
+                        extensions: Extensions::default(),
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // And next.
+        watcher
+            .inner
+            .manager
+            .control_native(process_id, process::NativeControl::Detach)
+            .unwrap();
+        let exit = within_5s(wait).await.unwrap().expect("the exit");
+        assert_eq!(exit.code, 4);
+        drop((look, attachment));
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_slow_to_take_its_window_after_the_exit_gets_all_its_output() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([12; 16], None).unwrap();
+        let mut attachment = owner
+            .spawn(
+                &spawn_request(sh("{head} -c 1081344 /dev/zero; exit 4"), Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Longer than the kill grace (2 s): a slow link, or a client that waits for the exit
+        // before it reads.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output.len(), 1081344);
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_residue_owner_slow_to_take_its_window_after_the_exit_gets_all_its_output() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([13; 16], None).unwrap();
+        let mut request = residue_request(String::new(), Some(Duration::from_millis(300)));
+        request.argv = sh("{head} -c 1081344 /dev/zero; exit 4");
+        let mut attachment = owner.spawn(&request, None).await.unwrap();
+        // Longer than its grace: nothing of the group is left, so the grace does not cut it.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output.len(), 1081344);
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_residue_writing_on_ends_its_grace_though_the_owner_reads_nothing() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([14; 16], None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut request = residue_request(String::new(), Some(Duration::from_millis(300)));
+        request.argv = sh(&format!(
+            "{{yes}} & echo $! > '{}'; exit 0",
+            pid_file.display()
+        ));
+        let started = std::time::Instant::now();
+        let mut attachment = owner.spawn(&request, None).await.unwrap();
+        // The owner takes nothing until the exit: the residue fills its window and blocks.
+        let exit = loop {
+            if let Event::Exit(exit) =
+                tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            {
+                break exit;
+            }
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.detail, b"residual process group left running");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(pid), "the residue is left running");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stdin_null_gives_the_child_the_null_device() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([15; 16], None).unwrap();
+        // A character device (the null device) rather than a pipe; /dev/stdin
+        // names fd 0 on Linux and macOS alike, where /proc does not exist.
+        let mut request = spawn_request(
+            vec![
+                executable("sh"),
+                b"-c".to_vec(),
+                b"if [ -c /dev/stdin ]; then echo character-device; else echo other; fi".to_vec(),
+            ],
+            Vec::new(),
+        );
+        request.flags = schema::process::SPAWN_STDIN_NULL as u16;
+        let mut attachment = session.spawn(&request, None).await.unwrap();
+        assert_eq!(attachment.stdin_window, 0);
+        let (output, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), 0).await;
+        assert_eq!(output, b"character-device\n");
         assert_eq!(exit.code, 0);
         session.shutdown().await;
         server.shutdown().await;
@@ -1183,6 +2018,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_after_a_fast_exit_returns_the_exit_record() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([4; 16], None).unwrap();
+        for _ in 0..50 {
+            let mut attachment = session
+                .spawn(
+                    &spawn_request(
+                        vec![executable("sh"), b"-c".to_vec(), b"exit 7".to_vec()],
+                        Vec::new(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            let handle = attachment.process_handle;
+            while !matches!(
+                tokio::time::timeout(Duration::from_secs(5), attachment.next())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Event::Exit(_)
+            ) {}
+            let exit = session
+                .wait(&wire::Wait {
+                    process_handle: handle,
+                    timeout_ns: 5_000_000_000,
+                    extensions: Extensions::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(exit.code, 7);
+        }
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn empty_environment_is_exact_and_wait_observes_exit() {
         let server = Server::new(false, true);
         let runtime = Runtime::new(server.clone());
@@ -1242,6 +2115,436 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(waited, exit);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+}
+
+/// Windows process semantics against real children: console control, jobs, LEAVE_RESIDUE.
+/// `ping` answers CTRL_BREAK with statistics and keeps going, so it stands for a process that
+/// ignores it; `waitfor` has no handler, so CTRL_BREAK ends it with STATUS_CONTROL_C_EXIT.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess,
+    };
+    use yas_wire::{Extension, Extensions};
+
+    /// STATUS_CONTROL_C_EXIT, as the exit code's bits.
+    const CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+
+    fn system32(program: &str) -> Vec<u8> {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        format!(r"{root}\System32\{program}").into_bytes()
+    }
+
+    fn request(argv: &[&[u8]], flags: u64, operation: u8) -> wire::Spawn {
+        wire::Spawn {
+            operation_id: [operation; 16],
+            flags: (flags | schema::process::SPAWN_MERGE_STDERR | schema::process::SPAWN_STDIN_NULL)
+                as u16,
+            environment_kind: wire::EnvironmentKind::Session,
+            cwd: wire::Cwd::ServerDefault,
+            argv: argv.iter().map(|value| value.to_vec()).collect(),
+            env: Vec::new(),
+            stdout_receive_credit: 1024 * 1024,
+            stderr_receive_credit: 0,
+            extensions: Extensions::default(),
+        }
+    }
+
+    fn with_residue_grace(mut request: wire::Spawn, grace: Duration) -> wire::Spawn {
+        request.extensions = Extensions(vec![Extension {
+            tag: schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+            required: true,
+            value: (grace.as_nanos() as u64).to_le_bytes().to_vec(),
+        }]);
+        request
+    }
+
+    fn powershell(script: &str) -> Vec<Vec<u8>> {
+        vec![
+            system32(r"WindowsPowerShell\v1.0\powershell.exe"),
+            b"-NoProfile".to_vec(),
+            b"-NonInteractive".to_vec(),
+            b"-Command".to_vec(),
+            script.as_bytes().to_vec(),
+        ]
+    }
+
+    /// Starts a `ping` that shares the script's console and pipes, prints its PID on a line of
+    /// its own, then runs `rest`.
+    fn residue_script(rest: &str) -> Vec<Vec<u8>> {
+        powershell(&format!(
+            "$p = Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' \
+             -NoNewWindow -PassThru; [Console]::Out.WriteLine('PID ' + $p.Id); {rest}"
+        ))
+    }
+
+    async fn control(session: &Session, handle: u64, action: wire::ControlAction, value: u16) {
+        session
+            .control(&wire::Control {
+                process_handle: handle,
+                operation_id: rand_operation(),
+                action,
+                value,
+                extensions: Extensions::default(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn rand_operation() -> [u8; 16] {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let mut id = [0x5a; 16];
+        id[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        id
+    }
+
+    /// Reads output until `until` finds what it wants in it, crediting as it goes.
+    async fn read_until<T>(
+        attachment: &mut Attachment,
+        acked: &mut u64,
+        mut until: impl FnMut(&str) -> Option<T>,
+    ) -> T {
+        let mut output = String::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), attachment.next())
+                .await
+                .expect("output in time")
+                .expect("the attachment is open")
+            {
+                Event::Output { stream, data, .. } => {
+                    *acked += data.len() as u64;
+                    attachment.acknowledge_output(stream, *acked).unwrap();
+                    output.push_str(&String::from_utf8_lossy(&data));
+                    if let Some(found) = until(&output) {
+                        return found;
+                    }
+                }
+                Event::Exit(exit) => panic!("exited early: {exit:?}; output {output:?}"),
+                Event::StdinProgress { .. } => {}
+            }
+        }
+    }
+
+    async fn exit_of(attachment: &mut Attachment, acked: &mut u64, within: Duration) -> ExitInfo {
+        loop {
+            match tokio::time::timeout(within, attachment.next())
+                .await
+                .expect("the exit in time")
+                .expect("the attachment is open")
+            {
+                Event::Output { stream, data, .. } => {
+                    *acked += data.len() as u64;
+                    attachment.acknowledge_output(stream, *acked).unwrap();
+                }
+                Event::Exit(exit) => return exit,
+                Event::StdinProgress { .. } => {}
+            }
+        }
+    }
+
+    fn residue_pid(output: &str) -> Option<u32> {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("PID "))
+            .and_then(|pid| pid.trim().parse().ok())
+    }
+
+    fn alive(pid: u32) -> bool {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let running =
+                GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE as u32;
+            CloseHandle(process);
+            running
+        }
+    }
+
+    fn kill(pid: u32) {
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !process.is_null() {
+                TerminateProcess(process, 1);
+                CloseHandle(process);
+            }
+        }
+    }
+
+    async fn gone_within(pid: u32, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        !alive(pid)
+    }
+
+    #[test]
+    fn leave_residue_is_offered() {
+        let runtime = Runtime::new(Server::new(false, true));
+        let flags = runtime.limits().launcher_flags;
+        assert_ne!(flags & schema::process::SPAWN_LEAVE_RESIDUE as u32, 0);
+        assert_ne!(flags & schema::process::SPAWN_STDIN_NULL as u32, 0);
+    }
+
+    #[tokio::test]
+    async fn terminate_sends_ctrl_break_to_the_group() {
+        ctrl_break_ends_waitfor().await;
+    }
+
+    async fn ctrl_break_ends_waitfor() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([31; 16], None).unwrap();
+        let mut attachment = session
+            .spawn(
+                &request(
+                    &[
+                        &system32("waitfor.exe"),
+                        b"/t",
+                        b"60",
+                        b"yastestneversignalled",
+                    ],
+                    0,
+                    1,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = std::time::Instant::now();
+        control(
+            &session,
+            attachment.process_handle,
+            wire::ControlAction::Terminate,
+            0,
+        )
+        .await;
+        let mut acked = 0;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(10)).await;
+        assert_eq!(
+            (exit.kind, exit.code),
+            (wire::ExitKind::Code, CONTROL_C_EXIT),
+            "CTRL_BREAK ended it: {exit:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "before the kill grace: {:?}",
+            started.elapsed()
+        );
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// A server without a console (as `yas connect` starts one) reaches the group through the
+    /// child's own hidden console. Ignored: it gives up this process's console, which the other
+    /// tests share; run it alone (`--ignored without_a_console`).
+    #[tokio::test]
+    #[ignore]
+    async fn without_a_console_terminate_still_sends_ctrl_break() {
+        unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+        ctrl_break_ends_waitfor().await;
+    }
+
+    #[tokio::test]
+    async fn terminate_never_leaves_a_process_that_ignores_ctrl_break_running() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([32; 16], None).unwrap();
+        let mut attachment = session
+            .spawn(
+                &request(&[&system32("PING.EXE"), b"-n", b"120", b"127.0.0.1"], 0, 2),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut acked = 0;
+        read_until(&mut attachment, &mut acked, |output| {
+            output.contains("127.0.0.1").then_some(())
+        })
+        .await;
+        let started = std::time::Instant::now();
+        control(
+            &session,
+            attachment.process_handle,
+            wire::ControlAction::Terminate,
+            0,
+        )
+        .await;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(10)).await;
+        assert_eq!(exit.kind, wire::ExitKind::Killed, "{exit:?}");
+        assert_eq!(
+            exit.reason,
+            schema::process::EXIT_REASON_TERMINATE_TIMEOUT as u8,
+            "{exit:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "within the kill grace: {:?}",
+            started.elapsed()
+        );
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signals_map_to_ctrl_break_and_the_job() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([33; 16], None).unwrap();
+        // INTERRUPT is CTRL_BREAK: waitfor has no handler for it.
+        let mut waiting = session
+            .spawn(
+                &request(
+                    &[
+                        &system32("waitfor.exe"),
+                        b"/t",
+                        b"60",
+                        b"yastestneverinterrupted",
+                    ],
+                    0,
+                    3,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        control(
+            &session,
+            waiting.process_handle,
+            wire::ControlAction::Signal,
+            schema::process::SIGNAL_INTERRUPT as u16,
+        )
+        .await;
+        let mut acked = 0;
+        let exit = exit_of(&mut waiting, &mut acked, Duration::from_secs(10)).await;
+        assert_eq!(
+            (exit.kind, exit.code),
+            (wire::ExitKind::Code, CONTROL_C_EXIT)
+        );
+        // KILL ends the job, and says so.
+        let mut pinging = session
+            .spawn(
+                &request(&[&system32("PING.EXE"), b"-n", b"120", b"127.0.0.1"], 0, 4),
+                None,
+            )
+            .await
+            .unwrap();
+        control(
+            &session,
+            pinging.process_handle,
+            wire::ControlAction::Signal,
+            schema::process::SIGNAL_KILL as u16,
+        )
+        .await;
+        let mut acked = 0;
+        let exit = exit_of(&mut pinging, &mut acked, Duration::from_secs(5)).await;
+        assert_eq!(exit.kind, wire::ExitKind::Killed, "{exit:?}");
+        assert_eq!(exit.reason, schema::process::EXIT_REASON_CLIENT as u8);
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn leave_residue_reports_the_exit_after_its_grace_and_leaves_the_job_running() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([34; 16], None).unwrap();
+        let started = std::time::Instant::now();
+        let mut attachment = session
+            .spawn(
+                &with_residue_grace(
+                    request(
+                        &residue_script("exit 3")
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>(),
+                        schema::process::SPAWN_LEAVE_RESIDUE,
+                        5,
+                    ),
+                    Duration::from_millis(500),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut acked = 0;
+        let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(20)).await;
+        assert_eq!(
+            (exit.kind, exit.code),
+            (wire::ExitKind::Code, 3),
+            "{exit:?}"
+        );
+        assert_eq!(exit.detail, b"residual process group left running");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(alive(pid), "the residue runs after the exit");
+        session.shutdown().await;
+        server.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(alive(pid), "the residue outlives its session and server");
+        kill(pid);
+    }
+
+    #[tokio::test]
+    async fn leave_residue_terminate_ends_the_job_after_the_kill_grace() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([35; 16], None).unwrap();
+        let mut attachment = session
+            .spawn(
+                &with_residue_grace(
+                    request(
+                        &residue_script("Start-Sleep -Seconds 120")
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>(),
+                        schema::process::SPAWN_LEAVE_RESIDUE,
+                        6,
+                    ),
+                    Duration::from_millis(100),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut acked = 0;
+        let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let started = std::time::Instant::now();
+        control(
+            &session,
+            attachment.process_handle,
+            wire::ControlAction::Terminate,
+            0,
+        )
+        .await;
+        let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(10)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the exit waits for no residue: {:?} {exit:?}",
+            started.elapsed()
+        );
+        assert!(
+            gone_within(
+                pid,
+                Duration::from_secs(5).saturating_sub(started.elapsed())
+            )
+            .await,
+            "TERMINATE ended the job, ping included"
+        );
         session.shutdown().await;
         server.shutdown().await;
     }

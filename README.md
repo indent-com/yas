@@ -142,6 +142,14 @@ yas client list
 yas client disconnect "$SESSION_ID" --reason "duplicate browser tab"
 ```
 
+Each row lists the client's terminal and surface views with their sizes, and a
+shared terminal or window is sized to fit the smallest of them. To tell whose
+view that is, clients can report an identifier of their choosing, shown in the
+`IDENTIFIER` column: the CLI sends `YAS_CLIENT_IDENTIFIER`, and embedders set
+`clientIdentifier` ([EMBEDDING.md](EMBEDDING.md#client-identifiers)). It is
+shown as reported; YAS requires UTF-8 of at most 1 KiB but checks nothing
+else, and identifiers need not be unique.
+
 Manage → Clients shows Git/FS watch paths, effective flags, and resolved settle
 delays. Use the [event journal](docs/events.md) to trace native requests, results,
 individual state records, raw filesystem notifications, and transport traffic.
@@ -278,12 +286,14 @@ deployment are covered by [ARCHITECTURE.md](ARCHITECTURE.md) and
 | `YAS_PROXY_UID`                                  | client process effective UID       | Numeric kernel peer UID required for the proxy (root is also accepted); cross-UID use also requires an explicitly permissioned `YAS_PROXY_SOCK`                              |
 | `YAS_SERVER_NAME`                                | `default`                          | Server instance name (also `yas server --name NAME`); isolates the socket, state, cache, and built-in extension settings. Address it with `--on local:NAME`                  |
 | `YAS_EXPORT_SOCK`                                | unset                              | Set to `1` (or pass `--export-sock` to `yas server`) to export the server's socket path as `YAS_SOCK` in spawned terminals, so `yas` commands inside them target that server |
+| `YAS_READ_ONLY_SOCK`                             | unset                              | A second socket (or pass `--read-only-sock PATH` to `yas server`) where every session is read-only: viewers watch terminals and windows, nothing more (Unix)                 |
 | `YAS_INJECT_PATH`                                | unset                              | Set to `1` (or pass `--inject-path` to `yas server`) to append the server binary's directory to `PATH` in spawned terminals, so `yas` itself is callable inside them         |
 | `YAS_UPLINK_TOKEN`                               | unset                              | Bearer token for the `yas uplink` control endpoint                                                                                                                           |
 | `YAS_UPLINK_CLIENT_TOKEN`                        | unset                              | Consumer routing token for `yas uplink-url`; overridden by `--client-token`                                                                                                  |
 | `YAS_UPLINK_IDENTITY`                            | unset                              | X25519 private key as 43-character base64url; producer `--identity` or consumer URI `identity` overrides it                                                                  |
 | `YAS_UPLINK_CLIENT_KEYS`                         | unset                              | Producer allowlist of comma-separated X25519 public keys (43-character base64url each); equivalent to repeatable `--allow-client`                                            |
 | `YAS_TARGET`                                     | unset                              | Default remote for non-browser CLI commands: a URI or named remote (overrides `yas.target` in `yas.conf`)                                                                    |
+| `YAS_CLIENT_IDENTIFIER`                          | unset                              | Text (UTF-8, at most 1 KiB) the CLI reports as its identifier, shown as is in the `IDENTIFIER` column of `yas client list` and in Manage → Clients                           |
 | `YAS_REMOTES`                                    | `~/.config/yas/yas.remotes`        | Only the file the one-time import reads; the live catalogue is the home server's `remotes` KV key                                                                            |
 | `YAS_RELAY`                                      | `1`                                | Set to `0` on the home server to disable route publication and nested connections                                                                                            |
 | `YAS_FONTS`                                      | `1`                                | Set to `0` on the server to disable font enumeration, descriptions, and fetch                                                                                                |

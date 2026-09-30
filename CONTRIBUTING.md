@@ -160,7 +160,7 @@ For local runs using an already built UI and CLI, build the fixture with
 `direnv exec . cargo build -p yas-cli --example uplink-e2e-fixture`, then run
 `direnv exec . e2e/node_modules/.bin/playwright test --config e2e/playwright.uplink.config.ts`.
 
-CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, and `./bin/coverage`. These delegate to `nix run .#<task>`, etc.
+CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, `./bin/coverage`, and `./bin/package-crates`. These delegate to `nix run .#<task>`, etc.
 
 ## Packaging
 
@@ -170,7 +170,15 @@ Every `nix run` target has a corresponding script in `bin/`:
 ./bin/build-tarballs         # release tarballs -> dist/tarballs/
 ./bin/publish-npm-packages   # npm publish @yas-run/browser, @yas-run/core, @yas-run/react, @yas-run/solid
 ./bin/publish-crates         # cargo publish
+./bin/package-crates         # build every crates.io crate from its package, as its users will
 ```
+
+`publish-crates` publishes with `--no-verify`, so nothing there notices a crate
+that only builds inside the repository; `package-crates` (a CI job) does. A
+crate's build must not reach outside its own directory: `yas-wire` builds from
+its checked-in `src/generated.rs` when `protocol/` is not there, and `yas-edge`
+embeds the web UI from `js/ui/dist`, or from the copy in `crates/edge/ui/` that
+both scripts put into its package.
 
 `build-tarballs` accepts an optional output directory argument (default `dist/tarballs`).
 The version and platform are derived from `flake.nix` and the build host.
@@ -280,11 +288,12 @@ Most Rust crates are one or two source files. The CLI crate (`yas-cli`) is split
 | `crates/compositor/src/render.rs`          | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer               |
 | `crates/compositor/src/vulkan_render.rs`   | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                       |
 | `crates/webrtc-forwarder/src/`             | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                 |
-| `crates/cli/src/yas_*.rs`                  | Typed native family clients used by terminal, surface, FS, Git, LSP, KV, and other CLI commands                   |
+| `crates/cli/src/yas_*.rs`                  | CLI commands over the native session (`yas_native.rs` re-exports `yas_client::native`)                            |
 | `crates/cli/src/main.rs`                   | Dispatch, embedded server/edge                                                                                    |
 | `crates/cli/src/cli.rs`                    | Clap struct definitions                                                                                           |
 | `crates/cli/src/interactive.rs`            | Browser mode                                                                                                      |
-| `crates/cli/src/transport.rs`              | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                       |
+| `crates/cli/src/transport.rs`              | CLI connect policy (current executable, `YAS_PROXY`) over `yas_client::transport`                                 |
+| `crates/client/src/`                       | `yas-client`: transports, native session, concurrent `Client`, Process/FS/KV/Env APIs, hosted servers             |
 | `crates/cli/src/yas_net.rs`                | Native YAS Net/Transfer client shared by `forward` and `socks`                                                    |
 | `crates/cli/src/forward.rs`                | `yas forward`: spec grammar, TCP/UDP/TLS listeners, `yas.forwards`                                                |
 | `crates/cli/src/socks.rs`                  | `yas socks`: SOCKS5 CONNECT proxy over the relay                                                                  |

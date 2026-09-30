@@ -1,6 +1,6 @@
 {
   "name": "@yas-run/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -108,7 +108,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@yas-run/browser": ">=0.9.0"
+    "@yas-run/browser": "^0.3.0"
   },
   "dependencies": {
     "tweetnacl": "^1.0.3"

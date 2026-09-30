@@ -21,8 +21,8 @@ import {
   YAS_FAMILY_CHANNEL,
   YAS_FAMILY_TRANSFER,
   YAS_TRANSFER_RESET,
-} from "./generated";
-import type { YasConnection } from "./session";
+} from "./generated.js";
+import type { YasConnection } from "./session.js";
 import {
   YAS_STATE_ADD,
   YAS_STATE_DELTA,
@@ -38,7 +38,7 @@ import {
   negotiatedStateLimitU32,
   type YasStateBatch,
   type YasWatchOptions,
-} from "./state";
+} from "./state.js";
 import {
   YAS_TRANSFER_MODE_MESSAGE,
   YAS_TRANSFER_RECEIVER_TO_SENDER,
@@ -48,7 +48,7 @@ import {
   transfersFor,
   type YasTransfer,
   type YasTransferDescriptor,
-} from "./transfer";
+} from "./transfer.js";
 import {
   YAS_STATUS_CANCELLED,
   YAS_STATUS_RESOURCE_EXHAUSTED,
@@ -61,7 +61,7 @@ import {
   encodeExtensions,
   type YasExtension,
   type YasTypedRecord,
-} from "./wire";
+} from "./wire.js";
 
 export {
   YAS_CHANNEL_ACCEPT,
@@ -75,7 +75,7 @@ export {
   YAS_CHANNEL_UNWATCH,
   YAS_CHANNEL_VERSION,
   YAS_CHANNEL_WATCH,
-} from "./generated";
+} from "./generated.js";
 
 export interface YasChannelListenerRecord {
   listenerHandle: bigint;

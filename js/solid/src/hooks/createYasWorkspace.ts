@@ -1,6 +1,6 @@
 import { createSignal, onCleanup } from "solid-js";
 import type { YasWorkspace, YasWorkspaceSnapshot } from "@yas-run/core";
-import { useRequiredYasWorkspace } from "../YasContext";
+import { useRequiredYasWorkspace } from "../YasContext.js";
 
 export function createYasWorkspace(): YasWorkspace {
   return useRequiredYasWorkspace();

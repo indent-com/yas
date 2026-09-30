@@ -56,7 +56,7 @@ pub(crate) async fn dispatch(
 
 impl Namespace {
     async fn open(on: Option<&str>, hub: &str, prefix: &[u8]) -> Result<Self, String> {
-        let mut client = NativeClient::connect(on, hub).await?;
+        let mut client = crate::yas_native::connect(on, hub).await?;
         let result: OpenResult = client
             .request_typed(
                 family::KV,
@@ -89,6 +89,7 @@ impl Namespace {
             )
             .await
             .map(|_| ())
+            .map_err(String::from)
     }
 }
 

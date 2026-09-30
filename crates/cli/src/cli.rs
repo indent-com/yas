@@ -66,13 +66,74 @@ pub struct Cli {
 #[derive(Args, Clone)]
 pub struct ConnectOpts {
     /// Remote to connect to: a URI (ssh:host, tcp:h:p, socket:/p, share:pass, local[:name])
-    /// or a named remote from yas.remotes. Overrides YAS_TARGET and yas.conf `target`.
+    /// or the name of a remote on the home server (see `yas remote`). Overrides
+    /// YAS_TARGET and yas.conf `yas.target`.
     #[arg(long, global = true)]
     pub on: Option<String>,
 
     /// Signaling hub URL
     #[arg(long, global = true, env = "YAS_HUB", default_value = yas_webrtc_forwarder::DEFAULT_HUB_URL)]
     pub hub: String,
+}
+
+/// Process family maxima. Each flag overrides its environment variable; the
+/// defaults are the values YAS has always enforced.
+#[derive(Args, Clone, Debug, Default)]
+pub struct ProcessMaximaOpts {
+    /// Live processes per session [env: YAS_PROCESS_MAX_PER_SESSION; default 16, at most 16384]
+    #[arg(long, value_name = "N")]
+    pub process_max_per_session: Option<usize>,
+
+    /// Process generations server-wide [env: YAS_PROCESS_MAX; default 64, at most 65536]
+    #[arg(long, value_name = "N")]
+    pub process_max: Option<usize>,
+
+    /// Spawns in flight per session [env: YAS_PROCESS_MAX_PENDING_SPAWNS; default 8, at most 4096]
+    #[arg(long, value_name = "N")]
+    pub process_max_pending_spawns: Option<usize>,
+
+    /// Largest process stream buffer (stdin window) [env: YAS_PROCESS_STREAM_BUFFER_MAX; default 8 MiB, at most 1 GiB]
+    #[arg(long, value_name = "BYTES")]
+    pub process_stream_buffer_max: Option<u64>,
+
+    /// Environment entries per spawn [env: YAS_PROCESS_MAX_ENV; default 256, at most 16384]
+    #[arg(long, value_name = "N")]
+    pub process_max_env: Option<usize>,
+
+    /// Pending process WAITs per session [env: YAS_PROCESS_MAX_WAITS; default 32, at most 65536]
+    #[arg(long, value_name = "N")]
+    pub process_max_waits: Option<usize>,
+
+    /// Pending process ATTACH/CONTROL operations per session [env: YAS_PROCESS_MAX_OPERATIONS; default 16, at most 16384]
+    #[arg(long, value_name = "N")]
+    pub process_max_operations: Option<usize>,
+}
+
+impl ProcessMaximaOpts {
+    /// The environment's maxima with these flags applied, validated.
+    /// Environment warnings are printed; an out-of-range flag is an error.
+    pub fn resolve(&self) -> Result<yas_server::ProcessMaxima, String> {
+        let (mut maxima, warnings) = yas_server::ProcessMaxima::from_env();
+        for warning in warnings {
+            eprintln!("yas server: {warning}");
+        }
+        let apply = |slot: &mut usize, value: Option<usize>| {
+            if let Some(value) = value {
+                *slot = value;
+            }
+        };
+        apply(&mut maxima.per_session, self.process_max_per_session);
+        apply(&mut maxima.total, self.process_max);
+        apply(&mut maxima.pending_spawns, self.process_max_pending_spawns);
+        if let Some(value) = self.process_stream_buffer_max {
+            maxima.stream_buffer_bytes = value;
+        }
+        apply(&mut maxima.envc, self.process_max_env);
+        apply(&mut maxima.pending_waits, self.process_max_waits);
+        apply(&mut maxima.pending_operations, self.process_max_operations);
+        maxima.validate()?;
+        Ok(maxima)
+    }
 }
 
 /// Startup-only extension and native-channel deployment policy.
@@ -397,11 +458,16 @@ pub enum Command {
     /// Execute a process and connect its standard streams
     Run(RunArgs),
 
-    /// Manage named remotes in yas.remotes
+    /// Manage the server's named remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
-    /// name instead of a full URI.  They are stored in ~/.config/yas/yas.remotes
-    /// (mode 0o600) and can also be set as the default target via `yas.conf`.
+    /// name instead of a full URI. They are stored in a server's KV store (the
+    /// `remotes` key), which is also the catalogue its Relay publishes to the
+    /// browser. These verbs edit the home server (YAS_SOCK, else the default
+    /// local instance) unless --on names another; YAS_TARGET and `yas.target`
+    /// do not redirect them. `--on NAME`, YAS_TARGET, and `yas.target` look
+    /// names up on the home server. A legacy ~/.config/yas/yas.remotes file is
+    /// imported once into a server that has no catalogue yet.
     ///
     /// Examples:
     ///   yas remote add rabbit ssh:rabbit
@@ -421,9 +487,9 @@ pub enum Command {
     #[command(
         about = "Open the terminal UI in the browser",
         long_about = "Open the terminal UI in the browser\n\n\
-            Opens the browser with all named remotes from ~/.config/yas/yas.remotes\n\
-            plus the local yas server. Manage remotes with `yas remote add/remove`\n\
-            or through the Remotes dialog in the browser.\n\n\
+            Opens the browser on the local yas server, with that server's named\n\
+            remotes reachable through its Relay. Manage remotes with\n\
+            `yas remote add/remove` or through the Remotes dialog in the browser.\n\n\
             Examples:\n\
               yas open                        # local + all configured remotes\n\
               yas remote add rabbit ssh:rabbit\n\
@@ -473,6 +539,15 @@ pub enum Command {
             required = true
         )]
         allow_client: Vec<String>,
+
+        /// What carries the relay session: auto (WebTransport, else WebSocket
+        /// where UDP is blocked), webtransport or websocket
+        #[arg(
+            long,
+            env = "YAS_UPLINK_TRANSPORT",
+            value_parser = ["auto", "webtransport", "websocket"]
+        )]
+        transport: Option<String>,
     },
 
     /// Print an X25519 key pair as JSON (private_key and public_key, base64url)
@@ -562,6 +637,30 @@ pub enum Command {
         listen: String,
     },
 
+    /// Carry a native YAS session over this process's stdin and stdout
+    ///
+    /// With --stdio, stdin and stdout become one YAS session with the server
+    /// (`--on` picks it; the local server by default, started if none runs).
+    /// A program that can only run commands, such as `ssh host yas connect
+    /// --stdio` or `docker exec -i CONTAINER yas connect --stdio`, then speaks
+    /// YAS to that server through the command's pipes. Nothing else is written
+    /// to stdout; errors go to stderr. When stdin ends the server is told, and
+    /// the command exits once the server closes the session.
+    ///
+    /// Examples:
+    ///   ssh host yas connect --stdio
+    ///   docker exec -i sandbox yas connect --stdio
+    ///   yas --on socket:/run/yas/app.sock connect --stdio --no-start
+    Connect {
+        /// Relay the session over stdin and stdout (the only mode)
+        #[arg(long, required = true)]
+        stdio: bool,
+
+        /// Fail instead of starting the local server when none runs
+        #[arg(long)]
+        no_start: bool,
+    },
+
     /// Print the full CLI reference (usage guide for scripts and LLM agents)
     Learn,
     /// Run the yas terminal multiplexer server
@@ -592,6 +691,14 @@ pub enum Command {
         #[cfg(unix)]
         #[arg(long)]
         fd_channel: Option<i32>,
+
+        /// Also listen on PATH, where every session is read-only whatever it
+        /// asks for: clients there watch terminals and windows but cannot
+        /// type, click, read files or run anything (or set
+        /// YAS_READ_ONLY_SOCK; Unix only)
+        #[cfg(unix)]
+        #[arg(long, value_name = "PATH", env = "YAS_READ_ONLY_SOCK")]
+        read_only_sock: Option<String>,
 
         /// Export the server socket path as YAS_SOCK in spawned terminals
         /// (or set YAS_EXPORT_SOCK=1)
@@ -673,6 +780,9 @@ pub enum Command {
         /// Disable native non-PTY child processes (or set YAS_PROCESS=0)
         #[arg(long)]
         no_processes: bool,
+
+        #[command(flatten)]
+        process_maxima: ProcessMaximaOpts,
     },
 
     /// Shut down the yas server
@@ -1019,9 +1129,11 @@ pub enum TerminalCommand {
 
     /// Print one command's output (needs OSC 133 shell integration).
     ///
-    /// Defaults to the newest command. With --wait, blocks server-side until
-    /// the command finishes and exits with its status (124 if the wait timed
-    /// out), which is how to run something in a live shell and collect the
+    /// Defaults to the newest command. With --wait and no INDEX, it picks the
+    /// command that is running, or if none is, the next one to start (so a
+    /// command sent just before still counts), blocks server-side until that
+    /// command finishes, and exits with its status (124 if the wait timed
+    /// out). This is how to run something in a live shell and collect the
     /// result:
     ///   yas terminal send 3 'cargo test\n'
     ///   yas terminal output 3 --wait 600
@@ -1277,6 +1389,7 @@ pub enum TerminalCommand {
 
     /// Send input to a terminal.
     ///
+    /// Fails if the terminal is unknown or has exited, even for empty input.
     /// Supports C-style escapes: \n \r \t \\ \0 \xHH.
     /// \n sends CR (Enter), matching real terminal behavior. Use \x0a for literal LF.
     /// To control interactive programs like vim:
@@ -2660,8 +2773,8 @@ pub enum RemoteCommand {
     },
 
     /// Disable or enable a named remote without removing it.
-    /// Disabled remotes are kept in yas.remotes (commented out) and excluded
-    /// from connection resolution until re-enabled.
+    /// Disabled remotes stay in the catalogue but are not published by the
+    /// Relay, and `--on NAME` refuses them until re-enabled.
     Toggle {
         /// Name of the remote to toggle
         name: String,
@@ -2669,8 +2782,9 @@ pub enum RemoteCommand {
 
     /// Set the default remote in yas.conf
     ///
-    /// After this, all agent subcommands (list, start, show, …) will connect
-    /// to this remote by default, without needing --on.
+    /// Writes `yas.target` in this machine's yas.conf. After this, commands
+    /// without --on connect to this remote. A name is looked up on the home
+    /// server at each connection.
     SetDefault {
         /// Name or URI to use as the default target.
         /// Pass an empty string or "local" to reset to local.

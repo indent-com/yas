@@ -2,14 +2,15 @@ import type {
   YasTransport,
   YasTransportOptions,
   ConnectionStatus,
-} from "../types";
+} from "../types.js";
 
 export interface UnixSocketTransportOptions extends YasTransportOptions {}
 
 /**
- * Shared implementation of the yas local-IPC framing protocol
- * (little-endian `u32` length prefix, see `crates/server/src/lib.rs`
- * `read_frame`/`write_frame`).
+ * Shared implementation of the YAS local-IPC byte stream. The socket
+ * carries the raw preface followed by `u32` little-endian length-prefixed
+ * frames (see `docs/design/yas.md`, "Transport framing"); the transport
+ * passes bytes through unchanged and {@link YasConnection} does the framing.
  *
  * Concrete subclasses plug in a socket backend (Node's `net` module,
  * Bun's `Bun.connect`, ...) via {@link openRawSocket}.  They receive
@@ -17,6 +18,7 @@ export interface UnixSocketTransportOptions extends YasTransportOptions {}
  * via {@link onRawConnect}, {@link onRawClose} and {@link onRawError}.
  */
 export abstract class AbstractUnixSocketTransport implements YasTransport {
+  readonly yasFraming = "stream" as const;
   readonly maxDatagramSize = 0;
   private _status: ConnectionStatus = "disconnected";
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -29,8 +31,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
   authRejected = false;
   lastError: string | null = null;
 
-  /** Incoming byte accumulator. */
-  private recvBuf = new Uint8Array(0);
   /** Sentinel that tracks which socket attempt events belong to. */
   protected currentAttempt: symbol | null = null;
 
@@ -57,13 +57,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
 
   send(data: Uint8Array): void {
     if (this._status !== "connected") return;
-    const header = new Uint8Array(4);
-    const len = data.byteLength;
-    header[0] = len & 0xff;
-    header[1] = (len >> 8) & 0xff;
-    header[2] = (len >> 16) & 0xff;
-    header[3] = (len >>> 24) & 0xff;
-    this.writeRaw(header);
     this.writeRaw(data);
   }
 
@@ -73,7 +66,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
     this.clearConnectTimer();
     this.currentAttempt = null;
     this.destroyRawSocket();
-    this.recvBuf = new Uint8Array(0);
     this.setStatus("closed");
   }
 
@@ -83,7 +75,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
     this.clearConnectTimer();
     this.currentAttempt = null;
     this.destroyRawSocket();
-    this.recvBuf = new Uint8Array(0);
     this.currentDelay = this.initialDelay;
     this.setStatus("disconnected");
   }
@@ -94,7 +85,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
     this.clearConnectTimer();
     this.currentAttempt = null;
     this.destroyRawSocket();
-    this.recvBuf = new Uint8Array(0);
     this.currentDelay = this.initialDelay;
     this.setStatus("disconnected");
     this.connect();
@@ -159,7 +149,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
       return;
     }
     this.setStatus("connecting");
-    this.recvBuf = new Uint8Array(0);
 
     const attempt = Symbol("unix-attempt");
     this.currentAttempt = attempt;
@@ -211,25 +200,9 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
   protected ingestChunk(attempt: symbol, chunk: Uint8Array): void {
     if (this.currentAttempt !== attempt || this.disposed) return;
     if (chunk.byteLength === 0) return;
-    if (this.recvBuf.byteLength === 0) {
-      const copy = new Uint8Array(chunk.byteLength);
-      copy.set(chunk);
-      this.recvBuf = copy;
-    } else {
-      const merged = new Uint8Array(this.recvBuf.byteLength + chunk.byteLength);
-      merged.set(this.recvBuf, 0);
-      merged.set(chunk, this.recvBuf.byteLength);
-      this.recvBuf = merged;
-    }
-    while (this.recvBuf.byteLength >= 4) {
-      const b = this.recvBuf;
-      const len = b[0]! | (b[1]! << 8) | (b[2]! << 16) | (b[3]! * 0x01000000);
-      if (this.recvBuf.byteLength < 4 + len) break;
-      const ab = new ArrayBuffer(len);
-      new Uint8Array(ab).set(this.recvBuf.subarray(4, 4 + len));
-      this.recvBuf = this.recvBuf.subarray(4 + len);
-      for (const l of this.messageListeners) l(ab);
-    }
+    const ab = new ArrayBuffer(chunk.byteLength);
+    new Uint8Array(ab).set(chunk);
+    for (const l of this.messageListeners) l(ab);
   }
 
   protected onRawError(attempt: symbol, message: string): void {
@@ -242,7 +215,6 @@ export abstract class AbstractUnixSocketTransport implements YasTransport {
     if (this.currentAttempt !== attempt || this.disposed) return;
     this.clearConnectTimer();
     this.currentAttempt = null;
-    this.recvBuf = new Uint8Array(0);
     this.setStatus("disconnected");
     this.scheduleReconnect();
   }

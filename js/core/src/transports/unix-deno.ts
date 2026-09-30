@@ -1,9 +1,9 @@
 import {
   AbstractUnixSocketTransport,
   type UnixSocketTransportOptions,
-} from "./unix-base";
+} from "./unix-base.js";
 
-export type { UnixSocketTransportOptions } from "./unix-base";
+export type { UnixSocketTransportOptions } from "./unix-base.js";
 
 // Minimal structural typing for the subset of the Deno global we use, so
 // this file compiles under Node/Bun tsconfigs without @types/deno.

@@ -13,12 +13,17 @@ pub const MAX_ARGC: usize = crate::schema::process::MAX_ARGC as usize;
 pub const MAX_ARG_BYTES: usize = crate::schema::process::MAX_ARG_BYTES as usize;
 pub const MAX_ARG_LEN: usize = crate::schema::process::MAX_ARG_LEN as usize;
 pub const MAX_ENVC: usize = crate::schema::process::MAX_ENVC as usize;
+/// Environment entries a SPAWN may carry on the wire. A server admits at most
+/// the [`Limits::max_envc`] it advertised, [`MAX_ENVC`] unless configured higher.
+pub const MAX_ENVC_EXTENDED: usize = crate::schema::process::MAX_ENVC_EXTENDED as usize;
 pub const MAX_ENV_BYTES: usize = crate::schema::process::MAX_ENV_BYTES as usize;
 pub const MAX_ENV_KEY_BYTES: usize = crate::schema::process::MAX_ENV_KEY_BYTES as usize;
 pub const MAX_ENV_VALUE_BYTES: usize = crate::schema::process::MAX_ENV_VALUE_BYTES as usize;
 pub const MAX_CWD_BYTES: usize = crate::schema::process::MAX_CWD_BYTES as usize;
 pub const MAX_PATH_COMPONENTS: usize = crate::schema::process::MAX_PATH_COMPONENTS as usize;
 pub const MAX_STREAM_BUFFER_BYTES: u64 = crate::schema::process::MAX_STREAM_BUFFER_BYTES;
+pub const MAX_STREAM_BUFFER_BYTES_EXTENDED: u64 =
+    crate::schema::process::MAX_STREAM_BUFFER_BYTES_EXTENDED;
 
 pub mod request_kind {
     pub use crate::schema::process::request::*;
@@ -193,7 +198,9 @@ pub struct Spawn {
 impl Spawn {
     fn validate(&self) -> Result<()> {
         validate_operation_id(&self.operation_id)?;
-        if self.flags & !(crate::schema::process::SPAWN_FLAGS as u16) != 0 {
+        let known = crate::schema::process::SPAWN_FLAGS
+            | crate::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED;
+        if self.flags & !(known as u16) != 0 {
             return Err(Error::Invalid("Process spawn flags"));
         }
         self.cwd.validate()?;
@@ -206,7 +213,71 @@ impl Spawn {
         if merged != (self.stderr_receive_credit == 0) {
             return Err(Error::Invalid("Process stderr receive credit"));
         }
-        validate_spawn_extensions(&self.extensions)
+        validate_spawn_extensions(&self.extensions)?;
+        let leave_residue = self.flags & crate::schema::process::SPAWN_LEAVE_RESIDUE as u16 != 0;
+        if !leave_residue && self.residue_grace_ns()?.is_some() {
+            return Err(Error::Invalid(
+                "Process residue grace without LEAVE_RESIDUE",
+            ));
+        }
+        let keep_output = self.flags & crate::schema::process::SPAWN_KEEP_OUTPUT as u16 != 0;
+        let report_exit = self.flags & crate::schema::process::SPAWN_REPORT_EXIT as u16 != 0;
+        if keep_output != self.keep_output()?.is_some() {
+            return Err(Error::Invalid(
+                "Process KEEP_OUTPUT flag and extension go together",
+            ));
+        }
+        if keep_output && !report_exit {
+            return Err(Error::Invalid("Process KEEP_OUTPUT without REPORT_EXIT"));
+        }
+        Ok(())
+    }
+
+    /// `KEEP_OUTPUT`: how many bytes of each output stream's head and tail are sent (the
+    /// middle is dropped, and counted in the EXIT event), or None: all of it.
+    pub fn keep_output(&self) -> Result<Option<(u64, u64)>> {
+        let Some(extension) = self.extensions.0.iter().find(|extension| {
+            extension.tag == crate::schema::process::SPAWN_KEEP_OUTPUT_EXTENSION as u16
+        }) else {
+            return Ok(None);
+        };
+        let value: [u8; 16] = extension
+            .value
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid("Process keep-output extension"))?;
+        let head = u64::from_le_bytes(value[..8].try_into().expect("8 bytes"));
+        let tail = u64::from_le_bytes(value[8..].try_into().expect("8 bytes"));
+        if tail > crate::schema::process::MAX_KEEP_OUTPUT_TAIL_BYTES {
+            return Err(limit(
+                "Process keep-output tail bytes",
+                tail,
+                crate::schema::process::MAX_KEEP_OUTPUT_TAIL_BYTES,
+            ));
+        }
+        Ok(Some((head, tail)))
+    }
+
+    /// The `KEEP_OUTPUT` extension keeping `head` and `tail` bytes of each output stream.
+    pub fn keep_output_extension(head: u64, tail: u64) -> Extension {
+        let mut value = Vec::with_capacity(16);
+        value.extend_from_slice(&head.to_le_bytes());
+        value.extend_from_slice(&tail.to_le_bytes());
+        Extension {
+            tag: crate::schema::process::SPAWN_KEEP_OUTPUT_EXTENSION as u16,
+            required: true,
+            value,
+        }
+    }
+
+    /// How long a `LEAVE_RESIDUE` process's streams are forwarded after its direct child
+    /// exits, or None: until they close.
+    pub fn residue_grace_ns(&self) -> Result<Option<u64>> {
+        extension_u64(
+            &self.extensions,
+            crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION,
+            "Process residue grace extension",
+        )
     }
 
     pub fn surface_app_handle(&self) -> Result<Option<u64>> {
@@ -277,7 +348,7 @@ impl Decode for Spawn {
             argv.push(decoder.len_bytes_u32()?.to_vec());
         }
         let envc = usize::from(decoder.u16()?);
-        if envc > MAX_ENVC || envc > decoder.remaining() / 6 {
+        if envc > MAX_ENVC_EXTENDED || envc > decoder.remaining() / 6 {
             return Err(Error::Invalid("Process environment count"));
         }
         let mut env = Vec::with_capacity(envc);
@@ -890,6 +961,135 @@ impl Decode for RemovedProcess {
     }
 }
 
+/// EXIT: a process's final exit, sent to the session that spawned it with
+/// `SPAWN_REPORT_EXIT`, once the exit is final (as WAIT would answer it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitReport {
+    pub process_handle: u64,
+    pub exit: ExitRecord,
+    pub extensions: Extensions,
+}
+
+impl Encode for ExitReport {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        validate_handle(self.process_handle, "Process handle")?;
+        put_u64(out, self.process_handle);
+        put_bytes_u32(out, &self.exit.encode()?)?;
+        self.extensions.encode_tail(out)
+    }
+}
+
+impl Decode for ExitReport {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let process_handle = decoder.u64()?;
+        let exit = ExitRecord::decode(decoder.len_bytes_u32()?)?;
+        let value = Self {
+            process_handle,
+            exit,
+            extensions: decoder.extensions()?,
+        };
+        decoder.finish()?;
+        validate_handle(value.process_handle, "Process handle")?;
+        Ok(value)
+    }
+}
+
+impl ExitReport {
+    /// The process handle of an EXIT event's payload, without decoding the rest.
+    pub fn handle_of(payload: &[u8]) -> Option<u64> {
+        Some(u64::from_le_bytes(payload.get(..8)?.try_into().ok()?))
+    }
+
+    /// What `KEEP_OUTPUT` dropped of stdout (`stderr` false) or stderr, if anything.
+    pub fn elided(&self, stderr: bool) -> Result<Option<OutputElision>> {
+        let tag = if stderr {
+            crate::schema::process::EXIT_STDERR_ELIDED_EXTENSION
+        } else {
+            crate::schema::process::EXIT_STDOUT_ELIDED_EXTENSION
+        };
+        self.extensions
+            .0
+            .iter()
+            .find(|extension| extension.tag == tag as u16)
+            .map(|extension| OutputElision::decode(&extension.value))
+            .transpose()
+    }
+}
+
+/// What `KEEP_OUTPUT` dropped of an output stream: from `offset` on (the head's length),
+/// `bytes` bytes that decode, as a WHATWG UTF-8 decoder with replacement reads them within the
+/// whole stream, to `code_points` characters and `utf16_units` UTF-16 code units, `lines` of
+/// them `\n`. The tail follows the head in the stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputElision {
+    pub offset: u64,
+    pub bytes: u64,
+    pub lines: u64,
+    pub code_points: u64,
+    pub utf16_units: u64,
+}
+
+impl OutputElision {
+    /// As the EXIT event's extension for stdout (`stderr` false) or stderr.
+    pub fn extension(&self, stderr: bool) -> Extension {
+        let tag = if stderr {
+            crate::schema::process::EXIT_STDERR_ELIDED_EXTENSION
+        } else {
+            crate::schema::process::EXIT_STDOUT_ELIDED_EXTENSION
+        };
+        let mut value = Vec::with_capacity(40);
+        for field in [
+            self.offset,
+            self.bytes,
+            self.lines,
+            self.code_points,
+            self.utf16_units,
+        ] {
+            put_u64(&mut value, field);
+        }
+        Extension {
+            tag: tag as u16,
+            required: false,
+            value,
+        }
+    }
+}
+
+impl Decode for OutputElision {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let value = Self {
+            offset: decoder.u64()?,
+            bytes: decoder.u64()?,
+            lines: decoder.u64()?,
+            code_points: decoder.u64()?,
+            utf16_units: decoder.u64()?,
+        };
+        decoder.finish()?;
+        if value.bytes == 0
+            || value.lines > value.code_points
+            || value.code_points > value.bytes
+            || value.utf16_units < value.code_points
+            || value.utf16_units > value.code_points.saturating_mul(2)
+        {
+            return Err(Error::Invalid("Process output elision"));
+        }
+        Ok(value)
+    }
+}
+
+/// Process family maxima, as a server selects them in HELLO.
+///
+/// The first ten fields are the family's original limits (tags 1–10). A
+/// server may be configured above their original hard maxima (16 processes
+/// per session, 64 server-wide, 8 pending spawns, 8 MiB of stream buffer,
+/// 256 environment entries): it then advertises the original tag clamped to
+/// its hard maximum, which older clients accept, and the optional
+/// `*_EXTENDED` tag (12–16) with the real value, which [`Limits::from_extensions`]
+/// prefers. `max_pending_waits` and `max_pending_operations` (tags 17, 18)
+/// were fixed per-session admissions before they were advertised; a server
+/// that omits them admits [`Limits::DEFAULT`]'s values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub max_argc: u32,
@@ -902,20 +1102,49 @@ pub struct Limits {
     pub max_stream_buffer_bytes: u64,
     pub max_detached_retention_ns: u64,
     pub max_mutation_replays: u32,
+    /// SPAWN flags of `SPAWN_LAUNCHER_FLAGS_EXTENDED` the server honours (LEAVE_RESIDUE,
+    /// STDIN_NULL, REPORT_EXIT); 0 from servers that predate them. LAUNCHER_FLAGS (tag 11)
+    /// carries those of `SPAWN_LAUNCHER_FLAGS`, all older clients accept;
+    /// LAUNCHER_FLAGS_EXTENDED (tag 19) carries all of them, when there are more.
+    pub launcher_flags: u32,
+    /// Pending `WAIT`s one session may hold.
+    pub max_pending_waits: u32,
+    /// Completion-held `ATTACH`/`CONTROL` operations one session may hold.
+    pub max_pending_operations: u32,
 }
 
 impl Limits {
+    /// The largest values any server may advertise.
     pub const HARD: Self = Self {
         max_argc: crate::schema::process::MAX_ARGC as u32,
         max_arg_bytes: crate::schema::process::MAX_ARG_BYTES as u32,
-        max_envc: crate::schema::process::MAX_ENVC as u32,
+        max_envc: crate::schema::process::MAX_ENVC_EXTENDED as u32,
         max_env_bytes: crate::schema::process::MAX_ENV_BYTES as u32,
+        max_processes_per_session: crate::schema::process::MAX_PROCESSES_PER_SESSION_EXTENDED
+            as u32,
+        max_processes: crate::schema::process::MAX_PROCESSES_EXTENDED as u32,
+        max_pending_spawns: crate::schema::process::MAX_PENDING_SPAWNS_EXTENDED as u32,
+        max_stream_buffer_bytes: crate::schema::process::MAX_STREAM_BUFFER_BYTES_EXTENDED,
+        max_detached_retention_ns: crate::schema::process::MAX_DETACHED_RETENTION_NS,
+        max_mutation_replays: crate::schema::process::MAX_MUTATION_REPLAYS as u32,
+        max_pending_waits: crate::schema::process::MAX_PENDING_WAITS as u32,
+        max_pending_operations: crate::schema::process::MAX_PENDING_OPERATIONS as u32,
+        launcher_flags: crate::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32,
+    };
+
+    /// The original hard maxima: what an unconfigured server enforces, and
+    /// the most a client from before the extended tags accepts.
+    pub const DEFAULT: Self = Self {
+        max_envc: crate::schema::process::MAX_ENVC as u32,
         max_processes_per_session: crate::schema::process::MAX_PROCESSES_PER_SESSION as u32,
         max_processes: crate::schema::process::MAX_PROCESSES as u32,
         max_pending_spawns: crate::schema::process::MAX_PENDING_SPAWNS as u32,
         max_stream_buffer_bytes: crate::schema::process::MAX_STREAM_BUFFER_BYTES,
-        max_detached_retention_ns: crate::schema::process::MAX_DETACHED_RETENTION_NS,
-        max_mutation_replays: crate::schema::process::MAX_MUTATION_REPLAYS as u32,
+        max_pending_waits: crate::schema::process::LEGACY_PENDING_WAITS as u32,
+        max_pending_operations: crate::schema::process::LEGACY_PENDING_OPERATIONS as u32,
+        // What a server from before LAUNCHER_FLAGS offers.
+        launcher_flags: 0,
+        ..Self::HARD
     };
 
     pub fn validate(self) -> Result<()> {
@@ -936,6 +1165,9 @@ impl Limits {
             || self.max_detached_retention_ns == 0
             || self.max_detached_retention_ns > hard.max_detached_retention_ns
             || !valid_u32(self.max_mutation_replays, hard.max_mutation_replays)
+            || self.launcher_flags & !hard.launcher_flags != 0
+            || !valid_u32(self.max_pending_waits, hard.max_pending_waits)
+            || !valid_u32(self.max_pending_operations, hard.max_pending_operations)
         {
             return Err(Error::Invalid("Process family limit"));
         }
@@ -944,32 +1176,38 @@ impl Limits {
 
     pub fn to_extensions(self) -> Result<Extensions> {
         self.validate()?;
-        Ok(Extensions(vec![
+        let legacy = Self::DEFAULT;
+        let mut extensions = vec![
             limit_u32(crate::schema::process::LIMIT_MAX_ARGC, self.max_argc),
             limit_u32(
                 crate::schema::process::LIMIT_MAX_ARG_BYTES,
                 self.max_arg_bytes,
             ),
-            limit_u32(crate::schema::process::LIMIT_MAX_ENVC, self.max_envc),
+            limit_u32(
+                crate::schema::process::LIMIT_MAX_ENVC,
+                self.max_envc.min(legacy.max_envc),
+            ),
             limit_u32(
                 crate::schema::process::LIMIT_MAX_ENV_BYTES,
                 self.max_env_bytes,
             ),
             limit_u32(
                 crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION,
-                self.max_processes_per_session,
+                self.max_processes_per_session
+                    .min(legacy.max_processes_per_session),
             ),
             limit_u32(
                 crate::schema::process::LIMIT_MAX_PROCESSES,
-                self.max_processes,
+                self.max_processes.min(legacy.max_processes),
             ),
             limit_u32(
                 crate::schema::process::LIMIT_MAX_PENDING_SPAWNS,
-                self.max_pending_spawns,
+                self.max_pending_spawns.min(legacy.max_pending_spawns),
             ),
             limit_u64(
                 crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES,
-                self.max_stream_buffer_bytes,
+                self.max_stream_buffer_bytes
+                    .min(legacy.max_stream_buffer_bytes),
             ),
             limit_u64(
                 crate::schema::process::LIMIT_MAX_DETACHED_RETENTION_NS,
@@ -979,7 +1217,68 @@ impl Limits {
                 crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
                 self.max_mutation_replays,
             ),
-        ]))
+        ];
+        // The extended tags travel only when they say something the legacy
+        // tags cannot, so an unconfigured server's HELLO is unchanged.
+        let mut extended_u32 = |tag: u64, value: u32, legacy: u32| {
+            if value > legacy {
+                extensions.push(limit_u32(tag, value));
+            }
+        };
+        extended_u32(
+            crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED,
+            self.max_processes_per_session,
+            legacy.max_processes_per_session,
+        );
+        extended_u32(
+            crate::schema::process::LIMIT_MAX_PROCESSES_EXTENDED,
+            self.max_processes,
+            legacy.max_processes,
+        );
+        extended_u32(
+            crate::schema::process::LIMIT_MAX_PENDING_SPAWNS_EXTENDED,
+            self.max_pending_spawns,
+            legacy.max_pending_spawns,
+        );
+        extended_u32(
+            crate::schema::process::LIMIT_MAX_ENVC_EXTENDED,
+            self.max_envc,
+            legacy.max_envc,
+        );
+        if self.max_stream_buffer_bytes > legacy.max_stream_buffer_bytes {
+            extensions.push(limit_u64(
+                crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED,
+                self.max_stream_buffer_bytes,
+            ));
+        }
+        if self.max_pending_waits != legacy.max_pending_waits {
+            extensions.push(limit_u32(
+                crate::schema::process::LIMIT_MAX_PENDING_WAITS,
+                self.max_pending_waits,
+            ));
+        }
+        if self.max_pending_operations != legacy.max_pending_operations {
+            extensions.push(limit_u32(
+                crate::schema::process::LIMIT_MAX_PENDING_OPERATIONS,
+                self.max_pending_operations,
+            ));
+        }
+        let legacy_launcher_flags =
+            self.launcher_flags & crate::schema::process::SPAWN_LAUNCHER_FLAGS as u32;
+        if legacy_launcher_flags != 0 {
+            extensions.push(limit_u32(
+                crate::schema::process::LIMIT_LAUNCHER_FLAGS,
+                legacy_launcher_flags,
+            ));
+        }
+        if self.launcher_flags != legacy_launcher_flags {
+            extensions.push(limit_u32(
+                crate::schema::process::LIMIT_LAUNCHER_FLAGS_EXTENDED,
+                self.launcher_flags,
+            ));
+        }
+        extensions.sort_by_key(|extension| extension.tag);
+        Ok(Extensions(extensions))
     }
 
     pub fn from_extensions(extensions: &Extensions) -> Result<Self> {
@@ -994,26 +1293,64 @@ impl Limits {
             crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES as u16,
             crate::schema::process::LIMIT_MAX_DETACHED_RETENTION_NS as u16,
             crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS as u16,
+            crate::schema::process::LIMIT_LAUNCHER_FLAGS as u16,
+            crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED as u16,
+            crate::schema::process::LIMIT_MAX_PROCESSES_EXTENDED as u16,
+            crate::schema::process::LIMIT_MAX_PENDING_SPAWNS_EXTENDED as u16,
+            crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED as u16,
+            crate::schema::process::LIMIT_MAX_ENVC_EXTENDED as u16,
+            crate::schema::process::LIMIT_MAX_PENDING_WAITS as u16,
+            crate::schema::process::LIMIT_MAX_PENDING_OPERATIONS as u16,
+            crate::schema::process::LIMIT_LAUNCHER_FLAGS_EXTENDED as u16,
         ];
         reject_unknown_required(extensions, &known)?;
+        let legacy = Self::DEFAULT;
+        let u32_or = |tag: u64, fallback: u32| -> Result<u32> {
+            Ok(read_optional_limit_u32(extensions, tag)?.unwrap_or(fallback))
+        };
+        let max_envc = read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_ENVC)?;
+        let max_processes_per_session = read_limit_u32(
+            extensions,
+            crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION,
+        )?;
+        let max_processes =
+            read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_PROCESSES)?;
+        let max_pending_spawns =
+            read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_PENDING_SPAWNS)?;
+        let max_stream_buffer_bytes = read_limit_u64(
+            extensions,
+            crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES,
+        )?;
+        let legacy_launcher_flags =
+            if extensions.0.iter().any(|extension| {
+                extension.tag == crate::schema::process::LIMIT_LAUNCHER_FLAGS as u16
+            }) {
+                read_limit_u32(extensions, crate::schema::process::LIMIT_LAUNCHER_FLAGS)?
+            } else {
+                0
+            };
         let value = Self {
             max_argc: read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_ARGC)?,
             max_arg_bytes: read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_ARG_BYTES)?,
-            max_envc: read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_ENVC)?,
+            max_envc: u32_or(crate::schema::process::LIMIT_MAX_ENVC_EXTENDED, max_envc)?,
             max_env_bytes: read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_ENV_BYTES)?,
-            max_processes_per_session: read_limit_u32(
-                extensions,
-                crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION,
+            max_processes_per_session: u32_or(
+                crate::schema::process::LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED,
+                max_processes_per_session,
             )?,
-            max_processes: read_limit_u32(extensions, crate::schema::process::LIMIT_MAX_PROCESSES)?,
-            max_pending_spawns: read_limit_u32(
-                extensions,
-                crate::schema::process::LIMIT_MAX_PENDING_SPAWNS,
+            max_processes: u32_or(
+                crate::schema::process::LIMIT_MAX_PROCESSES_EXTENDED,
+                max_processes,
             )?,
-            max_stream_buffer_bytes: read_limit_u64(
-                extensions,
-                crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES,
+            max_pending_spawns: u32_or(
+                crate::schema::process::LIMIT_MAX_PENDING_SPAWNS_EXTENDED,
+                max_pending_spawns,
             )?,
+            max_stream_buffer_bytes: read_optional_limit_u64(
+                extensions,
+                crate::schema::process::LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED,
+            )?
+            .unwrap_or(max_stream_buffer_bytes),
             max_detached_retention_ns: read_limit_u64(
                 extensions,
                 crate::schema::process::LIMIT_MAX_DETACHED_RETENTION_NS,
@@ -1022,7 +1359,44 @@ impl Limits {
                 extensions,
                 crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
             )?,
+            // A flag this side does not know is one it never sets: ignored, so a later flag
+            // needs no new tag.
+            launcher_flags: read_optional_limit_u32(
+                extensions,
+                crate::schema::process::LIMIT_LAUNCHER_FLAGS_EXTENDED,
+            )?
+            .map(|flags| flags & crate::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32)
+            .unwrap_or(legacy_launcher_flags),
+            max_pending_waits: u32_or(
+                crate::schema::process::LIMIT_MAX_PENDING_WAITS,
+                legacy.max_pending_waits,
+            )?,
+            max_pending_operations: u32_or(
+                crate::schema::process::LIMIT_MAX_PENDING_OPERATIONS,
+                legacy.max_pending_operations,
+            )?,
         };
+        // A legacy tag carries its extended value clamped to the original
+        // hard maximum; an extended value below it contradicts what the
+        // server promised clients that read only the legacy tag.
+        if max_envc > legacy.max_envc
+            || max_processes_per_session > legacy.max_processes_per_session
+            || max_processes > legacy.max_processes
+            || max_pending_spawns > legacy.max_pending_spawns
+            || max_stream_buffer_bytes > legacy.max_stream_buffer_bytes
+            || value.max_envc < max_envc
+            || value.max_processes_per_session < max_processes_per_session
+            || value.max_processes < max_processes
+            || value.max_pending_spawns < max_pending_spawns
+            || value.max_stream_buffer_bytes < max_stream_buffer_bytes
+            // Tag 11 carries the v1 launcher flags and tag 19 all of them: the
+            // extended set keeps those the legacy tag promised, and no others of theirs.
+            || legacy_launcher_flags & !(crate::schema::process::SPAWN_LAUNCHER_FLAGS as u32) != 0
+            || value.launcher_flags & crate::schema::process::SPAWN_LAUNCHER_FLAGS as u32
+                != legacy_launcher_flags
+        {
+            return Err(Error::Invalid("Process family limit"));
+        }
         value.validate()?;
         Ok(value)
     }
@@ -1055,11 +1429,11 @@ fn validate_arg(arg: &[u8]) -> Result<()> {
 }
 
 fn validate_env(env: &[EnvEntry]) -> Result<()> {
-    if env.len() > MAX_ENVC {
+    if env.len() > MAX_ENVC_EXTENDED {
         return Err(limit(
             "Process environment entries",
             env.len() as u64,
-            MAX_ENVC as u64,
+            MAX_ENVC_EXTENDED as u64,
         ));
     }
     let mut previous: Option<&[u8]> = None;
@@ -1147,8 +1521,15 @@ fn validate_spawn_extensions(extensions: &Extensions) -> Result<()> {
     let known = [
         crate::schema::process::SPAWN_SURFACE_APP_EXTENSION as u16,
         crate::schema::process::SPAWN_RESOURCE_TAG_EXTENSION as u16,
+        crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+        crate::schema::process::SPAWN_KEEP_OUTPUT_EXTENSION as u16,
     ];
     reject_unknown_required(extensions, &known)?;
+    extension_u64(
+        extensions,
+        crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION,
+        "Process residue grace extension",
+    )?;
     if let Some(handle) = extension_u64(
         extensions,
         crate::schema::process::SPAWN_SURFACE_APP_EXTENSION,
@@ -1253,6 +1634,40 @@ fn read_limit_u32(extensions: &Extensions, tag: u64) -> Result<u32> {
     ))
 }
 
+fn read_optional_limit_u32(extensions: &Extensions, tag: u64) -> Result<Option<u32>> {
+    let Some(extension) = extensions
+        .0
+        .iter()
+        .find(|extension| extension.tag == tag as u16)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(u32::from_le_bytes(
+        extension
+            .value
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid("Process family limit length"))?,
+    )))
+}
+
+fn read_optional_limit_u64(extensions: &Extensions, tag: u64) -> Result<Option<u64>> {
+    let Some(extension) = extensions
+        .0
+        .iter()
+        .find(|extension| extension.tag == tag as u16)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(u64::from_le_bytes(
+        extension
+            .value
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid("Process family limit length"))?,
+    )))
+}
+
 fn read_limit_u64(extensions: &Extensions, tag: u64) -> Result<u64> {
     let extension = extensions
         .0
@@ -1271,6 +1686,50 @@ fn read_limit_u64(extensions: &Extensions, tag: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn elision_bytes(fields: [u64; 5]) -> Vec<u8> {
+        fields
+            .iter()
+            .flat_map(|field| field.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn an_output_elision_is_its_five_counts_and_they_must_agree() {
+        let elision = OutputElision {
+            offset: 7,
+            bytes: 10,
+            lines: 2,
+            code_points: 6,
+            utf16_units: 8,
+        };
+        let encoded = elision.extension(false).value;
+        assert_eq!(encoded, elision_bytes([7, 10, 2, 6, 8]));
+        assert_eq!(OutputElision::decode(&encoded).unwrap(), elision);
+        for end in 0..encoded.len() {
+            assert!(
+                OutputElision::decode(&encoded[..end]).is_err(),
+                "prefix {end}"
+            );
+        }
+        for fields in [
+            [0, 0, 0, 0, 0],
+            [0, 10, 7, 6, 6],
+            [0, 10, 0, 11, 11],
+            [0, 10, 0, 6, 5],
+            [0, 10, 0, 6, 13],
+        ] {
+            assert!(
+                OutputElision::decode(&elision_bytes(fields)).is_err(),
+                "{fields:?}"
+            );
+        }
+        // Twice these code points is past u64: checked without overflowing.
+        let widest = [u64::MAX; 5];
+        assert!(OutputElision::decode(&elision_bytes(widest)).is_ok());
+        let halves = [0, u64::MAX, 0, u64::MAX / 2 + 1, u64::MAX];
+        assert!(OutputElision::decode(&elision_bytes(halves)).is_ok());
+    }
 
     fn every_truncation<T>(value: &T)
     where
@@ -1404,6 +1863,276 @@ mod tests {
         });
         let extensions = Limits::HARD.to_extensions().unwrap();
         assert_eq!(Limits::from_extensions(&extensions).unwrap(), Limits::HARD);
+    }
+
+    fn limit_value(extensions: &Extensions, tag: u64) -> Option<u64> {
+        let extension = extensions.0.iter().find(|e| e.tag == tag as u16)?;
+        Some(match extension.value.len() {
+            4 => u64::from(u32::from_le_bytes(
+                extension.value.as_slice().try_into().unwrap(),
+            )),
+            _ => u64::from_le_bytes(extension.value.as_slice().try_into().unwrap()),
+        })
+    }
+
+    #[test]
+    fn extended_limits_keep_legacy_tags_within_their_original_maxima() {
+        use crate::schema::process as p;
+        // Unconfigured: exactly the original ten tags.
+        let default = Limits::DEFAULT.to_extensions().unwrap();
+        assert_eq!(default.0.len(), 10);
+        assert_eq!(Limits::from_extensions(&default).unwrap(), Limits::DEFAULT);
+
+        let configured = Limits {
+            max_processes_per_session: 1024,
+            max_processes: 4096,
+            max_pending_spawns: 64,
+            max_stream_buffer_bytes: 64 * 1024 * 1024,
+            max_envc: 4096,
+            max_pending_waits: 1024,
+            max_pending_operations: 256,
+            ..Limits::DEFAULT
+        };
+        let extensions = configured.to_extensions().unwrap();
+        for (legacy, extended, value, original) in [
+            (
+                p::LIMIT_MAX_PROCESSES_PER_SESSION,
+                p::LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED,
+                1024,
+                p::MAX_PROCESSES_PER_SESSION,
+            ),
+            (
+                p::LIMIT_MAX_PROCESSES,
+                p::LIMIT_MAX_PROCESSES_EXTENDED,
+                4096,
+                p::MAX_PROCESSES,
+            ),
+            (
+                p::LIMIT_MAX_PENDING_SPAWNS,
+                p::LIMIT_MAX_PENDING_SPAWNS_EXTENDED,
+                64,
+                p::MAX_PENDING_SPAWNS,
+            ),
+            (
+                p::LIMIT_MAX_STREAM_BUFFER_BYTES,
+                p::LIMIT_MAX_STREAM_BUFFER_BYTES_EXTENDED,
+                64 * 1024 * 1024,
+                p::MAX_STREAM_BUFFER_BYTES,
+            ),
+            (
+                p::LIMIT_MAX_ENVC,
+                p::LIMIT_MAX_ENVC_EXTENDED,
+                4096,
+                p::MAX_ENVC,
+            ),
+        ] {
+            assert_eq!(limit_value(&extensions, legacy), Some(original));
+            assert_eq!(limit_value(&extensions, extended), Some(value));
+        }
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_MAX_PENDING_WAITS),
+            Some(1024)
+        );
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_MAX_PENDING_OPERATIONS),
+            Some(256)
+        );
+        assert_eq!(Limits::from_extensions(&extensions).unwrap(), configured);
+
+        // A client that knows only the original tags reads the clamped values.
+        let legacy_only = Extensions(
+            extensions
+                .0
+                .iter()
+                .filter(|e| u64::from(e.tag) <= p::LIMIT_MAX_MUTATION_REPLAYS)
+                .cloned()
+                .collect(),
+        );
+        assert_eq!(
+            Limits::from_extensions(&legacy_only).unwrap(),
+            Limits::DEFAULT
+        );
+
+        // Lower than default: no extended tags, legacy tags carry the values.
+        let smaller = Limits {
+            max_processes_per_session: 4,
+            max_pending_waits: 8,
+            ..Limits::DEFAULT
+        };
+        let extensions = smaller.to_extensions().unwrap();
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_MAX_PROCESSES_PER_SESSION),
+            Some(4)
+        );
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED),
+            None
+        );
+        assert_eq!(Limits::from_extensions(&extensions).unwrap(), smaller);
+
+        // An extended value below its legacy tag contradicts it.
+        let mut contradictory = configured.to_extensions().unwrap();
+        for extension in &mut contradictory.0 {
+            if u64::from(extension.tag) == p::LIMIT_MAX_PROCESSES_PER_SESSION_EXTENDED {
+                extension.value = 8u32.to_le_bytes().to_vec();
+            }
+        }
+        assert!(Limits::from_extensions(&contradictory).is_err());
+        // Beyond the extended hard maximum.
+        assert!(
+            Limits {
+                max_processes_per_session: Limits::HARD.max_processes_per_session + 1,
+                ..Limits::DEFAULT
+            }
+            .to_extensions()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn report_exit_is_advertised_in_a_tag_older_clients_ignore() {
+        use crate::schema::process as p;
+        let v1 = p::SPAWN_LAUNCHER_FLAGS as u32;
+        let all = p::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32;
+        assert_eq!(
+            all & !v1,
+            (p::SPAWN_REPORT_EXIT | p::SPAWN_KEEP_OUTPUT) as u32
+        );
+
+        // Only the v1 flags: tag 11 alone, as before REPORT_EXIT.
+        let before = Limits {
+            launcher_flags: v1,
+            ..Limits::DEFAULT
+        };
+        let extensions = before.to_extensions().unwrap();
+        assert_eq!(limit_value(&extensions, p::LIMIT_LAUNCHER_FLAGS), Some(12));
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_LAUNCHER_FLAGS_EXTENDED),
+            None
+        );
+        assert_eq!(Limits::from_extensions(&extensions).unwrap(), before);
+
+        // With REPORT_EXIT: tag 11 keeps within the maximum clients from before it
+        // validate, and the optional tag 19 carries every flag.
+        let extended = Limits {
+            launcher_flags: all,
+            ..Limits::DEFAULT
+        };
+        let extensions = extended.to_extensions().unwrap();
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_LAUNCHER_FLAGS),
+            Some(p::SPAWN_LAUNCHER_FLAGS)
+        );
+        assert_eq!(
+            limit_value(&extensions, p::LIMIT_LAUNCHER_FLAGS_EXTENDED),
+            Some(p::SPAWN_LAUNCHER_FLAGS_EXTENDED)
+        );
+        assert!(extensions.0.iter().all(|extension| !extension.required));
+        assert_eq!(Limits::from_extensions(&extensions).unwrap(), extended);
+        // A client that does not know tag 19 reads the v1 flags: no REPORT_EXIT.
+        let without_19 = Extensions(
+            extensions
+                .0
+                .iter()
+                .filter(|e| u64::from(e.tag) != p::LIMIT_LAUNCHER_FLAGS_EXTENDED)
+                .cloned()
+                .collect(),
+        );
+        assert_eq!(Limits::from_extensions(&without_19).unwrap(), before);
+
+        let with = |tag_11: Option<u32>, tag_19: Option<u32>| {
+            let mut extensions = Limits::DEFAULT.to_extensions().unwrap();
+            for (tag, value) in [
+                (p::LIMIT_LAUNCHER_FLAGS, tag_11),
+                (p::LIMIT_LAUNCHER_FLAGS_EXTENDED, tag_19),
+            ] {
+                if let Some(value) = value {
+                    extensions.0.push(limit_u32(tag, value));
+                }
+            }
+            Limits::from_extensions(&extensions)
+        };
+        assert_eq!(
+            with(None, Some(p::SPAWN_REPORT_EXIT as u32))
+                .unwrap()
+                .launcher_flags,
+            p::SPAWN_REPORT_EXIT as u32
+        );
+        // REPORT_EXIT has no place in tag 11, which older clients bound to 12.
+        assert!(with(Some(all), None).is_err());
+        assert!(with(Some(all), Some(all)).is_err());
+        // Tag 19 keeps the v1 flags tag 11 promised, and adds none of theirs.
+        assert!(with(Some(v1), Some(p::SPAWN_REPORT_EXIT as u32)).is_err());
+        assert!(with(None, Some(all)).is_err());
+        assert!(with(Some(v1), Some(all << 1)).is_err());
+        // Tag 19 is a set of SPAWN flags: those this side does not know (a later server's) are
+        // ignored, and any u16 of them passes the family's limit bounds.
+        assert_eq!(
+            with(Some(v1), Some(all | 1 << 15)).unwrap().launcher_flags,
+            all
+        );
+        let tag_19 = crate::schema::family_metadata(crate::family::PROCESS, 1)
+            .unwrap()
+            .limits
+            .iter()
+            .find(|limit| u64::from(limit.tag) == p::LIMIT_LAUNCHER_FLAGS_EXTENDED)
+            .unwrap();
+        assert_eq!(tag_19.hard_max, u64::from(u16::MAX));
+    }
+
+    #[test]
+    fn exit_report_round_trips_and_names_its_process_cheaply() {
+        let report = ExitReport {
+            process_handle: 0x0102_0304_0506_0708,
+            exit: ExitRecord {
+                kind: ExitKind::Code,
+                reason: crate::schema::process::EXIT_REASON_UNKNOWN as u8,
+                code: 3,
+                exited_server_ns: 9,
+                detail: b"exited".to_vec(),
+            },
+            extensions: Extensions::default(),
+        };
+        every_truncation(&report);
+        let bytes = report.encode().unwrap();
+        assert_eq!(ExitReport::handle_of(&bytes), Some(report.process_handle));
+        assert_eq!(ExitReport::handle_of(&bytes[..7]), None);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(ExitReport::decode(&trailing).is_err());
+        assert!(
+            ExitReport {
+                process_handle: 0,
+                ..report.clone()
+            }
+            .encode()
+            .is_err()
+        );
+        let mut zero = bytes;
+        zero[..8].fill(0);
+        assert!(ExitReport::decode(&zero).is_err());
+    }
+
+    #[test]
+    fn spawn_accepts_report_exit_among_its_flags() {
+        use crate::schema::process as p;
+        let spawn = |flags: u64| Spawn {
+            operation_id: [1; 16],
+            flags: flags as u16,
+            environment_kind: EnvironmentKind::Session,
+            cwd: Cwd::ServerDefault,
+            argv: vec![b"true".to_vec()],
+            env: Vec::new(),
+            stdout_receive_credit: 65_536,
+            stderr_receive_credit: 65_536,
+            extensions: Extensions::default(),
+        };
+        every_truncation(&spawn(p::SPAWN_REPORT_EXIT | p::SPAWN_STDIN_NULL));
+        assert!(
+            spawn(p::SPAWN_LAUNCHER_FLAGS_EXTENDED << 1)
+                .encode()
+                .is_err()
+        );
     }
 
     #[test]
