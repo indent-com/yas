@@ -91,7 +91,13 @@ observe output, while at most one attachment owns stdin.
 
 `CONTROL` provides typed signal, terminate, kill, and detach actions under
 nonzero operation IDs. `WAIT` returns the final portable exit record or
-`TIMEOUT`. Closing stdin half-closes the child stream. An ordinary child belongs
+`TIMEOUT`. A client that sets `SPAWN_REPORT_EXIT`, where the server offers it
+(family-limit tag 19), is sent that record as an `EXIT` event once the exit is
+final, so a command's exit costs no round trip of its own: SPAWN's Result, its
+output and its exit all travel from one request. yas-client sets it whenever
+offered, and `Process::wait` then takes no request and no pending-`WAIT` slot;
+against older servers it sends `WAIT` as before. Closing stdin half-closes the
+child stream. An ordinary child belongs
 to its spawning session and is terminated when it disappears; a detachable
 child remains discoverable until its retained final record expires.
 

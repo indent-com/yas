@@ -3791,6 +3791,7 @@ pub const WAIT: u16 = 0x0005;
 pub mod event {
 pub const STATE: u16 = 0x0000;
 pub const STATE_ACK: u16 = 0x0001;
+pub const EXIT: u16 = 0x0002;
 }
 pub const SPAWN_MERGE_STDERR: u64 = 1;
 pub const SPAWN_DETACHABLE: u64 = 2;
@@ -3798,6 +3799,8 @@ pub const SPAWN_LEAVE_RESIDUE: u64 = 4;
 pub const SPAWN_STDIN_NULL: u64 = 8;
 pub const SPAWN_FLAGS: u64 = 3;
 pub const SPAWN_LAUNCHER_FLAGS: u64 = 12;
+pub const SPAWN_REPORT_EXIT: u64 = 16;
+pub const SPAWN_LAUNCHER_FLAGS_EXTENDED: u64 = 28;
 pub const ENV_EMPTY: u64 = 0;
 pub const ENV_SESSION: u64 = 1;
 pub const CWD_SERVER_DEFAULT: u64 = 0;
@@ -3886,6 +3889,7 @@ pub const LIMIT_MAX_DETACHED_RETENTION_NS: u64 = 9;
 pub const MAX_MUTATION_REPLAYS: u64 = 65536;
 pub const LIMIT_MAX_MUTATION_REPLAYS: u64 = 10;
 pub const LIMIT_LAUNCHER_FLAGS: u64 = 11;
+pub const LIMIT_LAUNCHER_FLAGS_EXTENDED: u64 = 19;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "WATCH", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "StateWatch; ResultPrefix + StateWatchResult" },
 super::OperationMetadata { name: "UNWATCH", class: 1, kind: 1, direction: 0, sensitive: 0, compression: 0, datagram: 0, layout: "subscription_id:u32; ResultPrefix" },
@@ -3895,11 +3899,13 @@ super::OperationMetadata { name: "CONTROL", class: 1, kind: 4, direction: 0, sen
 super::OperationMetadata { name: "WAIT", class: 1, kind: 5, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "process_handle:u64,timeout_ns:u64,Extensions; ResultPrefix + ExitRecord" },
 super::OperationMetadata { name: "STATE", class: 0, kind: 0, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "StateEvent<ProcessRecord>" },
 super::OperationMetadata { name: "STATE_ACK", class: 0, kind: 1, direction: 0, sensitive: 0, compression: 0, datagram: 0, layout: "StateAck" },
+super::OperationMetadata { name: "EXIT", class: 0, kind: 2, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "ExitReport" },
 ];
 pub static TYPES: &[super::TypeMetadata] = &[
 super::TypeMetadata { name: "cwd", layout: "kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16" },
 super::TypeMetadata { name: "process_record", layout: "process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u64,owner_session:[u8;16],argv0:bytes_u32,stdin_received:u64,stdout_produced:u64,stderr_produced:u64,retention_deadline_server_ns:u64,exit_present:u8,reserved:[u8;7]=0,optional exit:bytes_u32 containing ExitRecord,Extensions" },
 super::TypeMetadata { name: "remove_record", layout: "process_handle:u64" },
+super::TypeMetadata { name: "exit_report", layout: "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions" },
 super::TypeMetadata { name: "exit_record", layout: "kind:u8,reason:u8,reserved:u16=0,code:i32,exited_server_ns:u64,detail:bytes_u32" },
 super::TypeMetadata { name: "stream_bundle", layout: "process_handle:u64,flags:u16,reserved:u16=0,stdout_lifetime_offset:u64,stderr_lifetime_offset:u64,optional stdin/stdout/stderr descriptor:bytes_u32 containing sensitive BYTE TransferDescriptor,Extensions" },
 super::TypeMetadata { name: "state_entity_body", layout: "ADD/REPLACE complete ProcessRecord; REMOVE process_handle:u64" },
@@ -3924,6 +3930,7 @@ super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES_EXTENDED", tag: 15, value_
 super::LimitMetadata { name: "MAX_ENVC_EXTENDED", tag: 16, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
 super::LimitMetadata { name: "MAX_PENDING_WAITS", tag: 17, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 65536 },
 super::LimitMetadata { name: "MAX_PENDING_OPERATIONS", tag: 18, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
+super::LimitMetadata { name: "LAUNCHER_FLAGS_EXTENDED", tag: 19, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 28 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SPAWN_MERGE_STDERR", value: 1 },
@@ -3932,6 +3939,8 @@ super::ConstantMetadata { name: "SPAWN_LEAVE_RESIDUE", value: 4 },
 super::ConstantMetadata { name: "SPAWN_STDIN_NULL", value: 8 },
 super::ConstantMetadata { name: "SPAWN_FLAGS", value: 3 },
 super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS", value: 12 },
+super::ConstantMetadata { name: "SPAWN_REPORT_EXIT", value: 16 },
+super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS_EXTENDED", value: 28 },
 super::ConstantMetadata { name: "ENV_EMPTY", value: 0 },
 super::ConstantMetadata { name: "ENV_SESSION", value: 1 },
 super::ConstantMetadata { name: "CWD_SERVER_DEFAULT", value: 0 },
@@ -4020,6 +4029,7 @@ super::ConstantMetadata { name: "LIMIT_MAX_DETACHED_RETENTION_NS", value: 9 },
 super::ConstantMetadata { name: "MAX_MUTATION_REPLAYS", value: 65536 },
 super::ConstantMetadata { name: "LIMIT_MAX_MUTATION_REPLAYS", value: 10 },
 super::ConstantMetadata { name: "LIMIT_LAUNCHER_FLAGS", value: 11 },
+super::ConstantMetadata { name: "LIMIT_LAUNCHER_FLAGS_EXTENDED", value: 19 },
 ];
 }
 pub mod net {
@@ -5033,6 +5043,7 @@ GoldenVector { name: "yas.process.request.control.header", hex: "400004000901000
 GoldenVector { name: "yas.process.request.wait.header", hex: "400005000901000000" },
 GoldenVector { name: "yas.process.event.state.header", hex: "4000000008" },
 GoldenVector { name: "yas.process.event.state_ack.header", hex: "4000010000" },
+GoldenVector { name: "yas.process.event.exit.header", hex: "4000020008" },
 GoldenVector { name: "yas.net.request.open.header", hex: "410000000901000000" },
 GoldenVector { name: "yas.net.request.close.header", hex: "410001000901000000" },
 GoldenVector { name: "yas.net.event.datagram.header", hex: "4100000008" },

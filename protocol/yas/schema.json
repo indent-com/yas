@@ -8817,6 +8817,14 @@
           "required": false,
           "hard_min": 1,
           "hard_max": 16384
+        },
+        {
+          "name": "LAUNCHER_FLAGS_EXTENDED",
+          "tag": 19,
+          "type": "u32",
+          "required": false,
+          "hard_min": 0,
+          "hard_max": 28
         }
       ],
       "requests": [
@@ -8893,6 +8901,15 @@
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "StateAck"
+        },
+        {
+          "name": "EXIT",
+          "kind": 2,
+          "direction": "server_to_client",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "ExitReport"
         }
       ],
       "types": [
@@ -8907,6 +8924,10 @@
         {
           "name": "remove_record",
           "layout": "process_handle:u64"
+        },
+        {
+          "name": "exit_report",
+          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions"
         },
         {
           "name": "exit_record",
@@ -8949,6 +8970,14 @@
         {
           "name": "SPAWN_LAUNCHER_FLAGS",
           "value": 12
+        },
+        {
+          "name": "SPAWN_REPORT_EXIT",
+          "value": 16
+        },
+        {
+          "name": "SPAWN_LAUNCHER_FLAGS_EXTENDED",
+          "value": 28
         },
         {
           "name": "ENV_EMPTY",
@@ -9301,6 +9330,10 @@
         {
           "name": "LIMIT_LAUNCHER_FLAGS",
           "value": 11
+        },
+        {
+          "name": "LIMIT_LAUNCHER_FLAGS_EXTENDED",
+          "value": 19
         }
       ]
     },

@@ -51,6 +51,8 @@ pub(crate) enum Route {
     Transfer(u32),
     /// State events for one `(family, subscription_id)`.
     State(u16, u32),
+    /// Process EXIT events for one process handle (a SPAWN with REPORT_EXIT).
+    ProcessExit(u64),
 }
 
 /// Registered by a call: run by the reader on an OK `Result`, before any later
@@ -630,6 +632,18 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
                         .lock()
                         .unwrap()
                         .deliver(Route::Transfer(transfer_id), frame);
+                }
+                return Ok(());
+            }
+            if frame.header.family == family::PROCESS
+                && frame.header.kind == yas_wire::process::event_kind::EXIT
+            {
+                if let Some(handle) = yas_wire::process::ExitReport::handle_of(&frame.payload) {
+                    shared
+                        .router
+                        .lock()
+                        .unwrap()
+                        .deliver(Route::ProcessExit(handle), frame);
                 }
                 return Ok(());
             }

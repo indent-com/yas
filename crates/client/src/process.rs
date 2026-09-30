@@ -94,8 +94,8 @@ use yas_wire::{
     family,
     process::{
         self as wire, Attach, Control, ControlAction, ControlResult, Cwd, EnvEntry,
-        EnvironmentKind, ExitRecord, ProcessRecord, RemovedProcess, Spawn, StreamBundle, Wait,
-        request_kind,
+        EnvironmentKind, ExitRecord, ExitReport, ProcessRecord, RemovedProcess, Spawn,
+        StreamBundle, Wait, request_kind,
     },
     schema::process as schema,
     state::{Phase, RecordKind, Watch as StateWatch},
@@ -485,6 +485,49 @@ pub struct Process {
     stdout_offset: u64,
     stderr_offset: u64,
     merged_stderr: bool,
+    /// Where the server sends its exit, for a process spawned with REPORT_EXIT.
+    reported: Option<ReportedExit>,
+}
+
+/// The exit a server reports unasked (an EXIT event), received once and kept.
+struct ReportedExit {
+    frames: tokio::sync::Mutex<crate::client::FrameReceiver>,
+    status: tokio::sync::OnceCell<ExitStatus>,
+}
+
+impl std::fmt::Debug for ReportedExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReportedExit")
+            .field("status", &self.status.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReportedExit {
+    async fn wait(&self, client: &Client) -> Result<ExitStatus> {
+        self.status
+            .get_or_try_init(|| async {
+                use yas_wire::Decode;
+                let frame = self.frames.lock().await.recv().await.ok_or_else(|| {
+                    client
+                        .closed_reason()
+                        .unwrap_or_else(|| Error::protocol("Process EXIT route closed"))
+                })?;
+                Ok(ExitStatus::from_wire(
+                    ExitReport::decode(&frame.payload)?.exit,
+                ))
+            })
+            .await
+            .cloned()
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if self.reported.is_some() {
+            self.client.release(Route::ProcessExit(self.handle));
+        }
+    }
 }
 
 impl Process {
@@ -536,8 +579,13 @@ impl Process {
         self.stderr.take()
     }
 
-    /// Wait for the process to exit.
+    /// Wait for the process to exit. A process this session spawned from a server that
+    /// reports exits (SPAWN_REPORT_EXIT, in [`Client::launcher_flags`]) takes no request:
+    /// the server sends the exit as it happens. Otherwise this asks with WAIT.
     pub async fn wait(&self) -> Result<ExitStatus> {
+        if let Some(reported) = &self.reported {
+            return reported.wait(&self.client).await;
+        }
         self.client
             .wait_process(self.handle, None)
             .await?
@@ -546,6 +594,12 @@ impl Process {
 
     /// Wait at most `timeout`; `None` if it is still running.
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<Option<ExitStatus>> {
+        if let Some(reported) = &self.reported {
+            return match tokio::time::timeout(timeout, reported.wait(&self.client)).await {
+                Ok(status) => status.map(Some),
+                Err(_) => Ok(None),
+            };
+        }
         self.client.wait_process(self.handle, Some(timeout)).await
     }
 
@@ -765,13 +819,18 @@ fn change_from_record(record: &yas_wire::state::Record) -> Result<Option<Process
     }
 }
 
-fn bundle_hook() -> Hook {
-    Box::new(|prefix: &ResultPrefix| {
+/// The routes a SPAWN or ATTACH Result announces: its streams, and with `report_exit` the
+/// process's EXIT events.
+fn bundle_hook(report_exit: bool) -> Hook {
+    Box::new(move |prefix: &ResultPrefix| {
         use yas_wire::Decode;
         let Ok(bundle) = StreamBundle::decode(&prefix.body) else {
             return Vec::new();
         };
         let mut routes = vec![Route::Transfer(bundle.stdout.transfer_id)];
+        if report_exit {
+            routes.push(Route::ProcessExit(bundle.process_handle));
+        }
         if let Some(stdin) = &bundle.stdin {
             routes.push(Route::Transfer(stdin.transfer_id));
         }
@@ -787,10 +846,15 @@ impl Client {
     /// happens to it and its children.
     pub async fn spawn(&self, command: &Command) -> Result<Process> {
         let stdin_null = self.launcher_flags() & schema::SPAWN_STDIN_NULL as u32 != 0;
+        // The server sends the exit unasked: waiting for it takes no round trip.
+        let report_exit = self.launcher_flags() & schema::SPAWN_REPORT_EXIT as u32 != 0;
         let window = command
             .window
             .unwrap_or_else(|| self.default_process_window());
-        let spawn = command.to_wire(stdin_null, window)?;
+        let mut spawn = command.to_wire(stdin_null, window)?;
+        if report_exit {
+            spawn.flags |= schema::SPAWN_REPORT_EXIT as u16;
+        }
         // Servers from before the extended limits refuse more than 256
         // entries as undecodable; say why instead.
         if let Some(limits) = self.process_limits()
@@ -808,7 +872,7 @@ impl Client {
                 request_kind::SPAWN,
                 spawn.encode()?,
                 Some(DEFAULT_REQUEST_TIMEOUT),
-                Some(bundle_hook()),
+                Some(bundle_hook(report_exit)),
             )
             .await?;
         let mut process = self.process_from_reply(reply, window)?;
@@ -847,7 +911,7 @@ impl Client {
                 request_kind::ATTACH,
                 attach.encode()?,
                 Some(DEFAULT_REQUEST_TIMEOUT),
-                Some(bundle_hook()),
+                Some(bundle_hook(false)),
             )
             .await?;
         self.process_from_reply(reply, window)
@@ -893,6 +957,12 @@ impl Client {
             }
             None => None,
         };
+        let reported = reply
+            .take(Route::ProcessExit(bundle.process_handle))
+            .map(|frames| ReportedExit {
+                frames: tokio::sync::Mutex::new(frames),
+                status: tokio::sync::OnceCell::new(),
+            });
         Ok(Process {
             client: self.clone(),
             handle: bundle.process_handle,
@@ -902,6 +972,7 @@ impl Client {
             stdout_offset: bundle.stdout_lifetime_offset,
             stderr_offset: bundle.stderr_lifetime_offset,
             merged_stderr: bundle.merged_stderr,
+            reported,
         })
     }
 
@@ -1035,7 +1106,9 @@ impl Client {
             .and_then(|limits| wire::Limits::from_extensions(&limits).ok())
     }
 
-    /// The opt-in SPAWN flags this server honours (`SPAWN_LEAVE_RESIDUE`, `SPAWN_STDIN_NULL`);
+    /// The opt-in SPAWN flags this server honours (`SPAWN_LEAVE_RESIDUE`, `SPAWN_STDIN_NULL`,
+    /// `SPAWN_REPORT_EXIT`, which [`Client::spawn`] sets itself so that [`Process::wait`] takes
+    /// no round trip);
     /// 0 for servers that predate them. [`Stdin::Null`] uses the null device where offered.
     pub fn launcher_flags(&self) -> u32 {
         self.process_limits()

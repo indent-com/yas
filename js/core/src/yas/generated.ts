@@ -1649,12 +1649,15 @@ export const YAS_PROCESS_CONTROL = 4 as const;
 export const YAS_PROCESS_WAIT = 5 as const;
 export const YAS_PROCESS_STATE = 0 as const;
 export const YAS_PROCESS_STATE_ACK = 1 as const;
+export const YAS_PROCESS_EXIT = 2 as const;
 export const YAS_PROCESS_SPAWN_MERGE_STDERR = 1 as const;
 export const YAS_PROCESS_SPAWN_DETACHABLE = 2 as const;
 export const YAS_PROCESS_SPAWN_LEAVE_RESIDUE = 4 as const;
 export const YAS_PROCESS_SPAWN_STDIN_NULL = 8 as const;
 export const YAS_PROCESS_SPAWN_FLAGS = 3 as const;
 export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS = 12 as const;
+export const YAS_PROCESS_SPAWN_REPORT_EXIT = 16 as const;
+export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS_EXTENDED = 28 as const;
 export const YAS_PROCESS_ENV_EMPTY = 0 as const;
 export const YAS_PROCESS_ENV_SESSION = 1 as const;
 export const YAS_PROCESS_CWD_SERVER_DEFAULT = 0 as const;
@@ -1743,6 +1746,7 @@ export const YAS_PROCESS_LIMIT_MAX_DETACHED_RETENTION_NS = 9 as const;
 export const YAS_PROCESS_MAX_MUTATION_REPLAYS = 65536 as const;
 export const YAS_PROCESS_LIMIT_MAX_MUTATION_REPLAYS = 10 as const;
 export const YAS_PROCESS_LIMIT_LAUNCHER_FLAGS = 11 as const;
+export const YAS_PROCESS_LIMIT_LAUNCHER_FLAGS_EXTENDED = 19 as const;
 export const YAS_FAMILY_NET = 65 as const;
 export const YAS_NET_VERSION = 1 as const;
 export const YAS_NET_OPEN = 0 as const;
@@ -2251,6 +2255,7 @@ export const YAS_FAMILY_LIMIT_POLICIES: Readonly<Record<number, readonly YasFami
     [16, 4, false, 1n, 16384n],
     [17, 4, false, 1n, 65536n],
     [18, 4, false, 1n, 16384n],
+    [19, 4, false, 0n, 28n],
   ],
   65: [
     [1, 4, true, 1n, 255n],
@@ -2625,6 +2630,7 @@ export const YAS_OPERATION_POLICIES: Readonly<Record<string, YasOperationPolicy>
   "64/2/5": [1, 0, 0],
   "64/0/0": [1, 0, 0],
   "64/0/1": [0, 0, 0],
+  "64/0/2": [1, 0, 0],
   "65/1/0": [1, 0, 0],
   "65/2/0": [1, 0, 0],
   "65/1/1": [1, 0, 0],
@@ -2876,6 +2882,7 @@ export const YAS_OPERATION_DIRECTION_MASKS: Readonly<Record<string, number>> = {
   "64/1/5": 1,
   "64/0/0": 2,
   "64/0/1": 1,
+  "64/0/2": 2,
   "65/1/0": 1,
   "65/1/1": 1,
   "65/0/0": 3,
@@ -11733,6 +11740,14 @@ export const YAS_SCHEMA = {
           "required": false,
           "hard_min": 1,
           "hard_max": 16384
+        },
+        {
+          "name": "LAUNCHER_FLAGS_EXTENDED",
+          "tag": 19,
+          "type": "u32",
+          "required": false,
+          "hard_min": 0,
+          "hard_max": 28
         }
       ],
       "requests": [
@@ -11809,6 +11824,15 @@ export const YAS_SCHEMA = {
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "StateAck"
+        },
+        {
+          "name": "EXIT",
+          "kind": 2,
+          "direction": "server_to_client",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "ExitReport"
         }
       ],
       "types": [
@@ -11823,6 +11847,10 @@ export const YAS_SCHEMA = {
         {
           "name": "remove_record",
           "layout": "process_handle:u64"
+        },
+        {
+          "name": "exit_report",
+          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions"
         },
         {
           "name": "exit_record",
@@ -11865,6 +11893,14 @@ export const YAS_SCHEMA = {
         {
           "name": "SPAWN_LAUNCHER_FLAGS",
           "value": 12
+        },
+        {
+          "name": "SPAWN_REPORT_EXIT",
+          "value": 16
+        },
+        {
+          "name": "SPAWN_LAUNCHER_FLAGS_EXTENDED",
+          "value": 28
         },
         {
           "name": "ENV_EMPTY",
@@ -12217,6 +12253,10 @@ export const YAS_SCHEMA = {
         {
           "name": "LIMIT_LAUNCHER_FLAGS",
           "value": 11
+        },
+        {
+          "name": "LIMIT_LAUNCHER_FLAGS_EXTENDED",
+          "value": 19
         }
       ]
     },
@@ -15392,6 +15432,10 @@ export const YAS_GOLDEN_VECTORS = {
     {
       "name": "yas.process.event.state_ack.header",
       "hex": "4000010000"
+    },
+    {
+      "name": "yas.process.event.exit.header",
+      "hex": "4000020008"
     },
     {
       "name": "yas.net.request.open.header",

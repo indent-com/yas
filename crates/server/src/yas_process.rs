@@ -293,9 +293,10 @@ impl Runtime {
     }
 
     pub(crate) fn limits(&self) -> wire::Limits {
-        // LEAVE_RESIDUE works with Unix process groups and Windows jobs alike.
+        // LEAVE_RESIDUE works with Unix process groups and Windows jobs alike; REPORT_EXIT is
+        // the YAS connection's own.
         wire::Limits {
-            launcher_flags: schema::process::SPAWN_LAUNCHER_FLAGS as u32,
+            launcher_flags: schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32,
             ..self.server.maxima().limits()
         }
     }
@@ -381,7 +382,8 @@ impl Session {
         resolved_cwd: Option<Vec<u8>>,
     ) -> Result<Attachment, Error> {
         let cwd = resolve_cwd(&request.cwd, resolved_cwd)?;
-        let flags = u8::try_from(request.flags)
+        // REPORT_EXIT asks the YAS connection for an EXIT event; the process is the same.
+        let flags = u8::try_from(request.flags & !(schema::process::SPAWN_REPORT_EXIT as u16))
             .map_err(|_| Error::Invalid("Process SPAWN flags do not fit v1".to_owned()))?;
         let process_id = self.allocate_process_id()?;
         let (route, events) = self.install_route(process_id, false)?;
