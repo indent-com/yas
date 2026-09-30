@@ -462,6 +462,7 @@ async fn cmd_write(
                 create_parents: parents,
                 mode,
                 content,
+                in_place: false,
             },
             json,
         )
@@ -1241,6 +1242,7 @@ mod tests {
                 create_parents: false,
                 mode: 0,
                 content: b"contents".to_vec(),
+                in_place: false,
             },
             ApplyItem::Mkdir {
                 path: wire_path("directory").unwrap(),

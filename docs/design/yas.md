@@ -2861,11 +2861,11 @@ extensions remain forbidden by Core.
 Optional family limit `CAPABILITIES` (tag `LIMIT_CAPABILITIES` = 14, `u32`)
 advertises the opt-in values a server implements: `CAPABILITY_OS_ERROR` (1),
 `CAPABILITY_READ_LIST` (2), `CAPABILITY_READ_REALPATH` (4),
-`CAPABILITY_READ_STAT_ONLY` (8), and `CAPABILITY_STAGE_IN_PLACE` (16);
-`CAPABILITY_FLAGS` (31) is their union. Absent means zero and receivers ignore
-unknown bits. A client sends an opt-in question kind or flag only when its bit
-is set; an older server rejects them as INVALID. Nothing changes for a client
-that sends none of them.
+`CAPABILITY_READ_STAT_ONLY` (8), `CAPABILITY_STAGE_IN_PLACE` (16), and
+`CAPABILITY_APPLY_IN_PLACE` (32); `CAPABILITY_FLAGS` (63) is their union.
+Absent means zero and receivers ignore unknown bits. A client sends an opt-in
+question kind or flag only when its bit is set; an older server rejects them as
+INVALID. Nothing changes for a client that sends none of them.
 
 A failed top-level FS Result whose failure came from an OS error adds optional
 ResultPrefix `detail` tag `RESULT_OS_ERROR_EXTENSION` (2), whose exact value is
@@ -2923,6 +2923,15 @@ before. COMMIT's result describes the file written, which is the link's
 destination entry when that lies inside the root. STAGE_CREATE_PARENTS with
 STAGE_IN_PLACE is INVALID. `STAGE_EXTENDED_FLAGS` (2) lists the stage flags
 added after the v1 baseline `STAGE_FLAGS`.
+
+APPLY item flag `APPLY_ITEM_IN_PLACE` (2) on a `WRITE_INLINE` item writes
+its content in place in the same way, in one round trip: open with create and
+truncate through a final symlink, and no temporary file or rename. APPLY
+carries no sync flags. The item result's revision, time, and hash describe the
+file written. A directory at the destination is CONFLICT, and its
+ApplyOsErrors entry is `{EISDIR, open}`. The flag on another item kind, or
+with `APPLY_ITEM_CREATE_PARENTS`, is INVALID. `APPLY_ITEM_EXTENDED_FLAGS`
+(2) lists the item flags added after the v1 baseline `APPLY_ITEM_FLAGS`.
 
 ## Git family
 

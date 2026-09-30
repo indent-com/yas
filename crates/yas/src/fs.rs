@@ -2528,6 +2528,10 @@ pub enum ApplyItem {
         create_parents: bool,
         mode: u32,
         content: Vec<u8>,
+        /// `APPLY_ITEM_IN_PLACE` (with `CAPABILITY_APPLY_IN_PLACE`): write as `open(2)` with
+        /// `O_WRONLY|O_CREAT|O_TRUNC` would, through a final symlink, rather than replace the
+        /// file; never with `create_parents`.
+        in_place: bool,
     },
     Mkdir {
         path: Path,
@@ -2569,8 +2573,12 @@ impl ApplyItem {
                 precondition,
                 mode,
                 content,
-                ..
+                create_parents,
+                in_place,
             } => {
+                if *in_place && *create_parents {
+                    return Err(Error::Invalid("FS APPLY in-place write creating parents"));
+                }
                 if content.len() > MAX_INLINE_BYTES {
                     return Err(limit(
                         "FS inline apply bytes",
@@ -2668,16 +2676,16 @@ impl ApplyItem {
         let len = 4usize
             .checked_add(body.len())
             .ok_or(Error::LengthOverflow)?;
+        let mut item_flags = 0;
+        if create_parents {
+            item_flags |= crate::schema::fs::APPLY_ITEM_CREATE_PARENTS as u16;
+        }
+        if matches!(self, Self::WriteInline { in_place: true, .. }) {
+            item_flags |= crate::schema::fs::APPLY_ITEM_IN_PLACE as u16;
+        }
         put_len_u32(out, len)?;
         put_u16(out, kind);
-        put_u16(
-            out,
-            if create_parents {
-                crate::schema::fs::APPLY_ITEM_CREATE_PARENTS as u16
-            } else {
-                0
-            },
-        );
+        put_u16(out, item_flags);
         out.extend_from_slice(&body);
         Ok(())
     }
@@ -2687,10 +2695,18 @@ impl ApplyItem {
         let mut item = Decoder::new(bytes);
         let kind = item.u16()?;
         let item_flags = item.u16()?;
-        if item_flags & !(crate::schema::fs::APPLY_ITEM_FLAGS as u16) != 0 {
+        let known =
+            crate::schema::fs::APPLY_ITEM_FLAGS | crate::schema::fs::APPLY_ITEM_EXTENDED_FLAGS;
+        if item_flags & !(known as u16) != 0 {
             return Err(Error::Invalid("FS APPLY item flags"));
         }
         let create_parents = item_flags & crate::schema::fs::APPLY_ITEM_CREATE_PARENTS as u16 != 0;
+        let in_place = item_flags & crate::schema::fs::APPLY_ITEM_IN_PLACE as u16 != 0;
+        if in_place && kind != crate::schema::fs::APPLY_WRITE_INLINE as u16 {
+            return Err(Error::Invalid(
+                "FS APPLY in-place flag on an item that writes no file",
+            ));
+        }
         let value = match kind {
             value if value == crate::schema::fs::APPLY_WRITE_INLINE as u16 => Self::WriteInline {
                 path: Path::decode(item.len_bytes_u32()?)?,
@@ -2698,6 +2714,7 @@ impl ApplyItem {
                 create_parents,
                 mode: item.u32()?,
                 content: item.len_bytes_u32()?.to_vec(),
+                in_place,
             },
             value if value == crate::schema::fs::APPLY_MKDIR as u16 => Self::Mkdir {
                 path: Path::decode(item.len_bytes_u32()?)?,
@@ -3269,10 +3286,57 @@ mod tests {
                 create_parents: true,
                 mode: 0o644,
                 content: b"yas".to_vec(),
+                in_place: false,
             }],
             extensions: Extensions::default(),
         };
         truncations::<Apply>(&apply.encode().unwrap());
+    }
+
+    #[test]
+    fn an_in_place_apply_write_is_a_write_inline_flag_without_create_parents() {
+        let write = |create_parents, in_place| Apply {
+            root_handle: 1,
+            operation_id: [3; 16],
+            flags: 0,
+            items: vec![ApplyItem::WriteInline {
+                path: path(b"file"),
+                precondition: Precondition::Any,
+                create_parents,
+                mode: 0,
+                content: b"yas".to_vec(),
+                in_place,
+            }],
+            extensions: Extensions::default(),
+        };
+        let apply = write(false, true);
+        let bytes = apply.encode().unwrap();
+        assert_eq!(Apply::decode(&bytes).unwrap(), apply);
+        truncations::<Apply>(&bytes);
+        // The item's flags follow the root handle, operation ID, flags, count and item length.
+        let flags_at = 8 + 16 + 2 + 2 + 4 + 2;
+        assert_eq!(
+            u16::from_le_bytes([bytes[flags_at], bytes[flags_at + 1]]),
+            crate::schema::fs::APPLY_ITEM_IN_PLACE as u16
+        );
+        assert!(write(true, true).encode().is_err());
+        let mut both = bytes.clone();
+        both[flags_at] |= crate::schema::fs::APPLY_ITEM_CREATE_PARENTS as u8;
+        assert!(Apply::decode(&both).is_err());
+        // Only a write may be in place.
+        let mkdir = Apply {
+            items: vec![ApplyItem::Mkdir {
+                path: path(b"dir"),
+                precondition: Precondition::Any,
+                create_parents: false,
+                mode: 0,
+            }],
+            ..apply
+        };
+        let mut bytes = mkdir.encode().unwrap();
+        assert_eq!(Apply::decode(&bytes).unwrap(), mkdir);
+        bytes[flags_at] |= crate::schema::fs::APPLY_ITEM_IN_PLACE as u8;
+        assert!(Apply::decode(&bytes).is_err());
     }
 
     #[test]
