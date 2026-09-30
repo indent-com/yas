@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use yas_wire::process as wire;
 use yas_wire::schema::process as process_schema;
@@ -334,6 +334,10 @@ const PROCESS_KILL_TERMINATE_TIMEOUT: u8 = process_schema::EXIT_REASON_TERMINATE
 const PROCESS_KILL_SERVER_SHUTDOWN: u8 = process_schema::EXIT_REASON_SERVER_SHUTDOWN as u8;
 const PROCESS_MAX_UNACKED_PACKETS: usize = 1_024;
 const PROCESS_DEFAULT_STREAM_WINDOW: u64 = 1024 * 1024;
+/// Unacknowledged frames a process's owner may have on one stream: its window in whole frames,
+/// so a burst of small writes fits the adapter's queues (80 route events) as a full window does.
+const PROCESS_OWNER_UNACKED_FRAMES: usize =
+    (PROCESS_DEFAULT_STREAM_WINDOW / OUTPUT_FRAME_PAYLOAD as u64) as usize;
 
 pub(crate) const NATIVE_STREAM_STDOUT: u8 = PROCESS_STREAM_STDOUT;
 pub(crate) const NATIVE_STREAM_STDERR: u8 = PROCESS_STREAM_STDERR;
@@ -630,14 +634,35 @@ pub(crate) enum NativeControl {
 #[derive(Clone)]
 struct EndpointOutput {
     events: mpsc::Sender<NativeEventEnvelope>,
-    closed: watch::Sender<Option<String>>,
+    evictions: Arc<Evictions>,
+}
+
+/// The processes of one endpoint whose binding the output readers dropped: a watcher that fell
+/// a window behind, or one whose queue was full. Its adapter fails those attachments alone; the
+/// endpoint and its other processes go on.
+#[derive(Default)]
+pub(crate) struct Evictions {
+    process_ids: StdMutex<Vec<u32>>,
+    notify: Notify,
+}
+
+impl Evictions {
+    /// Waits for evictions (one waiter: the endpoint's adapter).
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// The process IDs evicted since the last call.
+    pub(crate) fn take(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.process_ids.lock().unwrap())
+    }
 }
 
 impl EndpointOutput {
-    fn kick(&self, reason: &str) {
-        if self.closed.borrow().is_none() {
-            let _ = self.closed.send(Some(reason.to_owned()));
-        }
+    fn evict(&self, process_id: u32) {
+        self.evictions.process_ids.lock().unwrap().push(process_id);
+        // A permit is kept when the adapter is not waiting yet.
+        self.evictions.notify.notify_one();
     }
 
     fn send_native(&self, event: NativeEvent, guard: Option<WriterGuard>) -> bool {
@@ -740,19 +765,22 @@ impl Server {
         &self,
         session_id: [u8; 16],
         event_capacity: usize,
-    ) -> (
-        Manager,
-        mpsc::Receiver<NativeEventEnvelope>,
-        watch::Receiver<Option<String>>,
-    ) {
+    ) -> (Manager, mpsc::Receiver<NativeEventEnvelope>, Arc<Evictions>) {
         debug_assert!(session_id.iter().any(|byte| *byte != 0));
         let id = self.0.next_endpoint.fetch_add(1, Ordering::Relaxed);
         let (events, receiver) = mpsc::channel(event_capacity.max(1));
-        let (closed, closed_receiver) = watch::channel(None);
+        let evictions = Arc::new(Evictions::default());
         (
-            self.endpoint_with_id(EndpointOutput { events, closed }, id, session_id),
+            self.endpoint_with_id(
+                EndpointOutput {
+                    events,
+                    evictions: evictions.clone(),
+                },
+                id,
+                session_id,
+            ),
             receiver,
-            closed_receiver,
+            evictions,
         )
     }
 
@@ -2855,6 +2883,11 @@ async fn stdin_writer(
 async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRead + Unpin) {
     let mut buffer = vec![0u8; OUTPUT_FRAME_PAYLOAD];
     loop {
+        // The process's owner takes all of its output: the pipe is read no further ahead of
+        // what the owner has taken than its window, so a writer faster than the owner's
+        // Transfer blocks on its pipe. (It used to be evicted, which closed the owner's whole
+        // Process endpoint.) Other watchers are still dropped when they fall a window behind.
+        let owner = owner_with_room(&record, stream).await;
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Err(_) => {
@@ -2862,6 +2895,17 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 break;
             }
             Ok(n) => {
+                // Room in the owner's event queue too, taken before the lock: its frame never
+                // finds the queue full.
+                let owner = match owner {
+                    Some((endpoint_id, process_id, events)) => events
+                        .reserve_owned()
+                        .await
+                        .ok()
+                        .map(|permit| (endpoint_id, process_id, permit)),
+                    None => None,
+                };
+                let mut owner = owner;
                 let mut inner = record.inner.lock().unwrap();
                 let state = if stream == PROCESS_STREAM_STDOUT {
                     &mut inner.stdout
@@ -2878,6 +2922,30 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 let mut evicted = Vec::new();
                 let mut index = 0;
                 while index < inner.bindings.len() {
+                    if let Some((endpoint_id, process_id, _)) = owner
+                        && inner.bindings[index].endpoint_id == endpoint_id
+                        && inner.bindings[index].process_id == process_id
+                    {
+                        let (_, _, permit) = owner.take().expect("owner permit");
+                        permit.send(NativeEventEnvelope {
+                            event: NativeEvent::Output {
+                                process_id,
+                                stream,
+                                offset,
+                                data: buffer[..n].to_vec(),
+                            },
+                            _guard: None,
+                        });
+                        let binding = &mut inner.bindings[index];
+                        let credit = if stream == PROCESS_STREAM_STDOUT {
+                            &mut binding.stdout
+                        } else {
+                            binding.stderr.as_mut().expect("separate stderr binding")
+                        };
+                        credit.frames.push_back(next);
+                        index += 1;
+                        continue;
+                    }
                     let has_credit = {
                         let binding = &inner.bindings[index];
                         let credit = if stream == PROCESS_STREAM_STDOUT {
@@ -2917,14 +2985,51 @@ async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRe
                 }
                 drop(inner);
                 for binding in evicted {
-                    binding
-                        .out
-                        .kick("native process watcher exceeded its output window");
+                    binding.out.evict(binding.process_id);
                 }
             }
         }
     }
     stream_closed(&record, stream);
+}
+
+/// Waits until the process's owner, while it is bound, can take another whole frame of
+/// `stream` (its window and unacknowledged frames); answers where to send it. None when the
+/// owner is not bound (it left, or detached): the output then goes to the watchers alone.
+async fn owner_with_room(
+    record: &Record,
+    stream: u8,
+) -> Option<(u64, u32, mpsc::Sender<NativeEventEnvelope>)> {
+    loop {
+        // Created before the check: an acknowledgement in between still wakes it.
+        let changed = record.changed.notified();
+        {
+            let inner = record.inner.lock().unwrap();
+            let owner = inner
+                .bindings
+                .iter()
+                .find(|binding| Weak::ptr_eq(&binding.endpoint, &record.owner))?;
+            let (next, credit) = if stream == PROCESS_STREAM_STDOUT {
+                (inner.stdout.next, &owner.stdout)
+            } else {
+                match (inner.stderr.as_ref(), owner.stderr.as_ref()) {
+                    (Some(state), Some(credit)) => (state.next, credit),
+                    _ => return None,
+                }
+            };
+            let debt = next.saturating_sub(credit.acked);
+            if debt.saturating_add(OUTPUT_FRAME_PAYLOAD as u64) <= PROCESS_DEFAULT_STREAM_WINDOW
+                && credit.frames.len() < PROCESS_OWNER_UNACKED_FRAMES
+            {
+                return Some((
+                    owner.endpoint_id,
+                    owner.process_id,
+                    owner.out.events.clone(),
+                ));
+            }
+        }
+        changed.await;
+    }
 }
 
 fn stream_closed(record: &Arc<Record>, stream: u8) {

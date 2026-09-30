@@ -186,6 +186,7 @@ pub(crate) struct AttachmentControl {
 
 pub(crate) struct AttachmentEvents {
     events: mpsc::Receiver<Event>,
+    failed: watch::Receiver<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -251,7 +252,13 @@ struct Route {
     auto_ack_output: bool,
     events: mpsc::Sender<Event>,
     exit: watch::Sender<Option<ExitInfo>>,
+    /// Why the process's output left this route: its native binding fell a window behind or
+    /// its queue filled. Only this attachment fails; the session and its other processes go on.
+    failed: watch::Sender<Option<String>>,
 }
+
+/// What a route dropped for falling behind tells its attachment and its WAITs.
+const ROUTE_EVICTED: &str = "Process output fell a window behind its reader and was dropped";
 
 enum WatchOutcome {
     Running(Attachment),
@@ -308,7 +315,7 @@ impl Runtime {
         if owner_session.iter().all(|byte| *byte == 0) {
             return Err(Error::Invalid("zero Process owner session".to_owned()));
         }
-        let (manager, events, endpoint_closed) = self
+        let (manager, events, evictions) = self
             .server
             .native_endpoint_with_session(owner_session, self.server.maxima().endpoint_events());
         let (closed, _) = watch::channel(None);
@@ -324,11 +331,7 @@ impl Runtime {
             #[cfg(test)]
             operation_gate: self.operation_gate.clone(),
         });
-        tokio::spawn(route_outbound(
-            Arc::downgrade(&inner),
-            events,
-            endpoint_closed,
-        ));
+        tokio::spawn(route_outbound(Arc::downgrade(&inner), events, evictions));
         Ok(Session { inner })
     }
 
@@ -512,6 +515,26 @@ impl Session {
     }
 
     pub(crate) async fn wait(&self, request: &wire::Wait) -> Result<ExitInfo, Error> {
+        let deadline = (request.timeout_ns != 0)
+            .then(|| tokio::time::Instant::now() + Duration::from_nanos(request.timeout_ns));
+        // The route waited on can leave first (its stream was dropped, or it fell behind and
+        // was failed): the process goes on, so the wait looks again.
+        loop {
+            if let Some(exit) = self.wait_route(request, deadline).await? {
+                return Ok(exit);
+            }
+            if let Some(error) = self.inner.closed.borrow().clone() {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Waits on the process's route of now; None when the route left before the exit.
+    async fn wait_route(
+        &self,
+        request: &wire::Wait,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<ExitInfo>, Error> {
         if let Some(exit) = self
             .inner
             .exits
@@ -520,11 +543,11 @@ impl Session {
             .get(request.process_handle)
             .cloned()
         {
-            return Ok(exit);
+            return Ok(Some(exit));
         }
-        let (mut exit, temporary) =
+        let (mut exit, mut failed, temporary) =
             if let Some(route) = self.route_by_handle(request.process_handle) {
-                (route.exit.subscribe(), None)
+                (route.exit.subscribe(), route.failed.subscribe(), None)
             } else if let Some(exit) = self
                 .inner
                 .exits
@@ -535,36 +558,42 @@ impl Session {
             {
                 // It exited between the first look and the route lookup; the
                 // replay is recorded before the route is removed.
-                return Ok(exit);
+                return Ok(Some(exit));
             } else {
                 match self
                     .watch_process(request.process_handle, false, true)
                     .await?
                 {
-                    WatchOutcome::Exited(exit) => return Ok(exit),
+                    WatchOutcome::Exited(exit) => return Ok(Some(exit)),
                     WatchOutcome::Running(attachment) => {
                         let exit = attachment.route.exit.subscribe();
-                        (exit, Some(attachment))
+                        let failed = attachment.route.failed.subscribe();
+                        (exit, failed, Some(attachment))
                     }
                 }
             };
         let wait = async {
             loop {
                 if let Some(exit) = exit.borrow().clone() {
-                    return Ok(exit);
+                    return Some(exit);
                 }
-                exit.changed()
-                    .await
-                    .map_err(|_| Error::Closed("Process attachment closed".to_owned()))?;
+                if failed.borrow().is_some() {
+                    return None;
+                }
+                tokio::select! {
+                    changed = exit.changed() => if changed.is_err() {
+                        // The route is gone: with its exit, or before it.
+                        return exit.borrow().clone();
+                    },
+                    _ = failed.changed() => {}
+                }
             }
         };
-        let result = if request.timeout_ns == 0 {
-            wait.await
-        } else {
-            match tokio::time::timeout(Duration::from_nanos(request.timeout_ns), wait).await {
-                Ok(result) => result,
-                Err(_) => Err(Error::Timeout),
-            }
+        let result = match deadline {
+            None => Ok(wait.await),
+            Some(deadline) => tokio::time::timeout_at(deadline, wait)
+                .await
+                .map_err(|_| Error::Timeout),
         };
         if let Some(attachment) = temporary {
             let _ = self
@@ -691,12 +720,14 @@ impl Session {
     ) -> Result<(Arc<Route>, mpsc::Receiver<Event>), Error> {
         let (events, receiver) = mpsc::channel(ROUTE_EVENTS);
         let (exit, _) = watch::channel(None);
+        let (failed, _) = watch::channel(None);
         let route = Arc::new(Route {
             process_id,
             process_handle: AtomicU64::new(0),
             auto_ack_output,
             events,
             exit,
+            failed,
         });
         if self
             .inner
@@ -743,10 +774,12 @@ impl Attachment {
             stdin_window: self.stdin_window,
             merged_stderr: self.merged_stderr,
         };
+        let failed = control.route.failed.subscribe();
         (
             control,
             AttachmentEvents {
                 events: self.events,
+                failed,
             },
         )
     }
@@ -768,8 +801,21 @@ impl Attachment {
 }
 
 impl AttachmentEvents {
+    /// The next event; None once the route is closed or failed ([`AttachmentEvents::failure`]).
     pub(crate) async fn next(&mut self) -> Option<Event> {
-        self.events.recv().await
+        if self.failed.borrow().is_some() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.failed.changed() => None,
+            event = self.events.recv() => event,
+        }
+    }
+
+    /// Why the route failed, when it did.
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.failed.borrow().clone()
     }
 }
 
@@ -814,26 +860,19 @@ impl AttachmentControl {
 async fn route_outbound(
     inner: std::sync::Weak<SessionInner>,
     mut events: mpsc::Receiver<process::NativeEventEnvelope>,
-    mut endpoint_closed: watch::Receiver<Option<String>>,
+    evictions: Arc<process::Evictions>,
 ) {
     loop {
         let event = tokio::select! {
             event = events.recv() => event,
-            changed = endpoint_closed.changed() => {
-                let detail = if changed.is_ok() {
-                    endpoint_closed.borrow().clone()
-                } else {
-                    None
+            () = evictions.notified() => {
+                let Some(inner) = inner.upgrade() else {
+                    return;
                 };
-                if let Some(inner) = inner.upgrade() {
-                    close_session(
-                        &inner,
-                        Error::Closed(detail.unwrap_or_else(|| {
-                            "Process endpoint writer closed".to_owned()
-                        })),
-                    );
+                for process_id in evictions.take() {
+                    fail_route(&inner, process_id, ROUTE_EVICTED);
                 }
-                return;
+                continue;
             }
         };
         let Some(event) = event else {
@@ -863,13 +902,10 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
             offset,
             data,
         } => {
-            let route = inner
-                .routes
-                .lock()
-                .unwrap()
-                .get(&process_id)
-                .cloned()
-                .ok_or_else(|| Error::Closed("output for unknown Process binding".to_owned()))?;
+            // Queued before its route failed or detached: nobody takes it now.
+            let Some(route) = inner.routes.lock().unwrap().get(&process_id).cloned() else {
+                return Ok(());
+            };
             let semantic_stream = match stream {
                 process::NATIVE_STREAM_STDOUT => Stream::Stdout,
                 process::NATIVE_STREAM_STDERR => Stream::Stderr,
@@ -885,31 +921,42 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                     .map_err(backend_error)?;
                 return Ok(());
             }
-            route
+            if route
                 .events
                 .try_send(Event::Output {
                     stream: semantic_stream,
                     lifetime_offset: offset,
                     data,
                 })
-                .map_err(|_| Error::Closed("Process semantic stream queue overflowed".to_owned()))
+                .is_err()
+            {
+                // This attachment's reader fell behind: it alone fails.
+                fail_route(inner, process_id, ROUTE_EVICTED);
+                let _ = inner
+                    .manager
+                    .control_native(process_id, process::NativeControl::Detach);
+            }
+            Ok(())
         }
         process::NativeEvent::StdinProgress {
             process_id,
             consumed,
             open,
         } => {
-            let route = inner
-                .routes
-                .lock()
-                .unwrap()
-                .get(&process_id)
-                .cloned()
-                .ok_or_else(|| Error::Closed("stdin ACK for unknown Process binding".to_owned()))?;
-            route
+            let Some(route) = inner.routes.lock().unwrap().get(&process_id).cloned() else {
+                return Ok(());
+            };
+            if route
                 .events
                 .try_send(Event::StdinProgress { consumed, open })
-                .map_err(|_| Error::Closed("Process semantic stream queue overflowed".to_owned()))
+                .is_err()
+            {
+                fail_route(inner, process_id, ROUTE_EVICTED);
+                let _ = inner
+                    .manager
+                    .control_native(process_id, process::NativeControl::Detach);
+            }
+            Ok(())
         }
         process::NativeEvent::Exit { process_id, exit } => {
             let exit = native_exit_info(exit);
@@ -939,11 +986,21 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
     }
 }
 
+/// The route of `process_id` leaves the session and its attachment and WAITs fail with
+/// `reason`; the session and its other processes go on.
+fn fail_route(inner: &SessionInner, process_id: u32, reason: &str) {
+    let route = inner.routes.lock().unwrap().remove(&process_id);
+    if let Some(route) = route {
+        route.failed.send_replace(Some(reason.to_owned()));
+    }
+}
+
 fn close_session(inner: &SessionInner, error: Error) {
     if inner.closed.borrow().is_some() {
         return;
     }
-    let _ = inner.closed.send(Some(error));
+    // send_replace: nobody subscribes, and send would drop the value.
+    inner.closed.send_replace(Some(error));
     inner.routes.lock().unwrap().clear();
     inner.exits.lock().unwrap().clear();
 }

@@ -175,6 +175,15 @@ for stdin, stdout, and stderr; MESSAGE/frame counts are bounded by the common
 Transfer limits. A slow attachment cannot force unbounded process-wide output
 retention.
 
+The spawning session's credit paces the child itself: the server reads a pipe no
+more than 1 MiB (32 frames) ahead of what that session's Transfer has taken, so a
+command that writes faster than its owner reads blocks on its pipe and loses
+nothing. Other sessions' attachments are not waited for. One that falls 1 MiB
+behind is dropped alone: its Transfers are reset with `RESOURCE_EXHAUSTED`, and a
+`WAIT` it had pending still answers at the exit. Its session and its other
+processes go on. (Servers up to 0.4.0 dropped the owner too when it fell behind,
+and closed the lagging session's whole Process endpoint with it.)
+
 Catalogue State is coalesced under its subscription credit. Output offsets are
 lifetime counters, so a later `ATTACH` reports the exact skipped prefix rather
 than pretending to replay bytes that were not retained. A detachable final
