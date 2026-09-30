@@ -893,6 +893,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | ---: | --- | --- | --- | --- | --- | --- |
 | `0x0000` | `STATE` | `server_to_client` | `required` | `allowed` | `forbidden` | StateEvent<ProcessRecord> |
 | `0x0001` | `STATE_ACK` | `client_to_server` | `allowed` | `allowed` | `forbidden` | StateAck |
+| `0x0002` | `EXIT` | `server_to_client` | `required` | `allowed` | `forbidden` | ExitReport |
 
 ### Limits
 
@@ -916,6 +917,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | 16 | `MAX_ENVC_EXTENDED` | 4 | false | 1 | 16384 |
 | 17 | `MAX_PENDING_WAITS` | 4 | false | 1 | 65536 |
 | 18 | `MAX_PENDING_OPERATIONS` | 4 | false | 1 | 16384 |
+| 19 | `LAUNCHER_FLAGS_EXTENDED` | 4 | false | 0 | 65535 |
 
 ### Shared types
 
@@ -924,6 +926,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `cwd` | kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16 |
 | `process_record` | process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u64,owner_session:[u8;16],argv0:bytes_u32,stdin_received:u64,stdout_produced:u64,stderr_produced:u64,retention_deadline_server_ns:u64,exit_present:u8,reserved:[u8;7]=0,optional exit:bytes_u32 containing ExitRecord,Extensions |
 | `remove_record` | process_handle:u64 |
+| `exit_report` | process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions |
 | `exit_record` | kind:u8,reason:u8,reserved:u16=0,code:i32,exited_server_ns:u64,detail:bytes_u32 |
 | `stream_bundle` | process_handle:u64,flags:u16,reserved:u16=0,stdout_lifetime_offset:u64,stderr_lifetime_offset:u64,optional stdin/stdout/stderr descriptor:bytes_u32 containing sensitive BYTE TransferDescriptor,Extensions |
 | `state_entity_body` | ADD/REPLACE complete ProcessRecord; REMOVE process_handle:u64 |

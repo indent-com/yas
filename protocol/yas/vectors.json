@@ -754,6 +754,10 @@
       "hex": "4000010000"
     },
     {
+      "name": "yas.process.event.exit.header",
+      "hex": "4000020008"
+    },
+    {
       "name": "yas.net.request.open.header",
       "hex": "410000000901000000"
     },

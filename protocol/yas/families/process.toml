@@ -20,6 +20,8 @@ limits = [
   { name = "MAX_ENVC_EXTENDED", tag = 16, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
   { name = "MAX_PENDING_WAITS", tag = 17, type = "u32", required = false, hard_min = 1, hard_max = 65536 },
   { name = "MAX_PENDING_OPERATIONS", tag = 18, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
+  # A set of SPAWN flags (u16): bits a client does not know are ignored, so later flags need no new tag.
+  { name = "LAUNCHER_FLAGS_EXTENDED", tag = 19, type = "u32", required = false, hard_min = 0, hard_max = 65535 },
 ]
 
 [[constant]]
@@ -40,6 +42,15 @@ value = 3
 [[constant]]
 name = "SPAWN_LAUNCHER_FLAGS"
 value = 12
+# The spawning session is sent an EXIT event once the exit is final, so it
+# learns it without a WAIT. Advertised by LAUNCHER_FLAGS_EXTENDED (tag 19),
+# which old clients ignore: LAUNCHER_FLAGS (tag 11) keeps its v1 maximum.
+[[constant]]
+name = "SPAWN_REPORT_EXIT"
+value = 16
+[[constant]]
+name = "SPAWN_LAUNCHER_FLAGS_EXTENDED"
+value = 28
 
 [[constant]]
 name = "ENV_EMPTY"
@@ -325,6 +336,9 @@ value = 10
 [[constant]]
 name = "LIMIT_LAUNCHER_FLAGS"
 value = 11
+[[constant]]
+name = "LIMIT_LAUNCHER_FLAGS_EXTENDED"
+value = 19
 
 [[request]]
 name = "WATCH"
@@ -398,6 +412,15 @@ compression = "allowed"
 datagram = "forbidden"
 layout = "StateAck"
 
+[[event]]
+name = "EXIT"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ExitReport"
+
 [[type]]
 name = "cwd"
 layout = "kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16"
@@ -409,6 +432,10 @@ layout = "process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u
 [[type]]
 name = "remove_record"
 layout = "process_handle:u64"
+
+[[type]]
+name = "exit_report"
+layout = "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions"
 
 [[type]]
 name = "exit_record"

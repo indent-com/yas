@@ -20,7 +20,7 @@
 //! terminates every ordinary process it spawned; see [`crate::process`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -51,6 +51,8 @@ pub(crate) enum Route {
     Transfer(u32),
     /// State events for one `(family, subscription_id)`.
     State(u16, u32),
+    /// Process EXIT events for one process handle (a SPAWN with REPORT_EXIT).
+    ProcessExit(u64),
 }
 
 /// Registered by a call: run by the reader on an OK `Result`, before any later
@@ -63,12 +65,49 @@ pub(crate) type FrameReceiver = mpsc::UnboundedReceiver<Frame>;
 pub(crate) struct Reply {
     pub(crate) prefix: ResultPrefix,
     routes: Vec<(Route, FrameReceiver)>,
+    /// With a [`Route::ProcessExit`]: told if that process's attachment goes first.
+    report_lost: Option<Arc<ReportLost>>,
 }
 
 impl Reply {
     pub(crate) fn take(&mut self, route: Route) -> Option<FrameReceiver> {
         let index = self.routes.iter().position(|(key, _)| *key == route)?;
         Some(self.routes.swap_remove(index).1)
+    }
+
+    pub(crate) fn take_report_lost(&mut self) -> Option<Arc<ReportLost>> {
+        self.report_lost.take()
+    }
+}
+
+/// Marked when the attachment that would report a process's exit (SPAWN_REPORT_EXIT) goes
+/// before it: a Transfer RESET, sent or received, on any of its streams, or a DETACH. The
+/// server then sends no EXIT, and the exit is asked for with WAIT.
+#[derive(Debug, Default)]
+pub(crate) struct ReportLost {
+    lost: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ReportLost {
+    pub(crate) fn mark(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Once marked.
+    pub(crate) async fn lost(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_lost() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -86,6 +125,8 @@ struct Router {
     orphan_bytes: usize,
     released: HashSet<Route>,
     released_order: VecDeque<Route>,
+    /// The open transfers of processes that report their exit: a RESET on one marks it.
+    report_watch: HashMap<u32, Arc<ReportLost>>,
     closed: Option<Error>,
 }
 
@@ -106,6 +147,9 @@ impl Router {
 
     fn release(&mut self, route: Route) {
         self.routes.remove(&route);
+        if let Route::Transfer(transfer_id) = route {
+            self.report_watch.remove(&transfer_id);
+        }
         if let Some(frames) = self.orphans.remove(&route) {
             for frame in frames {
                 self.orphan_bytes = self.orphan_bytes.saturating_sub(frame.payload.len());
@@ -119,6 +163,16 @@ impl Router {
                     self.released.remove(&old);
                 }
             }
+        }
+    }
+
+    /// A transfer closed, or reset (either way): a reset one's process, if it reports its
+    /// exit, will not.
+    fn transfer_ended(&mut self, transfer_id: u32, reset: bool) {
+        if let Some(lost) = self.report_watch.remove(&transfer_id)
+            && reset
+        {
+            lost.mark();
         }
     }
 
@@ -161,6 +215,7 @@ impl Router {
         // Dropping the senders ends every stream and subscription; they then
         // report the session error.
         self.routes.clear();
+        self.report_watch.clear();
         self.orphans.clear();
         self.orphan_order.clear();
         self.orphan_bytes = 0;
@@ -412,6 +467,16 @@ impl Client {
         if let Some(error) = self.closed_reason() {
             return Err(error);
         }
+        if frame.header.kind == yas_wire::transfer::kind::RESET
+            && let Some(transfer_id) = transfer_event_id(&frame)
+        {
+            self.inner
+                .shared
+                .router
+                .lock()
+                .unwrap()
+                .transfer_ended(transfer_id, true);
+        }
         self.inner
             .outbound
             .send(frame)
@@ -617,7 +682,26 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
                     routes.push((route, receiver));
                 }
             }
-            if pending.reply.send(Ok(Reply { prefix, routes })).is_err() {
+            // A process that reports its exit: any of its transfers reset (its attachment
+            // went) means no EXIT comes.
+            let report_lost = routes
+                .iter()
+                .any(|(route, _)| matches!(route, Route::ProcessExit(_)))
+                .then(|| {
+                    let lost = Arc::new(ReportLost::default());
+                    for (route, _) in &routes {
+                        if let Route::Transfer(transfer_id) = route {
+                            router.report_watch.insert(*transfer_id, lost.clone());
+                        }
+                    }
+                    lost
+                });
+            let reply = Reply {
+                prefix,
+                routes,
+                report_lost,
+            };
+            if pending.reply.send(Ok(reply)).is_err() {
                 // The caller went away between sending and now.
             }
             Ok(())
@@ -625,11 +709,27 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
         Class::Event => {
             if frame.header.family == family::TRANSFER {
                 if let Some(transfer_id) = transfer_event_id(&frame) {
+                    let mut router = shared.router.lock().unwrap();
+                    let kind = frame.header.kind;
+                    if matches!(
+                        kind,
+                        yas_wire::transfer::kind::CLOSE | yas_wire::transfer::kind::RESET
+                    ) {
+                        router.transfer_ended(transfer_id, kind == yas_wire::transfer::kind::RESET);
+                    }
+                    router.deliver(Route::Transfer(transfer_id), frame);
+                }
+                return Ok(());
+            }
+            if frame.header.family == family::PROCESS
+                && frame.header.kind == yas_wire::process::event_kind::EXIT
+            {
+                if let Some(handle) = yas_wire::process::ExitReport::handle_of(&frame.payload) {
                     shared
                         .router
                         .lock()
                         .unwrap()
-                        .deliver(Route::Transfer(transfer_id), frame);
+                        .deliver(Route::ProcessExit(handle), frame);
                 }
                 return Ok(());
             }

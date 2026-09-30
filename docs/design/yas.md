@@ -3242,7 +3242,7 @@ of defining separate data and ACK messages.
 | Class   | Kinds                                        |
 | ------- | -------------------------------------------- |
 | Request | WATCH, UNWATCH, SPAWN, ATTACH, CONTROL, WAIT |
-| Event   | STATE, STATE_ACK                             |
+| Event   | STATE, STATE_ACK, EXIT                       |
 
 SPAWN executes exact argv and environment bytes without an implicit shell. It
 accepts explicit cwd, inherited terminal cwd, FS root/path, session environment,
@@ -3268,6 +3268,29 @@ TERMINATE's escalation SIGKILLs members left after the kill grace (terminates
 the job on Windows) and stops waiting for their streams. The exit's detail says `residual process group left
 running` when members held the streams.
 
+`REPORT_EXIT` (16) sends the spawning session the exit as it becomes final,
+without a WAIT: one EXIT Event (`0x0002`, sensitive), `[process_handle: u64,
+exit: bytes_u32 containing ExitRecord, Extensions]`, the record a WAIT would
+return at that moment. The streams go on with what the process wrote before its
+exit, at the pace of their credit, so the event can arrive before their last
+bytes and their CLOSE. The spawning session's attachment sends it: when that
+attachment goes before the exit (a Transfer RESET on any of its streams, stdin
+included, from either side, or a DETACH), no EXIT is sent and the client WAITs
+for the exit instead, as it would without the flag. yas-client does so on its
+own. The report takes none of the session's pending WAITs, and
+nothing changes for other sessions: they, and sessions that ATTACH, still WAIT.
+A SPAWN retried under its operation ID shares the original attachment, whose
+exit is reported once.
+
+Servers advertise the opt-in flags they honour in two optional family limits:
+tag 11 `LAUNCHER_FLAGS` carries those of v1 (`LEAVE_RESIDUE`, `STDIN_NULL`),
+at most 12, which is all clients from before `REPORT_EXIT` accept; tag 19
+`LAUNCHER_FLAGS_EXTENDED` carries every flag the server honours, when that is
+more. Tag 19 names each flag tag 11 does and adds none of v1's. It is a set of
+SPAWN flags, any u16: a client ignores the flags it does not know, so later
+flags need no new tag. A client sets `REPORT_EXIT` only when tag 19 offers it,
+and otherwise WAITs, so either side may be older.
+
 Catalog records contain argv0, native PID for diagnostics, lifecycle, owner
 session, detachable flag, stream offsets, exit record, and retention deadline.
 An ordinary process is owned by its spawning session and terminated when that
@@ -3282,7 +3305,8 @@ pipe is read at most a window ahead); an attachment of another session that fall
 a window behind has its Transfers reset `RESOURCE_EXHAUSTED`, and nothing else
 changes. CONTROL provides portable signal, terminate, kill,
 and detach actions with operation IDs. Closing the stdin Transfer half-closes
-stdin. WAIT returns the final exit record or TIMEOUT.
+stdin. WAIT returns the final exit record or TIMEOUT; a process spawned with
+`REPORT_EXIT` needs none, its EXIT Event carries the same record.
 
 The canonical v1 payloads are generated from
 `protocol/yas/families/process.toml`. SPAWN carries `[operation_id, flags,
