@@ -177,8 +177,8 @@ Terminals persist until closed or the daemon exits. Clean up when done.
 A terminal shared by several viewers is sized to the smallest of them.
 `yas client list` shows each client's views and sizes, and ends each row with
 the identifier that client reported, if any; set `YAS_CLIENT_IDENTIFIER` to
-name your own connections that way. Identifiers are passed on as is: not
-validated, not unique.
+name your own connections that way. Identifiers are passed on as is: UTF-8 of
+at most 1 KiB, otherwise unchecked, not unique.
 
 `attach` needs a real tty on stdin and repaints the remote grid in the
 alternate screen, so your scrollback survives. It exits with the remote

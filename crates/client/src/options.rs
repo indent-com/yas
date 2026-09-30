@@ -27,8 +27,11 @@ pub struct HelloOptions {
     /// Any text to tell this client apart by in the server's client list
     /// (`yas client list`): a person, a device, the app embedding it. That
     /// list shows each client's Terminal and Surface views, so this is what
-    /// says who a view's size came from. The server passes it on as is: it is
-    /// not validated, and several clients may report the same one. `None`
+    /// says who a view's size came from. The server passes it on as is: being
+    /// a `String`, it is UTF-8, and it must take at most
+    /// [`MAX_CLIENT_IDENTIFIER_BYTES`](yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES)
+    /// (1 KiB), the only things asked of it; several clients may report the
+    /// same one. `None`
     /// reports none. [`Client::set_identifier`](crate::Client::set_identifier)
     /// replaces it later.
     pub identifier: Option<String>,
@@ -110,9 +113,11 @@ impl HelloOptions {
             extensions.push(read_only_extension());
         }
         if let Some(identifier) = &self.identifier {
-            extensions.push(yas_wire::core::client_identifier_extension(
-                identifier.as_bytes(),
-            ));
+            extensions.push(
+                yas_wire::core::client_identifier_extension(identifier).map_err(|error| {
+                    Error::invalid(format!("invalid client identifier: {error}"))
+                })?,
+            );
         }
         extensions.sort_by_key(|extension| extension.tag);
         Ok(Extensions(extensions))

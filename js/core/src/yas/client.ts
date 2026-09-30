@@ -19,6 +19,7 @@ import {
   YAS_CLIENT_UNWATCH,
   YAS_CLIENT_VERSION,
   YAS_CLIENT_WATCH,
+  YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
   YAS_FAMILY_CLIENT,
 } from "./generated.js";
 import type { YasConnection } from "./session.js";
@@ -123,9 +124,9 @@ export interface YasClientRecord {
   auxiliarySubscriptionDetails: YasClientAuxiliarySubscriptionDetails | null;
   auxiliarySubscriptionTimings: YasClientAuxiliarySubscriptionTimings | null;
   bandwidthRates: YasClientBandwidthRates | null;
-  /** What the client reported for itself in HELLO or CLIENT_UPDATE, decoded
-   *  leniently (it is not validated, not even as UTF-8) and possibly shared
-   *  with other clients; null when it reported none. */
+  /** What the client reported for itself in HELLO or CLIENT_UPDATE: UTF-8,
+   *  otherwise unvalidated, and possibly shared with other clients; null
+   *  when it reported none. */
   identifier: string | null;
 }
 
@@ -489,17 +490,23 @@ export function decodeClientActiveSubscriptions(
   return { terminals, surfaces, auxiliary };
 }
 
-const lenientUtf8 = new TextDecoder("utf-8");
-
-/** The identifier a Client record carries, replacing whatever is not UTF-8
- *  rather than refusing it. */
+/** The identifier a Client record carries; one that is not UTF-8, or takes
+ *  more than `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES`, is a protocol error. */
 export function decodeClientIdentifier(
   extensions: readonly YasExtension[],
 ): string | null {
   const extension = extensions.find(
     (candidate) => candidate.tag === YAS_CLIENT_IDENTIFIER_EXTENSION,
   );
-  return extension ? lenientUtf8.decode(extension.value) : null;
+  if (!extension) return null;
+  if (extension.value.length > YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES)
+    throw new YasProtocolError(
+      `Client identifier takes ${extension.value.length} bytes, more than ${YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES}`,
+    );
+  const cursor = new YasCursor(extension.value);
+  const identifier = cursor.utf8(extension.value.length, "Client identifier");
+  cursor.end("Client identifier");
+  return identifier;
 }
 
 export function decodeClientBandwidthRates(

@@ -251,8 +251,8 @@ app's own session ID) to name it in the server's client list: `yas client
 list`, and Manage → Clients in the browser. That list shows each client's
 terminal and surface view sizes, and a shared terminal or window is sized to
 fit the smallest, so the identifier is how to tell whose view that is. YAS
-passes it on as is: it does not validate it, and several clients may report
-the same one.
+passes it on as is: it must be UTF-8 of at most 1 KiB and nothing else is
+checked, and several clients may report the same one.
 
 ```ts
 new YasWorkspace({

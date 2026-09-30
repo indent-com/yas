@@ -721,12 +721,10 @@ export class YasConnection {
    * after a reconnect, reports it too, even when this Request fails.
    */
   async updateClientIdentifier(identifier: string): Promise<void> {
+    // Encoded first: one too long to report throws before it is kept.
+    const update = encodeClientUpdate({ clientIdentifier: identifier });
     this.options.clientIdentifier = identifier;
-    await this.request(
-      YAS_FAMILY_CORE,
-      YAS_CORE_CLIENT_UPDATE,
-      encodeClientUpdate({ clientIdentifier: identifier }),
-    );
+    await this.request(YAS_FAMILY_CORE, YAS_CORE_CLIENT_UPDATE, update);
   }
 
   async cancel(targetRequestId: number): Promise<void> {

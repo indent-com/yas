@@ -201,6 +201,7 @@ export const YAS_CORE_CLIENT_HELLO_PLATFORM_EXTENSION = 2 as const;
 export const YAS_CORE_CLIENT_HELLO_INITIAL_WATCHES_EXTENSION = 3 as const;
 export const YAS_CORE_CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION = 4 as const;
 export const YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION = 5 as const;
+export const YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES = 1024 as const;
 export const YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION = 1 as const;
 export const YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION = 2 as const;
 export const YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION = 3 as const;
@@ -3189,7 +3190,7 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "client_identifier_extension",
-          "layout": "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:remaining; the client's own text for people to recognize it by, conventionally UTF-8; neither validated nor deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION"
+          "layout": "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:utf8 remaining, at most MAX_CLIENT_IDENTIFIER_BYTES bytes; the client's own text for people to recognize it by; invalid UTF-8 or a longer one fails HELLO or CLIENT_UPDATE with INVALID, and nothing else is validated or deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION"
         },
         {
           "name": "initial_watches_extension",
@@ -3244,6 +3245,10 @@ export const YAS_SCHEMA = {
         {
           "name": "CLIENT_HELLO_IDENTIFIER_EXTENSION",
           "value": 5
+        },
+        {
+          "name": "MAX_CLIENT_IDENTIFIER_BYTES",
+          "value": 1024
         },
         {
           "name": "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION",
@@ -4851,7 +4856,7 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "client_identifier",
-          "layout": "ClientRecord/ClientPatch optional extension tag 5 exact value identifier:remaining; the bytes the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unvalidated and possibly shared by other sessions; absent when it reported none"
+          "layout": "ClientRecord/ClientPatch optional extension tag 5 exact value identifier:utf8 remaining, at most Core MAX_CLIENT_IDENTIFIER_BYTES bytes; the text the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unchanged and possibly shared by other sessions; absent when it reported none"
         },
         {
           "name": "family_limits",

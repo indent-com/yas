@@ -458,10 +458,10 @@ impl Client {
     /// of its [`HelloOptions`](crate::HelloOptions)) with Core CLIENT_UPDATE.
     /// Client catalogue watchers see it at their next refresh. A read-only
     /// session cannot: its HELLO identifier stays.
-    pub async fn set_identifier(&self, identifier: impl Into<String>) -> Result<()> {
-        let extensions = yas_wire::Extensions(vec![yas_wire::core::client_identifier_extension(
-            identifier.into(),
-        )]);
+    pub async fn set_identifier(&self, identifier: &str) -> Result<()> {
+        let extension = yas_wire::core::client_identifier_extension(identifier)
+            .map_err(|error| Error::invalid(format!("invalid client identifier: {error}")))?;
+        let extensions = yas_wire::Extensions(vec![extension]);
         self.call_ok(
             yas_wire::family::CORE,
             yas_wire::core::request_kind::CLIENT_UPDATE,

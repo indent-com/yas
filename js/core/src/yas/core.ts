@@ -31,6 +31,7 @@ import {
   YAS_CORE_SHUTDOWN,
   YAS_CORE_VERSION,
   YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
+  YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
   YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION,
   YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION,
   YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION,
@@ -109,8 +110,9 @@ export interface YasClientHelloOptions {
    * Any text to tell this client apart by in the server's client list: a
    * person, a device, the embedding app's own session. That list shows each
    * client's Terminal and Surface views, so this is what says whose view
-   * sized them. Sent as is: the server neither validates it nor requires it
-   * to be unique. `YasConnection.updateClientIdentifier` replaces it later.
+   * sized them. Sent as UTF-8, at most `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES`
+   * (1 KiB) of it; the server checks nothing else and does not require it to
+   * be unique. `YasConnection.updateClientIdentifier` replaces it later.
    */
   clientIdentifier?: string;
   families?: readonly YasFamilyOffer[];
@@ -275,12 +277,21 @@ export function encodeClientHello(options: YasClientHelloOptions): Uint8Array {
   return writer.bytes(encodeExtensions(helloExtensions(options))).finish();
 }
 
-/** The HELLO or CLIENT_UPDATE extension reporting `identifier` as is. */
+/**
+ * The HELLO or CLIENT_UPDATE extension reporting `identifier` as is. Throws
+ * when its UTF-8 takes more than `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES` (1 KiB),
+ * which the server would refuse.
+ */
 export function clientIdentifierExtension(identifier: string): YasExtension {
+  const value = new TextEncoder().encode(identifier);
+  if (value.length > YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES)
+    throw new YasProtocolError(
+      `client identifier takes ${value.length} bytes, more than ${YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES}`,
+    );
   return {
     tag: YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
     required: false,
-    value: new TextEncoder().encode(identifier),
+    value,
   };
 }
 

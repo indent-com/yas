@@ -121,7 +121,11 @@ async fn list(on: Option<&str>, hub: &str) -> Result<(), String> {
             format_session_id(record.session_id),
             server_now.saturating_sub(record.connected_server_ns) / 1_000_000_000,
             format_origin(&record.origin),
-            format_identifier(record.identifier()),
+            format_identifier(
+                record
+                    .identifier()
+                    .map_err(|error| format!("invalid Client identifier: {error}"))?
+            ),
         );
     }
     Ok(())
@@ -205,12 +209,10 @@ fn format_origin(origin: &client::Origin) -> String {
     }
 }
 
-/// A client's reported identifier as one TSV field: not UTF-8 is shown
-/// lossily, controls escaped, and none at all as an empty field.
-fn format_identifier(identifier: Option<&[u8]>) -> String {
-    identifier.map_or_else(String::new, |value| {
-        escape_field(&String::from_utf8_lossy(value))
-    })
+/// A client's reported identifier as one TSV field: controls escaped, and none
+/// at all as an empty field.
+fn format_identifier(identifier: Option<&str>) -> String {
+    identifier.map_or_else(String::new, escape_field)
 }
 
 fn escape_field(value: &str) -> String {
@@ -255,11 +257,10 @@ mod tests {
     #[test]
     fn identifiers_are_one_field_whatever_they_hold() {
         assert_eq!(format_identifier(None), "");
-        assert_eq!(format_identifier(Some(b"")), "");
+        assert_eq!(format_identifier(Some("")), "");
         assert_eq!(
-            format_identifier(Some(b"pierre's\tlaptop")),
-            "pierre's\\tlaptop"
+            format_identifier(Some("pierre's\tlaptop 🖥")),
+            "pierre's\\tlaptop 🖥"
         );
-        assert_eq!(format_identifier(Some(&[b'a', 0xff])), "a\u{fffd}");
     }
 }

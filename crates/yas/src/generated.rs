@@ -350,6 +350,7 @@ pub const CLIENT_HELLO_PLATFORM_EXTENSION: u64 = 2;
 pub const CLIENT_HELLO_INITIAL_WATCHES_EXTENSION: u64 = 3;
 pub const CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION: u64 = 4;
 pub const CLIENT_HELLO_IDENTIFIER_EXTENSION: u64 = 5;
+pub const MAX_CLIENT_IDENTIFIER_BYTES: u64 = 1024;
 pub const SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION: u64 = 1;
 pub const SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION: u64 = 2;
 pub const SERVER_HELLO_PLATFORM_EXTENSION: u64 = 3;
@@ -382,7 +383,7 @@ super::TypeMetadata { name: "session_info", layout: "session_id:[u8;16],catalog_
 super::TypeMetadata { name: "server_diagnostics_extension", layout: "active_sessions:u32,relay_active:u32,relay_pending:u32,reserved:u32=0,aggregate_receive_limit:u64,aggregate_receive_buffered:u64; buffered<=limit" },
 super::TypeMetadata { name: "session_update", layout: "catalog_revision:u64 nonzero,ReceiveLimits,Extensions; max_frame and max_decoded cannot decrease within a session" },
 super::TypeMetadata { name: "family_update", layout: "catalog_revision:u64 nonzero,FamilyDescriptor; family_id and version match the selected descriptor" },
-super::TypeMetadata { name: "client_identifier_extension", layout: "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:remaining; the client's own text for people to recognize it by, conventionally UTF-8; neither validated nor deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION" },
+super::TypeMetadata { name: "client_identifier_extension", layout: "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:utf8 remaining, at most MAX_CLIENT_IDENTIFIER_BYTES bytes; the client's own text for people to recognize it by; invalid UTF-8 or a longer one fails HELLO or CLIENT_UPDATE with INVALID, and nothing else is validated or deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION" },
 super::TypeMetadata { name: "initial_watches_extension", layout: "count:u16,repeated family_id:u16,family_version:u16,watch_payload:bytes_u32" },
 super::TypeMetadata { name: "initial_watch_results_extension", layout: "count:u16,repeated embedded_watch_result:bytes_u32" },
 super::TypeMetadata { name: "negotiated_codecs_extension", layout: "count:u8,repeated codec:u16; nonzero,unique,ascending,subset of ClientHello codecs" },
@@ -400,6 +401,7 @@ super::ConstantMetadata { name: "CLIENT_HELLO_PLATFORM_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "CLIENT_HELLO_INITIAL_WATCHES_EXTENSION", value: 3 },
 super::ConstantMetadata { name: "CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION", value: 4 },
 super::ConstantMetadata { name: "CLIENT_HELLO_IDENTIFIER_EXTENSION", value: 5 },
+super::ConstantMetadata { name: "MAX_CLIENT_IDENTIFIER_BYTES", value: 1024 },
 super::ConstantMetadata { name: "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "SERVER_HELLO_PLATFORM_EXTENSION", value: 3 },
@@ -1057,7 +1059,7 @@ super::TypeMetadata { name: "active_subscriptions", layout: "terminal_count:u16,
 super::TypeMetadata { name: "bandwidth_rates", layout: "ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord" },
 super::TypeMetadata { name: "auxiliary_subscription_details", layout: "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the namespace prefix for KV or canonical worktree/gitdir path for Git; Git state-watch request_flags contain datasets in bits 0..15 plus GIT_WATCH_UNTRACKED/GIT_WATCH_IGNORED effective selection; Git query-watch request_flags contain GIT_QUERY_WATCH, query kind shifted by GIT_QUERY_KIND_SHIFT, and query flags in bits 0..15; state_watch_flags use StateWatch flags" },
 super::TypeMetadata { name: "auxiliary_subscription_timings", layout: "ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS" },
-super::TypeMetadata { name: "client_identifier", layout: "ClientRecord/ClientPatch optional extension tag 5 exact value identifier:remaining; the bytes the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unvalidated and possibly shared by other sessions; absent when it reported none" },
+super::TypeMetadata { name: "client_identifier", layout: "ClientRecord/ClientPatch optional extension tag 5 exact value identifier:utf8 remaining, at most Core MAX_CLIENT_IDENTIFIER_BYTES bytes; the text the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unchanged and possibly shared by other sessions; absent when it reported none" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[

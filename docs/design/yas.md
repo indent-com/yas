@@ -532,7 +532,7 @@ HELLO extension tags are:
 |   2 | `client_platform`   | typed records                  |
 |   3 | `initial_watches`   | repeated family WATCH requests |
 |   4 | `read_only_session` | REQUIRED, empty marker         |
-|   5 | `client_identifier` | bytes, conventionally UTF-8    |
+|   5 | `client_identifier` | UTF-8, at most 1 KiB           |
 
 `read_only_session` requests a server-enforced least-authority catalogue. It
 is REQUIRED so a server that does not understand the restriction rejects the
@@ -560,12 +560,14 @@ media acquisition or consent, CLIENT_UPDATE, and SHUTDOWN, is unadvertised and
 rejected. A read-only WebRTC producer injects this marker into the first HELLO;
 it never attempts to reproduce the policy by filtering operation bytes.
 
-`client_identifier` is whatever text the client chooses to be known by in
-Client records: a person, a device, an embedding application's own session.
-Its whole value is the identifier. The server neither validates it (not even
-as UTF-8) nor deduplicates it, and republishes it byte for byte as Client
-record extension tag 5; CLIENT_UPDATE may replace it. It is optional and
-authorizes nothing.
+`client_identifier` is whatever UTF-8 text the client chooses to be known by
+in Client records: a person, a device, an embedding application's own
+session. Its whole value is the identifier, at most
+`MAX_CLIENT_IDENTIFIER_BYTES` (1024) bytes so that its Client record always
+fits one State event. Invalid UTF-8 or a longer value makes HELLO (or
+CLIENT_UPDATE) fail with INVALID; beyond that the server neither validates nor
+deduplicates it, and republishes it unchanged as Client record extension tag
+5; CLIENT_UPDATE may replace it. It is optional and authorizes nothing.
 
 The `initial_watches` value is:
 
@@ -2143,8 +2145,9 @@ snapshot does not replace or suppress the independent bandwidth extension.
 
 Optional ClientRecord/ClientPatch extension tag 5 is the identifier the session
 last reported in its HELLO or CLIENT_UPDATE `client_identifier` extension,
-exactly as sent, and is absent when it reported none. The server does not
-validate it, and several sessions may carry the same one. Read next to the
+exactly as sent, and is absent when it reported none. It is UTF-8 of at most
+Core `MAX_CLIENT_IDENTIFIER_BYTES`, which decoders enforce; nothing else about
+it is checked, and several sessions may carry the same one. Read next to the
 active-subscription snapshot, it says whose Terminal rows and columns or
 Surface extent a shared terminal or surface is being sized to, since the
 smallest viewer bounds each.

@@ -6,6 +6,7 @@ import {
   YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_ORIGIN_EXTENSION,
   YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
+  YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
   YAS_FAMILY_FS,
   YasProtocolError,
   YasWriter,
@@ -179,18 +180,37 @@ describe("YAS Client family", () => {
     ]);
   });
 
-  it("reads a reported identifier leniently, whatever it holds", () => {
+  it("reads a reported identifier as UTF-8 of at most 1 KiB, and nothing else checked", () => {
     const identifier = (value: Uint8Array) =>
       decodeClientIdentifier([
         { tag: YAS_CLIENT_IDENTIFIER_EXTENSION, required: false, value },
       ]);
     expect(decodeClientIdentifier([])).toBeNull();
-    expect(identifier(new TextEncoder().encode("pierre's laptop"))).toBe(
-      "pierre's laptop",
+    expect(identifier(new TextEncoder().encode("pierre's\tlaptop 🖥"))).toBe(
+      "pierre's\tlaptop 🖥",
     );
     expect(identifier(new Uint8Array())).toBe("");
-    // Not validated, not even as UTF-8: shown, never refused.
-    expect(identifier(new Uint8Array([0x61, 0xff]))).toBe("a\ufffd");
+    expect(() => identifier(new Uint8Array([0x61, 0xff]))).toThrow(
+      YasProtocolError,
+    );
+    const longest = "é".repeat(YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES / 2);
+    expect(identifier(new TextEncoder().encode(longest))).toBe(longest);
+    expect(() => identifier(new TextEncoder().encode(`${longest}a`))).toThrow(
+      YasProtocolError,
+    );
+  });
+
+  it("refuses to report an identifier longer than 1 KiB", () => {
+    const longest = "é".repeat(YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES / 2);
+    expect(clientIdentifierExtension(longest).value).toHaveLength(
+      YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
+    );
+    expect(() => clientIdentifierExtension(`${longest}a`)).toThrow(
+      YasProtocolError,
+    );
+    expect(() =>
+      encodeClientUpdate({ clientIdentifier: `${longest}a` }),
+    ).toThrow(YasProtocolError);
   });
 
   it("reports an identifier in HELLO, in tag order, and in CLIENT_UPDATE", () => {

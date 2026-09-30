@@ -252,8 +252,9 @@ export interface YasClientInfo {
    *  ordinary network client. */
   origin: YasClientOrigin | null;
   /** What the client reported for itself (a person, a device, an embedding
-   *  app's session), unvalidated and not necessarily unique: the way to tell
-   *  whose view sized a terminal or a surface. Null when it reported none. */
+   *  app's session): UTF-8, otherwise unchecked, and not necessarily unique:
+   *  the way to tell whose view sized a terminal or a surface. Null when it
+   *  reported none. */
   identifier: string | null;
 }
 

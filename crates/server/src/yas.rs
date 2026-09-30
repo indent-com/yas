@@ -2038,7 +2038,11 @@ async fn serve_registered<S>(
         client_instance: hello.client_instance,
         name: hello.client_name.clone(),
         release: hello.client_release.clone(),
-        identifier: yas_wire::core::client_identifier(&hello.extensions).map(<[u8]>::to_vec),
+        // ClientHello::decode has refused a non-UTF-8 identifier already.
+        identifier: yas_wire::core::client_identifier(&hello.extensions)
+            .ok()
+            .flatten()
+            .map(str::to_owned),
     };
     // An embedded extension attempt is what it is regardless of the socket it
     // came in on; everything else is described by its transport.
@@ -5311,7 +5315,7 @@ async fn client_catalogue_snapshot(
         if let Some(identifier) = client
             .native_identity
             .as_ref()
-            .and_then(|identity| identity.identifier.clone())
+            .and_then(|identity| identity.identifier.as_deref())
         {
             extensions.push(yas_client::identifier_extension(identifier));
         }
@@ -5360,7 +5364,7 @@ async fn client_catalogue_snapshot(
         }
         // Tag 5 sorts after the subscription extensions above.
         if let Some(identifier) = &client.identity.identifier {
-            subscription_extensions.push(yas_client::identifier_extension(identifier.clone()));
+            subscription_extensions.push(yas_client::identifier_extension(identifier));
         }
         let extensions = Extensions(subscription_extensions);
         records.insert(
@@ -8090,8 +8094,15 @@ impl Session {
                             .send_result(&frame, Status::Unsupported, Vec::new())
                             .await;
                     }
-                    if let Some(identifier) = yas_wire::core::client_identifier(&extensions) {
-                        self.replace_client_identifier(identifier.to_vec()).await;
+                    match yas_wire::core::client_identifier(&extensions) {
+                        Ok(Some(identifier)) => {
+                            self.replace_client_identifier(identifier.to_owned()).await;
+                        }
+                        Ok(None) => {}
+                        // Not UTF-8: the one thing an identifier must be.
+                        Err(_) => {
+                            return self.send_result(&frame, Status::Invalid, Vec::new()).await;
+                        }
                     }
                     self.send_result(&frame, Status::Ok, Vec::new()).await
                 }
@@ -27206,7 +27217,7 @@ impl Session {
     /// Replace what this session reported as its identifier. Client catalogue
     /// watchers pick it up at their next refresh, as they do any other change
     /// to the record.
-    async fn replace_client_identifier(&mut self, identifier: Vec<u8>) {
+    async fn replace_client_identifier(&mut self, identifier: String) {
         let Some(state) = self.native.as_ref().map(|native| native.state.clone()) else {
             return;
         };
@@ -46238,17 +46249,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn client_catalogue_republishes_reported_identifiers_as_is() {
+    async fn client_catalogue_republishes_reported_utf8_identifiers() {
         let state = super::super::tests::process_transport::test_state(
             super::super::process::Server::new(false, true),
         );
-        // Not UTF-8, and reported by two sessions: the server passes it on
-        // regardless, for whoever reads the list to make sense of.
-        let odd = vec![0xff, b'\t', b'x'];
+        // Controls and all, and reported by two sessions: the server passes it
+        // on regardless, for whoever reads the list to make sense of.
+        let odd = "pierre's\tlaptop 🖥";
         let reporting = || {
-            Extensions(vec![yas_wire::core::client_identifier_extension(
-                odd.clone(),
-            )])
+            Extensions(vec![
+                yas_wire::core::client_identifier_extension(odd).unwrap(),
+            ])
         };
         let (mut watcher, watcher_codec, watcher_hello, watcher_task) =
             start_registered_session_with_hello_extensions(
@@ -46315,9 +46326,53 @@ mod tests {
             }
         }
         for session_id in [watcher_hello.session_id, target_hello.session_id] {
-            assert_eq!(records[&session_id].identifier(), Some(odd.as_slice()));
+            assert_eq!(records[&session_id].identifier().unwrap(), Some(odd));
         }
-        assert_eq!(records[&silent_hello.session_id].identifier(), None);
+        assert_eq!(
+            records[&silent_hello.session_id].identifier().unwrap(),
+            None
+        );
+
+        // Not UTF-8, or longer than 1 KiB: refused, and the identifier stays.
+        let reported = yas_wire::core::client_identifier_extension("").unwrap();
+        let too_long = vec![b'a'; yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES + 1];
+        for (request_id, value) in [(2, vec![0xff]), (3, too_long)] {
+            write_request(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                request_id,
+                &Extensions(vec![Extension {
+                    value,
+                    ..reported.clone()
+                }]),
+            )
+            .await;
+            assert_eq!(
+                next_result(
+                    &mut target,
+                    &target_codec,
+                    family::CORE,
+                    yas_wire::core::request_kind::CLIENT_UPDATE,
+                    request_id,
+                )
+                .await
+                .status,
+                Status::Invalid,
+            );
+            assert_eq!(
+                state
+                    .session
+                    .lock()
+                    .await
+                    .native_yas_clients
+                    .get(&target_hello.session_id)
+                    .and_then(|client| client.identity.identifier.clone())
+                    .as_deref(),
+                Some(odd),
+            );
+        }
 
         // CLIENT_UPDATE replaces it, and watchers see the record change.
         write_request(
@@ -46325,10 +46380,10 @@ mod tests {
             &target_codec,
             family::CORE,
             yas_wire::core::request_kind::CLIENT_UPDATE,
-            2,
-            &Extensions(vec![yas_wire::core::client_identifier_extension(
-                "pierre's laptop",
-            )]),
+            4,
+            &Extensions(vec![
+                yas_wire::core::client_identifier_extension("pierre's laptop").unwrap(),
+            ]),
         )
         .await;
         assert_eq!(
@@ -46337,7 +46392,7 @@ mod tests {
                 &target_codec,
                 family::CORE,
                 yas_wire::core::request_kind::CLIENT_UPDATE,
-                2,
+                4,
             )
             .await
             .status,
@@ -46353,7 +46408,7 @@ mod tests {
                 if event.records.iter().any(|state_record| {
                     yas_client::client_from_state_record(state_record).is_ok_and(|record| {
                         record.session_id == target_hello.session_id
-                            && record.identifier() == Some(&b"pierre's laptop"[..])
+                            && record.identifier() == Ok(Some("pierre's laptop"))
                     })
                 }) {
                     break;
