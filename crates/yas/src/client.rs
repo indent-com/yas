@@ -335,6 +335,13 @@ impl ClientRecord {
     pub fn bandwidth_rates(&self) -> Result<Option<BandwidthRates>> {
         decode_bandwidth_rates(&self.extensions)
     }
+
+    /// The identifier the client reported for itself in HELLO or
+    /// CLIENT_UPDATE, byte for byte: unvalidated, and possibly shared with
+    /// other clients. `None` when it reported none.
+    pub fn identifier(&self) -> Option<&[u8]> {
+        find_identifier(&self.extensions)
+    }
 }
 
 impl Encode for ClientRecord {
@@ -412,6 +419,29 @@ impl ClientPatch {
     pub fn bandwidth_rates(&self) -> Result<Option<BandwidthRates>> {
         decode_bandwidth_rates(&self.extensions)
     }
+
+    /// An updated client-reported identifier, when this patch carries one.
+    pub fn identifier(&self) -> Option<&[u8]> {
+        find_identifier(&self.extensions)
+    }
+}
+
+/// The Client record extension that republishes a client's reported
+/// identifier ([`crate::core::client_identifier_extension`]) unchanged.
+pub fn identifier_extension(identifier: impl Into<Vec<u8>>) -> Extension {
+    Extension {
+        tag: crate::schema::client::IDENTIFIER_EXTENSION as u16,
+        required: false,
+        value: identifier.into(),
+    }
+}
+
+fn find_identifier(extensions: &Extensions) -> Option<&[u8]> {
+    extensions
+        .0
+        .iter()
+        .find(|extension| extension.tag == crate::schema::client::IDENTIFIER_EXTENSION as u16)
+        .map(|extension| extension.value.as_slice())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -932,6 +962,8 @@ fn validate_record_extensions(extensions: &Extensions) -> Result<()> {
             {
                 AuxiliarySubscriptionTimings::decode(&extension.value)?;
             }
+            // Whatever the client reported, republished as is.
+            tag if tag == crate::schema::client::IDENTIFIER_EXTENSION as u16 => {}
             _ if extension.required => {
                 return Err(Error::Invalid("unknown required Client record extension"));
             }
@@ -1228,5 +1260,49 @@ mod tests {
             .encode()
             .is_err()
         );
+    }
+
+    #[test]
+    fn identifiers_are_republished_byte_for_byte() {
+        // Not UTF-8, not unique, not length-checked: whatever the client said.
+        let odd = vec![0xff, b'\t', 0, b'x'];
+        let mut record = ClientRecord {
+            session_id: [1; 16],
+            client_instance: [2; 16],
+            connected_server_ns: 3,
+            idle_ns: 4,
+            bytes_received: 5,
+            bytes_sent: 6,
+            name: "yas-cli".into(),
+            release: "1".into(),
+            label: "local client".into(),
+            origin: Origin::WebRtc {
+                peer_id: "peer".into(),
+            },
+            extensions: Extensions(vec![identifier_extension(odd.clone())]),
+        };
+        let decoded = ClientRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier(), Some(odd.as_slice()));
+
+        record.extensions = Extensions(vec![identifier_extension("")]);
+        let decoded = ClientRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier(), Some(&b""[..]));
+
+        record.extensions = Extensions::default();
+        assert_eq!(record.identifier(), None);
+
+        let patch = ClientPatch {
+            session_id: [1; 16],
+            extensions: Extensions(vec![Extension {
+                required: true,
+                ..identifier_extension("pierre's laptop")
+            }]),
+        };
+        let decoded = ClientPatch::decode(&patch.encode().unwrap()).unwrap();
+        assert_eq!(decoded.identifier(), Some(&b"pierre's laptop"[..]));
+
+        let hello = Extensions(vec![crate::core::client_identifier_extension(odd.clone())]);
+        assert_eq!(crate::core::client_identifier(&hello), Some(odd.as_slice()));
+        assert_eq!(crate::core::client_identifier(&Extensions::default()), None);
     }
 }

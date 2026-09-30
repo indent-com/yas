@@ -532,6 +532,7 @@ HELLO extension tags are:
 |   2 | `client_platform`   | typed records                  |
 |   3 | `initial_watches`   | repeated family WATCH requests |
 |   4 | `read_only_session` | REQUIRED, empty marker         |
+|   5 | `client_identifier` | bytes, conventionally UTF-8    |
 
 `read_only_session` requests a server-enforced least-authority catalogue. It
 is REQUIRED so a server that does not understand the restriction rejects the
@@ -558,6 +559,13 @@ including terminal creation/input/resizing, surface input/focus/resizing,
 media acquisition or consent, CLIENT_UPDATE, and SHUTDOWN, is unadvertised and
 rejected. A read-only WebRTC producer injects this marker into the first HELLO;
 it never attempts to reproduce the policy by filtering operation bytes.
+
+`client_identifier` is whatever text the client chooses to be known by in
+Client records: a person, a device, an embedding application's own session.
+Its whole value is the identifier. The server neither validates it (not even
+as UTF-8) nor deduplicates it, and republishes it byte for byte as Client
+record extension tag 5; CLIENT_UPDATE may replace it. It is optional and
+authorizes nothing.
 
 The `initial_watches` value is:
 
@@ -804,8 +812,11 @@ The counts and budget are server-wide diagnostic snapshots.
 `aggregate_receive_buffered` never exceeds `aggregate_receive_limit`.
 
 CLIENT_UPDATE changes non-authoritative connection presentation metadata such
-as a label. Display size, frame rate, decoder support, and queue depth belong
-to their actual Terminal or Surface view, not this connection-wide message.
+as a label. Its extensions use the HELLO extension tags; `client_identifier`
+(tag 5) replaces the identifier the session reported, and Client catalogue
+watchers observe the change as an ordinary record replacement. Display size,
+frame rate, decoder support, and queue depth belong to their actual Terminal or
+Surface view, not this connection-wide message.
 
 SHUTDOWN payload is:
 
@@ -2129,6 +2140,14 @@ exceeds it, the server keeps the deterministic sorted prefix in wire section
 order (Terminal, then Surface, then auxiliary). A catalogue refresh observes
 the snapshot transition as an ordinary Client record replacement. The active
 snapshot does not replace or suppress the independent bandwidth extension.
+
+Optional ClientRecord/ClientPatch extension tag 5 is the identifier the session
+last reported in its HELLO or CLIENT_UPDATE `client_identifier` extension,
+exactly as sent, and is absent when it reported none. The server does not
+validate it, and several sessions may carry the same one. Read next to the
+active-subscription snapshot, it says whose Terminal rows and columns or
+Surface extent a shared terminal or surface is being sized to, since the
+smallest viewer bounds each.
 
 Client family-limit tags 1 and 2 are the nonzero `u32` maximum published client
 records and maximum active subscriptions represented per client. Both are

@@ -24,6 +24,14 @@ pub struct HelloOptions {
     /// HELLO extension, so a server that does not understand it refuses the
     /// session instead of silently granting full control.
     pub read_only: bool,
+    /// Any text to tell this client apart by in the server's client list
+    /// (`yas client list`): a person, a device, the app embedding it. That
+    /// list shows each client's Terminal and Surface views, so this is what
+    /// says who a view's size came from. The server passes it on as is: it is
+    /// not validated, and several clients may report the same one. `None`
+    /// reports none. [`Client::set_identifier`](crate::Client::set_identifier)
+    /// replaces it later.
+    pub identifier: Option<String>,
 }
 
 impl Default for HelloOptions {
@@ -34,6 +42,7 @@ impl Default for HelloOptions {
             families: None,
             required: Vec::new(),
             read_only: false,
+            identifier: None,
         }
     }
 }
@@ -65,6 +74,12 @@ impl HelloOptions {
         self
     }
 
+    /// Report `identifier` as this client's identifier.
+    pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
+        self.identifier = Some(identifier.into());
+        self
+    }
+
     pub(crate) fn family_offers(&self) -> Vec<FamilyOffer> {
         yas_wire::schema::FAMILIES
             .iter()
@@ -93,6 +108,11 @@ impl HelloOptions {
         ];
         if self.read_only {
             extensions.push(read_only_extension());
+        }
+        if let Some(identifier) = &self.identifier {
+            extensions.push(yas_wire::core::client_identifier_extension(
+                identifier.as_bytes(),
+            ));
         }
         extensions.sort_by_key(|extension| extension.tag);
         Ok(Extensions(extensions))

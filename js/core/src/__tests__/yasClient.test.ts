@@ -3,13 +3,19 @@ import {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
+  YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_ORIGIN_EXTENSION,
+  YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
   YAS_FAMILY_FS,
   YasProtocolError,
   YasWriter,
+  clientIdentifierExtension,
   decodeClientActiveSubscriptions,
   decodeClientAuxiliarySubscriptionDetails,
   decodeClientAuxiliarySubscriptionTimings,
+  decodeClientIdentifier,
+  encodeClientHello,
+  encodeClientUpdate,
   type YasClientRecord,
 } from "../yas";
 
@@ -115,6 +121,7 @@ function clientRecord(): YasClientRecord {
     auxiliarySubscriptionDetails: null,
     auxiliarySubscriptionTimings: null,
     bandwidthRates: null,
+    identifier: null,
   };
 }
 
@@ -170,5 +177,55 @@ describe("YAS Client family", () => {
     expect([...decoded!.entries[0]!.resource]).toEqual([
       ...new TextEncoder().encode("/workspace"),
     ]);
+  });
+
+  it("reads a reported identifier leniently, whatever it holds", () => {
+    const identifier = (value: Uint8Array) =>
+      decodeClientIdentifier([
+        { tag: YAS_CLIENT_IDENTIFIER_EXTENSION, required: false, value },
+      ]);
+    expect(decodeClientIdentifier([])).toBeNull();
+    expect(identifier(new TextEncoder().encode("pierre's laptop"))).toBe(
+      "pierre's laptop",
+    );
+    expect(identifier(new Uint8Array())).toBe("");
+    // Not validated, not even as UTF-8: shown, never refused.
+    expect(identifier(new Uint8Array([0x61, 0xff]))).toBe("a\ufffd");
+  });
+
+  it("reports an identifier in HELLO, in tag order, and in CLIENT_UPDATE", () => {
+    const clientInstance = new Uint8Array(16).fill(1);
+    const platform = { tag: 2, value: new Uint8Array([9]) };
+    const later = { tag: 7, value: new Uint8Array() };
+    const expected = encodeClientHello({
+      clientInstance,
+      extensions: [platform, clientIdentifierExtension("pierre"), later],
+    });
+    expect(
+      encodeClientHello({
+        clientInstance,
+        clientIdentifier: "pierre",
+        extensions: [platform, later],
+      }),
+    ).toEqual(expected);
+    // The option wins over a stale extension with the same tag.
+    expect(
+      encodeClientHello({
+        clientInstance,
+        clientIdentifier: "pierre",
+        extensions: [platform, clientIdentifierExtension("stale"), later],
+      }),
+    ).toEqual(expected);
+    expect(encodeClientUpdate({ clientIdentifier: "x" })).toEqual(
+      new YasWriter()
+        .bytesU32(
+          new YasWriter()
+            .u16(YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION)
+            .u16(0)
+            .bytesU32(new Uint8Array([0x78]))
+            .finish(),
+        )
+        .finish(),
+    );
   });
 });

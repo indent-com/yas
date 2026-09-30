@@ -454,6 +454,25 @@ impl Client {
         Ok(R::decode(&reply.prefix.body)?)
     }
 
+    /// Replace the identifier this session reported in HELLO (the `identifier`
+    /// of its [`HelloOptions`](crate::HelloOptions)) with Core CLIENT_UPDATE.
+    /// Client catalogue watchers see it at their next refresh. A read-only
+    /// session cannot: its HELLO identifier stays.
+    pub async fn set_identifier(&self, identifier: impl Into<String>) -> Result<()> {
+        let extensions = yas_wire::Extensions(vec![yas_wire::core::client_identifier_extension(
+            identifier.into(),
+        )]);
+        self.call_ok(
+            yas_wire::family::CORE,
+            yas_wire::core::request_kind::CLIENT_UPDATE,
+            extensions.encode()?,
+            Some(DEFAULT_REQUEST_TIMEOUT),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Nanoseconds on this session's clock, for input events.
     pub(crate) fn monotonic_ns(&self) -> u64 {
         u64::try_from(self.inner.started.elapsed().as_nanos()).unwrap_or(u64::MAX)

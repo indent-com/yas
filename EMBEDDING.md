@@ -244,6 +244,27 @@ Surfaces created by the terminal appear in the connection's `surfaceStore`, keye
 - `setVisibleSessions(sessionIds)`
 - `addConnection(...)` / `removeConnection(connectionId)` / `reconnectConnection(connectionId)`
 
+### Client identifiers
+
+A connection can report an identifier of your choosing (a user, a device, your
+app's own session ID) to name it in the server's client list: `yas client
+list`, and Manage → Clients in the browser. That list shows each client's
+terminal and surface view sizes, and a shared terminal or window is sized to
+fit the smallest, so the identifier is how to tell whose view that is. YAS
+passes it on as is: it does not validate it, and several clients may report
+the same one.
+
+```ts
+new YasWorkspace({
+  wasm,
+  connections: [{ id: "default", transport, clientIdentifier: "alice@laptop" }],
+});
+```
+
+On a `YasConnection` of your own, pass `clientIdentifier` in its options, and
+call `updateClientIdentifier(text)` to replace it on the live session. The Rust
+client takes `HelloOptions::identifier` and `Client::set_identifier`.
+
 ### Transports
 
 All transports share a common set of options (`YasTransportOptions`):

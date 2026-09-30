@@ -251,6 +251,10 @@ export interface YasClientInfo {
   /** Null when the peer did not provide an origin; this is distinct from an
    *  ordinary network client. */
   origin: YasClientOrigin | null;
+  /** What the client reported for itself (a person, a device, an embedding
+   *  app's session), unvalidated and not necessarily unique: the way to tell
+   *  whose view sized a terminal or a surface. Null when it reported none. */
+  identifier: string | null;
 }
 
 /** Snapshot returned by listClients or a live subscribeClients callback. */

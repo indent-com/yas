@@ -76,12 +76,17 @@ function formatRate(value: number): string {
 /**
  * What to call a connection in the clients list.
  *
- * An extension is named by its definition, because "Client 7" tells a reader
- * nothing about the one row in the pane they did not open themselves. An
- * unnamed transient `ext run` falls back to `id:…`, the same handle the
+ * A client that reported an identifier is called by it, as reported: that is
+ * what tells a reader whose views are sizing a terminal or a surface. Nothing
+ * makes it unique, so two rows may share one.
+ *
+ * An extension is otherwise named by its definition, because "Client 7" tells
+ * a reader nothing about the one row in the pane they did not open themselves.
+ * An unnamed transient `ext run` falls back to `id:…`, the same handle the
  * extensions panel shows and the same one `yas ext status` accepts.
  */
 export function formatClientLabel(client: YasClientInfo): string {
+  if (client.identifier) return client.identifier;
   const origin = client.origin;
   if (origin?.kind !== "extension") {
     return tp("clients.clientName", { id: client.id });

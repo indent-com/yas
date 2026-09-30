@@ -518,6 +518,34 @@ impl Decode for NegotiatedCodecs {
     }
 }
 
+const CLIENT_IDENTIFIER_TAG: u16 = crate::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION as u16;
+
+/// The optional HELLO or CLIENT_UPDATE extension through which a client
+/// reports an identifier: any text of its choosing (a person, a device, an
+/// embedding app's own session) for people to tell it apart by. The server
+/// republishes it byte for byte in the client's Client record
+/// ([`crate::client::ClientRecord::identifier`]), next to the Terminal and
+/// Surface views the client holds open, so a client list can say who sized a
+/// terminal or a surface. It is neither validated nor deduplicated: two
+/// sessions may report the same identifier. CLIENT_UPDATE replaces it.
+pub fn client_identifier_extension(identifier: impl Into<Vec<u8>>) -> Extension {
+    Extension {
+        tag: CLIENT_IDENTIFIER_TAG,
+        required: false,
+        value: identifier.into(),
+    }
+}
+
+/// The identifier a client reported in a HELLO's or a CLIENT_UPDATE's
+/// `extensions`, exactly as sent, or `None` when it reported none.
+pub fn client_identifier(extensions: &Extensions) -> Option<&[u8]> {
+    extensions
+        .0
+        .iter()
+        .find(|extension| extension.tag == CLIENT_IDENTIFIER_TAG)
+        .map(|extension| extension.value.as_slice())
+}
+
 /// What a peer is running on: the operating system, the CPU architecture, and
 /// the platform flavour that distinguishes two builds for the same pair.
 ///
@@ -1710,6 +1738,27 @@ mod tests {
         for end in 0..bytes.len() {
             assert!(ClientHello::decode(&bytes[..end]).is_err(), "prefix {end}");
         }
+    }
+
+    #[test]
+    fn client_hello_carries_any_identifier() {
+        let identifier = vec![0xc3, 0x28, b'\n', 0];
+        let hello = ClientHello {
+            min_minor: 0,
+            max_minor: 0,
+            receive: limits(),
+            client_instance: [0xaa; 16],
+            client_name: "web".into(),
+            client_release: "1".into(),
+            families: Vec::new(),
+            codecs: Vec::new(),
+            extensions: Extensions(vec![client_identifier_extension(identifier.clone())]),
+        };
+        let decoded = ClientHello::decode(&hello.encode().unwrap()).unwrap();
+        assert_eq!(
+            client_identifier(&decoded.extensions),
+            Some(identifier.as_slice())
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ import {
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
+  YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
   YAS_CLIENT_MAX_PUBLISHED_CLIENTS,
   YAS_CLIENT_LIMIT_MAX_PUBLISHED_CLIENTS,
@@ -55,6 +56,7 @@ export {
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
+  YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
   YAS_CLIENT_ORIGIN_EDGE,
   YAS_CLIENT_ORIGIN_EXTENSION,
@@ -121,6 +123,10 @@ export interface YasClientRecord {
   auxiliarySubscriptionDetails: YasClientAuxiliarySubscriptionDetails | null;
   auxiliarySubscriptionTimings: YasClientAuxiliarySubscriptionTimings | null;
   bandwidthRates: YasClientBandwidthRates | null;
+  /** What the client reported for itself in HELLO or CLIENT_UPDATE, decoded
+   *  leniently (it is not validated, not even as UTF-8) and possibly shared
+   *  with other clients; null when it reported none. */
+  identifier: string | null;
 }
 
 export interface YasClientBandwidthRates {
@@ -276,6 +282,7 @@ export function decodeClientRecord(bytes: Uint8Array): YasClientRecord {
     auxiliarySubscriptionTimings:
       decodeClientAuxiliarySubscriptionTimings(extensions),
     bandwidthRates: decodeClientBandwidthRates(extensions),
+    identifier: decodeClientIdentifier(extensions),
   };
   cursor.end("Client record");
   requireNonzeroId(record.sessionId, "Client session ID");
@@ -480,6 +487,19 @@ export function decodeClientActiveSubscriptions(
   }
   cursor.end("Client active subscriptions");
   return { terminals, surfaces, auxiliary };
+}
+
+const lenientUtf8 = new TextDecoder("utf-8");
+
+/** The identifier a Client record carries, replacing whatever is not UTF-8
+ *  rather than refusing it. */
+export function decodeClientIdentifier(
+  extensions: readonly YasExtension[],
+): string | null {
+  const extension = extensions.find(
+    (candidate) => candidate.tag === YAS_CLIENT_IDENTIFIER_EXTENSION,
+  );
+  return extension ? lenientUtf8.decode(extension.value) : null;
 }
 
 export function decodeClientBandwidthRates(
@@ -791,6 +811,7 @@ export class YasClientCatalog {
           auxiliarySubscriptionTimings:
             decodeClientAuxiliarySubscriptionTimings(mergedExtensions),
           bandwidthRates: decodeClientBandwidthRates(mergedExtensions),
+          identifier: decodeClientIdentifier(mergedExtensions),
         });
         retention.upsert(key, estimateStateRetainedBytes(next));
         target.set(key, next);

@@ -38,6 +38,10 @@ name = "CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION"
 value = 4
 
 [[constant]]
+name = "CLIENT_HELLO_IDENTIFIER_EXTENSION"
+value = 5
+
+[[constant]]
 name = "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION"
 value = 1
 
@@ -253,6 +257,10 @@ layout = "catalog_revision:u64 nonzero,ReceiveLimits,Extensions; max_frame and m
 [[type]]
 name = "family_update"
 layout = "catalog_revision:u64 nonzero,FamilyDescriptor; family_id and version match the selected descriptor"
+
+[[type]]
+name = "client_identifier_extension"
+layout = "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:remaining; the client's own text for people to recognize it by, conventionally UTF-8; neither validated nor deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION"
 
 [[type]]
 name = "initial_watches_extension"

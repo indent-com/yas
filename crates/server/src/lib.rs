@@ -956,6 +956,10 @@ struct NativeClientIdentity {
     client_instance: [u8; 16],
     name: String,
     release: String,
+    /// The identifier the client last reported (HELLO, then CLIENT_UPDATE),
+    /// byte for byte: never validated or deduplicated, only republished in
+    /// its Client record so a list can say whose views size what.
+    identifier: Option<Vec<u8>>,
 }
 
 /// A YAS session registered directly with the shared backend. This is the

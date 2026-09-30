@@ -2118,6 +2118,7 @@ function productClient(
       scale120: entry.scale120 || null,
     })),
     origin: productOrigin(record.origin),
+    identifier: record.identifier,
   };
 }
 
