@@ -1490,6 +1490,11 @@ async fn surfaces_are_none_without_the_compositor() {
         .await
         .unwrap_err();
     assert!(missing.is_not_found(), "{missing:?}");
+    let missing = client
+        .capture_surface_at(1, 1, CaptureFormat::Png)
+        .await
+        .unwrap_err();
+    assert!(missing.is_not_found(), "{missing:?}");
 }
 
 /// Against a real window: build the compositor's probe client
@@ -1574,7 +1579,46 @@ async fn surfaces_capture_take_input_and_close_with_the_paste_probe() {
         .await
         .unwrap();
     client.type_surface_text(surface.id, "é").await.unwrap();
+    // At the revision listed, the capture goes at once.
+    let listed = client.surface(surface.id).await.unwrap();
+    let png = client
+        .capture_surface_at(surface.id, listed.revision, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
     client.resize_surface(surface.id, 320, 240).await.unwrap();
+    // Once the window changed, that revision is stale: the server says so, and
+    // capture_surface_at looks the window up again rather than failing.
+    let deadline = Instant::now() + TIMEOUT;
+    while client.surface(surface.id).await.unwrap().revision == listed.revision {
+        assert!(
+            Instant::now() < deadline,
+            "the resize never changed the window"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stale = client
+        .request_raw(
+            yas_client::wire::family::SURFACE,
+            yas_client::wire::surface::request_kind::CAPTURE,
+            yas_client::wire::Encode::encode(&yas_client::wire::surface::Capture {
+                surface_handle: surface.id,
+                revision: listed.revision,
+                initial_receive_credit: 0,
+                formats: vec![yas_client::wire::schema::surface::CAPTURE_PNG as u8],
+                extensions: Default::default(),
+            })
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status, yas_client::wire::core::Status::Stale);
+    let png = client
+        .capture_surface_at(surface.id, listed.revision, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
 
     // A read-only session sees the window but cannot send it input.
     let viewer = server
