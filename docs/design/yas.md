@@ -2862,10 +2862,10 @@ Optional family limit `CAPABILITIES` (tag `LIMIT_CAPABILITIES` = 14, `u32`)
 advertises the opt-in values a server implements: `CAPABILITY_OS_ERROR` (1),
 `CAPABILITY_READ_LIST` (2), `CAPABILITY_READ_REALPATH` (4),
 `CAPABILITY_READ_STAT_ONLY` (8), `CAPABILITY_STAGE_IN_PLACE` (16), and
-`CAPABILITY_APPLY_IN_PLACE` (32); `CAPABILITY_FLAGS` (63) is their union. Absent means zero and receivers ignore
-unknown bits. A client sends an opt-in question kind or flag only when its bit
-is set; an older server rejects them as INVALID. Nothing changes for a client
-that sends none of them.
+`CAPABILITY_APPLY_IN_PLACE` (32); `CAPABILITY_FLAGS` (63) is their union.
+Absent means zero and receivers ignore unknown bits. A client sends an opt-in
+question kind or flag only when its bit is set; an older server rejects them as
+INVALID. Nothing changes for a client that sends none of them.
 
 A failed top-level FS Result whose failure came from an OS error adds optional
 ResultPrefix `detail` tag `RESULT_OS_ERROR_EXTENSION` (2), whose exact value is

@@ -2568,6 +2568,8 @@ fn commit_in_place(
 /// the content's hash, the operation marking the entry, and COMMIT flags
 /// (`COMMIT_SYNC_DATA`, `COMMIT_SYNC_DIRECTORY`; APPLY gives none).
 struct InPlace {
+    /// Read on Unix alone: a file Windows creates takes its directory's ACL.
+    #[cfg_attr(not(unix), allow(dead_code))]
     mode: u32,
     content_hash: [u8; 32],
     operation_id: [u8; 16],
