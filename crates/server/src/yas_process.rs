@@ -1747,6 +1747,9 @@ mod tests {
             .expect("the exit is kept for its owner");
         assert!(!watched.running);
         assert_eq!(watched.exit.map(|exit| exit.code), Some(4));
+        // The eviction follows the release that `left_the_catalogue` saw: wait for it (a permit
+        // is kept when it came first).
+        within_5s(evictions.notified()).await;
         assert_eq!(evictions.take(), vec![1]);
         manager.shutdown().await;
         server.shutdown().await;
