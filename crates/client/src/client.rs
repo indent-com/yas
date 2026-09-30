@@ -249,6 +249,8 @@ struct Inner {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The session clock that input events' `client_monotonic_ns` count on.
     started: std::time::Instant,
+    /// What this client offered to receive at once ([`HelloOptions::receive_budget`]).
+    receive_budget: u64,
 }
 
 impl Drop for Inner {
@@ -317,6 +319,7 @@ impl Client {
     /// runtime: it spawns the reader and writer tasks.
     pub fn from_native(native: NativeClient) -> Self {
         let hello = native.hello().clone();
+        let receive_budget = native.receive_budget();
         let (reader, sender) = native.into_framed();
         let (closed, _) = watch::channel(None);
         let shared = Arc::new(Shared {
@@ -334,6 +337,7 @@ impl Client {
                 next_request_id: AtomicU32::new(3),
                 tasks: vec![writer, reader],
                 started: std::time::Instant::now(),
+                receive_budget,
             }),
         }
     }
@@ -341,6 +345,13 @@ impl Client {
     /// The server's HELLO answer, updated by catalogue changes.
     pub fn hello(&self) -> ServerHello {
         self.inner.shared.hello.read().unwrap().clone()
+    }
+
+    /// How many bytes the server may have on their way to this session at
+    /// once, as this client offered in HELLO
+    /// ([`HelloOptions::receive_budget`]).
+    pub fn receive_budget(&self) -> u64 {
+        self.inner.receive_budget
     }
 
     /// The server instance name (`default`, or the `--name` it runs under).

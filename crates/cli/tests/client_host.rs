@@ -1011,6 +1011,70 @@ async fn a_server_from_before_report_exit_is_waited_for() {
     exits_come_with_all_their_output(&server, &client).await;
 }
 
+/// Every stdout/stderr stream holds its window of the session's receive budget
+/// while it is open, writing or not. A client that asks for a wider budget
+/// gets windows that still all fit: at 256 processes a session in 256 MiB,
+/// 384 KiB each, where 16 MiB gives 24 KiB. With 255 quiet processes holding
+/// theirs (510 streams, 191 MiB: more than the default budget), one more still
+/// gets credit, and all of its output at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wider_receive_budget_fits_every_process_window() {
+    const BUDGET: u64 = 256 << 20;
+    const QUIET: usize = 255;
+    let server = within(
+        "hosted server start",
+        HostedServer::start(
+            options()
+                .args(["--process-max-per-session", "256"])
+                .args(["--process-max", "1024"])
+                .hello(HelloOptions::named("yas-test").receive_budget(BUDGET)),
+        ),
+    )
+    .await
+    .expect("hosted server starts");
+    let narrow = server
+        .connect_with(&HelloOptions::named("yas-test"))
+        .await
+        .unwrap();
+    assert_eq!(narrow.default_process_window(), 24 * 1024);
+    drop(narrow);
+    let client = server.connect().await.unwrap();
+    assert_eq!(client.receive_budget(), BUDGET);
+    assert_eq!(client.default_process_window(), 384 * 1024);
+    let mut quiet = Vec::with_capacity(QUIET);
+    for _ in 0..QUIET {
+        quiet.push(client.spawn(Command::new("sleep").arg("60")).await.unwrap());
+    }
+    // Three windows of output: it comes whole only if credit keeps coming.
+    const BYTES: usize = 3 * 384 * 1024;
+    let started = Instant::now();
+    let output = within(
+        "a command beside the quiet ones",
+        client
+            .spawn(Command::new("sh").args(["-c", &format!("head -c {BYTES} /dev/zero; echo end")]))
+            .await
+            .unwrap()
+            .output(),
+    )
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    assert!(output.status.success(), "{}", output.status);
+    assert_eq!(output.stdout.len(), BYTES + 4);
+    assert!(output.stdout.ends_with(b"end\n"));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    for process in &quiet {
+        process.kill().await.unwrap();
+    }
+    for process in &quiet {
+        within("a quiet process's exit", process.wait())
+            .await
+            .unwrap();
+    }
+    drop(quiet);
+    still_runs_commands(&client).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commands_background_children_die_with_it() {
     let server = start().await;
