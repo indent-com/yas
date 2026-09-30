@@ -3282,6 +3282,29 @@ nothing changes for other sessions: they, and sessions that ATTACH, still WAIT.
 A SPAWN retried under its operation ID shares the original attachment, whose
 exit is reported once.
 
+`KEEP_OUTPUT` (32), with `REPORT_EXIT` and SPAWN extension tag 4
+`head_bytes: u64, tail_bytes: u64` (the tail at most
+`MAX_KEEP_OUTPUT_TAIL_BYTES`, 1 MiB), sends only the head and the tail of each
+output stream: what comes between is dropped as the server reads it, never
+held for the client's credit, so the pipe drains at the writer's speed. The
+head is at least `head_bytes` and ends between characters, as a WHATWG UTF-8
+decoder with replacement reads the whole stream: where it is between
+characters, or where the next byte cannot continue the character it is in. The
+tail is at most `tail_bytes`, starts between characters, and once anything was
+dropped never starts with a continuation byte. Decoding the head and the tail,
+apart or one after the other, gives exactly the characters they have within the
+whole. The Transfer carries the head then the tail, contiguous; the EXIT event
+says what was dropped of each stream in extension tag 1 (stdout) and 2
+(stderr), present only when something was: `OutputElision`
+`[offset: u64, bytes: u64, lines: u64, code_points: u64, utf16_units: u64]`,
+where `offset` is the head's length and the counts are the dropped bytes as
+that decoder reads them within the whole stream. A client can then say how
+much it did not get in the units it counts. The tail goes out when the stream
+ends, or before the exit is reported when the stream outlives it (a residue
+past its grace, a TERMINATE, a lost owner, a forced cleanup): what is written
+after that goes to nobody. A tail cut short by an aborted stream is not counted
+in the elision; that stream does not end cleanly.
+
 Servers advertise the opt-in flags they honour in two optional family limits:
 tag 11 `LAUNCHER_FLAGS` carries those of v1 (`LEAVE_RESIDUE`, `STDIN_NULL`),
 at most 12, which is all clients from before `REPORT_EXIT` accept; tag 19
