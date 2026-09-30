@@ -574,16 +574,32 @@ impl Session {
                 // replay is recorded before the route is removed.
                 return Ok(Some(exit));
             } else {
+                // A look refused as CONFLICT is one that comes too soon: the process's exit is
+                // on its way to its watchers (it is final once they have it), or this session's
+                // own last look at it, a CONTROL's, is still leaving. Either settles with the
+                // catalogue's next change, after which the WAIT looks again.
+                let revision = self.inner.server.native_catalogue_revision();
                 match self
                     .watch_process(request.process_handle, false, true)
-                    .await?
+                    .await
                 {
-                    WatchOutcome::Exited(exit) => return Ok(Some(exit)),
-                    WatchOutcome::Running(attachment) => {
+                    Ok(WatchOutcome::Exited(exit)) => return Ok(Some(exit)),
+                    Ok(WatchOutcome::Running(attachment)) => {
                         let exit = attachment.route.exit.subscribe();
                         let failed = attachment.route.failed.subscribe();
                         (exit, failed, Some(attachment))
                     }
+                    Err(Error::Conflict) => {
+                        let settled = self.inner.server.wait_native_catalogue_change(revision);
+                        match deadline {
+                            None => settled.await,
+                            Some(deadline) => tokio::time::timeout_at(deadline, settled)
+                                .await
+                                .map_err(|_| Error::Timeout)?,
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
                 }
             };
         let wait = async {
@@ -1183,6 +1199,13 @@ mod tests {
         assert_eq!(exits.get(newest).unwrap().code, newest as i32);
     }
 
+    /// FUTURE, which must end within 5 s.
+    async fn within_5s<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("within 5 s")
+    }
+
     fn spawn_request(argv: Vec<Vec<u8>>, env: Vec<EnvEntry>) -> wire::Spawn {
         wire::Spawn {
             operation_id: [7; 16],
@@ -1552,10 +1575,13 @@ mod tests {
                         attachment.acknowledge_output(stream, end).unwrap();
                     }
                 }
+                // Its stdin reports when the child lets go of it, among the frames.
+                Event::StdinProgress { .. } => {}
                 other => panic!("{other:?}"),
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // `z` is in the pipe once the child is gone.
+        within_5s(server.wait_reaped(attachment.process_handle)).await;
         attachment.acknowledge_output(Stream::Stdout, end).unwrap();
         let (rest, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), end).await;
         assert_eq!((rest, exit.code), (b"z".to_vec(), 0));
@@ -1594,6 +1620,49 @@ mod tests {
         let exit = owner.wait(&wait).await.unwrap();
         assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
         owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// WAIT on a detached process right after this session KILLed it: the CONTROL's own look at
+    /// the process may still be leaving, or its exit still on its way to its watchers, when the
+    /// WAIT looks. The WAIT waits for that to settle and answers with the exit, never CONFLICT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_right_after_a_kill_of_a_detached_process_gets_its_exit() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([12; 16], None).unwrap();
+        for round in 1..=64u8 {
+            let mut request = spawn_request(sh("exec {sleep} 30"), Vec::new());
+            request.flags = schema::process::SPAWN_DETACHABLE as u16;
+            let attachment = session.spawn(&request, None).await.unwrap();
+            let handle = attachment.process_handle;
+            let (control_half, _events) = attachment.split();
+            control_half.detach().await.unwrap();
+            session
+                .control(&wire::Control {
+                    process_handle: handle,
+                    operation_id: [round; 16],
+                    action: wire::ControlAction::Kill,
+                    value: 0,
+                    extensions: Extensions::default(),
+                })
+                .await
+                .unwrap();
+            let wait = wire::Wait {
+                process_handle: handle,
+                timeout_ns: 5_000_000_000,
+                extensions: Extensions::default(),
+            };
+            let exit = tokio::time::timeout(Duration::from_secs(10), session.wait(&wait))
+                .await
+                .expect("the WAIT answers")
+                .expect("with the exit");
+            assert!(
+                matches!(exit.kind, wire::ExitKind::Killed | wire::ExitKind::Signal),
+                "{exit:?}"
+            );
+        }
+        session.shutdown().await;
         server.shutdown().await;
     }
 

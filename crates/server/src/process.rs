@@ -889,6 +889,28 @@ impl Server {
             .map(|record| record.cwd.clone())
     }
 
+    /// The catalogue's revision, which every change of it moves: what
+    /// [`Self::wait_native_catalogue_change`] waits past.
+    pub(crate) fn native_catalogue_revision(&self) -> u64 {
+        self.0.state.lock().unwrap().catalog_revision
+    }
+
+    /// Tests: until the child of `process_handle` is reaped (at once when it is not live).
+    #[cfg(all(test, unix))]
+    pub(crate) async fn wait_reaped(&self, process_handle: u64) {
+        let record = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .live
+            .get(&process_handle)
+            .and_then(Weak::upgrade);
+        if let Some(record) = record {
+            record.wait_reaped().await;
+        }
+    }
+
     pub(crate) async fn wait_native_catalogue_change(&self, revision: u64) {
         loop {
             let notified = self.0.catalog_changed.notified();
