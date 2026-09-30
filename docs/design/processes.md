@@ -107,7 +107,12 @@ yas-client's `Command::keep_output` asks for it where offered, and
 `Process::elided` reads the counts. Closing stdin half-closes the
 child stream. An ordinary child belongs
 to its spawning session and is terminated when it disappears; a detachable
-child remains discoverable until its retained final record expires.
+child remains discoverable until its retained final record expires. The spawning
+session can still WAIT for an ordinary child that has gone when its exit did not
+reach it: its attachment went first (a stream reset or dropped, a DETACH, a
+route failed as the exit came), or the exit found its queue full. The server
+keeps such exits for that session alone, as many as the process generations
+maximum (64 by default, never fewer), until the session ends.
 
 Arguments and environment values preserve arbitrary bytes on Unix and use exact
 UTF-8-to-native conversion on Windows. The cwd union is server default, native

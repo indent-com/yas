@@ -574,16 +574,35 @@ impl Session {
                 // replay is recorded before the route is removed.
                 return Ok(Some(exit));
             } else {
+                // A look refused as CONFLICT is one that comes too soon: the process's exit is
+                // on its way to its watchers (it is final once they have it), or this session's
+                // own look at it is still bound (a concurrent CONTROL's, or a route that failed
+                // and has yet to detach). The WAIT waits for that to settle, then looks again.
+                let revision = self.inner.server.native_catalogue_revision();
                 match self
                     .watch_process(request.process_handle, false, true)
-                    .await?
+                    .await
                 {
-                    WatchOutcome::Exited(exit) => return Ok(Some(exit)),
-                    WatchOutcome::Running(attachment) => {
+                    Ok(WatchOutcome::Exited(exit)) => return Ok(Some(exit)),
+                    Ok(WatchOutcome::Running(attachment)) => {
                         let exit = attachment.route.exit.subscribe();
                         let failed = attachment.route.failed.subscribe();
                         (exit, failed, Some(attachment))
                     }
+                    Err(Error::Conflict) => {
+                        let settled = self
+                            .inner
+                            .manager
+                            .wait_native_look(request.process_handle, revision);
+                        match deadline {
+                            None => settled.await,
+                            Some(deadline) => tokio::time::timeout_at(deadline, settled)
+                                .await
+                                .map_err(|_| Error::Timeout)?,
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
                 }
             };
         let wait = async {
@@ -972,26 +991,25 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
             }
             Ok(())
         }
-        process::NativeEvent::Exit { process_id, exit } => {
+        process::NativeEvent::Exit {
+            process_id,
+            process_handle,
+            exit,
+        } => {
             let exit = native_exit_info(exit);
+            // The replay goes first, and whether the route is there or not: a WAIT in this
+            // session that no longer finds the route (it left, or failed as the exit was queued)
+            // must find the exit.
+            inner
+                .exits
+                .lock()
+                .unwrap()
+                .insert(process_handle, exit.clone());
             let route = {
                 let mut routes = inner.routes.lock().unwrap();
-                // Its route failed as the exit was queued: that attachment is gone already. No
-                // replay is recorded (the handle left with the route), so a WAIT in this session
-                // answers CONFLICT while the exit is in flight, then NOT_FOUND.
                 let Some(route) = routes.get(&process_id).cloned() else {
                     return Ok(());
                 };
-                let process_handle = route.process_handle.load(Ordering::Acquire);
-                if process_handle != 0 {
-                    // Record the replay before the route disappears: a WAIT
-                    // that no longer finds the route must find the exit.
-                    inner
-                        .exits
-                        .lock()
-                        .unwrap()
-                        .insert(process_handle, exit.clone());
-                }
                 routes.remove(&process_id);
                 route.exit.send_replace(Some(exit.clone()));
                 route
@@ -1181,6 +1199,13 @@ mod tests {
         // WAIT has no operation ID, so successful delivery remains retryable
         // until ordinary FIFO churn evicts the replay.
         assert_eq!(exits.get(newest).unwrap().code, newest as i32);
+    }
+
+    /// FUTURE, which must end within 5 s.
+    async fn within_5s<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("within 5 s")
     }
 
     fn spawn_request(argv: Vec<Vec<u8>>, env: Vec<EnvEntry>) -> wire::Spawn {
@@ -1509,57 +1534,79 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_watcher_whose_queue_fills_after_the_exit_fails_alone() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
         let server = Server::new(false, true);
         let runtime = Runtime::new(server.clone());
         let owner = runtime.session([6; 16], None).unwrap();
         let watcher = runtime.session([7; 16], None).unwrap();
-        let mut attachment = owner
-            .spawn(
-                &spawn_request(
-                    sh(
-                        "{sleep} 0.3; i=0; while [ $i -lt 80 ]; do echo x; {sleep} 0.02; \
-                        i=$((i+1)); done; printf z; exit 0",
-                    ),
-                    Vec::new(),
-                ),
-                None,
-            )
-            .await
-            .unwrap();
-        // Never read: its route queue (80 events) fills with the 80 lines, and the last
-        // frame comes after the child exits.
-        let _watched = watcher
+        // The child writes its next line once the test has the last one, as a FIFO says: one
+        // line a frame, however slow the machine.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("go");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut request = spawn_request(
+            sh(&format!(
+                "exec 3<'{}'; i=0; while [ $i -lt 80 ]; do echo x; read -r go <&3; \
+                i=$((i+1)); done; printf z; exit 0",
+                fifo.display()
+            )),
+            Vec::new(),
+        );
+        // No stdin, so no stdin events: the watcher's queue takes output alone.
+        request.flags = schema::process::SPAWN_STDIN_NULL as u16;
+        let mut attachment = owner.spawn(&request, None).await.unwrap();
+        // Never read: its route queue (80 events) fills with the 80 lines, and the next frame
+        // comes after the child exits.
+        let (_watch, watched) = watcher
             .attach(&watch_request(attachment.process_handle))
             .await
-            .unwrap();
+            .unwrap()
+            .split();
+        // The child's first line waits for this: the watcher sees every line.
+        let mut go = within_5s(tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(fifo)
+        }))
+        .await
+        .unwrap()
+        .unwrap();
         // The owner acknowledges its first 48 frames only: with 32 unacknowledged, the reader
         // waits for it, and `z` stays in the pipe as the child exits.
         let (mut frames, mut end) = (0, 0u64);
         while frames < 80 {
-            match tokio::time::timeout(Duration::from_secs(5), attachment.next())
-                .await
-                .unwrap()
-                .unwrap()
-            {
+            match within_5s(attachment.next()).await.unwrap() {
                 Event::Output {
                     stream,
                     lifetime_offset,
                     data,
                 } => {
                     frames += 1;
-                    end = lifetime_offset + data.len() as u64;
+                    assert_eq!(
+                        (lifetime_offset, data.as_slice()),
+                        (end, &b"x\n"[..]),
+                        "frame {frames}"
+                    );
+                    end += data.len() as u64;
                     if frames <= 48 {
                         attachment.acknowledge_output(stream, end).unwrap();
                     }
+                    go.write_all(b"\n").unwrap();
                 }
+                Event::StdinProgress { .. } => {}
                 other => panic!("{other:?}"),
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // `z` is in the pipe once the child is gone.
+        within_5s(server.wait_reaped(attachment.process_handle)).await;
         attachment.acknowledge_output(Stream::Stdout, end).unwrap();
         let (rest, exit) = output_and_exit(&mut attachment, Duration::from_secs(5), end).await;
         assert_eq!((rest, exit.code), (b"z".to_vec(), 0));
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // `z` found the watcher's queue full: its attachment alone failed.
+        let mut failed = watched.failed.clone();
+        within_5s(failed.wait_for(Option::is_some)).await.unwrap();
+        assert_eq!(watched.failure().as_deref(), Some(ROUTE_EVICTED));
         assert!(watcher.inner.closed.borrow().is_none());
         assert_eq!(runs_a_command(&watcher).await, (b"after\n".to_vec(), 0));
         owner.shutdown().await;
@@ -1573,7 +1620,10 @@ mod tests {
         let runtime = Runtime::new(server.clone());
         let owner = runtime.session([10; 16], None).unwrap();
         // The reader takes a window (1 MiB) and waits for the owner; the last 32 KiB stay in
-        // the pipe as the child exits.
+        // the pipe as the child exits. (Or a loaded reader's small reads reach the frames the
+        // owner may leave unacknowledged first, and the child exits after the detach, with no
+        // look of its owner's to take the exit. Its WAIT gets it all the same: the server keeps
+        // it for the owner.)
         let attachment = owner
             .spawn(
                 &spawn_request(sh("{head} -c 1081344 /dev/zero; exit 4"), Vec::new()),
@@ -1594,6 +1644,202 @@ mod tests {
         let exit = owner.wait(&wait).await.unwrap();
         assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
         owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    fn wait_request(process_handle: u64) -> wire::Wait {
+        wire::Wait {
+            process_handle,
+            timeout_ns: 5_000_000_000,
+            extensions: Extensions::default(),
+        }
+    }
+
+    /// Until `handle` has left the catalogue: its exit is final and its record released.
+    async fn left_the_catalogue(server: &Server, handle: u64) {
+        loop {
+            let revision = server.native_catalogue_revision();
+            let snapshot = server.native_snapshot();
+            if !snapshot
+                .records
+                .iter()
+                .any(|record| record.process_handle == handle)
+            {
+                return;
+            }
+            server.wait_native_catalogue_change(revision).await;
+        }
+    }
+
+    /// The owner's look at its process went before the exit (its client dropped the streams),
+    /// so no route took the exit, and the process left the catalogue: the owner's WAIT still
+    /// answers with the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_whose_look_went_before_the_exit_still_waits_for_it() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([16; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 0.3; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let (control, _events) = attachment.split();
+        control.detach().await.unwrap();
+        within_5s(left_the_catalogue(&server, handle)).await;
+        let exit = owner.wait(&wait_request(handle)).await.unwrap();
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// The owner's route failed as its process's exit came (an eviction fails the route before
+    /// it detaches the binding): the exit reached the session with no route to take it. The
+    /// owner's WAIT still answers with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_whose_route_failed_as_the_exit_came_still_waits_for_it() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([17; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 0.3; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        fail_route(&owner.inner, attachment.route.process_id, ROUTE_EVICTED);
+        within_5s(left_the_catalogue(&server, handle)).await;
+        let exit = owner.wait(&wait_request(handle)).await.unwrap();
+        assert_eq!((exit.code, exit.detail.as_slice()), (4, &b""[..]));
+        drop(attachment);
+        owner.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// The owner's queue was full as its process's exit came, so the exit never reached the
+    /// session: its binding is evicted (its attachment fails, and its client WAITs), and a
+    /// look at the process still finds the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owner_whose_queue_was_full_as_the_exit_came_still_finds_it() {
+        let server = Server::new(false, true);
+        // Room for one event, never taken: the output takes it, and the exit finds it full.
+        let (manager, _events, evictions) = server.native_endpoint_with_session([18; 16], 1);
+        let started = manager
+            .spawn_native(
+                process::NativeSpawnRequest {
+                    process_id: 1,
+                    flags: schema::process::SPAWN_STDIN_NULL as u8,
+                    preserve_residual: false,
+                    residue_grace: None,
+                    keep_output: None,
+                    cwd: None,
+                    argv: sh("printf x; exit 4"),
+                    env: Vec::new(),
+                    clear_environment: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = started.process_handle;
+        within_5s(left_the_catalogue(&server, handle)).await;
+        let watched = manager
+            .watch_native(2, handle, false)
+            .expect("the exit is kept for its owner");
+        assert!(!watched.running);
+        assert_eq!(watched.exit.map(|exit| exit.code), Some(4));
+        // The eviction follows the release that `left_the_catalogue` saw: wait for it (a permit
+        // is kept when it came first).
+        within_5s(evictions.notified()).await;
+        assert_eq!(evictions.take(), vec![1]);
+        manager.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// WAIT on a detached process right after this session KILLed it: the CONTROL's own look at
+    /// the process may still be leaving, or its exit still on its way to its watchers, when the
+    /// WAIT looks. The WAIT waits for that to settle and answers with the exit, never CONFLICT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_right_after_a_kill_of_a_detached_process_gets_its_exit() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([12; 16], None).unwrap();
+        for round in 1..=64u8 {
+            let mut request = spawn_request(sh("exec {sleep} 30"), Vec::new());
+            request.flags = schema::process::SPAWN_DETACHABLE as u16;
+            let attachment = session.spawn(&request, None).await.unwrap();
+            let handle = attachment.process_handle;
+            let (control_half, _events) = attachment.split();
+            control_half.detach().await.unwrap();
+            session
+                .control(&wire::Control {
+                    process_handle: handle,
+                    operation_id: [round; 16],
+                    action: wire::ControlAction::Kill,
+                    value: 0,
+                    extensions: Extensions::default(),
+                })
+                .await
+                .unwrap();
+            let wait = wire::Wait {
+                process_handle: handle,
+                timeout_ns: 5_000_000_000,
+                extensions: Extensions::default(),
+            };
+            let exit = tokio::time::timeout(Duration::from_secs(10), session.wait(&wait))
+                .await
+                .expect("the WAIT answers")
+                .expect("with the exit");
+            assert!(
+                matches!(exit.kind, wire::ExitKind::Killed | wire::ExitKind::Signal),
+                "{exit:?}"
+            );
+        }
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// WAIT while this session's own look at the process is still bound: an eviction fails the
+    /// route first and detaches its binding next, and the WAIT looks between the two. The
+    /// Detach settles it: the WAIT looks again, attaches and answers with the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_that_finds_its_own_look_still_bound_answers_once_it_goes() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([14; 16], None).unwrap();
+        let watcher = runtime.session([15; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 1; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let look = watcher.attach(&watch_request(handle)).await.unwrap();
+        let process_id = look.route.process_id;
+        // What an eviction does first.
+        fail_route(&watcher.inner, process_id, ROUTE_EVICTED);
+        let wait = tokio::spawn({
+            let watcher = watcher.clone();
+            async move {
+                watcher
+                    .wait(&wire::Wait {
+                        process_handle: handle,
+                        timeout_ns: 5_000_000_000,
+                        extensions: Extensions::default(),
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // And next.
+        watcher
+            .inner
+            .manager
+            .control_native(process_id, process::NativeControl::Detach)
+            .unwrap();
+        let exit = within_5s(wait).await.unwrap().expect("the exit");
+        assert_eq!(exit.code, 4);
+        drop((look, attachment));
+        owner.shutdown().await;
+        watcher.shutdown().await;
         server.shutdown().await;
     }
 
