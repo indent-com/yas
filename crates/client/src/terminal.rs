@@ -381,7 +381,8 @@ impl Client {
     /// one with this journal `index`, or the one running now (else the next
     /// one to start). Answers its journal record (exit code, times, command
     /// line). When it still runs at the timeout: a `Timeout` error; when
-    /// none started by then (or it left the backlog): a `NotFound` status.
+    /// none started by then: a `Timeout` status; when it left the backlog,
+    /// or the terminal exited: a `NotFound` status.
     /// Needs shell integration.
     pub async fn wait_terminal_command(
         &self,

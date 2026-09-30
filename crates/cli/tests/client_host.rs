@@ -1465,12 +1465,17 @@ exec sleep 600"#;
         std::fs::canonicalize(String::from_utf8(cwd).unwrap()).unwrap(),
         std::fs::canonicalize(directory.path()).unwrap()
     );
-    // Nothing else starts: waiting for the next command finds none.
+    // Nothing else starts: waiting for the next command times out (TIMEOUT
+    // since #54; NOT_FOUND is for an exited terminal or an evicted index).
     let waited = client
         .wait_terminal_command(id, None, Duration::from_millis(200))
         .await
         .unwrap_err();
-    assert!(waited.is_not_found(), "{waited:?}");
+    assert_eq!(
+        waited.status(),
+        Some(yas_client::wire::core::Status::Timeout),
+        "{waited:?}"
+    );
     client.close_terminal(id).await.unwrap();
 }
 
@@ -1482,6 +1487,11 @@ async fn surfaces_are_none_without_the_compositor() {
     assert!(client.surfaces().await.unwrap().is_empty());
     let missing = client
         .capture_surface(1, CaptureFormat::Png)
+        .await
+        .unwrap_err();
+    assert!(missing.is_not_found(), "{missing:?}");
+    let missing = client
+        .capture_surface_at(1, 1, CaptureFormat::Png)
         .await
         .unwrap_err();
     assert!(missing.is_not_found(), "{missing:?}");
@@ -1569,7 +1579,46 @@ async fn surfaces_capture_take_input_and_close_with_the_paste_probe() {
         .await
         .unwrap();
     client.type_surface_text(surface.id, "é").await.unwrap();
+    // At the revision listed, the capture goes at once.
+    let listed = client.surface(surface.id).await.unwrap();
+    let png = client
+        .capture_surface_at(surface.id, listed.revision, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
     client.resize_surface(surface.id, 320, 240).await.unwrap();
+    // Once the window changed, that revision is stale: the server says so, and
+    // capture_surface_at looks the window up again rather than failing.
+    let deadline = Instant::now() + TIMEOUT;
+    while client.surface(surface.id).await.unwrap().revision == listed.revision {
+        assert!(
+            Instant::now() < deadline,
+            "the resize never changed the window"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stale = client
+        .request_raw(
+            yas_client::wire::family::SURFACE,
+            yas_client::wire::surface::request_kind::CAPTURE,
+            yas_client::wire::Encode::encode(&yas_client::wire::surface::Capture {
+                surface_handle: surface.id,
+                revision: listed.revision,
+                initial_receive_credit: 0,
+                formats: vec![yas_client::wire::schema::surface::CAPTURE_PNG as u8],
+                extensions: Default::default(),
+            })
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status, yas_client::wire::core::Status::Stale);
+    let png = client
+        .capture_surface_at(surface.id, listed.revision, CaptureFormat::Png)
+        .await
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
 
     // A read-only session sees the window but cannot send it input.
     let viewer = server
