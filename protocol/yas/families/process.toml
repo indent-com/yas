@@ -20,7 +20,8 @@ limits = [
   { name = "MAX_ENVC_EXTENDED", tag = 16, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
   { name = "MAX_PENDING_WAITS", tag = 17, type = "u32", required = false, hard_min = 1, hard_max = 65536 },
   { name = "MAX_PENDING_OPERATIONS", tag = 18, type = "u32", required = false, hard_min = 1, hard_max = 16384 },
-  { name = "LAUNCHER_FLAGS_EXTENDED", tag = 19, type = "u32", required = false, hard_min = 0, hard_max = 28 },
+  # A set of SPAWN flags (u16): bits a client does not know are ignored, so later flags need no new tag.
+  { name = "LAUNCHER_FLAGS_EXTENDED", tag = 19, type = "u32", required = false, hard_min = 0, hard_max = 65535 },
 ]
 
 [[constant]]

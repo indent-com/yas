@@ -2255,7 +2255,7 @@ export const YAS_FAMILY_LIMIT_POLICIES: Readonly<Record<number, readonly YasFami
     [16, 4, false, 1n, 16384n],
     [17, 4, false, 1n, 65536n],
     [18, 4, false, 1n, 16384n],
-    [19, 4, false, 0n, 28n],
+    [19, 4, false, 0n, 65535n],
   ],
   65: [
     [1, 4, true, 1n, 255n],
@@ -11747,7 +11747,7 @@ export const YAS_SCHEMA = {
           "type": "u32",
           "required": false,
           "hard_min": 0,
-          "hard_max": 28
+          "hard_max": 65535
         }
       ],
       "requests": [

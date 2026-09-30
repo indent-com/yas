@@ -3930,7 +3930,7 @@ super::LimitMetadata { name: "MAX_STREAM_BUFFER_BYTES_EXTENDED", tag: 15, value_
 super::LimitMetadata { name: "MAX_ENVC_EXTENDED", tag: 16, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
 super::LimitMetadata { name: "MAX_PENDING_WAITS", tag: 17, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 65536 },
 super::LimitMetadata { name: "MAX_PENDING_OPERATIONS", tag: 18, value_type: super::LimitValueType::U32, required: false, hard_min: 1, hard_max: 16384 },
-super::LimitMetadata { name: "LAUNCHER_FLAGS_EXTENDED", tag: 19, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 28 },
+super::LimitMetadata { name: "LAUNCHER_FLAGS_EXTENDED", tag: 19, value_type: super::LimitValueType::U32, required: false, hard_min: 0, hard_max: 65535 },
 ];
 pub static CONSTANTS: &[super::ConstantMetadata] = &[
 super::ConstantMetadata { name: "SPAWN_MERGE_STDERR", value: 1 },

@@ -1235,10 +1235,13 @@ impl Limits {
                 extensions,
                 crate::schema::process::LIMIT_MAX_MUTATION_REPLAYS,
             )?,
+            // A flag this side does not know is one it never sets: ignored, so a later flag
+            // needs no new tag.
             launcher_flags: read_optional_limit_u32(
                 extensions,
                 crate::schema::process::LIMIT_LAUNCHER_FLAGS_EXTENDED,
             )?
+            .map(|flags| flags & crate::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32)
             .unwrap_or(legacy_launcher_flags),
             max_pending_waits: u32_or(
                 crate::schema::process::LIMIT_MAX_PENDING_WAITS,
@@ -1890,6 +1893,19 @@ mod tests {
         assert!(with(Some(v1), Some(p::SPAWN_REPORT_EXIT as u32)).is_err());
         assert!(with(None, Some(all)).is_err());
         assert!(with(Some(v1), Some(all << 1)).is_err());
+        // Tag 19 is a set of SPAWN flags: those this side does not know (a later server's) are
+        // ignored, and any u16 of them passes the family's limit bounds.
+        assert_eq!(
+            with(Some(v1), Some(all | 1 << 15)).unwrap().launcher_flags,
+            all
+        );
+        let tag_19 = crate::schema::family_metadata(crate::family::PROCESS, 1)
+            .unwrap()
+            .limits
+            .iter()
+            .find(|limit| u64::from(limit.tag) == p::LIMIT_LAUNCHER_FLAGS_EXTENDED)
+            .unwrap();
+        assert_eq!(tag_19.hard_max, u64::from(u16::MAX));
     }
 
     #[test]

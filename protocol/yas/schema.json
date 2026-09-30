@@ -8824,7 +8824,7 @@
           "type": "u32",
           "required": false,
           "hard_min": 0,
-          "hard_max": 28
+          "hard_max": 65535
         }
       ],
       "requests": [

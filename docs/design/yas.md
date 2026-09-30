@@ -3286,9 +3286,10 @@ Servers advertise the opt-in flags they honour in two optional family limits:
 tag 11 `LAUNCHER_FLAGS` carries those of v1 (`LEAVE_RESIDUE`, `STDIN_NULL`),
 at most 12, which is all clients from before `REPORT_EXIT` accept; tag 19
 `LAUNCHER_FLAGS_EXTENDED` carries every flag the server honours, when that is
-more. Tag 19 names each flag tag 11 does and adds none of v1's. A client sets
-`REPORT_EXIT` only when tag 19 offers it, and otherwise WAITs, so either side
-may be older.
+more. Tag 19 names each flag tag 11 does and adds none of v1's. It is a set of
+SPAWN flags, any u16: a client ignores the flags it does not know, so later
+flags need no new tag. A client sets `REPORT_EXIT` only when tag 19 offers it,
+and otherwise WAITs, so either side may be older.
 
 Catalog records contain argv0, native PID for diagnostics, lifecycle, owner
 session, detachable flag, stream offsets, exit record, and retention deadline.

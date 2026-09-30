@@ -917,7 +917,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | 16 | `MAX_ENVC_EXTENDED` | 4 | false | 1 | 16384 |
 | 17 | `MAX_PENDING_WAITS` | 4 | false | 1 | 65536 |
 | 18 | `MAX_PENDING_OPERATIONS` | 4 | false | 1 | 16384 |
-| 19 | `LAUNCHER_FLAGS_EXTENDED` | 4 | false | 0 | 28 |
+| 19 | `LAUNCHER_FLAGS_EXTENDED` | 4 | false | 0 | 65535 |
 
 ### Shared types
 
