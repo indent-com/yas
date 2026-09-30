@@ -8332,6 +8332,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",
