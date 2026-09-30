@@ -111,7 +111,8 @@ export interface YasClientHelloOptions {
    * person, a device, the embedding app's own session. That list shows each
    * client's Terminal and Surface views, so this is what says whose view
    * sized them. Sent as UTF-8, at most `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES`
-   * (1 KiB) of it; the server checks nothing else and does not require it to
+   * (1 KiB) of it (a `YasConnection` given a longer one throws when
+   * constructed); the server checks nothing else and does not require it to
    * be unique. `YasConnection.updateClientIdentifier` replaces it later.
    */
   clientIdentifier?: string;

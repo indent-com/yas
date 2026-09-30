@@ -25,6 +25,7 @@ import {
   decodeServerHello,
   decodeSessionUpdate,
   decodeSessionInfo,
+  clientIdentifierExtension,
   encodeCancel,
   encodeClientHello,
   encodeClientUpdate,
@@ -361,6 +362,9 @@ export class YasConnection {
     readonly transport: YasTransport,
     options: YasConnectionOptions = {},
   ) {
+    // Refused here: thrown while encoding HELLO, it would stall the handshake.
+    if (options.clientIdentifier !== undefined)
+      clientIdentifierExtension(options.clientIdentifier);
     const clientInstance = options.clientInstance ?? randomUuidBytes();
     this.requestedReceiveMaxDatagram = options.receiveMaxDatagram;
     this.options = {

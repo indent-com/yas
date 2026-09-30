@@ -8099,7 +8099,8 @@ impl Session {
                             self.replace_client_identifier(identifier.to_owned()).await;
                         }
                         Ok(None) => {}
-                        // Not UTF-8: the one thing an identifier must be.
+                        // Not UTF-8, or longer than MAX_CLIENT_IDENTIFIER_BYTES:
+                        // the only two rules an identifier has.
                         Err(_) => {
                             return self.send_result(&frame, Status::Invalid, Vec::new()).await;
                         }

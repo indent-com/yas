@@ -10,6 +10,7 @@ import {
   YAS_FAMILY_FS,
   YasProtocolError,
   YasWriter,
+  YasConnection,
   clientIdentifierExtension,
   decodeClientActiveSubscriptions,
   decodeClientAuxiliarySubscriptionDetails,
@@ -19,6 +20,7 @@ import {
   encodeClientUpdate,
   type YasClientRecord,
 } from "../yas";
+import { MockYasTransport } from "./mock-yas-transport";
 
 function activeSubscriptionsValue(): Uint8Array {
   return new YasWriter()
@@ -211,6 +213,18 @@ describe("YAS Client family", () => {
     expect(() =>
       encodeClientUpdate({ clientIdentifier: `${longest}a` }),
     ).toThrow(YasProtocolError);
+    // Up front, before any handshake a throwing HELLO could stall.
+    expect(
+      () =>
+        new YasConnection(new MockYasTransport("disconnected"), {
+          clientIdentifier: `${longest}a`,
+        }),
+    ).toThrow(YasProtocolError);
+    expect(
+      new YasConnection(new MockYasTransport("disconnected"), {
+        clientIdentifier: longest,
+      }).options.clientIdentifier,
+    ).toBe(longest);
   });
 
   it("reports an identifier in HELLO, in tag order, and in CLIENT_UPDATE", () => {
