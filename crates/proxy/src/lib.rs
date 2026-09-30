@@ -782,6 +782,8 @@ fn parse_uplink_uri(rest: &str) -> Result<UplinkTarget, String> {
     })
 }
 
+pub mod uplink_producer;
+
 /// HTTPS control client with the same explicit CA override semantics as the
 /// WSS and WebTransport legs. Reqwest's platform verifier otherwise ignores
 /// SSL_CERT_FILE/SSL_CERT_DIR on macOS.
