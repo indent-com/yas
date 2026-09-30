@@ -2038,6 +2038,11 @@ async fn serve_registered<S>(
         client_instance: hello.client_instance,
         name: hello.client_name.clone(),
         release: hello.client_release.clone(),
+        // ClientHello::decode has refused a non-UTF-8 identifier already.
+        identifier: yas_wire::core::client_identifier(&hello.extensions)
+            .ok()
+            .flatten()
+            .map(str::to_owned),
     };
     // An embedded extension attempt is what it is regardless of the socket it
     // came in on; everything else is described by its transport.
@@ -5306,6 +5311,14 @@ async fn client_catalogue_snapshot(
         }
         .extension()
         .expect("fixed Client bandwidth window is valid");
+        let mut extensions = vec![rates];
+        if let Some(identifier) = client
+            .native_identity
+            .as_ref()
+            .and_then(|identity| identity.identifier.as_deref())
+        {
+            extensions.push(yas_client::identifier_extension(identifier));
+        }
         records.insert(
             session_id,
             yas_client::ClientRecord {
@@ -5319,7 +5332,7 @@ async fn client_catalogue_snapshot(
                 release,
                 label: client.origin.label().to_owned(),
                 origin: typed_client_origin(&client.origin),
-                extensions: Extensions(vec![rates]),
+                extensions: Extensions(extensions),
             },
         );
     }
@@ -5348,6 +5361,10 @@ async fn client_catalogue_snapshot(
                     .extension()
                     .expect("validated native Client watch timings"),
             );
+        }
+        // Tag 5 sorts after the subscription extensions above.
+        if let Some(identifier) = &client.identity.identifier {
+            subscription_extensions.push(yas_client::identifier_extension(identifier));
         }
         let extensions = Extensions(subscription_extensions);
         records.insert(
@@ -8072,10 +8089,21 @@ impl Session {
                             return self.send_result(&frame, Status::Invalid, Vec::new()).await;
                         }
                     };
-                    if has_unknown_required(&extensions, &[]) {
+                    if has_unknown_required(&extensions, &[CLIENT_IDENTIFIER_EXTENSION]) {
                         return self
                             .send_result(&frame, Status::Unsupported, Vec::new())
                             .await;
+                    }
+                    match yas_wire::core::client_identifier(&extensions) {
+                        Ok(Some(identifier)) => {
+                            self.replace_client_identifier(identifier.to_owned()).await;
+                        }
+                        Ok(None) => {}
+                        // Not UTF-8, or longer than MAX_CLIENT_IDENTIFIER_BYTES:
+                        // the only two rules an identifier has.
+                        Err(_) => {
+                            return self.send_result(&frame, Status::Invalid, Vec::new()).await;
+                        }
                     }
                     self.send_result(&frame, Status::Ok, Vec::new()).await
                 }
@@ -27187,6 +27215,22 @@ impl Session {
         }
     }
 
+    /// Replace what this session reported as its identifier. Client catalogue
+    /// watchers pick it up at their next refresh, as they do any other change
+    /// to the record.
+    async fn replace_client_identifier(&mut self, identifier: String) {
+        let Some(state) = self.native.as_ref().map(|native| native.state.clone()) else {
+            return;
+        };
+        let mut shared = state.session.lock().await;
+        if let Some(client) = shared
+            .native_yas_clients
+            .get_mut(&self.negotiated.session_id)
+        {
+            client.identity.identifier = Some(identifier);
+        }
+    }
+
     async fn refresh_client_catalogue(&mut self) -> bool {
         let Some((state, boot_id)) = self
             .native
@@ -28853,7 +28897,10 @@ fn negotiate(
     }
     const READ_ONLY_SESSION_EXTENSION: u16 =
         yas_wire::schema::core::CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION as u16;
-    if has_unknown_required(&hello.extensions, &[READ_ONLY_SESSION_EXTENSION]) {
+    if has_unknown_required(
+        &hello.extensions,
+        &[READ_ONLY_SESSION_EXTENSION, CLIENT_IDENTIFIER_EXTENSION],
+    ) {
         return Err(Status::Unsupported);
     }
     let read_only = hello
@@ -35374,6 +35421,10 @@ fn has_unknown_required(extensions: &Extensions, supported: &[u16]) -> bool {
         .any(|extension| extension.required && !supported.contains(&extension.tag))
 }
 
+/// The HELLO and CLIENT_UPDATE extension carrying a client's own identifier.
+const CLIENT_IDENTIFIER_EXTENSION: u16 =
+    yas_wire::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION as u16;
+
 const fn channel_status(error: ChannelError) -> Status {
     match error {
         ChannelError::Unavailable => Status::Unavailable,
@@ -40501,6 +40552,27 @@ mod tests {
         ServerHello,
         tokio::task::JoinHandle<()>,
     ) {
+        start_registered_session_with_hello_extensions(
+            state,
+            family_ids,
+            max_buffered,
+            Extensions::default(),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn start_registered_session_with_hello_extensions(
+        state: AppState,
+        family_ids: &[u16],
+        max_buffered: u64,
+        extensions: Extensions,
+    ) -> (
+        DuplexStream,
+        FrameCodec,
+        ServerHello,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (mut client, server) = tokio::io::duplex(4 * 1024 * 1024);
         let cancellation = ConnectionCancellation::default();
         let registration = state
@@ -40518,8 +40590,13 @@ mod tests {
             None,
             ConnectionOrigin::Network,
         ));
-        let (codec, server_hello) =
-            handshake_with_receive(&mut client, family_ids, max_buffered).await;
+        let (codec, server_hello) = handshake_with_receive_and_extensions(
+            &mut client,
+            family_ids,
+            max_buffered,
+            extensions,
+        )
+        .await;
         (client, codec, server_hello, task)
     }
 
@@ -46176,6 +46253,184 @@ mod tests {
         drop(watcher);
         timeout(TEST_TIMEOUT, watcher_task).await.unwrap().unwrap();
         process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_catalogue_republishes_reported_utf8_identifiers() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        // Controls and all, and reported by two sessions: the server passes it
+        // on regardless, for whoever reads the list to make sense of.
+        let odd = "pierre's\tlaptop 🖥";
+        let reporting = || {
+            Extensions(vec![
+                yas_wire::core::client_identifier_extension(odd).unwrap(),
+            ])
+        };
+        let (mut watcher, watcher_codec, watcher_hello, watcher_task) =
+            start_registered_session_with_hello_extensions(
+                state.clone(),
+                &[family::CLIENT],
+                TEST_PEER_MAX_BUFFERED,
+                reporting(),
+            )
+            .await;
+        let (mut target, target_codec, target_hello, target_task) =
+            start_registered_session_with_hello_extensions(
+                state.clone(),
+                &[family::TERMINAL],
+                TEST_PEER_MAX_BUFFERED,
+                reporting(),
+            )
+            .await;
+        let (silent, _silent_codec, silent_hello, silent_task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        timeout(TEST_TIMEOUT, async {
+            while state.session.lock().await.native_yas_clients.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native clients registered directly");
+
+        write_request(
+            &mut watcher,
+            &watcher_codec,
+            family::CLIENT,
+            yas_wire::schema::client::request::WATCH,
+            1,
+            &Watch {
+                initial_credit: 1024 * 1024,
+                resume: None,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let watched = next_result(
+            &mut watcher,
+            &watcher_codec,
+            family::CLIENT,
+            yas_wire::schema::client::request::WATCH,
+            1,
+        )
+        .await;
+        assert_eq!(watched.status, Status::Ok);
+        let mut records = BTreeMap::new();
+        loop {
+            let frame = next_frame(&mut watcher, &watcher_codec).await;
+            if frame.header.family != family::CLIENT || frame.header.class != Class::Event {
+                continue;
+            }
+            let event = StateEvent::decode(&frame.payload).unwrap();
+            for state_record in event.records {
+                if let Ok(record) = yas_client::client_from_state_record(&state_record) {
+                    records.insert(record.session_id, record);
+                }
+            }
+            if event.phase == Phase::SnapshotEnd {
+                break;
+            }
+        }
+        for session_id in [watcher_hello.session_id, target_hello.session_id] {
+            assert_eq!(records[&session_id].identifier().unwrap(), Some(odd));
+        }
+        assert_eq!(
+            records[&silent_hello.session_id].identifier().unwrap(),
+            None
+        );
+
+        // Not UTF-8, or longer than 1 KiB: refused, and the identifier stays.
+        let reported = yas_wire::core::client_identifier_extension("").unwrap();
+        let too_long = vec![b'a'; yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES + 1];
+        for (request_id, value) in [(2, vec![0xff]), (3, too_long)] {
+            write_request(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                request_id,
+                &Extensions(vec![Extension {
+                    value,
+                    ..reported.clone()
+                }]),
+            )
+            .await;
+            assert_eq!(
+                next_result(
+                    &mut target,
+                    &target_codec,
+                    family::CORE,
+                    yas_wire::core::request_kind::CLIENT_UPDATE,
+                    request_id,
+                )
+                .await
+                .status,
+                Status::Invalid,
+            );
+            assert_eq!(
+                state
+                    .session
+                    .lock()
+                    .await
+                    .native_yas_clients
+                    .get(&target_hello.session_id)
+                    .and_then(|client| client.identity.identifier.clone())
+                    .as_deref(),
+                Some(odd),
+            );
+        }
+
+        // CLIENT_UPDATE replaces it, and watchers see the record change.
+        write_request(
+            &mut target,
+            &target_codec,
+            family::CORE,
+            yas_wire::core::request_kind::CLIENT_UPDATE,
+            4,
+            &Extensions(vec![
+                yas_wire::core::client_identifier_extension("pierre's laptop").unwrap(),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            next_result(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                4,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let frame = next_frame(&mut watcher, &watcher_codec).await;
+                if frame.header.family != family::CLIENT || frame.header.class != Class::Event {
+                    continue;
+                }
+                let event = StateEvent::decode(&frame.payload).unwrap();
+                if event.records.iter().any(|state_record| {
+                    yas_client::client_from_state_record(state_record).is_ok_and(|record| {
+                        record.session_id == target_hello.session_id
+                            && record.identifier() == Ok(Some("pierre's laptop"))
+                    })
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the watcher saw the replaced identifier");
+
+        drop((target, silent));
+        timeout(TEST_TIMEOUT, target_task).await.unwrap().unwrap();
+        timeout(TEST_TIMEOUT, silent_task).await.unwrap().unwrap();
+        drop(watcher);
+        timeout(TEST_TIMEOUT, watcher_task).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]

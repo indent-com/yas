@@ -200,6 +200,8 @@ export const YAS_CORE_CLIENT_HELLO_IDLE_TIMEOUT_EXTENSION = 1 as const;
 export const YAS_CORE_CLIENT_HELLO_PLATFORM_EXTENSION = 2 as const;
 export const YAS_CORE_CLIENT_HELLO_INITIAL_WATCHES_EXTENSION = 3 as const;
 export const YAS_CORE_CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION = 4 as const;
+export const YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION = 5 as const;
+export const YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES = 1024 as const;
 export const YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION = 1 as const;
 export const YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION = 2 as const;
 export const YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION = 3 as const;
@@ -471,6 +473,7 @@ export const YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION = 1 as const;
 export const YAS_CLIENT_BANDWIDTH_RATES_EXTENSION = 2 as const;
 export const YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION = 3 as const;
 export const YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION = 4 as const;
+export const YAS_CLIENT_IDENTIFIER_EXTENSION = 5 as const;
 export const YAS_CLIENT_GIT_WATCH_UNTRACKED = 65536 as const;
 export const YAS_CLIENT_GIT_WATCH_IGNORED = 131072 as const;
 export const YAS_CLIENT_GIT_QUERY_WATCH = 2147483648 as const;
@@ -3191,6 +3194,10 @@ export const YAS_SCHEMA = {
           "layout": "catalog_revision:u64 nonzero,FamilyDescriptor; family_id and version match the selected descriptor"
         },
         {
+          "name": "client_identifier_extension",
+          "layout": "ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:utf8 remaining, at most MAX_CLIENT_IDENTIFIER_BYTES bytes; the client's own text for people to recognize it by; invalid UTF-8 or a longer one fails HELLO or CLIENT_UPDATE with INVALID, and nothing else is validated or deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION"
+        },
+        {
           "name": "initial_watches_extension",
           "layout": "count:u16,repeated family_id:u16,family_version:u16,watch_payload:bytes_u32"
         },
@@ -3239,6 +3246,14 @@ export const YAS_SCHEMA = {
         {
           "name": "CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION",
           "value": 4
+        },
+        {
+          "name": "CLIENT_HELLO_IDENTIFIER_EXTENSION",
+          "value": 5
+        },
+        {
+          "name": "MAX_CLIENT_IDENTIFIER_BYTES",
+          "value": 1024
         },
         {
           "name": "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION",
@@ -4845,6 +4860,10 @@ export const YAS_SCHEMA = {
           "layout": "ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS"
         },
         {
+          "name": "client_identifier",
+          "layout": "ClientRecord/ClientPatch optional extension tag 5 exact value identifier:utf8 remaining, at most Core MAX_CLIENT_IDENTIFIER_BYTES bytes; the text the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unchanged and possibly shared by other sessions; absent when it reported none"
+        },
+        {
           "name": "family_limits",
           "layout": "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor"
         }
@@ -4889,6 +4908,10 @@ export const YAS_SCHEMA = {
         {
           "name": "AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION",
           "value": 4
+        },
+        {
+          "name": "IDENTIFIER_EXTENSION",
+          "value": 5
         },
         {
           "name": "GIT_WATCH_UNTRACKED",

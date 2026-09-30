@@ -230,6 +230,9 @@ impl ClientHello {
                 {
                     return Err(Error::Invalid("HELLO read-only session extension"));
                 }
+                crate::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION => {
+                    check_client_identifier(&extension.value)?;
+                }
                 _ => {}
             }
         }
@@ -516,6 +519,57 @@ impl Decode for NegotiatedCodecs {
         value.validate()?;
         Ok(value)
     }
+}
+
+const CLIENT_IDENTIFIER_TAG: u16 = crate::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION as u16;
+
+/// The most bytes a client identifier may take.
+pub const MAX_CLIENT_IDENTIFIER_BYTES: usize =
+    crate::schema::core::MAX_CLIENT_IDENTIFIER_BYTES as usize;
+
+/// A client identifier's only requirements: UTF-8, and at most
+/// [`MAX_CLIENT_IDENTIFIER_BYTES`], so its Client record always fits a State
+/// event.
+pub(crate) fn check_client_identifier(value: &[u8]) -> Result<&str> {
+    if value.len() > MAX_CLIENT_IDENTIFIER_BYTES {
+        return Err(Error::LimitExceeded {
+            limit: "client identifier bytes",
+            actual: value.len() as u64,
+            maximum: MAX_CLIENT_IDENTIFIER_BYTES as u64,
+        });
+    }
+    core::str::from_utf8(value).map_err(|_| Error::InvalidUtf8)
+}
+
+/// The optional HELLO or CLIENT_UPDATE extension through which a client
+/// reports an identifier: any UTF-8 text of its choosing, up to
+/// [`MAX_CLIENT_IDENTIFIER_BYTES`] (a person, a device, an embedding app's own
+/// session), for people to tell it apart by. The server republishes it
+/// unchanged in the client's Client record
+/// ([`crate::client::ClientRecord::identifier`]), next to the Terminal and
+/// Surface views the client holds open, so a client list can say who sized a
+/// terminal or a surface. Nothing else about it is checked, and it is not
+/// deduplicated: two sessions may report the same identifier. CLIENT_UPDATE
+/// replaces it.
+pub fn client_identifier_extension(identifier: &str) -> Result<Extension> {
+    check_client_identifier(identifier.as_bytes())?;
+    Ok(Extension {
+        tag: CLIENT_IDENTIFIER_TAG,
+        required: false,
+        value: identifier.as_bytes().to_vec(),
+    })
+}
+
+/// The identifier a client reported in a HELLO's or a CLIENT_UPDATE's
+/// `extensions`, or `None` when it reported none. Fails when it is not UTF-8
+/// or too long (a decoded [`ClientHello`] has been checked already).
+pub fn client_identifier(extensions: &Extensions) -> Result<Option<&str>> {
+    extensions
+        .0
+        .iter()
+        .find(|extension| extension.tag == CLIENT_IDENTIFIER_TAG)
+        .map(|extension| check_client_identifier(&extension.value))
+        .transpose()
 }
 
 /// What a peer is running on: the operating system, the CPU architecture, and
@@ -1710,6 +1764,64 @@ mod tests {
         for end in 0..bytes.len() {
             assert!(ClientHello::decode(&bytes[..end]).is_err(), "prefix {end}");
         }
+    }
+
+    #[test]
+    fn client_hello_carries_a_bounded_utf8_identifier() {
+        let mut hello = ClientHello {
+            min_minor: 0,
+            max_minor: 0,
+            receive: limits(),
+            client_instance: [0xaa; 16],
+            client_name: "web".into(),
+            client_release: "1".into(),
+            families: Vec::new(),
+            codecs: Vec::new(),
+            extensions: Extensions(vec![
+                client_identifier_extension("pierre's\tlaptop 🖥").unwrap(),
+            ]),
+        };
+        let decoded = ClientHello::decode(&hello.encode().unwrap()).unwrap();
+        assert_eq!(
+            client_identifier(&decoded.extensions).unwrap(),
+            Some("pierre's\tlaptop 🖥")
+        );
+        assert_eq!(client_identifier(&Extensions::default()).unwrap(), None);
+        let longest = "x".repeat(MAX_CLIENT_IDENTIFIER_BYTES);
+        assert!(client_identifier_extension(&longest).is_ok());
+
+        // UTF-8 and at most 1 KiB are the only things asked of it, on both
+        // sides of the wire.
+        let too_long = "x".repeat(MAX_CLIENT_IDENTIFIER_BYTES + 1);
+        assert!(client_identifier_extension(&too_long).is_err());
+        let spoiled = |value: Vec<u8>| {
+            let mut hello = hello.clone();
+            hello.extensions = Extensions::default();
+            let mut bytes = hello.encode().unwrap();
+            bytes.truncate(bytes.len() - 4);
+            Extensions(vec![Extension {
+                tag: crate::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION as u16,
+                required: false,
+                value,
+            }])
+            .encode_tail(&mut bytes)
+            .unwrap();
+            bytes
+        };
+        assert_eq!(
+            ClientHello::decode(&spoiled(vec![0xff])),
+            Err(Error::InvalidUtf8)
+        );
+        assert!(matches!(
+            ClientHello::decode(&spoiled(too_long.clone().into_bytes())),
+            Err(Error::LimitExceeded { .. })
+        ));
+        hello.extensions.0[0].value = vec![0xc3, 0x28];
+        assert!(client_identifier(&hello.extensions).is_err());
+        assert!(hello.encode().is_err());
+        hello.extensions.0[0].value = too_long.into_bytes();
+        assert!(client_identifier(&hello.extensions).is_err());
+        assert!(hello.encode().is_err());
     }
 
     #[test]

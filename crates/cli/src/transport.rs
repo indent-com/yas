@@ -10,12 +10,14 @@ fn current_exe() -> Result<std::path::PathBuf, String> {
     std::env::current_exe().map_err(|error| format!("cannot locate yas executable: {error}"))
 }
 
-/// Connect options for a CLI invocation: named `yas-cli`, using `hub` for
-/// share links, the local proxy unless `YAS_PROXY=0`, and auto-starting the
-/// local server from this executable.
+/// Connect options for a CLI invocation: named `yas-cli`, identified as
+/// `YAS_CLIENT_IDENTIFIER` says, using `hub` for share links, the local proxy
+/// unless `YAS_PROXY=0`, and auto-starting the local server from this
+/// executable.
 pub fn cli_options(hub: &str) -> ConnectOptions {
     let mut options = ConnectOptions::named("yas-cli");
     options.hello.client_release = env!("CARGO_PKG_VERSION").to_string();
+    options.hello.identifier = std::env::var("YAS_CLIENT_IDENTIFIER").ok();
     options.hub = hub.to_string();
     options.proxy = proxy_enabled();
     options.executable = std::env::current_exe().ok();

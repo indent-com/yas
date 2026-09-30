@@ -30,6 +30,8 @@ import {
   YAS_CORE_SESSION_UPDATE,
   YAS_CORE_SHUTDOWN,
   YAS_CORE_VERSION,
+  YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
+  YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
   YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION,
   YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION,
   YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION,
@@ -104,6 +106,16 @@ export interface YasClientHelloOptions {
   clientInstance: Uint8Array;
   clientName?: string;
   clientRelease?: string;
+  /**
+   * Any text to tell this client apart by in the server's client list: a
+   * person, a device, the embedding app's own session. That list shows each
+   * client's Terminal and Surface views, so this is what says whose view
+   * sized them. Sent as UTF-8, at most `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES`
+   * (1 KiB) of it (a `YasConnection` given a longer one throws when
+   * constructed); the server checks nothing else and does not require it to
+   * be unique. `YasConnection.updateClientIdentifier` replaces it later.
+   */
+  clientIdentifier?: string;
   families?: readonly YasFamilyOffer[];
   codecs?: readonly number[];
   extensions?: readonly YasExtension[];
@@ -263,7 +275,46 @@ export function encodeClientHello(options: YasClientHelloOptions): Uint8Array {
     previousCodec = codec;
     writer.u16(codec);
   }
-  return writer.bytes(encodeExtensions(options.extensions)).finish();
+  return writer.bytes(encodeExtensions(helloExtensions(options))).finish();
+}
+
+/**
+ * The HELLO or CLIENT_UPDATE extension reporting `identifier` as is. Throws
+ * when its UTF-8 takes more than `YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES` (1 KiB),
+ * which the server would refuse.
+ */
+export function clientIdentifierExtension(identifier: string): YasExtension {
+  const value = new TextEncoder().encode(identifier);
+  if (value.length > YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES)
+    throw new YasProtocolError(
+      `client identifier takes ${value.length} bytes, more than ${YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES}`,
+    );
+  return {
+    tag: YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
+    required: false,
+    value,
+  };
+}
+
+function helloExtensions(
+  options: YasClientHelloOptions,
+): readonly YasExtension[] {
+  const extensions = options.extensions ?? [];
+  if (options.clientIdentifier === undefined) return extensions;
+  return [
+    ...extensions.filter(
+      (extension) =>
+        extension.tag !== YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
+    ),
+    clientIdentifierExtension(options.clientIdentifier),
+  ].sort((left, right) => left.tag - right.tag);
+}
+
+/** A Core CLIENT_UPDATE payload replacing the session's reported identifier. */
+export function encodeClientUpdate(update: {
+  clientIdentifier: string;
+}): Uint8Array {
+  return encodeExtensions([clientIdentifierExtension(update.clientIdentifier)]);
 }
 
 export function encodeNegotiatedCodecs(codecs: readonly number[]): Uint8Array {

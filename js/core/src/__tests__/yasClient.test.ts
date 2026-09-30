@@ -3,15 +3,24 @@ import {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
   YAS_CLIENT_AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION,
+  YAS_CLIENT_IDENTIFIER_EXTENSION,
   YAS_CLIENT_ORIGIN_EXTENSION,
+  YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION,
+  YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
   YAS_FAMILY_FS,
   YasProtocolError,
   YasWriter,
+  YasConnection,
+  clientIdentifierExtension,
   decodeClientActiveSubscriptions,
   decodeClientAuxiliarySubscriptionDetails,
   decodeClientAuxiliarySubscriptionTimings,
+  decodeClientIdentifier,
+  encodeClientHello,
+  encodeClientUpdate,
   type YasClientRecord,
 } from "../yas";
+import { MockYasTransport } from "./mock-yas-transport";
 
 function activeSubscriptionsValue(): Uint8Array {
   return new YasWriter()
@@ -115,6 +124,7 @@ function clientRecord(): YasClientRecord {
     auxiliarySubscriptionDetails: null,
     auxiliarySubscriptionTimings: null,
     bandwidthRates: null,
+    identifier: null,
   };
 }
 
@@ -170,5 +180,86 @@ describe("YAS Client family", () => {
     expect([...decoded!.entries[0]!.resource]).toEqual([
       ...new TextEncoder().encode("/workspace"),
     ]);
+  });
+
+  it("reads a reported identifier as UTF-8 of at most 1 KiB, and nothing else checked", () => {
+    const identifier = (value: Uint8Array) =>
+      decodeClientIdentifier([
+        { tag: YAS_CLIENT_IDENTIFIER_EXTENSION, required: false, value },
+      ]);
+    expect(decodeClientIdentifier([])).toBeNull();
+    expect(identifier(new TextEncoder().encode("pierre's\tlaptop 🖥"))).toBe(
+      "pierre's\tlaptop 🖥",
+    );
+    expect(identifier(new Uint8Array())).toBe("");
+    expect(() => identifier(new Uint8Array([0x61, 0xff]))).toThrow(
+      YasProtocolError,
+    );
+    const longest = "é".repeat(YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES / 2);
+    expect(identifier(new TextEncoder().encode(longest))).toBe(longest);
+    expect(() => identifier(new TextEncoder().encode(`${longest}a`))).toThrow(
+      YasProtocolError,
+    );
+  });
+
+  it("refuses to report an identifier longer than 1 KiB", () => {
+    const longest = "é".repeat(YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES / 2);
+    expect(clientIdentifierExtension(longest).value).toHaveLength(
+      YAS_CORE_MAX_CLIENT_IDENTIFIER_BYTES,
+    );
+    expect(() => clientIdentifierExtension(`${longest}a`)).toThrow(
+      YasProtocolError,
+    );
+    expect(() =>
+      encodeClientUpdate({ clientIdentifier: `${longest}a` }),
+    ).toThrow(YasProtocolError);
+    // Up front, before any handshake a throwing HELLO could stall.
+    expect(
+      () =>
+        new YasConnection(new MockYasTransport("disconnected"), {
+          clientIdentifier: `${longest}a`,
+        }),
+    ).toThrow(YasProtocolError);
+    expect(
+      new YasConnection(new MockYasTransport("disconnected"), {
+        clientIdentifier: longest,
+      }).options.clientIdentifier,
+    ).toBe(longest);
+  });
+
+  it("reports an identifier in HELLO, in tag order, and in CLIENT_UPDATE", () => {
+    const clientInstance = new Uint8Array(16).fill(1);
+    const platform = { tag: 2, value: new Uint8Array([9]) };
+    const later = { tag: 7, value: new Uint8Array() };
+    const expected = encodeClientHello({
+      clientInstance,
+      extensions: [platform, clientIdentifierExtension("pierre"), later],
+    });
+    expect(
+      encodeClientHello({
+        clientInstance,
+        clientIdentifier: "pierre",
+        extensions: [platform, later],
+      }),
+    ).toEqual(expected);
+    // The option wins over a stale extension with the same tag.
+    expect(
+      encodeClientHello({
+        clientInstance,
+        clientIdentifier: "pierre",
+        extensions: [platform, clientIdentifierExtension("stale"), later],
+      }),
+    ).toEqual(expected);
+    expect(encodeClientUpdate({ clientIdentifier: "x" })).toEqual(
+      new YasWriter()
+        .bytesU32(
+          new YasWriter()
+            .u16(YAS_CORE_CLIENT_HELLO_IDENTIFIER_EXTENSION)
+            .u16(0)
+            .bytesU32(new Uint8Array([0x78]))
+            .finish(),
+        )
+        .finish(),
+    );
   });
 });

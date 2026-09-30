@@ -47,6 +47,10 @@ export interface AddYasConnectionOptions {
   wasm?: YasWasmModule | Promise<YasWasmModule>;
   autoConnect?: boolean;
   logger?: YasLogger;
+  /** What this connection reports as its identifier in the server's client
+   *  list (see {@link YasClientHelloOptions.clientIdentifier}). Ignored when
+   *  `connection` is supplied: that one's own options apply. */
+  clientIdentifier?: string;
   /** Prebuilt native product connection supplied by an embedding shell. */
   connection?: YasWorkspaceConnection;
 }
@@ -172,10 +176,10 @@ export class YasWorkspace {
       options.connection ??
       new YasNativeWorkspaceConnection(
         options.id,
-        new NativeYasConnection(
-          resolveNativeTransport(options.transport),
-          yasBrowserConnectionOptions(),
-        ),
+        new NativeYasConnection(resolveNativeTransport(options.transport), {
+          ...yasBrowserConnectionOptions(),
+          clientIdentifier: options.clientIdentifier,
+        }),
         options.wasm ?? this.defaultWasm,
         options.autoConnect,
       );

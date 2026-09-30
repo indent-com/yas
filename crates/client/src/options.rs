@@ -24,6 +24,17 @@ pub struct HelloOptions {
     /// HELLO extension, so a server that does not understand it refuses the
     /// session instead of silently granting full control.
     pub read_only: bool,
+    /// Any text to tell this client apart by in the server's client list
+    /// (`yas client list`): a person, a device, the app embedding it. That
+    /// list shows each client's Terminal and Surface views, so this is what
+    /// says who a view's size came from. The server passes it on as is: being
+    /// a `String`, it is UTF-8, and it must take at most
+    /// [`MAX_CLIENT_IDENTIFIER_BYTES`](yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES)
+    /// (1 KiB), the only things asked of it; several clients may report the
+    /// same one. `None`
+    /// reports none. [`Client::set_identifier`](crate::Client::set_identifier)
+    /// replaces it later.
+    pub identifier: Option<String>,
     /// How many bytes the server may have on their way to this client at once
     /// (HELLO's `max_buffered`): every Transfer and State window the session
     /// grants comes out of it, and [`crate::Client::default_process_window`]
@@ -42,6 +53,7 @@ impl Default for HelloOptions {
             families: None,
             required: Vec::new(),
             read_only: false,
+            identifier: None,
             receive_budget: yas_wire::schema::transport::RECOMMENDED_BUFFERED,
         }
     }
@@ -71,6 +83,12 @@ impl HelloOptions {
     /// Ask for a read-only session.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Report `identifier` as this client's identifier.
+    pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
+        self.identifier = Some(identifier.into());
         self
     }
 
@@ -109,6 +127,13 @@ impl HelloOptions {
         ];
         if self.read_only {
             extensions.push(read_only_extension());
+        }
+        if let Some(identifier) = &self.identifier {
+            extensions.push(
+                yas_wire::core::client_identifier_extension(identifier).map_err(|error| {
+                    Error::invalid(format!("invalid client identifier: {error}"))
+                })?,
+            );
         }
         extensions.sort_by_key(|extension| extension.tag);
         Ok(Extensions(extensions))

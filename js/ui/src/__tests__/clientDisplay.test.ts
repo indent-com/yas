@@ -191,7 +191,10 @@ describe("client subscription sizes", () => {
 });
 
 describe("client identity", () => {
-  function client(origin: YasClientOrigin | null): YasClientInfo {
+  function client(
+    origin: YasClientOrigin | null,
+    identifier: string | null = null,
+  ): YasClientInfo {
     return {
       id: "00000000000000000000000000000007",
       ageSeconds: 11,
@@ -201,6 +204,7 @@ describe("client identity", () => {
       terminals: [],
       surfaces: [],
       origin,
+      identifier,
     };
   }
 
@@ -240,6 +244,21 @@ describe("client identity", () => {
       expect(formatExtensionAttempt(client(origin))).toBeNull();
       expect(formatKickAction(client(origin)).idle).toBe("Kick");
     }
+  });
+
+  it("calls a client by the identifier it reported, as reported", () => {
+    // Whoever limits a terminal's size is then named, not numbered; nothing
+    // makes identifiers unique, and an extension's own is preferred too.
+    expect(
+      formatClientLabel(client({ kind: "network" }, "pierre's iPad")),
+    ).toBe("pierre's iPad");
+    expect(formatClientLabel(client(extension, "nightly build"))).toBe(
+      "nightly build",
+    );
+    // An empty one names nothing, so the usual name stands.
+    expect(formatClientLabel(client(null, ""))).toBe(
+      "Client 00000000000000000000000000000007",
+    );
   });
 
   it("says a kind it cannot name is not an ordinary client", () => {
