@@ -302,6 +302,8 @@ impl WebSocketRelay {
             let mut session_taken = false;
             loop {
                 let (tcp, _) = listener.accept().await.unwrap();
+                // As a relay does: its answers go out at once.
+                let _ = tcp.set_nodelay(true);
                 let Ok(tls) = tls.accept(tcp).await else {
                     continue;
                 };
@@ -647,6 +649,78 @@ async fn websocket_session_serves_consumers_and_takes_allowlist_changes() {
     })
     .await
     .expect("WebSocket session test stalled");
+}
+
+/// Small writes a moment apart, the shape of a terminal's echo, go out at
+/// once: were Nagle's algorithm on for the relay's TCP connection, the second
+/// would wait for the relay to acknowledge the first, which it delays by
+/// 40 ms or more while it has nothing to send back.
+#[cfg(unix)]
+#[tokio::test]
+async fn websocket_streams_answer_small_writes_without_nagle_stalls() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = keys();
+        let (local, listener) = local_socket(dir.path());
+        let mut relay = WebSocketRelay::start().await;
+        let producer = Producer::new(
+            "https://127.0.0.1:1/control",
+            "token",
+            keys.server.clone(),
+            local,
+        )
+        .unwrap();
+        let active = Active::default();
+        let _session = {
+            let (producer, active, relay) = (producer.clone(), active.clone(), relay.relay());
+            tokio::spawn(async move { producer.websocket_session(&relay, &active).await })
+        };
+        relay.ask("echo");
+        let (_, stream) = relay.stream().await;
+        let mut consumer = yas_uplink::connect(stream, keys.client.clone())
+            .await
+            .unwrap();
+        consumer
+            .write_all(yas_wire::PREFACE.as_slice())
+            .await
+            .unwrap();
+        consumer.flush().await.unwrap();
+        let (mut ipc, _) = listener.accept().await.unwrap();
+        let mut preface = vec![0; yas_wire::PREFACE.len()];
+        ipc.read_exact(&mut preface).await.unwrap();
+        // The local server answers each byte with two, a millisecond apart.
+        tokio::spawn(async move {
+            let mut byte = [0; 1];
+            while ipc.read_exact(&mut byte).await.is_ok() {
+                if ipc.write_all(b"a").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if ipc.write_all(b"b").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut rounds = Vec::new();
+        for _ in 0..30 {
+            let start = std::time::Instant::now();
+            consumer.write_all(b"k").await.unwrap();
+            consumer.flush().await.unwrap();
+            let mut answer = [0; 2];
+            consumer.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"ab");
+            rounds.push(start.elapsed());
+        }
+        rounds.sort();
+        let median = rounds[rounds.len() / 2];
+        assert!(
+            median < Duration::from_millis(20),
+            "a round took {median:?} (median of {rounds:?}): is Nagle's algorithm on?"
+        );
+        active.close().await;
+    })
+    .await
+    .expect("Nagle test stalled");
 }
 
 #[tokio::test]
