@@ -2012,6 +2012,45 @@ impl Manager {
         }
     }
 
+    /// Until a look at `process_handle` that WATCH refused as CONFLICT, with the catalogue at
+    /// `revision`, is worth another: the catalogue has moved on (the process's exit reached its
+    /// watchers and is final, or it left), or nothing refuses the look now (this endpoint's
+    /// own binding on it, a concurrent CONTROL's or a failed route's, has gone).
+    pub(crate) async fn wait_native_look(&self, process_handle: u64, revision: u64) {
+        let record = {
+            let state = self.server.0.state.lock().unwrap();
+            if state.catalog_revision != revision {
+                return;
+            }
+            state.live.get(&process_handle).and_then(Weak::upgrade)
+        };
+        let Some(record) = record else {
+            return;
+        };
+        loop {
+            // Both before the looks: notify_waiters reaches futures made before it.
+            let catalogue = self.server.0.catalog_changed.notified();
+            let changed = record.changed.notified();
+            if self.server.0.state.lock().unwrap().catalog_revision != revision {
+                return;
+            }
+            {
+                let inner = record.inner.lock().unwrap();
+                let own = inner
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.endpoint_id == self.endpoint.id);
+                if !inner.terminal_queued && !own {
+                    return;
+                }
+            }
+            tokio::select! {
+                () = catalogue => {}
+                () = changed => {}
+            }
+        }
+    }
+
     fn get(&self, process_id: u32) -> Option<Arc<Record>> {
         match self.endpoint.state.lock().unwrap().slots.get(&process_id) {
             Some(EndpointSlot::Bound(record)) => Some(record.clone()),

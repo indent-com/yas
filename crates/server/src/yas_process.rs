@@ -576,8 +576,8 @@ impl Session {
             } else {
                 // A look refused as CONFLICT is one that comes too soon: the process's exit is
                 // on its way to its watchers (it is final once they have it), or this session's
-                // own last look at it, a CONTROL's, is still leaving. Either settles with the
-                // catalogue's next change, after which the WAIT looks again.
+                // own look at it is still bound (a concurrent CONTROL's, or a route that failed
+                // and has yet to detach). The WAIT waits for that to settle, then looks again.
                 let revision = self.inner.server.native_catalogue_revision();
                 match self
                     .watch_process(request.process_handle, false, true)
@@ -590,7 +590,10 @@ impl Session {
                         (exit, failed, Some(attachment))
                     }
                     Err(Error::Conflict) => {
-                        let settled = self.inner.server.wait_native_catalogue_change(revision);
+                        let settled = self
+                            .inner
+                            .manager
+                            .wait_native_look(request.process_handle, revision);
                         match deadline {
                             None => settled.await,
                             Some(deadline) => tokio::time::timeout_at(deadline, settled)
@@ -994,7 +997,8 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                 let mut routes = inner.routes.lock().unwrap();
                 // Its route failed as the exit was queued: that attachment is gone already. No
                 // replay is recorded (the handle left with the route), so a WAIT in this session
-                // answers CONFLICT while the exit is in flight, then NOT_FOUND.
+                // waits for the exit to be final, then finds the final record of a detachable
+                // process and nothing (NOT_FOUND) of an ordinary one.
                 let Some(route) = routes.get(&process_id).cloned() else {
                     return Ok(());
                 };
@@ -1663,6 +1667,51 @@ mod tests {
             );
         }
         session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// WAIT while this session's own look at the process is still bound: an eviction fails the
+    /// route first and detaches its binding next, and the WAIT looks between the two. The
+    /// Detach settles it: the WAIT looks again, attaches and answers with the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_that_finds_its_own_look_still_bound_answers_once_it_goes() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let owner = runtime.session([14; 16], None).unwrap();
+        let watcher = runtime.session([15; 16], None).unwrap();
+        let attachment = owner
+            .spawn(&spawn_request(sh("{sleep} 1; exit 4"), Vec::new()), None)
+            .await
+            .unwrap();
+        let handle = attachment.process_handle;
+        let look = watcher.attach(&watch_request(handle)).await.unwrap();
+        let process_id = look.route.process_id;
+        // What an eviction does first.
+        fail_route(&watcher.inner, process_id, ROUTE_EVICTED);
+        let wait = tokio::spawn({
+            let watcher = watcher.clone();
+            async move {
+                watcher
+                    .wait(&wire::Wait {
+                        process_handle: handle,
+                        timeout_ns: 5_000_000_000,
+                        extensions: Extensions::default(),
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // And next.
+        watcher
+            .inner
+            .manager
+            .control_native(process_id, process::NativeControl::Detach)
+            .unwrap();
+        let exit = within_5s(wait).await.unwrap().expect("the exit");
+        assert_eq!(exit.code, 4);
+        drop((look, attachment));
+        owner.shutdown().await;
+        watcher.shutdown().await;
         server.shutdown().await;
     }
 
