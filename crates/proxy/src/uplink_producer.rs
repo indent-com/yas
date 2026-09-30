@@ -1015,6 +1015,8 @@ async fn connect_websocket(url: &url::Url, cert_hash: Option<&[u8]>) -> Result<S
     let connecting = tokio_tungstenite::connect_async_tls_with_config(
         request,
         Some(config),
+        // Nagle's algorithm off: a keystroke's echo goes at once, not after
+        // the relay's delayed acknowledgement of what went before.
         true,
         Some(connector),
     );
