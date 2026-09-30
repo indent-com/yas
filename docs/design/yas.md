@@ -3317,8 +3317,12 @@ and otherwise WAITs, so either side may be older.
 Catalog records contain argv0, native PID for diagnostics, lifecycle, owner
 session, detachable flag, stream offsets, exit record, and retention deadline.
 An ordinary process is owned by its spawning session and terminated when that
-session disappears. A detachable process survives without watchers and remains
-discoverable until its retained exit result expires.
+session disappears. That session's WAIT answers with its exit even after it has
+gone, when no attachment of the session's took the exit (one went first, or the
+exit came as it failed): the server keeps such exits for the session alone, as
+many as `MAX_PROCESSES` (never fewer than 64), until the session ends. A
+detachable process survives without watchers and remains discoverable until its
+retained exit result expires.
 
 ATTACH returns new stdout/stderr Transfers beginning at the process's current
 lifetime offsets; earlier output is explicitly reported as a gap and is not

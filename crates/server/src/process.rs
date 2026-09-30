@@ -451,14 +451,22 @@ impl Policy {
     }
 }
 
+/// Runs its action once, told whether the event it rides was dispatched: true after its
+/// dispatch, false when it is dropped without (its queue was full, or its reader gone).
 struct WriterGuard {
-    action: Option<Box<dyn FnOnce() + Send>>,
+    action: Option<Box<dyn FnOnce(bool) + Send>>,
 }
 
 impl WriterGuard {
-    fn new(f: impl FnOnce() + Send + 'static) -> Self {
+    fn new(f: impl FnOnce(bool) + Send + 'static) -> Self {
         Self {
             action: Some(Box::new(f)),
+        }
+    }
+
+    fn dispatched(mut self) {
+        if let Some(f) = self.action.take() {
+            f(true);
         }
     }
 }
@@ -466,7 +474,7 @@ impl WriterGuard {
 impl Drop for WriterGuard {
     fn drop(&mut self) {
         if let Some(f) = self.action.take() {
-            f();
+            f(false);
         }
     }
 }
@@ -619,13 +627,14 @@ pub(crate) enum NativeEvent {
     },
     Exit {
         process_id: u32,
+        process_handle: u64,
         exit: NativeExit,
     },
 }
 
 pub(crate) struct NativeEventEnvelope {
     pub(crate) event: NativeEvent,
-    _guard: Option<WriterGuard>,
+    guard: Option<WriterGuard>,
 }
 
 impl NativeEventEnvelope {
@@ -636,7 +645,9 @@ impl NativeEventEnvelope {
     /// before a concurrent final output acknowledgement observes retirement.
     pub(crate) fn dispatch<T>(self, dispatch: impl FnOnce(NativeEvent) -> T) -> T {
         let result = dispatch(self.event);
-        drop(self._guard);
+        if let Some(guard) = self.guard {
+            guard.dispatched();
+        }
         result
     }
 }
@@ -697,10 +708,7 @@ impl EndpointOutput {
 
     fn send_native(&self, event: NativeEvent, guard: Option<WriterGuard>) -> bool {
         self.events
-            .try_send(NativeEventEnvelope {
-                event,
-                _guard: guard,
-            })
+            .try_send(NativeEventEnvelope { event, guard })
             .is_ok()
     }
 
@@ -727,8 +735,21 @@ impl EndpointOutput {
         )
     }
 
-    fn send_exit(&self, process_id: u32, exit: NativeExit, guard: WriterGuard) -> bool {
-        self.send_native(NativeEvent::Exit { process_id, exit }, Some(guard))
+    fn send_exit(
+        &self,
+        process_id: u32,
+        process_handle: u64,
+        exit: NativeExit,
+        guard: WriterGuard,
+    ) -> bool {
+        self.send_native(
+            NativeEvent::Exit {
+                process_id,
+                process_handle,
+                exit,
+            },
+            Some(guard),
+        )
     }
 }
 
@@ -1093,6 +1114,36 @@ struct EndpointState {
     slots: FxHashMap<u32, EndpointSlot>,
     /// Ordinary processes remain owned after their creator unsubscribes.
     owned: FxHashMap<u64, Weak<Record>>,
+    /// The finals of this endpoint's ordinary processes whose exits it missed: a WAIT of its
+    /// own finds them, as it finds the exits it took.
+    missed: MissedExits,
+}
+
+/// The newest finals of an endpoint's ordinary processes whose exits it missed: it had no
+/// binding to take the exit (its attachment went first), or the exit was dropped on its way
+/// (its queue was full). Nobody else sees them.
+#[derive(Default)]
+struct MissedExits {
+    values: FxHashMap<u64, Arc<FinalRecord>>,
+    order: VecDeque<u64>,
+}
+
+impl MissedExits {
+    fn insert(&mut self, final_record: Arc<FinalRecord>, capacity: usize) {
+        let generation = final_record.generation;
+        if self.values.insert(generation, final_record).is_none() {
+            self.order.push_back(generation);
+        }
+        while self.order.len() > capacity.max(1) {
+            if let Some(retired) = self.order.pop_front() {
+                self.values.remove(&retired);
+            }
+        }
+    }
+
+    fn get(&self, generation: u64) -> Option<&Arc<FinalRecord>> {
+        self.values.get(&generation)
+    }
 }
 
 enum EndpointSlot {
@@ -1988,7 +2039,11 @@ impl Manager {
             drop(server);
             record.changed.notify_waiters();
             Ok(watched)
-        } else if let Some(record) = server.finals.get(&process_handle) {
+        } else if let Some(record) = server
+            .finals
+            .get(&process_handle)
+            .or_else(|| endpoint.missed.get(process_handle))
+        {
             if endpoint_usage(&endpoint) >= self.server.0.policy.max_per_endpoint {
                 return Err(NativeError::ResourceExhausted);
             }
@@ -2062,6 +2117,7 @@ impl Manager {
         let (slots, owned) = {
             let mut endpoint = self.endpoint.state.lock().unwrap();
             endpoint.accepting = false;
+            endpoint.missed = MissedExits::default();
             (
                 std::mem::take(&mut endpoint.slots),
                 std::mem::take(&mut endpoint.owned),
@@ -3200,7 +3256,7 @@ fn deliver(
                     offset,
                     data: data.to_vec(),
                 },
-                _guard: None,
+                guard: None,
             });
             let binding = &mut inner.bindings[index];
             let credit = if stream == PROCESS_STREAM_STDOUT {
@@ -3806,27 +3862,49 @@ fn try_queue_terminal(record: &Arc<Record>) {
     record.terminal_notify.notify_waiters();
     let (bindings, final_record) = terminal;
     if bindings.is_empty() {
-        finish_terminal(record.clone(), final_record);
+        // Nobody takes the exit, its owner included.
+        finish_terminal(record.clone(), final_record, true);
         return;
     }
+    // Whether the owner misses the exit: it has no binding to take it (its attachment went
+    // first), or the exit is dropped on its way to it.
+    let owner = record.owner.upgrade().map(|owner| owner.id);
+    let owner_missed = Arc::new(AtomicBool::new(
+        !bindings
+            .iter()
+            .any(|binding| Some(binding.endpoint_id) == owner),
+    ));
     let remaining = Arc::new(AtomicUsize::new(bindings.len()));
     for binding in bindings {
         let endpoint = binding.endpoint.upgrade();
         let record_for_guard = record.clone();
         let final_for_guard = final_record.clone();
         let remaining_for_guard = remaining.clone();
+        let owner_missed = owner_missed.clone();
+        let owners = Some(binding.endpoint_id) == owner;
         let process_id = binding.process_id;
-        let guard = WriterGuard::new(move || {
+        let guard = WriterGuard::new(move |dispatched| {
+            if owners && !dispatched {
+                owner_missed.store(true, Ordering::Release);
+            }
             if let Some(endpoint) = endpoint {
                 remove_bound_slot(&endpoint, process_id, &record_for_guard);
             }
             if remaining_for_guard.fetch_sub(1, Ordering::AcqRel) == 1 {
-                finish_terminal(record_for_guard, final_for_guard);
+                let owner_missed = owner_missed.load(Ordering::Acquire);
+                finish_terminal(record_for_guard, final_for_guard, owner_missed);
             }
         });
-        let _ = binding
-            .out
-            .send_exit(binding.process_id, final_record.exit(), guard);
+        if !binding.out.send_exit(
+            binding.process_id,
+            record.generation,
+            final_record.exit(),
+            guard,
+        ) {
+            // Its queue is full, and the exit lost to it: its attachment fails, as one that
+            // falls behind does, and its client WAITs.
+            binding.out.evict(binding.process_id);
+        }
     }
 }
 
@@ -3898,11 +3976,21 @@ fn portable_signal_reason(signal: u32) -> u8 {
     }
 }
 
-fn finish_terminal(record: Arc<Record>, final_record: Arc<FinalRecord>) {
+/// `owner_missed`: the exit did not reach the owner. An ordinary process's final is then kept
+/// for it, before the release moves the catalogue: a WAIT of its that found the exit on its way
+/// looks again at that change.
+fn finish_terminal(record: Arc<Record>, final_record: Arc<FinalRecord>, owner_missed: bool) {
     if record.detachable {
         let server = record.server.clone();
         server.finish_detached(record, final_record);
     } else {
+        if owner_missed && let Some(owner) = record.owner.upgrade() {
+            let mut state = owner.state.lock().unwrap();
+            if state.accepting {
+                let capacity = record.server.0.maxima.exit_replays();
+                state.missed.insert(final_record, capacity);
+            }
+        }
         record.server.release_record(&record);
     }
 }
