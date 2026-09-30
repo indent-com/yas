@@ -2083,6 +2083,70 @@ async fn terminals_restart_take_signals_and_keep_deadlines() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_send_refuses_unknown_and_exited_terminals_even_with_empty_input() {
+    use yas_client::terminal::{SignalKind, TerminalCommand};
+    async fn send(on: &str, id: u64, text: &str) -> std::process::Output {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_yas"))
+            .args(["--on", on, "terminal", "send"])
+            .arg(id.to_string())
+            .arg(text)
+            .env("YAS_PROXY", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap()
+    }
+    fn refused(output: std::process::Output, message: &str) {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("yas: {message}\n")
+        );
+    }
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let on = format!("socket:{}", server.socket_path().display());
+
+    let id = client
+        .start_terminal(&TerminalCommand::new("sh").args(["-c", "echo run-$$; exec sleep 600"]))
+        .await
+        .unwrap();
+    wait_for_screen(&client, id, "run-").await;
+    for text in ["", "ls\\n"] {
+        let output = send(&on, id, text).await;
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move { client.wait_terminal_exit(id).await })
+    };
+    client
+        .signal_terminal(id, SignalKind::Terminate)
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for text in ["", "ls\\n"] {
+        refused(
+            send(&on, id, text).await,
+            &format!(
+                "cannot send to pty {id}: it is no longer running (status signal(15, Terminate)); \
+                 `yas terminal restart {id}` re-runs it"
+            ),
+        );
+    }
+
+    client.close_terminal(id).await.unwrap();
+    for text in ["", "ls\\n"] {
+        refused(send(&on, id, text).await, &format!("pty {id} not found"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_whose_shell_reports_its_commands_answers_journal_output_and_cwd() {
     use yas_client::terminal::TerminalCommand;
     let server = start().await;
