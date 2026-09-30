@@ -1660,7 +1660,8 @@ export const YAS_PROCESS_SPAWN_STDIN_NULL = 8 as const;
 export const YAS_PROCESS_SPAWN_FLAGS = 3 as const;
 export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS = 12 as const;
 export const YAS_PROCESS_SPAWN_REPORT_EXIT = 16 as const;
-export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS_EXTENDED = 28 as const;
+export const YAS_PROCESS_SPAWN_KEEP_OUTPUT = 32 as const;
+export const YAS_PROCESS_SPAWN_LAUNCHER_FLAGS_EXTENDED = 60 as const;
 export const YAS_PROCESS_ENV_EMPTY = 0 as const;
 export const YAS_PROCESS_ENV_SESSION = 1 as const;
 export const YAS_PROCESS_CWD_SERVER_DEFAULT = 0 as const;
@@ -1707,6 +1708,10 @@ export const YAS_PROCESS_STREAM_STDERR_CONTENT_KIND = 2 as const;
 export const YAS_PROCESS_SPAWN_SURFACE_APP_EXTENSION = 1 as const;
 export const YAS_PROCESS_SPAWN_RESOURCE_TAG_EXTENSION = 2 as const;
 export const YAS_PROCESS_SPAWN_RESIDUE_GRACE_EXTENSION = 3 as const;
+export const YAS_PROCESS_SPAWN_KEEP_OUTPUT_EXTENSION = 4 as const;
+export const YAS_PROCESS_MAX_KEEP_OUTPUT_TAIL_BYTES = 1048576 as const;
+export const YAS_PROCESS_EXIT_STDOUT_ELIDED_EXTENSION = 1 as const;
+export const YAS_PROCESS_EXIT_STDERR_ELIDED_EXTENSION = 2 as const;
 export const YAS_PROCESS_MAX_ARGC = 1024 as const;
 export const YAS_PROCESS_MAX_ARG_BYTES = 1048576 as const;
 export const YAS_PROCESS_MAX_ARG_LEN = 65536 as const;
@@ -11873,7 +11878,15 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "exit_report",
-          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions"
+          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream"
+        },
+        {
+          "name": "keep_output_extension",
+          "layout": "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES"
+        },
+        {
+          "name": "output_elision",
+          "layout": "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream"
         },
         {
           "name": "exit_record",
@@ -11922,8 +11935,12 @@ export const YAS_SCHEMA = {
           "value": 16
         },
         {
+          "name": "SPAWN_KEEP_OUTPUT",
+          "value": 32
+        },
+        {
           "name": "SPAWN_LAUNCHER_FLAGS_EXTENDED",
-          "value": 28
+          "value": 60
         },
         {
           "name": "ENV_EMPTY",
@@ -12108,6 +12125,22 @@ export const YAS_SCHEMA = {
         {
           "name": "SPAWN_RESIDUE_GRACE_EXTENSION",
           "value": 3
+        },
+        {
+          "name": "SPAWN_KEEP_OUTPUT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "MAX_KEEP_OUTPUT_TAIL_BYTES",
+          "value": 1048576
+        },
+        {
+          "name": "EXIT_STDOUT_ELIDED_EXTENSION",
+          "value": 1
+        },
+        {
+          "name": "EXIT_STDERR_ELIDED_EXTENSION",
+          "value": 2
         },
         {
           "name": "MAX_ARGC",

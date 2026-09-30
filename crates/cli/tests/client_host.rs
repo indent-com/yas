@@ -840,6 +840,135 @@ async fn a_spawned_process_reports_its_exit_without_a_wait() {
     }
 }
 
+/// A process spawned with `keep_output`: its streams' heads and tails, and what was dropped.
+async fn kept(client: &Client, command: &Command) -> yas_client::process::Output {
+    let process = client.spawn(command).await.unwrap();
+    within("the kept output", process.output_limited(4 << 20))
+        .await
+        .unwrap()
+}
+
+/// What a WHATWG UTF-8 decoder makes of `text`, as an elision counts it.
+fn elision_of(offset: usize, text: &str) -> yas_client::process::OutputElision {
+    yas_client::process::OutputElision {
+        offset: offset as u64,
+        bytes: text.len() as u64,
+        lines: text.matches('\n').count() as u64,
+        code_points: text.chars().count() as u64,
+        utf16_units: text.encode_utf16().count() as u64,
+    }
+}
+
+/// With `keep_output`, each stream is sent as its head and its tail, cut between characters,
+/// and the exit says exactly what was dropped between them: far more output than the session
+/// takes runs at the speed of its pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kept_output_is_its_head_and_tail_and_the_exit_counts_the_rest() {
+    use yas_client::wire::schema::process as schema;
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    assert_ne!(
+        client.launcher_flags() & schema::SPAWN_KEEP_OUTPUT as u32,
+        0
+    );
+
+    // 64 MiB of `yes` on stdout, 1 MiB on stderr: 1,000 + 2,000 bytes of each come.
+    const BYTES: usize = 64 << 20;
+    let yes = kept(
+        &client,
+        Command::new("sh")
+            .args([
+                "-c".to_owned(),
+                format!("yes | head -c {BYTES}; yes e | head -c 1048576 >&2; exit 4"),
+            ])
+            .keep_output(1_000, 2_000),
+    )
+    .await;
+    assert_eq!(yes.status.code(), Some(4), "{}", server_log(&server));
+    assert_eq!(yes.stdout, "y\n".repeat(1_500).into_bytes());
+    assert_eq!(yes.stderr, "e\n".repeat(1_500).into_bytes());
+    assert_eq!(
+        yes.elided,
+        [
+            Some(elision_of(1_000, &"y\n".repeat((BYTES - 3_000) / 2))),
+            Some(elision_of(1_000, &"e\n".repeat((1_048_576 - 3_000) / 2))),
+        ]
+    );
+    // Mixed widths: the cuts fall inside emoji and CJK, and move to their ends.
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("mixed");
+    let middle = "中文 🙂 ascii\n".repeat(700);
+    let whole = format!("ab🙂中{middle}🙂中cd");
+    std::fs::write(&file, &whole).unwrap();
+    // 3 bytes of head end within 🙂 (2 + 4), 8 of tail start within 🙂 (…🙂 中 c d).
+    let (head, tail) = (3, 8);
+    let head_len = 6;
+    let tail_start = whole.len() - "中cd".len();
+    assert!(whole.is_char_boundary(head_len) && whole.is_char_boundary(tail_start));
+    let mixed = kept(
+        &client,
+        Command::new("sh")
+            .args([
+                "-c".to_owned(),
+                format!("cat '{0}'; cat '{0}' >&2", file.display()),
+            ])
+            .keep_output(head, tail),
+    )
+    .await;
+    assert!(mixed.status.success(), "{}", mixed.status);
+    let expected = [&whole[..head_len], &whole[tail_start..]]
+        .concat()
+        .into_bytes();
+    assert_eq!(
+        String::from_utf8_lossy(&mixed.stdout),
+        String::from_utf8_lossy(&expected)
+    );
+    assert_eq!(mixed.stderr, expected);
+    let dropped = Some(elision_of(head_len, &whole[head_len..tail_start]));
+    assert_eq!(mixed.elided, [dropped, dropped]);
+
+    // What fits is all sent, and nothing said dropped; merged stderr is stdout's.
+    let fits = kept(
+        &client,
+        Command::new("sh")
+            .args(["-c", "printf 'out 🙂'; printf ' err' >&2"])
+            .merge_stderr(true)
+            .keep_output(100, 100),
+    )
+    .await;
+    assert_eq!(fits.stdout, "out 🙂 err".as_bytes());
+    assert_eq!(fits.elided, [None, None]);
+    let merged = kept(
+        &client,
+        Command::new("sh")
+            .args(["-c", "yes o | head -c 100000; yes e | head -c 100000 >&2"])
+            .merge_stderr(true)
+            .keep_output(10, 10),
+    )
+    .await;
+    assert_eq!(merged.stdout, b"o\no\no\no\no\ne\ne\ne\ne\ne\n");
+    assert_eq!(merged.elided[0].unwrap().bytes, 200_000 - 20);
+    assert_eq!(merged.elided[1], None);
+
+    // A residue holding the streams past the grace: the tail kept so far goes out before
+    // the exit, which counts what was dropped until then.
+    let residue = kept(
+        &client,
+        Command::new("sh")
+            .args(["-c", "yes | head -c 3000000; (sleep 2; echo late) &"])
+            .leave_residue(Some(Duration::from_millis(300)))
+            .keep_output(10, 10),
+    )
+    .await;
+    assert_eq!(residue.status.detail, "residual process group left running");
+    assert_eq!(residue.stdout, "y\n".repeat(10).into_bytes());
+    assert_eq!(
+        residue.elided[0],
+        Some(elision_of(10, &"y\n".repeat((3_000_000 - 20) / 2)))
+    );
+    still_runs_commands(&client).await;
+}
+
 /// Against a server from before SPAWN_REPORT_EXIT, the same commands are
 /// waited for with WAIT. Run with
 /// `YAS_OLD_SERVER=/path/to/yas cargo test -p yas-cli --test client_host -- --ignored`, with a
@@ -880,6 +1009,70 @@ async fn a_server_from_before_report_exit_is_waited_for() {
         .unwrap();
     assert_eq!(process.wait().await.unwrap().code(), Some(5));
     exits_come_with_all_their_output(&server, &client).await;
+}
+
+/// Every stdout/stderr stream holds its window of the session's receive budget
+/// while it is open, writing or not. A client that asks for a wider budget
+/// gets windows that still all fit: at 256 processes a session in 256 MiB,
+/// 384 KiB each, where 16 MiB gives 24 KiB. With 255 quiet processes holding
+/// theirs (510 streams, 191 MiB: more than the default budget), one more still
+/// gets credit, and all of its output at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wider_receive_budget_fits_every_process_window() {
+    const BUDGET: u64 = 256 << 20;
+    const QUIET: usize = 255;
+    let server = within(
+        "hosted server start",
+        HostedServer::start(
+            options()
+                .args(["--process-max-per-session", "256"])
+                .args(["--process-max", "1024"])
+                .hello(HelloOptions::named("yas-test").receive_budget(BUDGET)),
+        ),
+    )
+    .await
+    .expect("hosted server starts");
+    let narrow = server
+        .connect_with(&HelloOptions::named("yas-test"))
+        .await
+        .unwrap();
+    assert_eq!(narrow.default_process_window(), 24 * 1024);
+    drop(narrow);
+    let client = server.connect().await.unwrap();
+    assert_eq!(client.receive_budget(), BUDGET);
+    assert_eq!(client.default_process_window(), 384 * 1024);
+    let mut quiet = Vec::with_capacity(QUIET);
+    for _ in 0..QUIET {
+        quiet.push(client.spawn(Command::new("sleep").arg("60")).await.unwrap());
+    }
+    // Three windows of output: it comes whole only if credit keeps coming.
+    const BYTES: usize = 3 * 384 * 1024;
+    let started = Instant::now();
+    let output = within(
+        "a command beside the quiet ones",
+        client
+            .spawn(Command::new("sh").args(["-c", &format!("head -c {BYTES} /dev/zero; echo end")]))
+            .await
+            .unwrap()
+            .output(),
+    )
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    assert!(output.status.success(), "{}", output.status);
+    assert_eq!(output.stdout.len(), BYTES + 4);
+    assert!(output.stdout.ends_with(b"end\n"));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    for process in &quiet {
+        process.kill().await.unwrap();
+    }
+    for process in &quiet {
+        within("a quiet process's exit", process.wait())
+            .await
+            .unwrap();
+    }
+    drop(quiet);
+    still_runs_commands(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1234,7 +1427,10 @@ async fn a_command_can_leave_its_background_running_with_a_null_stdin() {
     let client = server.connect().await.unwrap();
     assert_eq!(
         client.launcher_flags(),
-        (schema::SPAWN_LEAVE_RESIDUE | schema::SPAWN_STDIN_NULL | schema::SPAWN_REPORT_EXIT) as u32
+        (schema::SPAWN_LEAVE_RESIDUE
+            | schema::SPAWN_STDIN_NULL
+            | schema::SPAWN_REPORT_EXIT
+            | schema::SPAWN_KEEP_OUTPUT) as u32
     );
     // The background `sleep` holds stdout: the exit comes after the grace, and
     // the sleep keeps running.
@@ -1884,6 +2080,70 @@ async fn terminals_restart_take_signals_and_keep_deadlines() {
     assert!(started.elapsed() < Duration::from_secs(20));
     client.close_terminal(id).await.unwrap();
     assert!(client.close_terminal(id).await.unwrap_err().is_not_found());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_send_refuses_unknown_and_exited_terminals_even_with_empty_input() {
+    use yas_client::terminal::{SignalKind, TerminalCommand};
+    async fn send(on: &str, id: u64, text: &str) -> std::process::Output {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_yas"))
+            .args(["--on", on, "terminal", "send"])
+            .arg(id.to_string())
+            .arg(text)
+            .env("YAS_PROXY", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap()
+    }
+    fn refused(output: std::process::Output, message: &str) {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("yas: {message}\n")
+        );
+    }
+    let server = start().await;
+    let client = server.connect().await.unwrap();
+    let on = format!("socket:{}", server.socket_path().display());
+
+    let id = client
+        .start_terminal(&TerminalCommand::new("sh").args(["-c", "echo run-$$; exec sleep 600"]))
+        .await
+        .unwrap();
+    wait_for_screen(&client, id, "run-").await;
+    for text in ["", "ls\\n"] {
+        let output = send(&on, id, text).await;
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move { client.wait_terminal_exit(id).await })
+    };
+    client
+        .signal_terminal(id, SignalKind::Terminate)
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for text in ["", "ls\\n"] {
+        refused(
+            send(&on, id, text).await,
+            &format!(
+                "cannot send to pty {id}: it is no longer running (status signal(15, Terminate)); \
+                 `yas terminal restart {id}` re-runs it"
+            ),
+        );
+    }
+
+    client.close_terminal(id).await.unwrap();
+    for text in ["", "ls\\n"] {
+        refused(send(&on, id, text).await, &format!("pty {id} not found"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

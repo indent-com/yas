@@ -35,6 +35,14 @@ pub struct HelloOptions {
     /// reports none. [`Client::set_identifier`](crate::Client::set_identifier)
     /// replaces it later.
     pub identifier: Option<String>,
+    /// How many bytes the server may have on their way to this client at once
+    /// (HELLO's `max_buffered`): every Transfer and State window the session
+    /// grants comes out of it, and [`crate::Client::default_process_window`]
+    /// sizes process output windows so that all of them fit in it. Each open
+    /// stream holds its window whether or not it is writing, so a client that
+    /// runs many processes at once and wants wide windows raises it. It bounds
+    /// what may wait here unread, not what is allocated. 16 MiB by default.
+    pub receive_budget: u64,
 }
 
 impl Default for HelloOptions {
@@ -46,6 +54,7 @@ impl Default for HelloOptions {
             required: Vec::new(),
             read_only: false,
             identifier: None,
+            receive_budget: yas_wire::schema::transport::RECOMMENDED_BUFFERED,
         }
     }
 }
@@ -80,6 +89,13 @@ impl HelloOptions {
     /// Report `identifier` as this client's identifier.
     pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
+        self
+    }
+
+    /// Set [`HelloOptions::receive_budget`], at least 1 byte and at most
+    /// 1 GiB (the protocol's hard maximum).
+    pub fn receive_budget(mut self, bytes: u64) -> Self {
+        self.receive_budget = bytes.clamp(1, yas_wire::schema::transport::HARD_MAX_BUFFERED);
         self
     }
 

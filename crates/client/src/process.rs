@@ -80,10 +80,12 @@
 //! flags to a hosted server.
 //!
 //! Every stdout/stderr stream holds its [`Command::window`] of the
-//! session's receive budget (16 MiB) while it is open. Unless a command sets
+//! session's receive budget ([`crate::HelloOptions::receive_budget`], 16 MiB
+//! unless the client asks for more) while it is open. Unless a command sets
 //! one, [`Client::default_process_window`] sizes it so that the server's
-//! per-session maximum of processes fits: 384 KiB at the default of 16,
-//! never more than 1 MiB nor less than 16 KiB.
+//! per-session maximum of processes fits: 384 KiB at the default of 16 in
+//! 16 MiB (or 256 in 256 MiB), never more than 1 MiB nor less than 16 KiB.
+//! Over a network a stream carries at most about a window a round trip.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -110,7 +112,7 @@ use crate::transfer::{ByteSink, ByteStream, DEFAULT_WINDOW};
 /// The smallest output window [`Client::default_process_window`] picks.
 const MIN_AUTO_WINDOW: u64 = 16 * 1024;
 
-pub use yas_wire::process::ExitKind;
+pub use yas_wire::process::{ExitKind, OutputElision};
 
 /// What the child's stdin is connected to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -148,6 +150,7 @@ pub struct Command {
     window: Option<u64>,
     operation_id: [u8; 16],
     leave_residue: Option<Option<Duration>>,
+    keep_output: Option<(u64, u64)>,
 }
 
 impl Command {
@@ -164,6 +167,7 @@ impl Command {
             window: None,
             operation_id: nonzero_id(),
             leave_residue: None,
+            keep_output: None,
         }
     }
 
@@ -246,6 +250,18 @@ impl Command {
     /// servers) refuse the spawn.
     pub fn leave_residue(&mut self, grace: Option<Duration>) -> &mut Self {
         self.leave_residue = Some(grace);
+        self
+    }
+
+    /// Send only the first `head` bytes of each output stream (a few more, to end between
+    /// UTF-8 characters) and its last `tail` bytes (at most 1 MiB,
+    /// `MAX_KEEP_OUTPUT_TAIL_BYTES`; a few fewer, to start between characters), where the
+    /// server offers `SPAWN_KEEP_OUTPUT` with `SPAWN_REPORT_EXIT` ([`Client::launcher_flags`]):
+    /// what comes between is dropped as the server reads it, so the command runs at the speed
+    /// of its pipe rather than of this session, and counted ([`Process::elided`]). Other
+    /// servers send it all.
+    pub fn keep_output(&mut self, head: u64, tail: u64) -> &mut Self {
+        self.keep_output = Some((head, tail.min(schema::MAX_KEEP_OUTPUT_TAIL_BYTES)));
         self
     }
 
@@ -469,10 +485,14 @@ impl std::fmt::Display for ExitStatus {
 pub struct Output {
     /// How it ended.
     pub status: ExitStatus,
-    /// Everything it wrote to stdout (and stderr, when merged).
+    /// Everything it wrote to stdout (and stderr, when merged); with
+    /// [`Command::keep_output`], its head then its tail, as `elided` says.
     pub stdout: Vec<u8>,
-    /// Everything it wrote to stderr (empty when merged).
+    /// Everything it wrote to stderr (empty when merged), or its head then its tail.
     pub stderr: Vec<u8>,
+    /// What `KEEP_OUTPUT` dropped of stdout and of stderr ([`Process::elided`]): None when
+    /// nothing was, the stream then whole.
+    pub elided: [Option<OutputElision>; 2],
 }
 
 /// A running (or finished) process and the streams this session holds.
@@ -495,7 +515,8 @@ pub struct Process {
 /// detached), the exit is asked for with WAIT.
 struct ReportedExit {
     frames: tokio::sync::Mutex<crate::client::FrameReceiver>,
-    status: std::sync::OnceLock<ExitStatus>,
+    /// The exit, and what KEEP_OUTPUT dropped of stdout and of stderr.
+    status: std::sync::OnceLock<(ExitStatus, [Option<OutputElision>; 2])>,
     lost: Arc<crate::client::ReportLost>,
 }
 
@@ -524,14 +545,14 @@ impl ReportedExit {
             }
         };
         tokio::pin!(until_deadline);
-        if let Some(status) = self.status.get() {
+        if let Some((status, _)) = self.status.get() {
             return Ok(Some(status.clone()));
         }
         let mut frames = tokio::select! {
             frames = self.frames.lock() => frames,
             () = &mut until_deadline => return Ok(None),
         };
-        if let Some(status) = self.status.get() {
+        if let Some((status, _)) = self.status.get() {
             return Ok(Some(status.clone()));
         }
         let frame = tokio::select! {
@@ -542,13 +563,17 @@ impl ReportedExit {
             () = &mut until_deadline => return Ok(None),
         };
         let status = match frame {
-            Some(frame) => ExitStatus::from_wire(ExitReport::decode(&frame.payload)?.exit),
+            Some(frame) => {
+                let report = ExitReport::decode(&frame.payload)?;
+                let elided = [report.elided(false)?, report.elided(true)?];
+                (ExitStatus::from_wire(report.exit), elided)
+            }
             None if self.lost.is_lost() => {
                 let left = deadline.map(|deadline| {
                     deadline.saturating_duration_since(tokio::time::Instant::now())
                 });
                 match client.wait_process(handle, left).await? {
-                    Some(status) => status,
+                    Some(status) => (status, [None; 2]),
                     None => return Ok(None),
                 }
             }
@@ -558,7 +583,7 @@ impl ReportedExit {
                     .unwrap_or_else(|| Error::protocol("Process EXIT route closed")));
             }
         };
-        Ok(Some(self.status.get_or_init(|| status).clone()))
+        Ok(Some(self.status.get_or_init(|| status).0.clone()))
     }
 }
 
@@ -664,6 +689,14 @@ impl Process {
             .await
     }
 
+    /// What `KEEP_OUTPUT` ([`Command::keep_output`]) dropped of stdout (or, with `stderr`, of
+    /// stderr), once [`Process::wait`] answered: None when nothing was. The stream's bytes
+    /// are its head, up to `offset`, then its tail; the elision's counts say what was between.
+    pub fn elided(&self, stderr: bool) -> Option<OutputElision> {
+        let (_, elided) = self.reported.as_ref()?.status.get()?;
+        elided[usize::from(stderr)]
+    }
+
     /// Make a detachable process independent of this session's attachment.
     pub async fn detach(&self) -> Result<()> {
         // Its attachment goes, and would have reported the exit.
@@ -702,6 +735,7 @@ impl Process {
             status,
             stdout,
             stderr,
+            elided: [self.elided(false), self.elided(true)],
         })
     }
 
@@ -897,6 +931,17 @@ impl Client {
         let mut spawn = command.to_wire(stdin_null, window)?;
         if report_exit {
             spawn.flags |= schema::SPAWN_REPORT_EXIT as u16;
+        }
+        // Its last extension (tag 4): the others' tags are lower.
+        if let Some((head, tail)) = command.keep_output
+            && report_exit
+            && self.launcher_flags() & schema::SPAWN_KEEP_OUTPUT as u32 != 0
+        {
+            spawn.flags |= schema::SPAWN_KEEP_OUTPUT as u16;
+            spawn
+                .extensions
+                .0
+                .push(Spawn::keep_output_extension(head, tail));
         }
         // Servers from before the extended limits refuse more than 256
         // entries as undecodable; say why instead.
@@ -1135,13 +1180,13 @@ impl Client {
     /// The output window a [`Command`] gets unless it sets one: 1 MiB, or
     /// less when the server admits so many processes per session that their
     /// stdout and stderr windows would not fit in three quarters of the
-    /// session's receive budget (16 MiB), leaving the rest for everything
-    /// else the session receives. Never below 16 KiB.
+    /// session's receive budget ([`Client::receive_budget`]), leaving the
+    /// rest for everything else the session receives. Never below 16 KiB.
     pub fn default_process_window(&self) -> u64 {
         let per_session = self.process_limits().map_or(1, |limits| {
             u64::from(limits.max_processes_per_session).max(1)
         });
-        let budget = yas_wire::schema::transport::RECOMMENDED_BUFFERED / 4 * 3;
+        let budget = self.receive_budget() / 4 * 3;
         (budget / (2 * per_session)).clamp(MIN_AUTO_WINDOW, DEFAULT_WINDOW)
     }
 

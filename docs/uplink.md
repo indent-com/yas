@@ -270,6 +270,22 @@ A WebTransport (HTTP/3 CONNECT) session to the relay URL. Liveness settings
 are a **10s keepalive** and a **30s idle timeout**, so a dead relay is
 noticed within 30 seconds without any application-level pings.
 
+Its congestion control is CUBIC with a **16 MiB initial window**, and the
+uplink asks for an **8 MiB UDP receive buffer**. quinn paces a window over the
+round trip, and answers leave the connection app-limited, so the window
+never grows past what they need. From quinn's usual 12,000 bytes (ten
+1,200-byte datagrams, as RFC 9002 recommends), a 1 MiB answer settles at two
+round trips; from 16 MiB, it takes one. Loss still shrinks the window, and
+each stream's 1.25 MB receive window still bounds what one consumer has in
+flight. A system may allow a smaller buffer: Linux caps it at
+`net.core.rmem_max` (then doubles it for bookkeeping, so all 8 MiB reads as
+16 MiB), while macOS and the BSDs refuse a size over their cap
+(`kern.ipc.maxsockbuf`, less their overhead: about 7.1 MiB of macOS's usual
+8 MiB), so there the uplink asks for the largest size they take. The session
+goes on either way, and the uplink says what it got as it connects (`UDP
+receive buffer: N bytes`, and what caps it when something does). A relay
+should do the same for what it sends.
+
 The uplink never opens streams. The relay opens **one bidirectional stream
 per consumer**. After Noise authentication, the uplink bridges decrypted
 bytes to a fresh local YAS socket. Direct streams carry the normal YAS preface

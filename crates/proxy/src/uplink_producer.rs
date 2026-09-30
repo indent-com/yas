@@ -61,6 +61,38 @@ const MAX_PENDING: usize = 64;
 /// Liveness of a session: a keepalive this often, dead after this long silent.
 const KEEPALIVE: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The congestion window a WebTransport session starts with: CUBIC's, but
+/// large enough that an answer goes out at once. quinn paces a window over
+/// the round trip (1.25 windows per RTT), and a burst leaves the connection
+/// app-limited, which keeps the window from growing past it: from quinn's
+/// 12,000 bytes (ten 1,200-byte datagrams), a 1 MiB answer settles at two
+/// round trips. Loss shrinks the window as ever, and a stream's receive window
+/// (1.25 MB) still bounds what one consumer has in flight.
+const INITIAL_WINDOW: u64 = 16 << 20;
+/// The UDP receive buffer asked for (the system may allow less): a paced
+/// burst is up to 256 datagrams, well over Linux's default of 208 KiB.
+const RECEIVE_BUFFER: usize = 8 << 20;
+/// Whether the system reports double the receive buffer it allows (for its
+/// bookkeeping), as Linux does.
+const REPORTS_DOUBLE: bool = cfg!(any(target_os = "linux", target_os = "android"));
+/// What the system reports for all of [`RECEIVE_BUFFER`], uncapped.
+const RECEIVE_BUFFER_REPORTED: usize = if REPORTS_DOUBLE {
+    2 * RECEIVE_BUFFER
+} else {
+    RECEIVE_BUFFER
+};
+/// What caps a UDP receive buffer, for whoever would raise it.
+const RECEIVE_BUFFER_CAP: &str = if REPORTS_DOUBLE {
+    "net.core.rmem_max"
+} else if cfg!(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+)) {
+    "kern.ipc.maxsockbuf"
+} else {
+    "the system"
+};
 /// How long a WebSocket (session or stream) may take to open.
 const WEBSOCKET_CONNECT: Duration = Duration::from_secs(10);
 /// How long [`Transport::Auto`] waits for a WebTransport session before it
@@ -270,6 +302,11 @@ pub enum Event {
     /// A consumer stream couldn't be served (a WebSocket stream the relay
     /// asked for that didn't open, a datagram lane this session can't carry).
     StreamFailed { error: String },
+    /// The UDP receive buffer a WebTransport session got, in bytes, as the
+    /// system reports it (Linux doubles what it allows, for its bookkeeping).
+    /// A system allowing less than the uplink asks for only makes bursts lose
+    /// more packets; the session goes on.
+    ReceiveBuffer { bytes: usize },
 }
 
 impl fmt::Display for Event {
@@ -300,6 +337,17 @@ impl fmt::Display for Event {
                 write!(f, "local yas server unavailable at {local}: {error}")
             }
             Self::StreamFailed { error } => write!(f, "consumer stream failed: {error}"),
+            Self::ReceiveBuffer { bytes } if *bytes < RECEIVE_BUFFER_REPORTED => {
+                write!(f, "UDP receive buffer: {bytes} bytes, under the ")?;
+                if REPORTS_DOUBLE {
+                    write!(f, "{RECEIVE_BUFFER_REPORTED} Linux reports for the ")?;
+                }
+                write!(
+                    f,
+                    "{RECEIVE_BUFFER} asked for ({RECEIVE_BUFFER_CAP} caps it)"
+                )
+            }
+            Self::ReceiveBuffer { bytes } => write!(f, "UDP receive buffer: {bytes} bytes"),
         }
     }
 }
@@ -535,8 +583,8 @@ impl Producer {
         limit: Option<Duration>,
         active: &Active,
     ) -> SessionEnd {
-        let client = match webtransport_client(relay.cert_hash.as_deref()) {
-            Ok(client) => client,
+        let (client, receive_buffer) = match webtransport_client(relay.cert_hash.as_deref()) {
+            Ok(made) => made,
             Err(error) => return SessionEnd::NeverConnected(error),
         };
         // Careful: the URL is the credential — show `relay.label` only.
@@ -562,6 +610,9 @@ impl Producer {
             relay: relay.label.clone(),
             carrier: Carrier::WebTransport,
         });
+        if let Some(bytes) = receive_buffer {
+            self.emit(Event::ReceiveBuffer { bytes });
+        }
         active.set(Session::WebTransport(Box::new(session.clone())));
 
         let routes = DatagramRoutes::new(MAX_DATAGRAM_ROUTES);
@@ -946,9 +997,11 @@ enum SessionEnd {
 }
 
 /// A WebTransport client with the liveness settings of docs/uplink.md (10 s
-/// keepalive, 30 s idle timeout), on YAS's rustls provider, verifying the
-/// relay with the platform's roots or a certificate pin.
-fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
+/// keepalive, 30 s idle timeout) and a window for bursts ([`INITIAL_WINDOW`],
+/// [`RECEIVE_BUFFER`]), on YAS's rustls provider, verifying the relay with
+/// the platform's roots or a certificate pin; with the UDP receive buffer it
+/// got, where the system says.
+fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<(wt::Client, Option<usize>), String> {
     let provider = yas_webrtc_forwarder::tls::provider();
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -974,11 +1027,73 @@ fn webtransport_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
     transport.max_idle_timeout(Some(
         wt::quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("30s fits in an idle timeout"),
     ));
+    let mut cubic = wt::quinn::congestion::CubicConfig::default();
+    cubic.initial_window(INITIAL_WINDOW);
+    transport.congestion_controller_factory(Arc::new(cubic));
     config.transport_config(Arc::new(transport));
-    let endpoint = wt::quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
-        .or_else(|_| wt::quinn::Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))
+    let socket = udp_socket((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+        .or_else(|_| udp_socket((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))
         .map_err(|error| format!("UDP socket: {error}"))?;
-    Ok(wt::Client::new(endpoint, config))
+    let receive_buffer = socket2::SockRef::from(&socket).recv_buffer_size().ok();
+    let runtime = wt::quinn::default_runtime().ok_or("UDP socket: no async runtime")?;
+    let endpoint =
+        wt::quinn::Endpoint::new(wt::quinn::EndpointConfig::default(), None, socket, runtime)
+            .map_err(|error| format!("UDP socket: {error}"))?;
+    Ok((wt::Client::new(endpoint, config), receive_buffer))
+}
+
+/// A UDP socket bound to `address` (dual-stack for IPv6's unspecified one, as
+/// quinn's own client endpoint is), with as much of [`RECEIVE_BUFFER`] as the
+/// system allows.
+fn udp_socket(address: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if address.is_ipv6() {
+        let _ = socket.set_only_v6(false);
+    }
+    grow_receive_buffer(&socket);
+    socket.bind(&address.into())?;
+    Ok(socket.into())
+}
+
+/// Gives `socket` as much of [`RECEIVE_BUFFER`] as the system allows, which is
+/// still better than its default; none is no reason to fail. Linux caps a size
+/// over net.core.rmem_max, but macOS and the BSDs refuse one over their cap
+/// (kern.ipc.maxsockbuf less mbuf overhead: 7,456,540 bytes of macOS's usual
+/// 8 MiB) with ENOBUFS and keep their default, so there the uplink looks for
+/// the largest size they take, between the two.
+fn grow_receive_buffer(socket: &socket2::Socket) {
+    if socket.set_recv_buffer_size(RECEIVE_BUFFER).is_ok() {
+        return;
+    }
+    if let Ok(default) = socket.recv_buffer_size() {
+        largest_taken(default, RECEIVE_BUFFER, |size| {
+            socket.set_recv_buffer_size(size).is_ok()
+        });
+    }
+}
+
+/// The largest size from `taken` (one the system has) up to `refused` (one it
+/// refused, excluded) that `take` takes, halving the gap each try: a system
+/// takes every size up to its cap. A refused size leaves the buffer as it was,
+/// so what `take` took last is the size returned.
+fn largest_taken(
+    mut taken: usize,
+    mut refused: usize,
+    mut take: impl FnMut(usize) -> bool,
+) -> usize {
+    while refused.saturating_sub(taken) > 1 {
+        let size = taken + (refused - taken) / 2;
+        if take(size) {
+            taken = size;
+        } else {
+            refused = size;
+        }
+    }
+    taken
 }
 
 /// A WebSocket to `url` (`wss`, a session's or a stream's) speaking
@@ -1015,6 +1130,8 @@ async fn connect_websocket(url: &url::Url, cert_hash: Option<&[u8]>) -> Result<S
     let connecting = tokio_tungstenite::connect_async_tls_with_config(
         request,
         Some(config),
+        // Nagle's algorithm off: a keystroke's echo goes at once, not after
+        // the relay's delayed acknowledgement of what went before.
         true,
         Some(connector),
     );

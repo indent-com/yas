@@ -1389,6 +1389,7 @@ pub enum TerminalCommand {
 
     /// Send input to a terminal.
     ///
+    /// Fails if the terminal is unknown or has exited, even for empty input.
     /// Supports C-style escapes: \n \r \t \\ \0 \xHH.
     /// \n sends CR (Enter), matching real terminal behavior. Use \x0a for literal LF.
     /// To control interactive programs like vim:

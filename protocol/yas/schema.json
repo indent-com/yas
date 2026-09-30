@@ -8947,7 +8947,15 @@
         },
         {
           "name": "exit_report",
-          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions"
+          "layout": "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream"
+        },
+        {
+          "name": "keep_output_extension",
+          "layout": "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES"
+        },
+        {
+          "name": "output_elision",
+          "layout": "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream"
         },
         {
           "name": "exit_record",
@@ -8996,8 +9004,12 @@
           "value": 16
         },
         {
+          "name": "SPAWN_KEEP_OUTPUT",
+          "value": 32
+        },
+        {
           "name": "SPAWN_LAUNCHER_FLAGS_EXTENDED",
-          "value": 28
+          "value": 60
         },
         {
           "name": "ENV_EMPTY",
@@ -9182,6 +9194,22 @@
         {
           "name": "SPAWN_RESIDUE_GRACE_EXTENSION",
           "value": 3
+        },
+        {
+          "name": "SPAWN_KEEP_OUTPUT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "MAX_KEEP_OUTPUT_TAIL_BYTES",
+          "value": 1048576
+        },
+        {
+          "name": "EXIT_STDOUT_ELIDED_EXTENSION",
+          "value": 1
+        },
+        {
+          "name": "EXIT_STDERR_ELIDED_EXTENSION",
+          "value": 2
         },
         {
           "name": "MAX_ARGC",

@@ -26,6 +26,7 @@ use tokio::task::AbortHandle;
 use yas_wire::process as wire;
 use yas_wire::schema::process as process_schema;
 
+use crate::output_keep::{Elision, KeptOutput};
 #[cfg(unix)]
 use crate::pty;
 
@@ -450,14 +451,22 @@ impl Policy {
     }
 }
 
+/// Runs its action once, told whether the event it rides was dispatched: true after its
+/// dispatch, false when it is dropped without (its queue was full, or its reader gone).
 struct WriterGuard {
-    action: Option<Box<dyn FnOnce() + Send>>,
+    action: Option<Box<dyn FnOnce(bool) + Send>>,
 }
 
 impl WriterGuard {
-    fn new(f: impl FnOnce() + Send + 'static) -> Self {
+    fn new(f: impl FnOnce(bool) + Send + 'static) -> Self {
         Self {
             action: Some(Box::new(f)),
+        }
+    }
+
+    fn dispatched(mut self) {
+        if let Some(f) = self.action.take() {
+            f(true);
         }
     }
 }
@@ -465,7 +474,7 @@ impl WriterGuard {
 impl Drop for WriterGuard {
     fn drop(&mut self) {
         if let Some(f) = self.action.take() {
-            f();
+            f(false);
         }
     }
 }
@@ -501,6 +510,22 @@ struct FinalRecord {
     kill_cause: u8,
     code: u32,
     detail: &'static str,
+    /// KEEP_OUTPUT: what was dropped of stdout and of stderr.
+    elided: [Option<Elision>; 2],
+}
+
+impl FinalRecord {
+    fn exit(&self) -> NativeExit {
+        NativeExit {
+            elided: self.elided,
+            ..native_exit(
+                self.reason,
+                self.kill_cause,
+                self.code,
+                self.detail.as_bytes(),
+            )
+        }
+    }
 }
 
 /// Transport-neutral process catalogue snapshot used by the YAS adapter.
@@ -531,6 +556,8 @@ pub(crate) struct NativeExit {
     pub(crate) reason: u8,
     pub(crate) code: i32,
     pub(crate) detail: Vec<u8>,
+    /// KEEP_OUTPUT: what was dropped of stdout and of stderr.
+    pub(crate) elided: [Option<Elision>; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -544,6 +571,9 @@ pub(crate) struct NativeSpawnRequest {
     /// LEAVE_RESIDUE: how long the streams are forwarded after the direct child exits (None:
     /// until they close). Only read with the flag.
     pub(crate) residue_grace: Option<Duration>,
+    /// KEEP_OUTPUT: the bytes of each output stream's head and tail that are sent (the middle
+    /// is dropped, and counted).
+    pub(crate) keep_output: Option<(u64, usize)>,
     pub(crate) cwd: Option<Vec<u8>>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<(Vec<u8>, Vec<u8>)>,
@@ -597,13 +627,14 @@ pub(crate) enum NativeEvent {
     },
     Exit {
         process_id: u32,
+        process_handle: u64,
         exit: NativeExit,
     },
 }
 
 pub(crate) struct NativeEventEnvelope {
     pub(crate) event: NativeEvent,
-    _guard: Option<WriterGuard>,
+    guard: Option<WriterGuard>,
 }
 
 impl NativeEventEnvelope {
@@ -614,7 +645,9 @@ impl NativeEventEnvelope {
     /// before a concurrent final output acknowledgement observes retirement.
     pub(crate) fn dispatch<T>(self, dispatch: impl FnOnce(NativeEvent) -> T) -> T {
         let result = dispatch(self.event);
-        drop(self._guard);
+        if let Some(guard) = self.guard {
+            guard.dispatched();
+        }
         result
     }
 }
@@ -675,10 +708,7 @@ impl EndpointOutput {
 
     fn send_native(&self, event: NativeEvent, guard: Option<WriterGuard>) -> bool {
         self.events
-            .try_send(NativeEventEnvelope {
-                event,
-                _guard: guard,
-            })
+            .try_send(NativeEventEnvelope { event, guard })
             .is_ok()
     }
 
@@ -705,8 +735,21 @@ impl EndpointOutput {
         )
     }
 
-    fn send_exit(&self, process_id: u32, exit: NativeExit, guard: WriterGuard) -> bool {
-        self.send_native(NativeEvent::Exit { process_id, exit }, Some(guard))
+    fn send_exit(
+        &self,
+        process_id: u32,
+        process_handle: u64,
+        exit: NativeExit,
+        guard: WriterGuard,
+    ) -> bool {
+        self.send_native(
+            NativeEvent::Exit {
+                process_id,
+                process_handle,
+                exit,
+            },
+            Some(guard),
+        )
     }
 }
 
@@ -838,12 +881,7 @@ impl Server {
                 stdin_received: record.stdin_received,
                 stdout_produced: record.stdout_next,
                 stderr_produced: record.stderr_next,
-                exit: Some(native_exit(
-                    record.reason,
-                    record.kill_cause,
-                    record.code,
-                    record.detail.as_bytes(),
-                )),
+                exit: Some(record.exit()),
             });
         }
         records.sort_unstable_by_key(|record| record.process_handle);
@@ -870,6 +908,28 @@ impl Server {
             .finals
             .get(&process_handle)
             .map(|record| record.cwd.clone())
+    }
+
+    /// The catalogue's revision, which every change of it moves: what
+    /// [`Self::wait_native_catalogue_change`] waits past.
+    pub(crate) fn native_catalogue_revision(&self) -> u64 {
+        self.0.state.lock().unwrap().catalog_revision
+    }
+
+    /// Tests: until the child of `process_handle` is reaped (at once when it is not live).
+    #[cfg(all(test, unix))]
+    pub(crate) async fn wait_reaped(&self, process_handle: u64) {
+        let record = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .live
+            .get(&process_handle)
+            .and_then(Weak::upgrade);
+        if let Some(record) = record {
+            record.wait_reaped().await;
+        }
     }
 
     pub(crate) async fn wait_native_catalogue_change(&self, revision: u64) {
@@ -1054,6 +1114,36 @@ struct EndpointState {
     slots: FxHashMap<u32, EndpointSlot>,
     /// Ordinary processes remain owned after their creator unsubscribes.
     owned: FxHashMap<u64, Weak<Record>>,
+    /// The finals of this endpoint's ordinary processes whose exits it missed: a WAIT of its
+    /// own finds them, as it finds the exits it took.
+    missed: MissedExits,
+}
+
+/// The newest finals of an endpoint's ordinary processes whose exits it missed: it had no
+/// binding to take the exit (its attachment went first), or the exit was dropped on its way
+/// (its queue was full). Nobody else sees them.
+#[derive(Default)]
+struct MissedExits {
+    values: FxHashMap<u64, Arc<FinalRecord>>,
+    order: VecDeque<u64>,
+}
+
+impl MissedExits {
+    fn insert(&mut self, final_record: Arc<FinalRecord>, capacity: usize) {
+        let generation = final_record.generation;
+        if self.values.insert(generation, final_record).is_none() {
+            self.order.push_back(generation);
+        }
+        while self.order.len() > capacity.max(1) {
+            if let Some(retired) = self.order.pop_front() {
+                self.values.remove(&retired);
+            }
+        }
+    }
+
+    fn get(&self, generation: u64) -> Option<&Arc<FinalRecord>> {
+        self.values.get(&generation)
+    }
 }
 
 enum EndpointSlot {
@@ -1104,6 +1194,7 @@ struct Pending {
     preserve_residual: bool,
     leave_residue: bool,
     residue_grace: Option<Duration>,
+    keep_output: Option<(u64, usize)>,
     stdin_null: bool,
     request_bytes: usize,
     endpoint: Weak<Endpoint>,
@@ -1149,6 +1240,17 @@ struct Binding {
 
 struct StreamState {
     next: u64,
+    /// KEEP_OUTPUT: the head and tail of this stream that are sent, the middle dropped.
+    kept: Option<KeptOutput>,
+}
+
+impl StreamState {
+    fn new(keep_output: Option<(u64, usize)>) -> Self {
+        Self {
+            next: 0,
+            kept: keep_output.map(|(head, tail)| KeptOutput::new(head, tail)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1195,6 +1297,8 @@ struct RecordInner {
     stderr_readers: u8,
     /// Output readers waiting for the owner to take its window (`owner_with_room`).
     paced_readers: u8,
+    /// KEEP_OUTPUT streams are to send their tails now (`flush_kept`).
+    flush_kept: bool,
     child_outcome: Option<ChildOutcome>,
     tree_cleanup_done: bool,
     exit_override: Option<ExitOverride>,
@@ -1346,6 +1450,7 @@ impl Manager {
             preserve_residual: request.preserve_residual,
             leave_residue: owned.flags & PROCESS_SPAWN_LEAVE_RESIDUE != 0,
             residue_grace: request.residue_grace,
+            keep_output: request.keep_output,
             stdin_null: owned.flags & PROCESS_SPAWN_STDIN_NULL != 0,
             request_bytes,
             endpoint: Arc::downgrade(&self.endpoint),
@@ -1525,8 +1630,9 @@ impl Manager {
                 },
                 stdin_closed_by_child: false,
                 stdin_writer_done: stdin.is_none(),
-                stdout: StreamState { next: 0 },
-                stderr: (!merged).then_some(StreamState { next: 0 }),
+                stdout: StreamState::new(pending.keep_output),
+                stderr: (!merged).then(|| StreamState::new(pending.keep_output)),
+                flush_kept: false,
                 stdout_readers: 1,
                 stderr_readers: if merged { 0 } else { 1 },
                 paced_readers: 0,
@@ -1933,7 +2039,11 @@ impl Manager {
             drop(server);
             record.changed.notify_waiters();
             Ok(watched)
-        } else if let Some(record) = server.finals.get(&process_handle) {
+        } else if let Some(record) = server
+            .finals
+            .get(&process_handle)
+            .or_else(|| endpoint.missed.get(process_handle))
+        {
             if endpoint_usage(&endpoint) >= self.server.0.policy.max_per_endpoint {
                 return Err(NativeError::ResourceExhausted);
             }
@@ -1950,15 +2060,49 @@ impl Manager {
                 stdout_next: record.stdout_next,
                 stderr_next: record.stderr_next,
                 stdin_window: 0,
-                exit: Some(native_exit(
-                    record.reason,
-                    record.kill_cause,
-                    record.code,
-                    record.detail.as_bytes(),
-                )),
+                exit: Some(record.exit()),
             })
         } else {
             Err(NativeError::NotFound)
+        }
+    }
+
+    /// Until a look at `process_handle` that WATCH refused as CONFLICT, with the catalogue at
+    /// `revision`, is worth another: the catalogue has moved on (the process's exit reached its
+    /// watchers and is final, or it left), or nothing refuses the look now (this endpoint's
+    /// own binding on it, a concurrent CONTROL's or a failed route's, has gone).
+    pub(crate) async fn wait_native_look(&self, process_handle: u64, revision: u64) {
+        let record = {
+            let state = self.server.0.state.lock().unwrap();
+            if state.catalog_revision != revision {
+                return;
+            }
+            state.live.get(&process_handle).and_then(Weak::upgrade)
+        };
+        let Some(record) = record else {
+            return;
+        };
+        loop {
+            // Both before the looks: notify_waiters reaches futures made before it.
+            let catalogue = self.server.0.catalog_changed.notified();
+            let changed = record.changed.notified();
+            if self.server.0.state.lock().unwrap().catalog_revision != revision {
+                return;
+            }
+            {
+                let inner = record.inner.lock().unwrap();
+                let own = inner
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.endpoint_id == self.endpoint.id);
+                if !inner.terminal_queued && !own {
+                    return;
+                }
+            }
+            tokio::select! {
+                () = catalogue => {}
+                () = changed => {}
+            }
         }
     }
 
@@ -1973,6 +2117,7 @@ impl Manager {
         let (slots, owned) = {
             let mut endpoint = self.endpoint.state.lock().unwrap();
             endpoint.accepting = false;
+            endpoint.missed = MissedExits::default();
             (
                 std::mem::take(&mut endpoint.slots),
                 std::mem::take(&mut endpoint.owned),
@@ -2068,6 +2213,8 @@ impl Manager {
         )
         .await;
         for record in &ordinary {
+            // The owner is gone: kept tails go to the watchers at once.
+            flush_kept(record).await;
             finish_pipes(record);
         }
         // Pipe abortion makes terminal publication eligible. Keep shutdown
@@ -2898,119 +3045,272 @@ async fn stdin_writer(
 
 async fn output_reader(record: Arc<Record>, stream: u8, mut reader: impl AsyncRead + Unpin) {
     let mut buffer = vec![0u8; OUTPUT_FRAME_PAYLOAD];
+    let kept = output_state(&mut record.inner.lock().unwrap(), stream)
+        .kept
+        .is_some();
+    // Whether the stream stopped for a flush (`flush_kept`) rather than at its end.
+    let mut flushed = false;
     loop {
         // The process's owner takes all of its output: the pipe is read no further ahead of
         // what the owner has taken than its window, so a writer faster than the owner's
         // Transfer blocks on its pipe. (It used to be evicted, which closed the owner's whole
         // Process endpoint.) Other watchers are still dropped when they fall a window behind.
-        let owner = owner_with_room(&record, stream).await;
-        match reader.read(&mut buffer).await {
+        // KEEP_OUTPUT: once the head is out, what the pipe gives is kept or dropped here, so it
+        // is read at the writer's speed; only what goes out waits for the owner.
+        let paced = !kept
+            || output_state(&mut record.inner.lock().unwrap(), stream)
+                .kept
+                .as_ref()
+                .is_some_and(KeptOutput::sends_now);
+        let owner = match (paced, kept) {
+            (false, _) => None,
+            (true, false) => owner_with_room(&record, stream).await,
+            (true, true) => tokio::select! {
+                owner = owner_with_room(&record, stream) => owner,
+                () = flush_requested(&record) => {
+                    flushed = true;
+                    break;
+                }
+            },
+        };
+        let read = if kept {
+            tokio::select! {
+                read = reader.read(&mut buffer) => read,
+                () = flush_requested(&record) => {
+                    flushed = true;
+                    break;
+                }
+            }
+        } else {
+            reader.read(&mut buffer).await
+        };
+        match read {
             Ok(0) => break,
             Err(_) => {
                 host_failure(&record, "process output pipe read failed");
                 break;
             }
             Ok(n) => {
-                // Room in the owner's event queue too, taken before the lock: its frame never
-                // finds the queue full.
-                let owner = match owner {
-                    Some((endpoint_id, process_id, events)) => events
-                        .reserve_owned()
-                        .await
-                        .ok()
-                        .map(|permit| (endpoint_id, process_id, permit)),
-                    None => None,
-                };
-                let mut owner = owner;
-                let mut inner = record.inner.lock().unwrap();
-                let state = if stream == PROCESS_STREAM_STDOUT {
-                    &mut inner.stdout
-                } else {
-                    inner.stderr.as_mut().expect("separate stderr")
-                };
-                let offset = state.next;
-                let Some(next) = offset.checked_add(n as u64) else {
-                    drop(inner);
+                let owner = reserve(owner).await;
+                if deliver(&record, stream, Output::Read(&buffer[..n]), owner).is_err() {
                     protocol_violation(&record);
                     return;
-                };
-                state.next = next;
-                let mut evicted = Vec::new();
-                let mut index = 0;
-                while index < inner.bindings.len() {
-                    if let Some((endpoint_id, process_id, _)) = owner
-                        && inner.bindings[index].endpoint_id == endpoint_id
-                        && inner.bindings[index].process_id == process_id
-                    {
-                        let (_, _, permit) = owner.take().expect("owner permit");
-                        permit.send(NativeEventEnvelope {
-                            event: NativeEvent::Output {
-                                process_id,
-                                stream,
-                                offset,
-                                data: buffer[..n].to_vec(),
-                            },
-                            _guard: None,
-                        });
-                        let binding = &mut inner.bindings[index];
-                        let credit = if stream == PROCESS_STREAM_STDOUT {
-                            &mut binding.stdout
-                        } else {
-                            binding.stderr.as_mut().expect("separate stderr binding")
-                        };
-                        credit.frames.push_back(next);
-                        index += 1;
-                        continue;
-                    }
-                    let has_credit = {
-                        let binding = &inner.bindings[index];
-                        let credit = if stream == PROCESS_STREAM_STDOUT {
-                            &binding.stdout
-                        } else {
-                            binding.stderr.as_ref().expect("separate stderr binding")
-                        };
-                        let available = offset
-                            .checked_sub(credit.acked)
-                            .and_then(|debt| PROCESS_DEFAULT_STREAM_WINDOW.checked_sub(debt));
-                        available.is_some_and(|bytes| bytes >= n as u64)
-                            && credit.frames.len() < PROCESS_MAX_UNACKED_PACKETS
-                    };
-                    if !has_credit {
-                        evicted.push(remove_binding_at(&mut inner, index));
-                        continue;
-                    }
-                    let process_id = inner.bindings[index].process_id;
-                    let sent = inner.bindings[index].out.send_output(
-                        process_id,
-                        stream,
-                        offset,
-                        &buffer[..n],
-                    );
-                    if sent {
-                        let binding = &mut inner.bindings[index];
-                        let credit = if stream == PROCESS_STREAM_STDOUT {
-                            &mut binding.stdout
-                        } else {
-                            binding.stderr.as_mut().expect("separate stderr binding")
-                        };
-                        credit.frames.push_back(next);
-                        index += 1;
-                    } else {
-                        evicted.push(remove_binding_at(&mut inner, index));
-                    }
-                }
-                drop(inner);
-                for binding in evicted {
-                    // Its endpoint goes on: free the slot, or the process holds one for good.
-                    if let Some(endpoint) = binding.endpoint.upgrade() {
-                        remove_bound_slot(&endpoint, binding.process_id, &record);
-                    }
-                    binding.out.evict(binding.process_id);
                 }
             }
         }
     }
+    if kept {
+        if send_kept_tail(&record, stream).await.is_err() {
+            protocol_violation(&record);
+            return;
+        }
+        // Flushed, the stream may go on (a residue holds it, or it is about to be aborted):
+        // what it gives now goes to nobody.
+        while flushed && matches!(reader.read(&mut buffer).await, Ok(1..)) {}
+    }
     stream_closed(&record, stream);
+}
+
+/// KEEP_OUTPUT: send what the stream kept of its end, a frame at a time as the owner takes them.
+/// The stream is finished: nothing more of it goes out.
+async fn send_kept_tail(record: &Arc<Record>, stream: u8) -> Result<(), ()> {
+    if let Some(kept) = output_state(&mut record.inner.lock().unwrap(), stream)
+        .kept
+        .as_mut()
+    {
+        kept.finish();
+    }
+    loop {
+        let owner = reserve(owner_with_room(record, stream).await).await;
+        if !deliver(record, stream, Output::Tail, owner)? {
+            break;
+        }
+    }
+    record.changed.notify_waiters();
+    Ok(())
+}
+
+/// Once the KEEP_OUTPUT streams are to send their tails now ([`flush_kept`]).
+async fn flush_requested(record: &Record) {
+    loop {
+        let changed = record.changed.notified();
+        if record.inner.lock().unwrap().flush_kept {
+            return;
+        }
+        changed.await;
+    }
+}
+
+/// KEEP_OUTPUT: have the streams send their tails now, as the exit is about to be reported or
+/// the streams stopped, and wait for them as [`drain_paced`] waits: while a reader waits for
+/// the owner to take its window, or until none has for `DRAIN_IDLE`. What a stream gives after
+/// its tail goes to nobody.
+async fn flush_kept(record: &Record) {
+    let tails_out = |inner: &RecordInner| {
+        let out = |state: Option<&StreamState>, readers: u8| {
+            state
+                .and_then(|state| state.kept.as_ref())
+                .is_none_or(|kept| kept.tail_out() || readers == 0)
+        };
+        out(Some(&inner.stdout), inner.stdout_readers)
+            && out(inner.stderr.as_ref(), inner.stderr_readers)
+    };
+    {
+        let mut inner = record.inner.lock().unwrap();
+        if tails_out(&inner) {
+            return;
+        }
+        inner.flush_kept = true;
+    }
+    record.changed.notify_waiters();
+    loop {
+        let changed = record.changed.notified();
+        let paced = {
+            let inner = record.inner.lock().unwrap();
+            if tails_out(&inner) {
+                return;
+            }
+            inner.paced_readers > 0
+        };
+        if paced {
+            changed.await;
+        } else if tokio::time::timeout(DRAIN_IDLE, changed).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// What an output reader sends: bytes it read (only their share of a KEEP_OUTPUT stream's head,
+/// when it keeps one), or the next frame of a kept tail.
+enum Output<'a> {
+    Read(&'a [u8]),
+    Tail,
+}
+
+/// The owner's Process events, with room for one frame of output reserved.
+type OwnerPermit = (u64, u32, mpsc::OwnedPermit<NativeEventEnvelope>);
+
+/// Reserve room in the owner's event queue ([`owner_with_room`]'s answer), before the record's
+/// lock is taken: its frame never finds the queue full.
+async fn reserve(
+    owner: Option<(u64, u32, mpsc::Sender<NativeEventEnvelope>)>,
+) -> Option<OwnerPermit> {
+    let (endpoint_id, process_id, events) = owner?;
+    let permit = events.reserve_owned().await.ok()?;
+    Some((endpoint_id, process_id, permit))
+}
+
+fn output_state(inner: &mut RecordInner, stream: u8) -> &mut StreamState {
+    if stream == PROCESS_STREAM_STDOUT {
+        &mut inner.stdout
+    } else {
+        inner.stderr.as_mut().expect("separate stderr")
+    }
+}
+
+/// Send output of `stream` to the process's bindings: to the owner through `owner`, reserved
+/// when it had room, and to each watcher that keeps up (the others are dropped). False when
+/// there was no tail left to send; Err past a u64 of offset (a protocol violation).
+fn deliver(
+    record: &Arc<Record>,
+    stream: u8,
+    output: Output<'_>,
+    owner: Option<OwnerPermit>,
+) -> Result<bool, ()> {
+    let mut owner = owner;
+    let mut inner = record.inner.lock().unwrap();
+    let tail;
+    let state = output_state(&mut inner, stream);
+    let data: &[u8] = match (output, state.kept.as_mut()) {
+        (Output::Read(data), None) => data,
+        (Output::Read(data), Some(kept)) => kept.feed(data),
+        (Output::Tail, Some(kept)) => match kept.next_tail_chunk(OUTPUT_FRAME_PAYLOAD) {
+            Some(chunk) => {
+                tail = chunk;
+                &tail
+            }
+            None => return Ok(false),
+        },
+        (Output::Tail, None) => return Ok(false),
+    };
+    if data.is_empty() {
+        return Ok(true);
+    }
+    let offset = state.next;
+    let Some(next) = offset.checked_add(data.len() as u64) else {
+        return Err(());
+    };
+    state.next = next;
+    let mut evicted = Vec::new();
+    let mut index = 0;
+    while index < inner.bindings.len() {
+        if let Some((endpoint_id, process_id, _)) = owner
+            && inner.bindings[index].endpoint_id == endpoint_id
+            && inner.bindings[index].process_id == process_id
+        {
+            let (_, _, permit) = owner.take().expect("owner permit");
+            permit.send(NativeEventEnvelope {
+                event: NativeEvent::Output {
+                    process_id,
+                    stream,
+                    offset,
+                    data: data.to_vec(),
+                },
+                guard: None,
+            });
+            let binding = &mut inner.bindings[index];
+            let credit = if stream == PROCESS_STREAM_STDOUT {
+                &mut binding.stdout
+            } else {
+                binding.stderr.as_mut().expect("separate stderr binding")
+            };
+            credit.frames.push_back(next);
+            index += 1;
+            continue;
+        }
+        let has_credit = {
+            let binding = &inner.bindings[index];
+            let credit = if stream == PROCESS_STREAM_STDOUT {
+                &binding.stdout
+            } else {
+                binding.stderr.as_ref().expect("separate stderr binding")
+            };
+            let available = offset
+                .checked_sub(credit.acked)
+                .and_then(|debt| PROCESS_DEFAULT_STREAM_WINDOW.checked_sub(debt));
+            available.is_some_and(|bytes| bytes >= data.len() as u64)
+                && credit.frames.len() < PROCESS_MAX_UNACKED_PACKETS
+        };
+        if !has_credit {
+            evicted.push(remove_binding_at(&mut inner, index));
+            continue;
+        }
+        let process_id = inner.bindings[index].process_id;
+        let sent = inner.bindings[index]
+            .out
+            .send_output(process_id, stream, offset, data);
+        if sent {
+            let binding = &mut inner.bindings[index];
+            let credit = if stream == PROCESS_STREAM_STDOUT {
+                &mut binding.stdout
+            } else {
+                binding.stderr.as_mut().expect("separate stderr binding")
+            };
+            credit.frames.push_back(next);
+            index += 1;
+        } else {
+            evicted.push(remove_binding_at(&mut inner, index));
+        }
+    }
+    drop(inner);
+    for binding in evicted {
+        // Its endpoint goes on: free the slot, or the process holds one for good.
+        if let Some(endpoint) = binding.endpoint.upgrade() {
+            remove_bound_slot(&endpoint, binding.process_id, record);
+        }
+        binding.out.evict(binding.process_id);
+    }
+    Ok(true)
 }
 
 /// Waits until the process's owner, while it is bound, can take another whole frame of
@@ -3224,6 +3524,7 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
                 record.changed.notify_waiters();
                 try_queue_terminal(&record);
             } else {
+                flush_kept(&record).await;
                 abandon_residue(&record);
             }
             return;
@@ -3284,6 +3585,8 @@ fn schedule_residual_cleanup(record: Arc<Record>) {
         if !cleanup_failed {
             drain_paced(&record).await;
         }
+        // What the streams kept of their ends goes out before they are stopped.
+        flush_kept(&record).await;
         let (stdin_abort, output_aborts) = {
             let mut inner = record.inner.lock().unwrap();
             if inner.tree_cleanup_done {
@@ -3524,6 +3827,16 @@ fn try_queue_terminal(record: &Arc<Record>) {
         }
         inner.terminal_queued = true;
         let (reason, kill_cause, code) = outcome_fields(outcome, inner.exit_override);
+        // A kept tail that never went out (its reader was stopped first) counts as dropped.
+        let elided = |state: Option<&mut StreamState>| {
+            let kept = state?.kept.as_mut()?;
+            kept.drop_rest();
+            kept.elision()
+        };
+        let elided = [
+            elided(Some(&mut inner.stdout)),
+            elided(inner.stderr.as_mut()),
+        ];
         let final_record = Arc::new(FinalRecord {
             generation: record.generation,
             pid: record.pid,
@@ -3541,6 +3854,7 @@ fn try_queue_terminal(record: &Arc<Record>) {
             kill_cause,
             code,
             detail: inner.cleanup_detail,
+            elided,
         });
         inner.stdin_controller = None;
         (std::mem::take(&mut inner.bindings), final_record)
@@ -3548,34 +3862,49 @@ fn try_queue_terminal(record: &Arc<Record>) {
     record.terminal_notify.notify_waiters();
     let (bindings, final_record) = terminal;
     if bindings.is_empty() {
-        finish_terminal(record.clone(), final_record);
+        // Nobody takes the exit, its owner included.
+        finish_terminal(record.clone(), final_record, true);
         return;
     }
+    // Whether the owner misses the exit: it has no binding to take it (its attachment went
+    // first), or the exit is dropped on its way to it.
+    let owner = record.owner.upgrade().map(|owner| owner.id);
+    let owner_missed = Arc::new(AtomicBool::new(
+        !bindings
+            .iter()
+            .any(|binding| Some(binding.endpoint_id) == owner),
+    ));
     let remaining = Arc::new(AtomicUsize::new(bindings.len()));
     for binding in bindings {
         let endpoint = binding.endpoint.upgrade();
         let record_for_guard = record.clone();
         let final_for_guard = final_record.clone();
         let remaining_for_guard = remaining.clone();
+        let owner_missed = owner_missed.clone();
+        let owners = Some(binding.endpoint_id) == owner;
         let process_id = binding.process_id;
-        let guard = WriterGuard::new(move || {
+        let guard = WriterGuard::new(move |dispatched| {
+            if owners && !dispatched {
+                owner_missed.store(true, Ordering::Release);
+            }
             if let Some(endpoint) = endpoint {
                 remove_bound_slot(&endpoint, process_id, &record_for_guard);
             }
             if remaining_for_guard.fetch_sub(1, Ordering::AcqRel) == 1 {
-                finish_terminal(record_for_guard, final_for_guard);
+                let owner_missed = owner_missed.load(Ordering::Acquire);
+                finish_terminal(record_for_guard, final_for_guard, owner_missed);
             }
         });
-        let _ = binding.out.send_exit(
+        if !binding.out.send_exit(
             binding.process_id,
-            native_exit(
-                final_record.reason,
-                final_record.kill_cause,
-                final_record.code,
-                final_record.detail.as_bytes(),
-            ),
+            record.generation,
+            final_record.exit(),
             guard,
-        );
+        ) {
+            // Its queue is full, and the exit lost to it: its attachment fails, as one that
+            // falls behind does, and its client WAITs.
+            binding.out.evict(binding.process_id);
+        }
     }
 }
 
@@ -3590,12 +3919,14 @@ fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeEx
             reason: process_schema::EXIT_REASON_UNKNOWN as u8,
             code: code as i32,
             detail: detail.to_vec(),
+            elided: [None; 2],
         },
         PROCESS_EXIT_SIGNALLED => NativeExit {
             kind: wire::ExitKind::Signal,
             reason: portable_signal_reason(code),
             code: code as i32,
             detail: detail.to_vec(),
+            elided: [None; 2],
         },
         PROCESS_EXIT_KILLED => NativeExit {
             kind: wire::ExitKind::Killed,
@@ -3608,6 +3939,7 @@ fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeEx
             },
             code: 0,
             detail: detail.to_vec(),
+            elided: [None; 2],
         },
         _ => NativeExit {
             kind: wire::ExitKind::Other,
@@ -3618,6 +3950,7 @@ fn native_exit(reason: u8, kill_cause: u8, code: u32, detail: &[u8]) -> NativeEx
             } else {
                 detail.to_vec()
             },
+            elided: [None; 2],
         },
     }
 }
@@ -3643,11 +3976,21 @@ fn portable_signal_reason(signal: u32) -> u8 {
     }
 }
 
-fn finish_terminal(record: Arc<Record>, final_record: Arc<FinalRecord>) {
+/// `owner_missed`: the exit did not reach the owner. An ordinary process's final is then kept
+/// for it, before the release moves the catalogue: a WAIT of its that found the exit on its way
+/// looks again at that change.
+fn finish_terminal(record: Arc<Record>, final_record: Arc<FinalRecord>, owner_missed: bool) {
     if record.detachable {
         let server = record.server.clone();
         server.finish_detached(record, final_record);
     } else {
+        if owner_missed && let Some(owner) = record.owner.upgrade() {
+            let mut state = owner.state.lock().unwrap();
+            if state.accepting {
+                let capacity = record.server.0.maxima.exit_replays();
+                state.missed.insert(final_record, capacity);
+            }
+        }
         record.server.release_record(&record);
     }
 }
@@ -3724,6 +4067,7 @@ async fn terminate_record(record: &Arc<Record>, cause: u8, grace: Duration) {
         };
         let _ = tokio::time::timeout(grace.max(Duration::from_millis(100)), forced).await;
     }
+    flush_kept(record).await;
     finish_pipes(record);
     let _ = tokio::time::timeout(
         grace.max(Duration::from_millis(100)),

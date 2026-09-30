@@ -135,22 +135,36 @@ pub(crate) async fn cmd_send(
     text: String,
 ) -> Result<(), String> {
     let bytes = terminal_args::parse_escapes(&text);
+    let mut client = crate::yas_native::connect(on, hub).await?;
+    let record = find_terminal(&mut client, id).await?;
+    refuse_exited_send(id, &record)?;
     if bytes.is_empty() {
         return Ok(());
     }
-    let mut client = crate::yas_native::connect(on, hub).await?;
     client
         .send_typed_event(
             family::TERMINAL,
             terminal::event_kind::WRITE,
             &terminal::Write {
-                terminal_handle: terminal_handle(id)?,
+                terminal_handle: record.terminal_handle,
                 data: bytes,
             },
             true,
         )
         .await
         .map_err(String::from)
+}
+
+/// WRITE is fire-and-forget, so input to an exited terminal would vanish.
+fn refuse_exited_send(id: u64, record: &terminal::TerminalRecord) -> Result<(), String> {
+    if record.lifecycle != terminal::Lifecycle::Exited {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot send to pty {id}: it is no longer running (status {}); \
+         `yas terminal restart {id}` re-runs it",
+        terminal_status(record)?
+    ))
 }
 
 pub(crate) async fn cmd_restart(on: Option<&str>, hub: &str, id: u64) -> Result<(), String> {
@@ -1778,6 +1792,69 @@ mod tests {
         assert_eq!(launch.environment[0].key, b"A");
         assert_eq!(launch.environment[1].key, b"Z");
         assert_eq!(launch.extensions.0[0].value, 3_000_000_000u64.to_le_bytes());
+    }
+
+    fn record(
+        lifecycle: terminal::Lifecycle,
+        exit: Option<terminal::ExitRecord>,
+    ) -> terminal::TerminalRecord {
+        terminal::TerminalRecord {
+            terminal_handle: 7,
+            lifecycle,
+            rows: 24,
+            cols: 80,
+            generation: 1,
+            used_rows: 0,
+            extensions: Extensions(
+                exit.into_iter()
+                    .map(|exit| Extension {
+                        tag: yas_wire::schema::terminal::STATE_EXIT_EXTENSION as u16,
+                        required: false,
+                        value: exit.encode().unwrap(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn send_refuses_an_exited_terminal_whatever_ended_it() {
+        assert_eq!(
+            refuse_exited_send(7, &record(terminal::Lifecycle::Running, None)),
+            Ok(())
+        );
+        for (exit, status) in [
+            (None, "exited"),
+            (
+                Some(terminal::ExitRecord::Code {
+                    code: 2,
+                    detail: String::new(),
+                }),
+                "exited(2)",
+            ),
+            (
+                Some(terminal::ExitRecord::Signal {
+                    reason: terminal::ExitReason::Terminate,
+                    native_signal: 15,
+                    detail: String::new(),
+                }),
+                "signal(15, Terminate)",
+            ),
+            (
+                Some(terminal::ExitRecord::Other {
+                    detail: "exit status unavailable".into(),
+                }),
+                "exited: exit status unavailable",
+            ),
+        ] {
+            assert_eq!(
+                refuse_exited_send(7, &record(terminal::Lifecycle::Exited, exit)),
+                Err(format!(
+                    "cannot send to pty 7: it is no longer running (status {status}); \
+                     `yas terminal restart 7` re-runs it"
+                ))
+            );
+        }
     }
 
     #[test]

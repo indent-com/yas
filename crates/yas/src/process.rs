@@ -220,7 +220,54 @@ impl Spawn {
                 "Process residue grace without LEAVE_RESIDUE",
             ));
         }
+        let keep_output = self.flags & crate::schema::process::SPAWN_KEEP_OUTPUT as u16 != 0;
+        let report_exit = self.flags & crate::schema::process::SPAWN_REPORT_EXIT as u16 != 0;
+        if keep_output != self.keep_output()?.is_some() {
+            return Err(Error::Invalid(
+                "Process KEEP_OUTPUT flag and extension go together",
+            ));
+        }
+        if keep_output && !report_exit {
+            return Err(Error::Invalid("Process KEEP_OUTPUT without REPORT_EXIT"));
+        }
         Ok(())
+    }
+
+    /// `KEEP_OUTPUT`: how many bytes of each output stream's head and tail are sent (the
+    /// middle is dropped, and counted in the EXIT event), or None: all of it.
+    pub fn keep_output(&self) -> Result<Option<(u64, u64)>> {
+        let Some(extension) = self.extensions.0.iter().find(|extension| {
+            extension.tag == crate::schema::process::SPAWN_KEEP_OUTPUT_EXTENSION as u16
+        }) else {
+            return Ok(None);
+        };
+        let value: [u8; 16] = extension
+            .value
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid("Process keep-output extension"))?;
+        let head = u64::from_le_bytes(value[..8].try_into().expect("8 bytes"));
+        let tail = u64::from_le_bytes(value[8..].try_into().expect("8 bytes"));
+        if tail > crate::schema::process::MAX_KEEP_OUTPUT_TAIL_BYTES {
+            return Err(limit(
+                "Process keep-output tail bytes",
+                tail,
+                crate::schema::process::MAX_KEEP_OUTPUT_TAIL_BYTES,
+            ));
+        }
+        Ok(Some((head, tail)))
+    }
+
+    /// The `KEEP_OUTPUT` extension keeping `head` and `tail` bytes of each output stream.
+    pub fn keep_output_extension(head: u64, tail: u64) -> Extension {
+        let mut value = Vec::with_capacity(16);
+        value.extend_from_slice(&head.to_le_bytes());
+        value.extend_from_slice(&tail.to_le_bytes());
+        Extension {
+            tag: crate::schema::process::SPAWN_KEEP_OUTPUT_EXTENSION as u16,
+            required: true,
+            value,
+        }
     }
 
     /// How long a `LEAVE_RESIDUE` process's streams are forwarded after its direct child
@@ -953,6 +1000,83 @@ impl ExitReport {
     pub fn handle_of(payload: &[u8]) -> Option<u64> {
         Some(u64::from_le_bytes(payload.get(..8)?.try_into().ok()?))
     }
+
+    /// What `KEEP_OUTPUT` dropped of stdout (`stderr` false) or stderr, if anything.
+    pub fn elided(&self, stderr: bool) -> Result<Option<OutputElision>> {
+        let tag = if stderr {
+            crate::schema::process::EXIT_STDERR_ELIDED_EXTENSION
+        } else {
+            crate::schema::process::EXIT_STDOUT_ELIDED_EXTENSION
+        };
+        self.extensions
+            .0
+            .iter()
+            .find(|extension| extension.tag == tag as u16)
+            .map(|extension| OutputElision::decode(&extension.value))
+            .transpose()
+    }
+}
+
+/// What `KEEP_OUTPUT` dropped of an output stream: from `offset` on (the head's length),
+/// `bytes` bytes that decode, as a WHATWG UTF-8 decoder with replacement reads them within the
+/// whole stream, to `code_points` characters and `utf16_units` UTF-16 code units, `lines` of
+/// them `\n`. The tail follows the head in the stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputElision {
+    pub offset: u64,
+    pub bytes: u64,
+    pub lines: u64,
+    pub code_points: u64,
+    pub utf16_units: u64,
+}
+
+impl OutputElision {
+    /// As the EXIT event's extension for stdout (`stderr` false) or stderr.
+    pub fn extension(&self, stderr: bool) -> Extension {
+        let tag = if stderr {
+            crate::schema::process::EXIT_STDERR_ELIDED_EXTENSION
+        } else {
+            crate::schema::process::EXIT_STDOUT_ELIDED_EXTENSION
+        };
+        let mut value = Vec::with_capacity(40);
+        for field in [
+            self.offset,
+            self.bytes,
+            self.lines,
+            self.code_points,
+            self.utf16_units,
+        ] {
+            put_u64(&mut value, field);
+        }
+        Extension {
+            tag: tag as u16,
+            required: false,
+            value,
+        }
+    }
+}
+
+impl Decode for OutputElision {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let value = Self {
+            offset: decoder.u64()?,
+            bytes: decoder.u64()?,
+            lines: decoder.u64()?,
+            code_points: decoder.u64()?,
+            utf16_units: decoder.u64()?,
+        };
+        decoder.finish()?;
+        if value.bytes == 0
+            || value.lines > value.code_points
+            || value.code_points > value.bytes
+            || value.utf16_units < value.code_points
+            || value.utf16_units > value.code_points.saturating_mul(2)
+        {
+            return Err(Error::Invalid("Process output elision"));
+        }
+        Ok(value)
+    }
 }
 
 /// Process family maxima, as a server selects them in HELLO.
@@ -1398,6 +1522,7 @@ fn validate_spawn_extensions(extensions: &Extensions) -> Result<()> {
         crate::schema::process::SPAWN_SURFACE_APP_EXTENSION as u16,
         crate::schema::process::SPAWN_RESOURCE_TAG_EXTENSION as u16,
         crate::schema::process::SPAWN_RESIDUE_GRACE_EXTENSION as u16,
+        crate::schema::process::SPAWN_KEEP_OUTPUT_EXTENSION as u16,
     ];
     reject_unknown_required(extensions, &known)?;
     extension_u64(
@@ -1561,6 +1686,50 @@ fn read_limit_u64(extensions: &Extensions, tag: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn elision_bytes(fields: [u64; 5]) -> Vec<u8> {
+        fields
+            .iter()
+            .flat_map(|field| field.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn an_output_elision_is_its_five_counts_and_they_must_agree() {
+        let elision = OutputElision {
+            offset: 7,
+            bytes: 10,
+            lines: 2,
+            code_points: 6,
+            utf16_units: 8,
+        };
+        let encoded = elision.extension(false).value;
+        assert_eq!(encoded, elision_bytes([7, 10, 2, 6, 8]));
+        assert_eq!(OutputElision::decode(&encoded).unwrap(), elision);
+        for end in 0..encoded.len() {
+            assert!(
+                OutputElision::decode(&encoded[..end]).is_err(),
+                "prefix {end}"
+            );
+        }
+        for fields in [
+            [0, 0, 0, 0, 0],
+            [0, 10, 7, 6, 6],
+            [0, 10, 0, 11, 11],
+            [0, 10, 0, 6, 5],
+            [0, 10, 0, 6, 13],
+        ] {
+            assert!(
+                OutputElision::decode(&elision_bytes(fields)).is_err(),
+                "{fields:?}"
+            );
+        }
+        // Twice these code points is past u64: checked without overflowing.
+        let widest = [u64::MAX; 5];
+        assert!(OutputElision::decode(&elision_bytes(widest)).is_ok());
+        let halves = [0, u64::MAX, 0, u64::MAX / 2 + 1, u64::MAX];
+        assert!(OutputElision::decode(&elision_bytes(halves)).is_ok());
+    }
 
     fn every_truncation<T>(value: &T)
     where
@@ -1825,7 +1994,10 @@ mod tests {
         use crate::schema::process as p;
         let v1 = p::SPAWN_LAUNCHER_FLAGS as u32;
         let all = p::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32;
-        assert_eq!(all & !v1, p::SPAWN_REPORT_EXIT as u32);
+        assert_eq!(
+            all & !v1,
+            (p::SPAWN_REPORT_EXIT | p::SPAWN_KEEP_OUTPUT) as u32
+        );
 
         // Only the v1 flags: tag 11 alone, as before REPORT_EXIT.
         let before = Limits {

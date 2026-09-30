@@ -3808,7 +3808,8 @@ pub const SPAWN_STDIN_NULL: u64 = 8;
 pub const SPAWN_FLAGS: u64 = 3;
 pub const SPAWN_LAUNCHER_FLAGS: u64 = 12;
 pub const SPAWN_REPORT_EXIT: u64 = 16;
-pub const SPAWN_LAUNCHER_FLAGS_EXTENDED: u64 = 28;
+pub const SPAWN_KEEP_OUTPUT: u64 = 32;
+pub const SPAWN_LAUNCHER_FLAGS_EXTENDED: u64 = 60;
 pub const ENV_EMPTY: u64 = 0;
 pub const ENV_SESSION: u64 = 1;
 pub const CWD_SERVER_DEFAULT: u64 = 0;
@@ -3855,6 +3856,10 @@ pub const STREAM_STDERR_CONTENT_KIND: u64 = 2;
 pub const SPAWN_SURFACE_APP_EXTENSION: u64 = 1;
 pub const SPAWN_RESOURCE_TAG_EXTENSION: u64 = 2;
 pub const SPAWN_RESIDUE_GRACE_EXTENSION: u64 = 3;
+pub const SPAWN_KEEP_OUTPUT_EXTENSION: u64 = 4;
+pub const MAX_KEEP_OUTPUT_TAIL_BYTES: u64 = 1048576;
+pub const EXIT_STDOUT_ELIDED_EXTENSION: u64 = 1;
+pub const EXIT_STDERR_ELIDED_EXTENSION: u64 = 2;
 pub const MAX_ARGC: u64 = 1024;
 pub const MAX_ARG_BYTES: u64 = 1048576;
 pub const MAX_ARG_LEN: u64 = 65536;
@@ -3913,7 +3918,9 @@ pub static TYPES: &[super::TypeMetadata] = &[
 super::TypeMetadata { name: "cwd", layout: "kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16" },
 super::TypeMetadata { name: "process_record", layout: "process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u64,owner_session:[u8;16],argv0:bytes_u32,stdin_received:u64,stdout_produced:u64,stderr_produced:u64,retention_deadline_server_ns:u64,exit_present:u8,reserved:[u8;7]=0,optional exit:bytes_u32 containing ExitRecord,Extensions" },
 super::TypeMetadata { name: "remove_record", layout: "process_handle:u64" },
-super::TypeMetadata { name: "exit_report", layout: "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions" },
+super::TypeMetadata { name: "exit_report", layout: "process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream" },
+super::TypeMetadata { name: "keep_output_extension", layout: "SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES" },
+super::TypeMetadata { name: "output_elision", layout: "offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream" },
 super::TypeMetadata { name: "exit_record", layout: "kind:u8,reason:u8,reserved:u16=0,code:i32,exited_server_ns:u64,detail:bytes_u32" },
 super::TypeMetadata { name: "stream_bundle", layout: "process_handle:u64,flags:u16,reserved:u16=0,stdout_lifetime_offset:u64,stderr_lifetime_offset:u64,optional stdin/stdout/stderr descriptor:bytes_u32 containing sensitive BYTE TransferDescriptor,Extensions" },
 super::TypeMetadata { name: "state_entity_body", layout: "ADD/REPLACE complete ProcessRecord; REMOVE process_handle:u64" },
@@ -3948,7 +3955,8 @@ super::ConstantMetadata { name: "SPAWN_STDIN_NULL", value: 8 },
 super::ConstantMetadata { name: "SPAWN_FLAGS", value: 3 },
 super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS", value: 12 },
 super::ConstantMetadata { name: "SPAWN_REPORT_EXIT", value: 16 },
-super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS_EXTENDED", value: 28 },
+super::ConstantMetadata { name: "SPAWN_KEEP_OUTPUT", value: 32 },
+super::ConstantMetadata { name: "SPAWN_LAUNCHER_FLAGS_EXTENDED", value: 60 },
 super::ConstantMetadata { name: "ENV_EMPTY", value: 0 },
 super::ConstantMetadata { name: "ENV_SESSION", value: 1 },
 super::ConstantMetadata { name: "CWD_SERVER_DEFAULT", value: 0 },
@@ -3995,6 +4003,10 @@ super::ConstantMetadata { name: "STREAM_STDERR_CONTENT_KIND", value: 2 },
 super::ConstantMetadata { name: "SPAWN_SURFACE_APP_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "SPAWN_RESOURCE_TAG_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "SPAWN_RESIDUE_GRACE_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "SPAWN_KEEP_OUTPUT_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "MAX_KEEP_OUTPUT_TAIL_BYTES", value: 1048576 },
+super::ConstantMetadata { name: "EXIT_STDOUT_ELIDED_EXTENSION", value: 1 },
+super::ConstantMetadata { name: "EXIT_STDERR_ELIDED_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "MAX_ARGC", value: 1024 },
 super::ConstantMetadata { name: "MAX_ARG_BYTES", value: 1048576 },
 super::ConstantMetadata { name: "MAX_ARG_LEN", value: 65536 },

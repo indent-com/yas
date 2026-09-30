@@ -67,6 +67,42 @@ async fn nothing_accepted(listener: &tokio::net::UnixListener) -> bool {
         .is_err()
 }
 
+/// A 1 MiB answer goes out in one round trip, not two: the session starts
+/// with a window for it (quinn paces a window over the round trip, and an
+/// app-limited connection never grows its window past what it sent).
+#[tokio::test]
+async fn webtransport_sessions_start_with_a_window_for_bursts() {
+    yas_webrtc_forwarder::tls::install_default_provider();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let hash = wt::crypto::sha256(&yas_webrtc_forwarder::tls::provider(), cert.cert.der());
+        let mut relay = wt::ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        let (client, receive_buffer) = webtransport_client(Some(hash.as_ref())).unwrap();
+        assert!(receive_buffer.is_some_and(|bytes| bytes > 0));
+        let url: url::Url = format!("https://127.0.0.1:{}/", relay.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let (connected, _accepted) = tokio::join!(client.connect(url), async {
+            relay.accept().await.unwrap().ok().await.unwrap()
+        });
+        let session = connected.unwrap();
+        let window = (*session).stats().path.cwnd;
+        assert!(
+            window >= INITIAL_WINDOW,
+            "the session starts with a {window}-byte window"
+        );
+    })
+    .await
+    .expect("window test stalled");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn producer_authenticates_before_ipc_and_encrypts_datagrams() {
@@ -88,7 +124,7 @@ async fn producer_authenticates_before_ipc_and_encrypts_datagrams() {
                     .into(),
             )
             .unwrap();
-        let outer = webtransport_client(Some(hash.as_ref())).unwrap();
+        let (outer, _) = webtransport_client(Some(hash.as_ref())).unwrap();
         let url: url::Url = format!("https://127.0.0.1:{}/", worker.local_addr().unwrap().port())
             .parse()
             .unwrap();
@@ -302,6 +338,8 @@ impl WebSocketRelay {
             let mut session_taken = false;
             loop {
                 let (tcp, _) = listener.accept().await.unwrap();
+                // As a relay does: its answers go out at once.
+                let _ = tcp.set_nodelay(true);
                 let Ok(tls) = tls.accept(tcp).await else {
                     continue;
                 };
@@ -649,6 +687,78 @@ async fn websocket_session_serves_consumers_and_takes_allowlist_changes() {
     .expect("WebSocket session test stalled");
 }
 
+/// Small writes a moment apart, the shape of a terminal's echo, go out at
+/// once: were Nagle's algorithm on for the relay's TCP connection, the second
+/// would wait for the relay to acknowledge the first, which it delays by
+/// 40 ms or more while it has nothing to send back.
+#[cfg(unix)]
+#[tokio::test]
+async fn websocket_streams_answer_small_writes_without_nagle_stalls() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = keys();
+        let (local, listener) = local_socket(dir.path());
+        let mut relay = WebSocketRelay::start().await;
+        let producer = Producer::new(
+            "https://127.0.0.1:1/control",
+            "token",
+            keys.server.clone(),
+            local,
+        )
+        .unwrap();
+        let active = Active::default();
+        let _session = {
+            let (producer, active, relay) = (producer.clone(), active.clone(), relay.relay());
+            tokio::spawn(async move { producer.websocket_session(&relay, &active).await })
+        };
+        relay.ask("echo");
+        let (_, stream) = relay.stream().await;
+        let mut consumer = yas_uplink::connect(stream, keys.client.clone())
+            .await
+            .unwrap();
+        consumer
+            .write_all(yas_wire::PREFACE.as_slice())
+            .await
+            .unwrap();
+        consumer.flush().await.unwrap();
+        let (mut ipc, _) = listener.accept().await.unwrap();
+        let mut preface = vec![0; yas_wire::PREFACE.len()];
+        ipc.read_exact(&mut preface).await.unwrap();
+        // The local server answers each byte with two, a millisecond apart.
+        tokio::spawn(async move {
+            let mut byte = [0; 1];
+            while ipc.read_exact(&mut byte).await.is_ok() {
+                if ipc.write_all(b"a").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if ipc.write_all(b"b").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut rounds = Vec::new();
+        for _ in 0..30 {
+            let start = std::time::Instant::now();
+            consumer.write_all(b"k").await.unwrap();
+            consumer.flush().await.unwrap();
+            let mut answer = [0; 2];
+            consumer.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"ab");
+            rounds.push(start.elapsed());
+        }
+        rounds.sort();
+        let median = rounds[rounds.len() / 2];
+        assert!(
+            median < Duration::from_millis(20),
+            "a round took {median:?} (median of {rounds:?}): is Nagle's algorithm on?"
+        );
+        active.close().await;
+    })
+    .await
+    .expect("Nagle test stalled");
+}
+
 #[tokio::test]
 async fn websocket_relay_must_speak_the_subprotocol() {
     // A WebSocket server that selects no subprotocol is not an uplink relay.
@@ -902,6 +1012,105 @@ fn events_read_as_yas_uplink_prints_them() {
         }
         .to_string(),
         "relay pool exhausted; re-querying in 4s"
+    );
+    assert_eq!(
+        Event::ReceiveBuffer { bytes: 16 << 20 }.to_string(),
+        "UDP receive buffer: 16777216 bytes"
+    );
+    // Linux reports double what it allows: all 8 MiB reads as 16 MiB, and
+    // 8 MiB is what a 4 MiB net.core.rmem_max allows.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    for (bytes, note) in [
+        (8 << 20, "8388608 bytes"),
+        (15_000_000, "15000000 bytes"),
+        (425_984, "425984 bytes"),
+    ] {
+        assert_eq!(
+            Event::ReceiveBuffer { bytes }.to_string(),
+            format!(
+                "UDP receive buffer: {note}, under the 16777216 Linux reports for the \
+                 8388608 asked for (net.core.rmem_max caps it)"
+            )
+        );
+    }
+    // macOS reports what it allows, and takes at most 2048/2304 of
+    // kern.ipc.maxsockbuf (8 MiB unless raised).
+    #[cfg(target_vendor = "apple")]
+    {
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 8 << 20 }.to_string(),
+            "UDP receive buffer: 8388608 bytes"
+        );
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 7_456_540 }.to_string(),
+            "UDP receive buffer: 7456540 bytes, under the 8388608 asked for \
+             (kern.ipc.maxsockbuf caps it)"
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 8 << 20 }.to_string(),
+            "UDP receive buffer: 8388608 bytes"
+        );
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 65_536 }.to_string(),
+            "UDP receive buffer: 65536 bytes, under the 8388608 asked for \
+             (the system caps it)"
+        );
+    }
+}
+
+/// macOS and the BSDs refuse a receive buffer over their cap rather than cap
+/// it, keeping their default: the uplink finds the most they take.
+#[test]
+fn receive_buffers_get_the_most_a_refusing_system_takes() {
+    // macOS's sbreserve takes up to kern.ipc.maxsockbuf × MCLBYTES / (MSIZE +
+    // MCLBYTES), from a default of net.inet.udp.recvspace.
+    let cap = (8 << 20) * 2048 / 2304;
+    assert_eq!(cap, 7_456_540);
+    let mut buffer = 786_896;
+    let mut tries = 0;
+    let got = largest_taken(buffer, RECEIVE_BUFFER, |size| {
+        tries += 1;
+        let taken = size <= cap;
+        if taken {
+            buffer = size;
+        }
+        taken
+    });
+    assert_eq!((got, buffer), (cap, cap));
+    assert!(tries <= 23, "{tries} tries");
+    // A system taking nothing over its default keeps it, and one whose
+    // default is already as large isn't asked again.
+    assert_eq!(largest_taken(786_896, RECEIVE_BUFFER, |_| false), 786_896);
+    assert_eq!(
+        largest_taken(16 << 20, RECEIVE_BUFFER, |_| unreachable!()),
+        16 << 20
+    );
+}
+
+/// On Linux, the uplink's socket gets as much of its ask as
+/// net.core.rmem_max allows (reported doubled), and the event notes a cap
+/// exactly when there is one.
+#[cfg(target_os = "linux")]
+#[test]
+fn receive_buffers_note_linux_caps() {
+    // Only the initial network namespace shows it.
+    let Some(rmem_max) = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+        .ok()
+        .and_then(|max| max.trim().parse::<usize>().ok())
+    else {
+        return;
+    };
+    let socket = udp_socket((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let bytes = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+    assert_eq!(bytes, 2 * rmem_max.min(RECEIVE_BUFFER));
+    let event = Event::ReceiveBuffer { bytes }.to_string();
+    assert_eq!(
+        event.contains("net.core.rmem_max caps it"),
+        rmem_max < RECEIVE_BUFFER,
+        "rmem_max {rmem_max}: {event}"
     );
 }
 
