@@ -1155,7 +1155,7 @@ impl DgramQueue {
                 let mut q = self.inner.lock().await;
                 if let Some(queued) = q.pop_front() {
                     self.bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                             Some(v.saturating_sub(queued.payload.len() as u64))
                         })
                         .ok();

@@ -920,7 +920,7 @@ impl Drop for Watch {
 
 fn next_nonzero(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1).filter(|next| *next != 0)
         })
         .ok()

@@ -13068,7 +13068,7 @@ fn spawn_yas_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let max = state.config.max_connections;
     let admitted = state
         .active_connections
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (max == 0 || current < max).then_some(current + 1)
         })
         .is_ok();

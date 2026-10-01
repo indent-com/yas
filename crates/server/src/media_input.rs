@@ -204,7 +204,7 @@ struct CameraWorkerPermit;
 impl CameraWorkerPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_CAMERA_DECODE_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CAMERA_DECODE_WORKERS).then_some(active + 1)
             })
             .ok()
