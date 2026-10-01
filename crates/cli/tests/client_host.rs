@@ -1578,6 +1578,36 @@ async fn files_answer_as_the_os_does() {
         let _ = std::fs::remove_file(base.join("fresh"));
         root.write_in_place("fresh", content).await.unwrap();
         assert_eq!(std::fs::read(base.join("fresh")).unwrap(), content);
+
+        // Only while the file holds what was read: a stale hash is a CONFLICT without an OS
+        // error, describing what the file holds and leaving it so; the current one writes.
+        let other = [content, &b"!"[..]].concat();
+        let stale = root
+            .write_in_place_if(
+                "file",
+                &other,
+                Precondition::Hash(*blake3::hash(b"stale").as_bytes()),
+            )
+            .await
+            .unwrap_err();
+        assert!(stale.is_conflict(), "{stale:?}");
+        assert!(yas_client::fs::os_error(&stale).is_none());
+        assert_eq!(
+            yas_client::fs::conflict_detail(&stale).and_then(|detail| detail.current_hash),
+            Some(*blake3::hash(content).as_bytes())
+        );
+        assert_eq!(std::fs::read(base.join("file")).unwrap(), content);
+        let written = root
+            .write_in_place_if(
+                "file",
+                &other,
+                Precondition::Hash(*blake3::hash(content).as_bytes()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.hash, *blake3::hash(&other).as_bytes());
+        assert_eq!(std::fs::read(base.join("file")).unwrap(), other);
+        assert_eq!(std::fs::metadata(base.join("file")).unwrap().ino(), inode);
     }
 
     assert_eq!(
