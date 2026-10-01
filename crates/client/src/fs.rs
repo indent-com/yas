@@ -838,6 +838,23 @@ impl FsRoot {
     /// (`STAGE_IN_PLACE`, needing `CAPABILITY_STAGE_IN_PLACE`; two round trips). A failure
     /// carries its [`os_error`] either way.
     pub async fn write_in_place(&self, path: &str, content: &[u8]) -> Result<Written> {
+        self.write_in_place_if(path, content, Precondition::Any)
+            .await
+    }
+
+    /// [`write_in_place`](Self::write_in_place), only while the entry at `path` matches
+    /// `precondition`, which the server checks and writes under its mutation lock:
+    /// [`Precondition::Hash`] of what was read makes a read, change and write a compare-and-swap
+    /// on content. The entry checked is the one at `path` itself (a final symlink's own, not its
+    /// target's), so name the file a link resolves to. A failed precondition is an
+    /// [`Error::Status`] with status `CONFLICT` and no [`os_error`]; [`conflict_detail`]
+    /// describes the current entry.
+    pub async fn write_in_place_if(
+        &self,
+        path: &str,
+        content: &[u8],
+        precondition: Precondition,
+    ) -> Result<Written> {
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::invalid(format!(
                 "file is {} bytes; the YAS limit is {MAX_FILE_BYTES}",
@@ -850,7 +867,7 @@ impl FsRoot {
             return self
                 .apply_one(ApplyItem::WriteInline {
                     path: wire_path(path)?,
-                    precondition: Precondition::Any,
+                    precondition,
                     create_parents: false,
                     mode: 0,
                     content: content.to_vec(),
@@ -861,7 +878,7 @@ impl FsRoot {
         self.stage_and_commit(
             wire_path(path)?,
             content,
-            Precondition::Any,
+            precondition,
             schema::STAGE_IN_PLACE as u16,
             0,
             0,
