@@ -719,7 +719,7 @@ impl ObjectStore {
         }
         entry
             .pins
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                 pins.checked_add(1)
             })
             .map_err(|_| ObjectStoreError::Budget)?;
@@ -773,7 +773,7 @@ impl ObjectStore {
         let entry = self.objects.get(hash).ok_or(ObjectStoreError::NotFound)?;
         entry
             .pins
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                 pins.checked_add(1)
             })
             .map_err(|_| ObjectStoreError::Budget)?;
@@ -784,7 +784,7 @@ impl ObjectStore {
         if let Some(entry) = self.objects.get(hash) {
             let _ = entry
                 .pins
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                     Some(pins.saturating_sub(1))
                 });
         }

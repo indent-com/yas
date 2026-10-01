@@ -122,7 +122,7 @@ pub(super) fn accumulate_write_duration(counter: &AtomicU64, elapsed: Duration) 
     if elapsed_us == 0 {
         return;
     }
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(elapsed_us))
     });
 }
@@ -34789,7 +34789,7 @@ static NEXT_PRESENTATION_HANDLE: AtomicU64 = AtomicU64::new(1 << 32);
 #[cfg(target_os = "linux")]
 fn alloc_presentation_handle() -> Option<u64> {
     NEXT_PRESENTATION_HANDLE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .ok()
