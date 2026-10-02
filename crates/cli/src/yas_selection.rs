@@ -30,6 +30,7 @@ pub(crate) async fn cmd_get(on: Option<&str>, hub: &str, mime: &str) -> Result<(
 
 async fn get_with_client(client: &mut NativeClient, mime: &str) -> Result<Vec<u8>, String> {
     let record = clipboard_record(client).await?;
+    let mime = resolve_mime(mime, &record.mime_types);
     let result: selection::GetResult = client
         .request_typed(
             family::SELECTION,
@@ -40,7 +41,7 @@ async fn get_with_client(client: &mut NativeClient, mime: &str) -> Result<Vec<u8
                     revision: record.revision,
                 },
                 initial_receive_credit: INITIAL_RECEIVE_CREDIT,
-                mime: mime.to_owned(),
+                mime,
                 extensions: Extensions::default(),
             },
             true,
@@ -147,6 +148,35 @@ async fn set_with_client(
     Ok(())
 }
 
+/// Plain text is offered under several equivalent names (`text/plain`, with
+/// or without a charset parameter, and X11's `UTF8_STRING`). A request for any
+/// of them reads whichever the owner offered; other types must match exactly.
+fn resolve_mime(requested: &str, offered: &[String]) -> String {
+    if let Some(exact) = offered
+        .iter()
+        .find(|mime| mime.eq_ignore_ascii_case(requested))
+    {
+        return exact.clone();
+    }
+    let is_plain_text = |mime: &str| {
+        let base = mime.split(';').next().unwrap_or_default().trim();
+        base.eq_ignore_ascii_case("text/plain") || mime.eq_ignore_ascii_case("UTF8_STRING")
+    };
+    if !is_plain_text(requested) {
+        return requested.to_owned();
+    }
+    let utf8 = |mime: &&String| {
+        let lower = mime.to_ascii_lowercase().replace(' ', "");
+        lower == "text/plain;charset=utf-8" || lower == "utf8_string"
+    };
+    offered
+        .iter()
+        .find(utf8)
+        .or_else(|| offered.iter().find(|mime| is_plain_text(mime)))
+        .cloned()
+        .unwrap_or_else(|| requested.to_owned())
+}
+
 async fn clipboard_record(client: &mut NativeClient) -> Result<selection::SelectionRecord, String> {
     let records = client
         .snapshot(family::SELECTION)
@@ -232,6 +262,31 @@ mod tests {
         state::RecordKind,
         transfer::{ByteData, Close, Descriptor, Direction, Mode, UploadStage},
     };
+
+    #[test]
+    fn plain_text_requests_read_any_offered_plain_text_variant() {
+        let offered = |types: &[&str]| types.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let utf8 = offered(&["image/png", "text/plain;charset=utf-8"]);
+        assert_eq!(
+            resolve_mime("text/plain", &utf8),
+            "text/plain;charset=utf-8"
+        );
+        let plain = offered(&["text/plain"]);
+        assert_eq!(
+            resolve_mime("text/plain;charset=utf-8", &plain),
+            "text/plain"
+        );
+        let both = offered(&["text/plain", "UTF8_STRING", "text/plain;charset=utf-8"]);
+        assert_eq!(resolve_mime("text/plain", &both), "text/plain");
+        assert_eq!(resolve_mime("TEXT/PLAIN", &both), "text/plain");
+        let x11 = offered(&["UTF8_STRING", "STRING"]);
+        assert_eq!(resolve_mime("text/plain", &x11), "UTF8_STRING");
+        assert_eq!(resolve_mime("image/png", &plain), "image/png");
+        assert_eq!(
+            resolve_mime("text/plain", &offered(&["image/png"])),
+            "text/plain"
+        );
+    }
 
     #[test]
     fn inline_boundary_accounts_for_the_typed_item_envelope() {

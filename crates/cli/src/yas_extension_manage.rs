@@ -30,8 +30,9 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Args, Clone, Debug)]
 pub(crate) struct ManageArgs {
-    /// Registry directory containing manifest.json and extension modules
-    #[arg(long, default_value = DEFAULT_REGISTRY)]
+    /// Registry base URL serving manifest.json and extension modules
+    /// (https://, or http:// on a loopback host)
+    #[arg(long, value_name = "URL", default_value = DEFAULT_REGISTRY)]
     pub from: String,
 }
 
