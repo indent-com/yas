@@ -412,6 +412,14 @@ struct Arms {
     /// The set may have drifted from the tree — directory churn, a rescan,
     /// an ignore-source edit — so reconcile on the next `sync_watches`.
     worktree_stale: bool,
+    /// The index the pruned set was cut against. Tracked paths are pruning
+    /// exceptions, and the status pipeline notices a moved index by this
+    /// same fingerprint (`StatusMemo`) on any settle, not only on the
+    /// index's own event: FSEvents can deliver `index.lock` before the
+    /// rename's `index`, so a snapshot could show a force-added path whose
+    /// directory is not watched yet. Comparing it before every snapshot
+    /// keeps the set at least as fresh as the status it goes with.
+    worktree_index: Option<FileSig>,
     /// Changed since the last debug-hook publish.
     watch_set_changed: bool,
     /// The native stream was torn down and re-registered during this pass,
@@ -789,6 +797,7 @@ impl Engine {
             worktree_dirs: BTreeSet::new(),
             worktree_pruned: false,
             worktree_stale: false,
+            worktree_index: None,
             watch_set_changed: false,
             stream_rebuilt: false,
         });
@@ -927,10 +936,12 @@ impl Engine {
                 .watch(&workdir, notify::RecursiveMode::NonRecursive);
             match result {
                 Ok(()) => {
+                    let index = file_sig(&self.local.index_path());
                     let arms = self.watch.as_mut().expect("checked above");
                     arms.worktree = true;
                     arms.worktree_pruned = prune;
                     arms.worktree_stale = false;
+                    arms.worktree_index = index;
                     arms.worktree_dirs.insert(workdir);
                     arms.watch_set_changed = true;
                     arms.stream_rebuilt = true;
@@ -950,16 +961,26 @@ impl Engine {
             }
         } else if want {
             // Rebuild the per-directory set when it may have drifted:
-            // directory churn, a rescan, an ignore-source edit, or a
-            // demand change past the pruning mode.
-            let stale = self
-                .watch
-                .as_ref()
-                .is_some_and(|a| a.worktree_stale || a.worktree_pruned != prune);
+            // directory churn, a rescan, an ignore-source edit, a demand
+            // change past the pruning mode, or (pruned) a moved index,
+            // whether or not its event has arrived yet.
+            let index = file_sig(&self.local.index_path());
+            let (stale, index_moved) = self.watch.as_ref().map_or((false, false), |a| {
+                let moved = prune && a.worktree_index != index;
+                (
+                    a.worktree_stale || a.worktree_pruned != prune || moved,
+                    moved,
+                )
+            });
             if stale {
                 if let Some(arms) = &mut self.watch {
                     arms.worktree_stale = false;
                     arms.worktree_pruned = prune;
+                    arms.worktree_index = index;
+                }
+                if index_moved {
+                    // The exclude stack reads the index too.
+                    self.excludes = None;
                 }
                 self.reconcile_worktree_watches();
             }

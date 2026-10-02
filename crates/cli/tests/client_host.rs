@@ -1356,27 +1356,45 @@ async fn read_only_sessions_cannot_spawn_or_open_writable_roots() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_process_catalogue_can_be_watched() {
-    use yas_client::process::ProcessChange;
+    use yas_client::process::{ProcessChange, ProcessWatch};
+    async fn next(watch: &mut ProcessWatch) -> ProcessChange {
+        tokio::time::timeout(TIMEOUT, watch.next())
+            .await
+            .expect("a change of the process catalogue")
+            .unwrap()
+    }
     let server = start().await;
     let client = server.connect().await.unwrap();
     let mut watch = client.watch_processes().await.unwrap();
-    assert!(
-        matches!(watch.next().await.unwrap(), ProcessChange::Snapshot(list) if list.is_empty())
-    );
-    let process = client.spawn(&Command::new("true")).await.unwrap();
+    assert!(matches!(next(&mut watch).await, ProcessChange::Snapshot(list) if list.is_empty()));
+    // The watch sends what changed between two looks at the catalogue, which an
+    // ordinary child leaves as soon as its exit is delivered: one that came and
+    // went between two looks never shows. This one waits on its stdin until the
+    // watch has shown it running.
+    let mut process = client
+        .spawn(Command::new("cat").stdin(Stdin::Piped))
+        .await
+        .unwrap();
     let handle = process.handle();
+    let mut stdin = process.take_stdin().unwrap();
+    loop {
+        match next(&mut watch).await {
+            ProcessChange::Updated(info) if info.handle == handle => {
+                assert!(info.exit.is_none(), "{info:?}");
+                break;
+            }
+            other => assert!(
+                !matches!(other, ProcessChange::Removed(removed) if removed == handle),
+                "{other:?}"
+            ),
+        }
+    }
+    stdin.finish().await.unwrap();
     assert!(process.wait().await.unwrap().success());
-    let deadline = Instant::now() + TIMEOUT;
-    let mut saw_exit = false;
-    while !saw_exit {
-        assert!(Instant::now() < deadline, "no exited record for {handle}");
-        match tokio::time::timeout(TIMEOUT, watch.next())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            ProcessChange::Updated(info) if info.handle == handle => saw_exit = info.exit.is_some(),
-            ProcessChange::Removed(removed) if removed == handle => saw_exit = true,
+    loop {
+        match next(&mut watch).await {
+            ProcessChange::Updated(info) if info.handle == handle && info.exit.is_some() => break,
+            ProcessChange::Removed(removed) if removed == handle => break,
             _ => {}
         }
     }
