@@ -406,6 +406,50 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
 `cargo run -p yas-client --example run -- local -- uname -a` is a complete
 example; `crates/cli/tests/client_host.rs` exercises the API end to end.
 
+## Rust: the whole CLI, `yas-cli`
+
+A program can carry the `yas` CLI itself, as a subcommand of its own or under
+the name `yas` (a link, or a copy so named), so one binary is both:
+
+```toml
+yas-cli = { path = "../yas/crates/cli", default-features = false, features = ["openh264"] }
+```
+
+```rust
+fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == "yas") {
+        let program = std::env::current_exe().unwrap();
+        let invocation = yas_cli::Invocation {
+            program,
+            args: vec!["yas".into()],
+            part_of: Some("myapp".into()),
+        };
+        yas_cli::run(invocation, std::iter::once("yas".into()).chain(args[2..].iter().cloned()));
+        return;
+    }
+    // … the program's own commands
+}
+```
+
+- `yas_cli::run(invocation, args)` runs the CLI on `args` (the program's name
+  first) and returns once the command is done, or exits the process. Call it
+  first in `main`, before any thread starts (it bounds glibc's malloc arenas)
+  and before a rustls crypto provider is installed (it installs ring's when
+  none is).
+- `Invocation` says how the CLI runs itself again: the local server a client
+  starts when none answers, the proxy daemon, `yas share`'s. It runs `program`
+  with `args` before the subcommand (`myapp yas server …`); for a binary named
+  `yas`, `args` is empty.
+- `part_of` names the program that brings this YAS: `yas upgrade` then fails
+  with "this yas is part of myapp: upgrade myapp instead".
+- Without the `ui` feature (a default one), the browser UI that `yas edge`
+  serves and a bare `yas` opens is a page saying this build carries none, and
+  the build needs no `js/ui/dist`.
+  `openh264` and `x264` are the CLI's video encoders, as for `yas` itself;
+  `mimalloc` (default too) is the `yas` binary's allocator, which a program
+  that carries the CLI leaves out and picks its own.
+
 ## Server-side: a Node/Bun client over a unix socket
 
 You can also run a `@yas-run/core` client **server-side** (Node/Bun/Deno) to drive a

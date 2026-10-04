@@ -13,6 +13,7 @@
 //! `proxy:URI` (force the shared yas-proxy daemon), or a remote name from
 //! the home server's catalogue.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -439,10 +440,12 @@ pub fn proxy_socket_path() -> String {
 
 /// Ensure a yas-proxy daemon is running.  Returns the socket/pipe path.
 ///
-/// If no live proxy is found, runs `executable proxy-daemon` (the `yas`
-/// CLI) in a detached background process so it outlives the caller.
-pub async fn ensure_proxy(executable: &Path) -> Result<String, String> {
-    yas_proxy::ensure_proxy(executable, true).await
+/// If no live proxy is found, runs `executable [args…] proxy-daemon` (the
+/// `yas` CLI, `args` what it takes before its subcommands: see
+/// [`ConnectOptions::executable_args`]) in a detached background process so it
+/// outlives the caller.
+pub async fn ensure_proxy(executable: &Path, args: &[OsString]) -> Result<String, String> {
+    yas_proxy::ensure_proxy_with(executable, args, true).await
 }
 
 /// Send a `shutdown\n` command to a running yas-proxy, causing it to exit.
@@ -546,10 +549,11 @@ async fn connect_via_native_proxy_at(
 pub async fn connect_via_native_proxy(
     upstream_uri: &str,
     executable: &Path,
+    args: &[OsString],
 ) -> Result<Transport, String> {
     let prepared = yas_proxy::prepare_uplink_uri(upstream_uri)?;
     let upstream_uri = prepared.as_str();
-    let socket = ensure_proxy(executable).await?;
+    let socket = ensure_proxy(executable, args).await?;
 
     #[cfg(unix)]
     {
@@ -712,10 +716,11 @@ async fn connect_via_composite_proxy_at(
 pub async fn connect_via_composite_proxy(
     upstream_uri: &str,
     executable: &Path,
+    args: &[OsString],
 ) -> Result<Transport, String> {
     #[cfg(any(unix, windows))]
     {
-        let socket = ensure_proxy(executable).await?;
+        let socket = ensure_proxy(executable, args).await?;
         let first = connect_via_composite_proxy_at(&socket, upstream_uri).await;
         let incompatible = matches!(
             first.as_ref(),
@@ -741,7 +746,7 @@ pub async fn connect_via_composite_proxy(
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let socket = ensure_proxy(executable).await?;
+        let socket = ensure_proxy(executable, args).await?;
         return connect_via_composite_proxy_at(&socket, upstream_uri).await;
     }
 
@@ -838,6 +843,11 @@ fn proxy_executable(options: &ConnectOptions) -> Option<&Path> {
     options.executable.as_deref().filter(|_| options.proxy)
 }
 
+/// What [`ConnectOptions::executable`] takes before its subcommands.
+fn executable_args(options: &ConnectOptions) -> &[OsString] {
+    &options.executable_args
+}
+
 async fn connect_target_uri(uri: &str, options: &ConnectOptions) -> Result<Transport, String> {
     if let Some(upstream) = uri.strip_prefix("proxy:") {
         let executable = options.executable.as_deref().ok_or_else(|| {
@@ -845,14 +855,14 @@ async fn connect_target_uri(uri: &str, options: &ConnectOptions) -> Result<Trans
                 "{uri}: the shared yas-proxy needs a yas executable (ConnectOptions::executable)"
             )
         })?;
-        return connect_via_native_proxy(upstream, executable).await;
+        return connect_via_native_proxy(upstream, executable, executable_args(options)).await;
     }
 
     if let Some(rest) = uri.strip_prefix("ssh:") {
         if options.ssh.is_none()
             && let Some(executable) = proxy_executable(options)
         {
-            return connect_via_native_proxy(uri, executable).await;
+            return connect_via_native_proxy(uri, executable, executable_args(options)).await;
         }
         let (user, host, socket) = yas_ssh::parse_ssh_uri(rest);
         let stream = match &options.ssh {
@@ -871,7 +881,7 @@ async fn connect_target_uri(uri: &str, options: &ConnectOptions) -> Result<Trans
     }
     if let Some(rest) = uri.strip_prefix("tcp:") {
         if let Some(executable) = proxy_executable(options) {
-            return connect_via_native_proxy(uri, executable).await;
+            return connect_via_native_proxy(uri, executable, executable_args(options)).await;
         }
         let stream = tokio::net::TcpStream::connect(rest)
             .await
@@ -887,7 +897,7 @@ async fn connect_target_uri(uri: &str, options: &ConnectOptions) -> Result<Trans
     }
     if uri.starts_with("ws://") || uri.starts_with("wss://") || uri.starts_with("uplink:") {
         if let Some(executable) = proxy_executable(options) {
-            return connect_via_native_proxy(uri, executable).await;
+            return connect_via_native_proxy(uri, executable, executable_args(options)).await;
         }
         return connect_native_upstream(uri).await;
     }
@@ -903,7 +913,8 @@ async fn connect_target_uri(uri: &str, options: &ConnectOptions) -> Result<Trans
             // invocation fresh paired reliable and unreliable DataChannels.
             // The local proxy connection also keeps those lanes separate.
             let proxy_uri = share_proxy_uri(target, &options.hub);
-            return connect_via_composite_proxy(&proxy_uri, executable).await;
+            return connect_via_composite_proxy(&proxy_uri, executable, executable_args(options))
+                .await;
         }
         let (passphrase, uri_hub) = yas_proxy::parse_share_uri(target);
         let hub = if has_explicit_hub {
@@ -954,7 +965,7 @@ pub async fn connect_local(
     if options.start_local
         && let Some(executable) = options.executable.as_deref()
     {
-        ensure_local_server(&path, name, executable).await?;
+        ensure_local_server(&path, name, executable, executable_args(options)).await?;
     }
     connect_native_home(&path).await
 }
@@ -1052,8 +1063,9 @@ pub async fn connect_target(
     connect_local(None, options).await
 }
 
-/// Connect to the local server, spawning `executable server` as a
-/// **detached process** if absent. In-process hosting (the old behavior)
+/// Connect to the local server, spawning `executable [args…] server` as a
+/// **detached process** if absent (`args`: what the executable takes before
+/// its subcommands, see [`ConnectOptions::executable_args`]). In-process hosting (the old behavior)
 /// breaks every daemon-resident feature for one-shot commands: warm LSP
 /// backends (docs/design/lsp.md "Sessions and discovery"), surviving PTYs —
 /// all died with each short-lived CLI invocation. The spawned `yas server`
@@ -1063,6 +1075,7 @@ pub async fn ensure_local_server(
     socket_path: &str,
     name: Option<&str>,
     executable: &Path,
+    args: &[OsString],
 ) -> Result<(), String> {
     if local_server_alive(socket_path).await {
         return Ok(());
@@ -1073,7 +1086,7 @@ pub async fn ensure_local_server(
     if std::path::Path::new(socket_path).exists() {
         let _ = std::fs::remove_file(socket_path);
     }
-    let mut spawned = spawn_detached_server(executable, socket_path, name)?;
+    let mut spawned = spawn_detached_server(executable, args, socket_path, name)?;
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Another concurrent auto-start may have won the bind while our
@@ -1150,17 +1163,18 @@ impl Drop for SpawnedServer {
     }
 }
 
-/// Spawn `yas server --socket <path>` detached from this process's
-/// session, stdio to the void. Configuration flows through inherited
+/// Spawn `yas server --socket <path>` (`executable`, with `args` before
+/// `server`) detached from this process's session, stdio to the void. Configuration flows through inherited
 /// `YAS_*`/`SHELL` env vars, which the server command reads itself —
 /// `YAS_PASSPHRASE` excepted, which is not the server's to hold.
 fn spawn_detached_server(
     executable: &Path,
+    args: &[OsString],
     socket_path: &str,
     name: Option<&str>,
 ) -> Result<SpawnedServer, String> {
     let mut cmd = std::process::Command::new(executable);
-    cmd.arg("server");
+    cmd.args(args).arg("server");
     if let Some(name) = name {
         cmd.arg("--name").arg(name);
     }

@@ -30,6 +30,12 @@ pub(crate) struct Runtime {
     server: Server,
     #[cfg(test)]
     operation_gate: Option<Arc<TestOperationGate>>,
+    #[cfg(test)]
+    terminal_gate: Option<Arc<TestOperationGate>>,
+    #[cfg(test)]
+    publication_gate: Option<Arc<TestOperationGate>>,
+    #[cfg(test)]
+    settlement_gate: Option<Arc<TestOperationGate>>,
 }
 
 #[cfg(test)]
@@ -210,12 +216,26 @@ struct SessionInner {
     shutting_down: AtomicBool,
     #[cfg(test)]
     operation_gate: Option<Arc<TestOperationGate>>,
+    #[cfg(test)]
+    terminal_gate: Option<Arc<TestOperationGate>>,
+    #[cfg(test)]
+    publication_gate: Option<Arc<TestOperationGate>>,
+    #[cfg(test)]
+    settlement_gate: Option<Arc<TestOperationGate>>,
 }
 
 struct ExitReplays {
     values: HashMap<u64, ExitInfo>,
     order: VecDeque<u64>,
     capacity: usize,
+    /// Prepared but not published exits survive route failure/removal. WAIT can discover
+    /// them without observing success before the native retirement fence has settled.
+    pending: HashMap<u64, watch::Sender<Option<ExitInfo>>>,
+}
+
+enum TerminalLookup {
+    Exit(ExitInfo),
+    Pending(watch::Receiver<Option<ExitInfo>>),
 }
 
 impl ExitReplays {
@@ -224,14 +244,37 @@ impl ExitReplays {
             values: HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
+            pending: HashMap::new(),
         }
     }
 
+    #[cfg(all(test, unix))]
     fn get(&self, process_handle: u64) -> Option<&ExitInfo> {
         self.values.get(&process_handle)
     }
 
+    fn lookup(&self, process_handle: u64) -> Option<TerminalLookup> {
+        self.values
+            .get(&process_handle)
+            .cloned()
+            .map(TerminalLookup::Exit)
+            .or_else(|| {
+                self.pending
+                    .get(&process_handle)
+                    .map(|pending| TerminalLookup::Pending(pending.subscribe()))
+            })
+    }
+
+    fn prepare(&mut self, process_handle: u64) {
+        self.pending
+            .entry(process_handle)
+            .or_insert_with(|| watch::channel(None).0);
+    }
+
     fn insert(&mut self, process_handle: u64, exit: ExitInfo) {
+        if let Some(pending) = self.pending.remove(&process_handle) {
+            pending.send_replace(Some(exit.clone()));
+        }
         if self.values.insert(process_handle, exit).is_none() {
             self.order.push_back(process_handle);
         }
@@ -245,6 +288,7 @@ impl ExitReplays {
     fn clear(&mut self) {
         self.values.clear();
         self.order.clear();
+        self.pending.clear();
     }
 }
 
@@ -254,6 +298,8 @@ struct Route {
     auto_ack_output: bool,
     events: mpsc::Sender<Event>,
     exit: watch::Sender<Option<ExitInfo>>,
+    /// Private ACK safety, not an externally observable completion value.
+    terminal_prepared: AtomicBool,
     /// Why the process's output left this route: its native binding fell a window behind or
     /// its queue filled. Only this attachment fails; the session and its other processes go on.
     failed: watch::Sender<Option<String>>,
@@ -273,12 +319,36 @@ impl Runtime {
             server,
             #[cfg(test)]
             operation_gate: None,
+            #[cfg(test)]
+            terminal_gate: None,
+            #[cfg(test)]
+            publication_gate: None,
+            #[cfg(test)]
+            settlement_gate: None,
         }
     }
 
     #[cfg(all(test, unix))]
     pub(crate) fn with_operation_gate(mut self, gate: Arc<TestOperationGate>) -> Self {
         self.operation_gate = Some(gate);
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_terminal_gate(mut self, gate: Arc<TestOperationGate>) -> Self {
+        self.terminal_gate = Some(gate);
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_publication_gate(mut self, gate: Arc<TestOperationGate>) -> Self {
+        self.publication_gate = Some(gate);
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_settlement_gate(mut self, gate: Arc<TestOperationGate>) -> Self {
+        self.settlement_gate = Some(gate);
         self
     }
 
@@ -333,6 +403,12 @@ impl Runtime {
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
             operation_gate: self.operation_gate.clone(),
+            #[cfg(test)]
+            terminal_gate: self.terminal_gate.clone(),
+            #[cfg(test)]
+            publication_gate: self.publication_gate.clone(),
+            #[cfg(test)]
+            settlement_gate: self.settlement_gate.clone(),
         });
         tokio::spawn(route_outbound(Arc::downgrade(&inner), events, evictions));
         Ok(Session { inner })
@@ -433,6 +509,10 @@ impl Session {
             )
             .await
             .map_err(backend_error);
+        #[cfg(test)]
+        if let Some(gate) = &self.inner.settlement_gate {
+            gate.enter().await;
+        }
         let started = match started {
             Ok(started) => started,
             Err(error) => {
@@ -444,23 +524,11 @@ impl Session {
             self.remove_route(process_id);
             return Err(Error::Closed("mismatched Process SPAWN reply".to_owned()));
         }
-        {
-            // Under the routes lock, like the Exit handler: either it sees
-            // this handle and records the exit replay, or this sees the
-            // exit it already published (a process that exits before SPAWN
-            // returns) and records it here. A WAIT never misses both.
-            let _routes = self.inner.routes.lock().unwrap();
-            route
-                .process_handle
-                .store(started.process_handle, Ordering::Release);
-            if let Some(exit) = route.exit.borrow().clone() {
-                self.inner
-                    .exits
-                    .lock()
-                    .unwrap()
-                    .insert(started.process_handle, exit);
-            }
-        }
+        // Native EXIT carries its definitive handle and is the sole replay publisher, even
+        // if it beat this SPAWN reply. A late settlement must not reinsert a cleared replay.
+        route
+            .process_handle
+            .store(started.process_handle, Ordering::Release);
         Ok(Attachment {
             session: self.clone(),
             route,
@@ -549,62 +617,70 @@ impl Session {
         request: &wire::Wait,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<ExitInfo>, Error> {
-        if let Some(exit) = self
+        let terminal = self
             .inner
             .exits
             .lock()
             .unwrap()
-            .get(request.process_handle)
-            .cloned()
-        {
-            return Ok(Some(exit));
+            .lookup(request.process_handle);
+        if let Some(terminal) = terminal {
+            return self.wait_terminal(terminal, deadline).await.map(Some);
         }
-        let (mut exit, mut failed, temporary) =
-            if let Some(route) = self.route_by_handle(request.process_handle) {
-                (route.exit.subscribe(), route.failed.subscribe(), None)
-            } else if let Some(exit) = self
-                .inner
-                .exits
-                .lock()
-                .unwrap()
-                .get(request.process_handle)
-                .cloned()
+        let (mut exit, mut failed, temporary) = if let Some(route) =
+            self.route_by_handle(request.process_handle)
+        {
+            (route.exit.subscribe(), route.failed.subscribe(), None)
+        } else if let Some(terminal) = {
+            let exits = self.inner.exits.lock().unwrap();
+            exits.lookup(request.process_handle)
+        } {
+            return self.wait_terminal(terminal, deadline).await.map(Some);
+        } else {
+            // A look refused as CONFLICT is one that comes too soon: the process's exit is
+            // on its way to its watchers (it is final once they have it), or this session's
+            // own look at it is still bound (a concurrent CONTROL's, or a route that failed
+            // and has yet to detach). The WAIT waits for that to settle, then looks again.
+            let revision = self.inner.server.native_catalogue_revision();
+            match self
+                .watch_process(request.process_handle, false, true)
+                .await
             {
-                // It exited between the first look and the route lookup; the
-                // replay is recorded before the route is removed.
-                return Ok(Some(exit));
-            } else {
-                // A look refused as CONFLICT is one that comes too soon: the process's exit is
-                // on its way to its watchers (it is final once they have it), or this session's
-                // own look at it is still bound (a concurrent CONTROL's, or a route that failed
-                // and has yet to detach). The WAIT waits for that to settle, then looks again.
-                let revision = self.inner.server.native_catalogue_revision();
-                match self
-                    .watch_process(request.process_handle, false, true)
-                    .await
-                {
-                    Ok(WatchOutcome::Exited(exit)) => return Ok(Some(exit)),
-                    Ok(WatchOutcome::Running(attachment)) => {
-                        let exit = attachment.route.exit.subscribe();
-                        let failed = attachment.route.failed.subscribe();
-                        (exit, failed, Some(attachment))
-                    }
-                    Err(Error::Conflict) => {
-                        let settled = self
-                            .inner
-                            .manager
-                            .wait_native_look(request.process_handle, revision);
-                        match deadline {
-                            None => settled.await,
-                            Some(deadline) => tokio::time::timeout_at(deadline, settled)
-                                .await
-                                .map_err(|_| Error::Timeout)?,
-                        }
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
+                Ok(WatchOutcome::Exited(exit)) => return Ok(Some(exit)),
+                Ok(WatchOutcome::Running(attachment)) => {
+                    let exit = attachment.route.exit.subscribe();
+                    let failed = attachment.route.failed.subscribe();
+                    (exit, failed, Some(attachment))
                 }
-            };
+                Err(Error::Conflict) => {
+                    let settled = self
+                        .inner
+                        .manager
+                        .wait_native_look(request.process_handle, revision);
+                    match deadline {
+                        None => settled.await,
+                        Some(deadline) => tokio::time::timeout_at(deadline, settled)
+                            .await
+                            .map_err(|_| Error::Timeout)?,
+                    }
+                    return Ok(None);
+                }
+                Err(Error::NotFound) => {
+                    // The native catalogue can retire between the look above and WATCH.
+                    // Preparation registered this pending value before its guard retired.
+                    let terminal = self
+                        .inner
+                        .exits
+                        .lock()
+                        .unwrap()
+                        .lookup(request.process_handle);
+                    return match terminal {
+                        Some(terminal) => self.wait_terminal(terminal, deadline).await.map(Some),
+                        None => Err(Error::NotFound),
+                    };
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let wait = async {
             loop {
                 if let Some(exit) = exit.borrow().clone() {
@@ -635,6 +711,40 @@ impl Session {
             self.remove_route(attachment.route.process_id);
         }
         result
+    }
+
+    async fn wait_terminal(
+        &self,
+        terminal: TerminalLookup,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ExitInfo, Error> {
+        let mut exit = match terminal {
+            TerminalLookup::Exit(exit) => return Ok(exit),
+            TerminalLookup::Pending(exit) => exit,
+        };
+        let mut closed = self.inner.closed.subscribe();
+        let wait = async {
+            loop {
+                if let Some(error) = closed.borrow().clone() {
+                    return Err(error);
+                }
+                if let Some(exit) = exit.borrow().clone() {
+                    return Ok(exit);
+                }
+                tokio::select! {
+                    changed = exit.changed() => if changed.is_err() {
+                        return Err(Error::Closed("Process terminal publication cancelled".to_owned()));
+                    },
+                    _ = closed.changed() => {}
+                }
+            }
+        };
+        match deadline {
+            None => wait.await,
+            Some(deadline) => tokio::time::timeout_at(deadline, wait)
+                .await
+                .map_err(|_| Error::Timeout)?,
+        }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -727,7 +837,11 @@ impl Session {
             // Terminal dispatch retires the native binding. Output already
             // delivered ahead of EXIT can still be consumed afterwards, and
             // its final acknowledgement is then an idempotent no-op.
-            Err(process::NativeError::NotFound) if route.exit.borrow().is_some() => Ok(()),
+            Err(process::NativeError::NotFound)
+                if route.terminal_prepared.load(Ordering::Acquire) =>
+            {
+                Ok(())
+            }
             Err(error) => Err(backend_error(error)),
         }
     }
@@ -760,6 +874,7 @@ impl Session {
             auto_ack_output,
             events,
             exit,
+            terminal_prepared: AtomicBool::new(false),
             failed,
         });
         if self
@@ -914,9 +1029,37 @@ async fn route_outbound(
         let Some(inner) = inner.upgrade() else {
             return;
         };
-        if let Err(error) = event.dispatch(|event| dispatch_outbound(&inner, event)) {
-            close_session(&inner, error);
-            return;
+        if matches!(event.event, process::NativeEvent::Exit { .. }) {
+            // Two endpoints can receive different generations' exits in opposite order.
+            // Waiting on the shared retirement fence here would deadlock their writers;
+            // only terminal publication waits, while this endpoint keeps draining events.
+            tokio::spawn(async move {
+                let prepared = event
+                    .prepare_and_retire(|event| async {
+                        let prepared = prepare_outbound(&inner, event);
+                        #[cfg(test)]
+                        if let Some(gate) = &inner.terminal_gate {
+                            gate.enter().await;
+                        }
+                        prepared
+                    })
+                    .await;
+                #[cfg(test)]
+                if let Some(gate) = &inner.publication_gate {
+                    gate.enter().await;
+                }
+                if let Err(error) = publish_outbound(&inner, prepared) {
+                    close_session(&inner, error);
+                }
+            });
+        } else {
+            let prepared = event
+                .prepare_and_retire(|event| std::future::ready(prepare_outbound(&inner, event)))
+                .await;
+            if let Err(error) = publish_outbound(&inner, prepared) {
+                close_session(&inner, error);
+                return;
+            }
         }
     }
     if let Some(inner) = inner.upgrade() {
@@ -927,7 +1070,16 @@ async fn route_outbound(
     }
 }
 
-fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> Result<(), Error> {
+struct ExitPublication {
+    process_id: u32,
+    process_handle: u64,
+    exit: ExitInfo,
+}
+
+fn prepare_outbound(
+    inner: &Arc<SessionInner>,
+    event: process::NativeEvent,
+) -> Result<Option<ExitPublication>, Error> {
     match event {
         process::NativeEvent::Output {
             process_id,
@@ -937,7 +1089,7 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
         } => {
             // Queued before its route failed or detached: nobody takes it now.
             let Some(route) = inner.routes.lock().unwrap().get(&process_id).cloned() else {
-                return Ok(());
+                return Ok(None);
             };
             let semantic_stream = match stream {
                 process::NATIVE_STREAM_STDOUT => Stream::Stdout,
@@ -952,7 +1104,7 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                     .manager
                     .acknowledge_output_native(process_id, stream, end)
                     .map_err(backend_error)?;
-                return Ok(());
+                return Ok(None);
             }
             if route
                 .events
@@ -969,7 +1121,7 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                     .manager
                     .control_native(process_id, process::NativeControl::Detach);
             }
-            Ok(())
+            Ok(None)
         }
         process::NativeEvent::StdinProgress {
             process_id,
@@ -977,7 +1129,7 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
             open,
         } => {
             let Some(route) = inner.routes.lock().unwrap().get(&process_id).cloned() else {
-                return Ok(());
+                return Ok(None);
             };
             if route
                 .events
@@ -989,35 +1141,67 @@ fn dispatch_outbound(inner: &Arc<SessionInner>, event: process::NativeEvent) -> 
                     .manager
                     .control_native(process_id, process::NativeControl::Detach);
             }
-            Ok(())
+            Ok(None)
         }
         process::NativeEvent::Exit {
             process_id,
             process_handle,
             exit,
         } => {
-            let exit = native_exit_info(exit);
-            // The replay goes first, and whether the route is there or not: a WAIT in this
-            // session that no longer finds the route (it left, or failed as the exit was queued)
-            // must find the exit.
-            inner
-                .exits
-                .lock()
-                .unwrap()
-                .insert(process_handle, exit.clone());
-            let route = {
-                let mut routes = inner.routes.lock().unwrap();
-                let Some(route) = routes.get(&process_id).cloned() else {
-                    return Ok(());
-                };
-                routes.remove(&process_id);
-                route.exit.send_replace(Some(exit.clone()));
-                route
-            };
-            let _ = route.events.try_send(Event::Exit(exit));
-            Ok(())
+            if let Some(route) = inner.routes.lock().unwrap().get(&process_id) {
+                // The binding may retire next, while queued output is still being consumed.
+                // Only the ACK fallback sees this; replay, WAIT and EXIT wait for retirement.
+                route.terminal_prepared.store(true, Ordering::Release);
+            }
+            let closed = inner.closed.borrow();
+            if closed.is_some() || inner.shutting_down.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            inner.exits.lock().unwrap().prepare(process_handle);
+            Ok(Some(ExitPublication {
+                process_id,
+                process_handle,
+                exit: native_exit_info(exit),
+            }))
         }
     }
+}
+
+fn publish_outbound(
+    inner: &Arc<SessionInner>,
+    prepared: Result<Option<ExitPublication>, Error>,
+) -> Result<(), Error> {
+    let Some(ExitPublication {
+        process_id,
+        process_handle,
+        exit,
+    }) = prepared?
+    else {
+        return Ok(());
+    };
+    // A terminal fence can outlive session shutdown. Hold the closed-state read through
+    // publication so close_session's subsequent clear cannot be undone by a delayed exit.
+    let closed = inner.closed.borrow();
+    if closed.is_some() || inner.shutting_down.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // The native writer guards have recycled every binding and the ordinary generation's
+    // global/owner budgets. Replay goes first so WAIT cannot miss an exit as its route leaves.
+    inner
+        .exits
+        .lock()
+        .unwrap()
+        .insert(process_handle, exit.clone());
+    let route = {
+        let mut routes = inner.routes.lock().unwrap();
+        let Some(route) = routes.remove(&process_id) else {
+            return Ok(());
+        };
+        route.exit.send_replace(Some(exit.clone()));
+        route
+    };
+    let _ = route.events.try_send(Event::Exit(exit));
+    Ok(())
 }
 
 /// The route of `process_id` leaves the session and its attachment and WAITs fail with
@@ -1231,6 +1415,314 @@ mod tests {
             .as_os_str()
             .as_bytes()
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn deferred_terminal_publication_cannot_reopen_a_closed_session() {
+        let server = Server::new(false, true);
+        let session = Runtime::new(server.clone())
+            .session([43; 16], None)
+            .unwrap();
+        let prepared = Ok(Some(ExitPublication {
+            process_id: 1,
+            process_handle: 1,
+            exit: ExitInfo {
+                kind: wire::ExitKind::Code,
+                reason: 0,
+                code: 0,
+                detail: Vec::new(),
+                elided: [None; 2],
+            },
+        }));
+        close_session(
+            &session.inner,
+            Error::Closed("test cancellation".to_owned()),
+        );
+        publish_outbound(&session.inner, prepared).unwrap();
+        assert!(session.inner.exits.lock().unwrap().values.is_empty());
+        session.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_spawn_settlement_does_not_reinsert_a_closed_sessions_exit() {
+        let server = Server::new(false, true);
+        let settlement = Arc::new(TestOperationGate::default());
+        let publication = Arc::new(TestOperationGate::default());
+        let owner = Runtime::new(server.clone())
+            .with_settlement_gate(settlement.clone())
+            .with_publication_gate(publication.clone())
+            .session([46; 16], None)
+            .unwrap();
+        let spawn = {
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                owner
+                    .spawn(&spawn_request(vec![executable("true")], Vec::new()), None)
+                    .await
+            })
+        };
+        within_5s(settlement.wait_for_entered(1)).await;
+        within_5s(publication.wait_for_entered(1)).await;
+        let route = owner.inner.routes.lock().unwrap().get(&1).unwrap().clone();
+        let mut exit = route.exit.subscribe();
+        publication.release(1);
+        within_5s(exit.wait_for(Option::is_some)).await.unwrap();
+        owner.shutdown().await;
+        settlement.release(1);
+        let attachment = within_5s(spawn).await.unwrap().unwrap();
+        assert_eq!(attachment.route.exit.borrow().as_ref().unwrap().code, 0);
+        assert!(owner.inner.exits.lock().unwrap().values.is_empty());
+        assert!(owner.inner.exits.lock().unwrap().pending.is_empty());
+        assert!(matches!(
+            owner.wait(&wait_request(attachment.process_handle)).await,
+            Err(Error::Permission)
+        ));
+        server.shutdown().await;
+    }
+
+    /// Remove the route before preparation, and while its retirement fence is held. Native
+    /// retirement wakes catalogue WAITs, but a private pending terminal must bridge the gap
+    /// until the deferred publisher records the replay: neither NotFound nor early success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_on_a_failed_route_bridges_retirement_to_deferred_replay() {
+        let server = Server::with_maxima(
+            false,
+            true,
+            process::ProcessMaxima {
+                per_session: 2,
+                total: 2,
+                ..process::ProcessMaxima::DEFAULT
+            },
+        );
+        let preparation = Arc::new(TestOperationGate::default());
+        let publication = Arc::new(TestOperationGate::default());
+        let runtime = Runtime::new(server.clone())
+            .with_terminal_gate(preparation.clone())
+            .with_publication_gate(publication.clone());
+        let owner = runtime.session([44; 16], None).unwrap();
+        let (watcher, mut events, _) = server.native_endpoint_with_session([45; 16], 16);
+        let mut request = spawn_request(vec![executable("cat")], Vec::new());
+        request.flags = schema::process::SPAWN_MERGE_STDERR as u16;
+        request.stderr_receive_credit = 0;
+        for round in 0..2 {
+            let attachment = owner.spawn(&request, None).await.unwrap();
+            let handle = attachment.process_handle;
+            watcher.watch_native(round + 1, handle, false).unwrap();
+            if round == 0 {
+                fail_route(&owner.inner, attachment.route.process_id, ROUTE_EVICTED);
+            }
+            owner
+                .send_control(
+                    attachment.route.process_id,
+                    process::NativeControl::CloseStdin,
+                )
+                .await
+                .unwrap();
+            let held = loop {
+                let event = within_5s(events.recv()).await.unwrap();
+                if matches!(event.event, process::NativeEvent::Exit { .. }) {
+                    break event;
+                }
+                event.prepare_and_retire(std::future::ready).await;
+            };
+            within_5s(preparation.wait_for_entered(round as usize + 1)).await;
+            if round == 1 {
+                fail_route(&owner.inner, attachment.route.process_id, ROUTE_EVICTED);
+            }
+            assert!(
+                owner
+                    .inner
+                    .exits
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .contains_key(&handle)
+            );
+            preparation.release(1);
+            drop(held);
+            within_5s(publication.wait_for_entered(round as usize + 1)).await;
+            assert!(
+                !server
+                    .native_snapshot()
+                    .records
+                    .iter()
+                    .any(|record| record.process_handle == handle)
+            );
+            assert!(owner.inner.exits.lock().unwrap().get(handle).is_none());
+            if round == 1 {
+                assert_eq!(
+                    owner.inner.manager.acknowledge_output_native(
+                        attachment.route.process_id,
+                        process::NATIVE_STREAM_STDOUT,
+                        0
+                    ),
+                    Err(process::NativeError::NotFound)
+                );
+                // Private ACK safety applies after binding retirement but before public EXIT.
+                attachment.acknowledge_output(Stream::Stdout, 0).unwrap();
+            }
+            let wait_request = wait_request(handle);
+            let mut wait = Box::pin(owner.wait(&wait_request));
+            tokio::select! {
+                biased;
+                result = &mut wait => panic!("WAIT escaped the deferred replay gap: {result:?}"),
+                () = std::future::ready(()) => {}
+            }
+            publication.release(1);
+            let exit = within_5s(&mut wait).await.unwrap();
+            drop(wait);
+            assert_eq!(exit.code, 0);
+            assert_eq!(owner.wait(&wait_request).await.unwrap(), exit);
+            owner.spawn(&request, None).await.unwrap();
+        }
+        preparation.release(2);
+        publication.release(2);
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// Full endpoint and global capacity, with two terminal publications prepared but their
+    /// writer guards held. A second endpoint holds both terminal envelopes as well, so even
+    /// retiring the owner's binding must not expose completion before global/owned recycling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_completion_recycles_admission_before_wait_and_exit() {
+        let server = Server::with_maxima(
+            false,
+            true,
+            process::ProcessMaxima {
+                per_session: 2,
+                total: 2,
+                ..process::ProcessMaxima::DEFAULT
+            },
+        );
+        let gate = Arc::new(TestOperationGate::default());
+        let runtime = Runtime::new(server.clone()).with_terminal_gate(gate.clone());
+        let owner = runtime.session([41; 16], None).unwrap();
+        let (watcher, mut native_events, _) = server.native_endpoint_with_session([42; 16], 16);
+        let mut request = spawn_request(vec![executable("cat")], Vec::new());
+        request.flags = schema::process::SPAWN_MERGE_STDERR as u16;
+        request.stderr_receive_credit = 0;
+        let mut attachments = Vec::new();
+        for process_id in 1..=2 {
+            let attachment = owner.spawn(&request, None).await.unwrap();
+            watcher
+                .watch_native(process_id, attachment.process_handle, false)
+                .unwrap();
+            owner
+                .inner
+                .manager
+                .write_stdin_native(attachment.route.process_id, 0, b"last")
+                .unwrap();
+            owner
+                .send_control(
+                    attachment.route.process_id,
+                    process::NativeControl::CloseStdin,
+                )
+                .await
+                .unwrap();
+            attachments.push(attachment);
+        }
+        let mut held = HashMap::new();
+        while held.len() < 2 {
+            let event = within_5s(native_events.recv()).await.unwrap();
+            if let process::NativeEvent::Exit { process_handle, .. } = &event.event {
+                held.insert(*process_handle, event);
+            } else {
+                event.prepare_and_retire(std::future::ready).await;
+            }
+        }
+        // Both preparations must run even while the first terminal fence is held. Blocking
+        // the endpoint writer on the first would deadlock opposite-order shared generations.
+        within_5s(gate.wait_for_entered(2)).await;
+        for attachment in &mut attachments {
+            let mut output = Vec::new();
+            while output.len() < 4 {
+                match within_5s(attachment.next()).await.unwrap() {
+                    Event::Output {
+                        stream,
+                        lifetime_offset,
+                        data,
+                    } => {
+                        assert_eq!(
+                            (stream, lifetime_offset),
+                            (Stream::Stdout, output.len() as u64)
+                        );
+                        output.extend_from_slice(&data);
+                    }
+                    Event::StdinProgress { .. } => {}
+                    Event::Exit(_) => panic!("EXIT escaped before native retirement"),
+                }
+            }
+            assert_eq!(output, b"last");
+            assert!(attachment.route.terminal_prepared.load(Ordering::Acquire));
+            assert!(attachment.route.exit.borrow().is_none());
+            assert!(
+                owner
+                    .inner
+                    .exits
+                    .lock()
+                    .unwrap()
+                    .get(attachment.process_handle)
+                    .is_none()
+            );
+        }
+        let handle = attachments[1].process_handle;
+        let wait_request = wait_request(handle);
+        let mut wait = Box::pin(owner.wait(&wait_request));
+        tokio::select! {
+            biased;
+            result = &mut wait => panic!("WAIT escaped retirement: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(matches!(
+            owner.spawn(&request, None).await,
+            Err(Error::ResourceExhausted)
+        ));
+        // Cancelling a pending WAIT must not disturb the later terminal replay.
+        drop(wait);
+        gate.release(2);
+        for mut attachment in attachments {
+            // A dropped watcher's envelope still retires its guard and releases the fence.
+            drop(held.remove(&attachment.process_handle).unwrap());
+            let exit = loop {
+                if let Event::Exit(exit) = within_5s(attachment.next()).await.unwrap() {
+                    break exit;
+                }
+            };
+            assert_eq!(exit.code, 0);
+            assert_eq!(
+                owner.inner.manager.acknowledge_output_native(
+                    attachment.route.process_id,
+                    process::NATIVE_STREAM_STDOUT,
+                    4
+                ),
+                Err(process::NativeError::NotFound)
+            );
+            attachment.acknowledge_output(Stream::Stdout, 4).unwrap();
+            assert_eq!(
+                owner
+                    .wait(&self::wait_request(attachment.process_handle))
+                    .await
+                    .unwrap(),
+                exit
+            );
+            // No wait for catalogue changes or retries: immediate replacement succeeds, and
+            // the second replacement stays within the same full two-process capacity.
+            let replacement = owner.spawn(&request, None).await.unwrap();
+            assert!(matches!(
+                owner.spawn(&request, None).await,
+                Err(Error::ResourceExhausted)
+            ));
+            drop(replacement);
+        }
+        // Cancelled WAITs must not consume or remove the authoritative replay.
+        assert_eq!(owner.wait(&wait_request).await.unwrap().code, 0);
+        gate.release(2);
+        owner.shutdown().await;
+        watcher.shutdown().await;
+        server.shutdown().await;
     }
 
     #[tokio::test]

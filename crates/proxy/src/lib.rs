@@ -161,12 +161,23 @@ pub async fn ensure_proxy(
     proxy_bin: &std::path::Path,
     use_subcommand: bool,
 ) -> Result<String, String> {
+    ensure_proxy_with(proxy_bin, &[], use_subcommand).await
+}
+
+/// [`ensure_proxy`] for a program that carries the yas CLI as a subcommand of
+/// its own: `args` come before `proxy-daemon` (`["yas"]` for `ultimator yas`).
+pub async fn ensure_proxy_with(
+    proxy_bin: &std::path::Path,
+    args: &[std::ffi::OsString],
+    use_subcommand: bool,
+) -> Result<String, String> {
     let spec = proxy_socket_spec()?;
-    ensure_proxy_at(proxy_bin, use_subcommand, spec).await
+    ensure_proxy_at(proxy_bin, args, use_subcommand, spec).await
 }
 
 async fn ensure_proxy_at(
     proxy_bin: &std::path::Path,
+    args: &[std::ffi::OsString],
     use_subcommand: bool,
     spec: ProxySocketSpec,
 ) -> Result<String, String> {
@@ -201,6 +212,7 @@ async fn ensure_proxy_at(
     {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(proxy_bin);
+        cmd.args(args);
         if use_subcommand {
             cmd.arg("proxy-daemon");
         }
@@ -226,6 +238,7 @@ async fn ensure_proxy_at(
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = std::process::Command::new(proxy_bin);
+        cmd.args(args);
         if use_subcommand {
             cmd.arg("proxy-daemon");
         }
@@ -2478,6 +2491,7 @@ mod tests {
         };
         let error = ensure_proxy_at(
             std::path::Path::new("/definitely-not-a-proxy-binary"),
+            &[],
             false,
             spec,
         )
@@ -2500,6 +2514,7 @@ mod tests {
         };
         let error = ensure_proxy_at(
             std::path::Path::new("/definitely-not-a-proxy-binary"),
+            &[],
             false,
             spec,
         )

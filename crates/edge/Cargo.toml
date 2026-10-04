@@ -13,6 +13,15 @@ include = ["/Cargo.toml", "/build.rs", "/src/**", "/ui/index.html.br", "/ui/sw.j
 name = "yas_edge"
 path = "src/lib.rs"
 
+[features]
+# The browser UI it serves, built from js/ui (see build.rs). Without it, a page
+# saying this build carries none, and nothing needs js/ui built.
+default = ["ui"]
+ui = []
+
+[build-dependencies]
+brotli = "9"
+
 [dependencies]
 yas-wire = { workspace = true }
 yas-composite-transport = { workspace = true }

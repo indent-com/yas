@@ -1,5 +1,6 @@
 //! Connection and HELLO options.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use yas_wire::{Extension, Extensions, core::FamilyOffer, family};
@@ -164,6 +165,11 @@ pub struct ConnectOptions {
     /// The `yas` executable, used to auto-start local servers and the proxy
     /// daemon. `None` (the default) never starts anything.
     pub executable: Option<PathBuf>,
+    /// What [`ConnectOptions::executable`] takes before a subcommand of the
+    /// yas CLI's (`server`, `proxy-daemon`): none for `yas` itself; `["yas"]`
+    /// for a program that carries the yas CLI as a subcommand of its own
+    /// (`ultimator yas …`).
+    pub executable_args: Vec<OsString>,
     /// Start `local` / `local:NAME` servers that are not running (needs
     /// [`ConnectOptions::executable`]).
     pub start_local: bool,
@@ -185,6 +191,7 @@ impl Default for ConnectOptions {
             hub: yas_webrtc_forwarder::DEFAULT_HUB_URL.into(),
             proxy: false,
             executable: None,
+            executable_args: Vec::new(),
             start_local: false,
             remotes: true,
             ssh: None,

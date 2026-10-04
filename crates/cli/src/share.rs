@@ -110,11 +110,11 @@ async fn standalone_upstream() -> yas_webrtc_forwarder::Upstream {
 
     // Provide a callback to restart the proxy if it dies mid-session.
     let proxy_ensure: Option<yas_webrtc_forwarder::ProxyEnsureFn> = proxy_sock.as_ref().map(|_| {
-        let exe = yas_proxy::yas_exe();
+        let invocation = crate::invocation();
         Arc::new(move || {
-            let exe = exe.clone();
-            Box::pin(async move { yas_proxy::ensure_proxy(&exe, true).await })
-                as std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+            Box::pin(async move {
+                yas_proxy::ensure_proxy_with(&invocation.program, &invocation.args, true).await
+            }) as std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         }) as yas_webrtc_forwarder::ProxyEnsureFn
     });
 

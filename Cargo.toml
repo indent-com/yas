@@ -59,7 +59,8 @@ yas-terminal-driver = { version = "0.5.0", path = "crates/alacritty-driver" }
 yas-fonts = { version = "0.5.0", path = "crates/fonts" }
 yas-webserver = { version = "0.5.0", path = "crates/webserver" }
 yas-server = { version = "0.5.0", path = "crates/server", default-features = false }
-yas-edge = { version = "0.5.0", path = "crates/edge" }
+# Without its browser UI by default: yas-cli turns it on (its `ui` feature).
+yas-edge = { version = "0.5.0", path = "crates/edge", default-features = false }
 yas-proxy = { version = "0.5.0", path = "crates/proxy", default-features = false }
 yas-webrtc-forwarder = { version = "0.5.0", path = "crates/webrtc-forwarder", default-features = false }
 yas-compositor = { version = "0.5.0", path = "crates/compositor" }

@@ -8243,6 +8243,7 @@ name = "yas-edge"
 version = "0.5.0"
 dependencies = [
  "axum",
+ "brotli",
  "futures-util",
  "http-body-util",
  "quinn-proto",

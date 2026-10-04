@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+# The CLI is a library too (`yas_cli::run`), for programs that carry it: a
+# `yas` subcommand of their own, or answering as `yas` by the name they run as.
+[lib]
+name = "yas_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "yas"
 path = "src/main.rs"
@@ -16,9 +22,16 @@ path = "src/main.rs"
 # yas-server, and reflected in `yas --license`. Any combination works:
 # none (AV1-only software fallback), one, or both. x264 (GPL-2.0-or-later)
 # is a deliberate opt-in; default builds stay MIT-clean.
-default = ["openh264"]
+default = ["openh264", "ui", "mimalloc"]
 x264 = ["yas-server/x264"]
 openh264 = ["yas-server/openh264"]
+# The browser UI `yas edge` and `yas` itself serve, built from js/ui. Without
+# it (a program that carries the CLI and serves no browser UI of its own) the
+# edge serves a page saying so, and nothing needs the UI built.
+ui = ["yas-edge/ui"]
+# The `yas` binary's allocator (main.rs); a program that carries the CLI
+# picks its own.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 yas-client = { workspace = true, features = ["ring"] }
@@ -49,7 +62,7 @@ web-transport-quinn = { version = "0.12", default-features = false, features = [
 url = "2"
 rustls-native-certs = "0.8"
 ring = "0.17"
-mimalloc = "0.1"
+mimalloc = { version = "0.1", optional = true }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 bytes = "1"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }

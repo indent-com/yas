@@ -2980,10 +2980,12 @@ enum Internal {
     },
     ProcessExited {
         attachment_id: u32,
+        report: Option<(u64, super::yas_process::ExitInfo)>,
     },
     ProcessOutputClosed {
         attachment_id: u32,
         transfer_id: u32,
+        final_data_bytes: u64,
         status: Status,
         detail: String,
     },
@@ -24925,7 +24927,10 @@ impl Session {
                 self.handle_process_stdin_progress(attachment_id, consumed_lifetime_offset, open)
                     .await?;
             }
-            Internal::ProcessExited { attachment_id } => {
+            Internal::ProcessExited {
+                attachment_id,
+                report,
+            } => {
                 if let Some(attachment) = self
                     .process
                     .as_mut()
@@ -24942,15 +24947,25 @@ impl Session {
                     }
                 }
                 self.maybe_remove_process_attachment(attachment_id);
+                if let Some((process_handle, exit)) = report {
+                    send_exit_report(&self.out, process_handle, exit, &self.cancellation).await;
+                }
             }
             Internal::ProcessOutputClosed {
                 attachment_id,
                 transfer_id,
+                final_data_bytes,
                 status,
                 detail,
             } => {
-                self.finish_process_output(attachment_id, transfer_id, status, &detail)
-                    .await?;
+                self.finish_process_output(
+                    attachment_id,
+                    transfer_id,
+                    final_data_bytes,
+                    status,
+                    &detail,
+                )
+                .await?;
             }
             Internal::ProcessFailed {
                 attachment_id,
@@ -25992,6 +26007,7 @@ impl Session {
         &mut self,
         attachment_id: u32,
         transfer_id: u32,
+        final_data_bytes: u64,
         status: Status,
         detail: &str,
     ) -> Result<(), ()> {
@@ -26031,8 +26047,23 @@ impl Session {
                 ProcessTransferKind::Stdin => unreachable!(),
             }
         }
+        // Admission and replay bookkeeping belong to this connection task. Retire them
+        // before CLOSE can let the peer release its permit and send a replacement SPAWN.
         self.maybe_remove_process_attachment(attachment_id);
-        Ok(())
+        send_event_with_sensitivity(
+            &self.out,
+            family::TRANSFER,
+            yas_wire::schema::transfer::event::CLOSE,
+            &Close {
+                transfer_id,
+                final_data_bytes,
+                status: Status::Ok.code(),
+                detail: Vec::new(),
+            },
+            &self.cancellation,
+            true,
+        )
+        .await
     }
 
     async fn fail_process_attachment(
@@ -31108,7 +31139,6 @@ fn spawn_process_attachment(
     cancellation: ConnectionCancellation,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let exit_out = out.clone();
         let (stdout_tx, stdout_rx) = mpsc::channel(PROCESS_STREAM_QUEUE);
         let stdout_task = tokio::spawn(run_process_output(
             attachment_id,
@@ -31206,18 +31236,14 @@ fn spawn_process_attachment(
                 }
                 Some(super::yas_process::Event::Exit(exit)) => {
                     exited = true;
-                    // As a WAIT would answer it, at once: the streams go on with what
-                    // the process wrote before, at the pace of their credit.
-                    // In a task of its own: removing the attachment meanwhile aborts this
-                    // one, and the exit is already this attachment's to report.
-                    if let Some(process_handle) = report_exit {
-                        let (out, connection) = (exit_out.clone(), connection.clone());
-                        tokio::spawn(async move {
-                            send_exit_report(&out, process_handle, exit, &connection).await;
-                        });
-                    }
+                    // Queue exit bookkeeping before dropping the output senders: every final
+                    // CLOSE is then handled after exited=true. The connection publishes the
+                    // report after bookkeeping, independent of this task being retired.
                     let _ = internal
-                        .send(Internal::ProcessExited { attachment_id })
+                        .send(Internal::ProcessExited {
+                            attachment_id,
+                            report: report_exit.map(|handle| (handle, exit)),
+                        })
                         .await;
                     break;
                 }
@@ -31331,25 +31357,8 @@ async fn run_process_output(
                 offset = end;
             }
         }
-        // Linearize stream-bundle retirement before CLOSE becomes observable.
-        // The connection task may otherwise service a duplicate SPAWN while
-        // ProcessOutputClosed is still waiting in its independent queue.
+        // The connection task owns final CLOSE publication and admission retirement.
         stream_bundle_replayable.store(false, Ordering::Release);
-        send_event_with_sensitivity(
-            &out,
-            family::TRANSFER,
-            yas_wire::schema::transfer::event::CLOSE,
-            &Close {
-                transfer_id,
-                final_data_bytes: offset,
-                status: Status::Ok.code(),
-                detail: Vec::new(),
-            },
-            &connection,
-            true,
-        )
-        .await
-        .map_err(|_| (Status::Internal, "Process output close failed".to_owned()))?;
         Ok::<_, (Status, String)>(())
     };
     let result = tokio::select! {
@@ -31366,6 +31375,7 @@ async fn run_process_output(
         .send(Internal::ProcessOutputClosed {
             attachment_id,
             transfer_id,
+            final_data_bytes: offset,
             status,
             detail,
         })
@@ -37503,6 +37513,8 @@ mod tests {
 
     mod aggregate_receive_qualification;
     mod peer_liveness;
+    #[cfg(unix)]
+    mod process_completion;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const TEST_PEER_MAX_BUFFERED: u64 = 32 * 1024 * 1024;

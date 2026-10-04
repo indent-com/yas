@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use yas_wire::process as wire;
 use yas_wire::schema::process as process_schema;
@@ -451,23 +451,30 @@ impl Policy {
     }
 }
 
-/// Runs its action once, told whether the event it rides was dispatched: true after its
-/// dispatch, false when it is dropped without (its queue was full, or its reader gone).
+/// Retires its binding once: true after terminal preparation, false if the event is dropped.
+/// Publication also waits for the other terminal bindings to retire the generation's budget.
 struct WriterGuard {
     action: Option<Box<dyn FnOnce(bool) + Send>>,
+    retired: watch::Receiver<bool>,
 }
 
 impl WriterGuard {
-    fn new(f: impl FnOnce(bool) + Send + 'static) -> Self {
+    fn new(retired: watch::Receiver<bool>, f: impl FnOnce(bool) + Send + 'static) -> Self {
         Self {
             action: Some(Box::new(f)),
+            retired,
         }
     }
 
-    fn dispatched(mut self) {
+    async fn dispatched(mut self) {
         if let Some(f) = self.action.take() {
             f(true);
         }
+        // The last action recycles global/owner admission before releasing this fence.
+        self.retired
+            .wait_for(|retired| *retired)
+            .await
+            .expect("terminal guards always finish retirement");
     }
 }
 
@@ -638,17 +645,20 @@ pub(crate) struct NativeEventEnvelope {
 }
 
 impl NativeEventEnvelope {
-    /// Dispatch the event before releasing its writer guard.
+    /// Prepare ACK-safe terminal state and retire admission before returning for publication.
     ///
-    /// Terminal guards retire the endpoint binding. Keeping the guard through
-    /// adapter dispatch ensures the adapter can publish the terminal value
-    /// before a concurrent final output acknowledgement observes retirement.
-    pub(crate) fn dispatch<T>(self, dispatch: impl FnOnce(NativeEvent) -> T) -> T {
-        let result = dispatch(self.event);
+    /// Preparation must not expose EXIT or a successful WAIT: another task can act on
+    /// either immediately. Nor may retirement precede preparation, since final output
+    /// acknowledgements can still arrive after the native binding has gone.
+    pub(crate) async fn prepare_and_retire<T, F: std::future::Future<Output = T>>(
+        self,
+        prepare: impl FnOnce(NativeEvent) -> F,
+    ) -> T {
+        let prepared = prepare(self.event).await;
         if let Some(guard) = self.guard {
-            guard.dispatched();
+            guard.dispatched().await;
         }
-        result
+        prepared
     }
 }
 
@@ -1020,11 +1030,15 @@ impl Server {
             state.live.remove(&record.generation);
             state.generations = state.generations.saturating_sub(1);
             state.catalog_revision = state.catalog_revision.wrapping_add(1);
-            self.0.catalog_changed.notify_waiters();
         }
-        drop(state);
+        // Native WAITs of an owner whose EXIT was dropped can discover its missed replay
+        // as soon as the catalogue retires. Recycle owned admission under the same server
+        // lock (the admission path's server -> endpoint order), before waking those WAITs.
         if let Some(owner) = record.owner.upgrade() {
             owner.state.lock().unwrap().owned.remove(&record.generation);
+        }
+        if remove {
+            self.0.catalog_changed.notify_waiters();
         }
     }
 
@@ -3875,6 +3889,7 @@ fn try_queue_terminal(record: &Arc<Record>) {
             .any(|binding| Some(binding.endpoint_id) == owner),
     ));
     let remaining = Arc::new(AtomicUsize::new(bindings.len()));
+    let (retired, _) = watch::channel(false);
     for binding in bindings {
         let endpoint = binding.endpoint.upgrade();
         let record_for_guard = record.clone();
@@ -3883,7 +3898,8 @@ fn try_queue_terminal(record: &Arc<Record>) {
         let owner_missed = owner_missed.clone();
         let owners = Some(binding.endpoint_id) == owner;
         let process_id = binding.process_id;
-        let guard = WriterGuard::new(move |dispatched| {
+        let retirement = retired.clone();
+        let guard = WriterGuard::new(retired.subscribe(), move |dispatched| {
             if owners && !dispatched {
                 owner_missed.store(true, Ordering::Release);
             }
@@ -3893,6 +3909,7 @@ fn try_queue_terminal(record: &Arc<Record>) {
             if remaining_for_guard.fetch_sub(1, Ordering::AcqRel) == 1 {
                 let owner_missed = owner_missed.load(Ordering::Acquire);
                 finish_terminal(record_for_guard, final_for_guard, owner_missed);
+                retirement.send_replace(true);
             }
         });
         if !binding.out.send_exit(
