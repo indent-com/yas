@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::yas_net::{self, Connection, DEFAULT_BIND, DatagramFlow, OnOpen, TlsConfig, bracket};
+use crate::yas_net::{self, Connection, DEFAULT_BIND, OnOpen, TlsConfig, bracket};
+use yas_client::net::DatagramFlow;
 
 // --------------------------------------------------------------------------- Specs ---------------------------------------------------------------------------
 
@@ -298,11 +299,11 @@ async fn serve_udp(socket: tokio::net::UdpSocket, spec: Spec, conn: Connection) 
             }
         }
         if let Some(flow) = flows.get(&from)
-            && let Err(error) = flow.send(&buf[..n]).await
+            && let Err(error) = flow.send(&buf[..n])
         {
             eprintln!("yas: UDP flow for {from}: {error}");
             if let Some(flow) = flows.remove(&from) {
-                flow.close_in_background();
+                flow.close();
             }
         }
     }
@@ -328,7 +329,7 @@ async fn start_udp_flow(
             match pump.recv().await {
                 Ok(Some(payload)) => {
                     if socket.send_to(&payload, from).await.is_err() {
-                        pump.close_in_background();
+                        pump.close();
                         break;
                     }
                 }
@@ -351,7 +352,6 @@ async fn start_udp_flow(
                 );
             }
         }
-        pump.retire();
     });
     Ok(flow)
 }

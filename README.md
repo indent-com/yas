@@ -79,7 +79,8 @@ DNS) reaches hosts your machine cannot look up.
 
 Listeners bind to loopback unless you name a bind address. The relay reaches
 whatever the server reaches; restrict it with
-`yas server --allow-forward 'host[:ports]'`. Saved forwards live in
+`yas server --allow-forward 'host[:ports]'` (`--allow-forward-strict` drops
+the implicit loopback; `--net-only` serves the relay alone). Saved forwards live in
 `~/.config/yas/yas.forwards` (mode 0600). See
 [docs/design/net.md](docs/design/net.md).
 

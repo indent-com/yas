@@ -226,11 +226,19 @@ struct Shared {
     hello: RwLock<ServerHello>,
     router: Mutex<Router>,
     closed: watch::Sender<Option<Error>>,
+    /// Net datagram flows by flow handle: each a bounded, drop-oldest queue
+    /// (a slow reader loses datagrams, as UDP does, instead of growing one).
+    datagrams: Mutex<HashMap<u64, Arc<crate::net::DatagramState>>>,
+    /// Bounds this session's Net opens in flight to the server's limit.
+    net_opens: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Shared {
     fn close(&self, error: Error) {
         self.router.lock().unwrap().fail(error.clone());
+        for (_, flow) in self.datagrams.lock().unwrap().drain() {
+            flow.fail(error.clone());
+        }
         self.closed.send_if_modified(|current| {
             if current.is_none() {
                 *current = Some(error);
@@ -251,6 +259,8 @@ struct Inner {
     started: std::time::Instant,
     /// What this client offered to receive at once ([`HelloOptions::receive_budget`]).
     receive_budget: u64,
+    /// The lossy datagram sideband's sender, when the transport has one.
+    datagram_sender: Option<NativeFrameSender>,
 }
 
 impl Drop for Inner {
@@ -320,12 +330,16 @@ impl Client {
     pub fn from_native(native: NativeClient) -> Self {
         let hello = native.hello().clone();
         let receive_budget = native.receive_budget();
+        let supports_datagrams = native.supports_datagrams();
         let (reader, sender) = native.into_framed();
+        let datagram_sender = supports_datagrams.then(|| sender.clone());
         let (closed, _) = watch::channel(None);
         let shared = Arc::new(Shared {
             hello: RwLock::new(hello),
             router: Mutex::new(Router::default()),
             closed,
+            datagrams: Mutex::new(HashMap::new()),
+            net_opens: std::sync::OnceLock::new(),
         });
         let (outbound, outbound_rx) = mpsc::unbounded_channel();
         let writer = tokio::spawn(write_loop(sender, outbound_rx, Arc::clone(&shared)));
@@ -338,6 +352,7 @@ impl Client {
                 tasks: vec![writer, reader],
                 started: std::time::Instant::now(),
                 receive_budget,
+                datagram_sender,
             }),
         }
     }
@@ -487,6 +502,50 @@ impl Client {
     /// Nanoseconds on this session's clock, for input events.
     pub(crate) fn monotonic_ns(&self) -> u64 {
         u64::try_from(self.inner.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether the transport carries a lossy datagram sideband.
+    pub(crate) fn supports_datagrams(&self) -> bool {
+        self.inner.datagram_sender.is_some()
+    }
+
+    /// Try one frame on the lossy datagram sideband.
+    pub(crate) fn try_send_datagram(
+        &self,
+        frame: &Frame,
+        context: yas_wire::frame::DatagramContext,
+    ) -> Result<crate::transport::DatagramSend> {
+        let Some(sender) = &self.inner.datagram_sender else {
+            return Ok(crate::transport::DatagramSend::Closed);
+        };
+        let maximum = self.inner.shared.hello.read().unwrap().receive.max_datagram;
+        sender.try_send_datagram(frame, maximum, context)
+    }
+
+    /// The registry Net datagram flows are delivered through.
+    pub(crate) fn datagrams(&self) -> Datagrams {
+        Datagrams(Arc::downgrade(&self.inner.shared))
+    }
+
+    /// The semaphore bounding Net opens in flight, made on first use.
+    pub(crate) fn net_opens(&self, permits: usize) -> Arc<tokio::sync::Semaphore> {
+        self.inner
+            .shared
+            .net_opens
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(permits.max(1))))
+            .clone()
+    }
+
+    /// Send one Request whose `Result` nobody waits for (a fire-and-forget
+    /// Net `CLOSE` from a destructor): its late `Result` is ignored.
+    pub(crate) fn send_request_detached(&self, family_id: u16, kind: u16, payload: Vec<u8>) {
+        if !self.supports(family_id, Class::Request, kind) {
+            return;
+        }
+        let request_id = self.next_request_id();
+        let mut header = FrameHeader::request(family_id, kind, request_id);
+        header.sensitive = default_sensitive(family_id, Class::Request, kind);
+        let _ = self.send_frame(Frame { header, payload });
     }
 
     pub(crate) fn release(&self, route: Route) {
@@ -673,7 +732,7 @@ async fn write_loop(
 async fn read_loop(mut reader: NativeFrameReader, shared: Arc<Shared>) {
     let mut revision = reader.hello().catalog_revision;
     loop {
-        let frame = match reader.next().await {
+        let (frame, transport_datagram) = match reader.next_with_source().await {
             Ok(frame) => frame,
             Err(error) => {
                 shared.close(error);
@@ -684,14 +743,14 @@ async fn read_loop(mut reader: NativeFrameReader, shared: Arc<Shared>) {
             revision = reader.hello().catalog_revision;
             *shared.hello.write().unwrap() = reader.hello().clone();
         }
-        if let Err(error) = dispatch(&shared, frame) {
+        if let Err(error) = dispatch(&shared, frame, transport_datagram) {
             shared.close(error);
             return;
         }
     }
 }
 
-fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
+fn dispatch(shared: &Shared, frame: Frame, transport_datagram: bool) -> Result<()> {
     match frame.header.class {
         Class::Result => {
             let Some(request_id) = frame.header.request_id else {
@@ -751,6 +810,9 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
                 }
                 return Ok(());
             }
+            if frame.header.family == family::NET {
+                return crate::net::dispatch_event(&shared.datagrams, frame, transport_datagram);
+            }
             if frame.header.family == family::PROCESS
                 && frame.header.kind == yas_wire::process::event_kind::EXIT
             {
@@ -781,6 +843,35 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
             "YAS server sent an unsupported peer Request {:#06x}/{:#06x}",
             frame.header.family, frame.header.kind
         ))),
+    }
+}
+
+/// The Net datagram flows of a session, held weakly: a flow keeps its
+/// registry entry, never the session.
+#[derive(Clone)]
+pub(crate) struct Datagrams(std::sync::Weak<Shared>);
+
+impl Datagrams {
+    pub(crate) fn insert(&self, handle: u64, flow: Arc<crate::net::DatagramState>) {
+        if let Some(shared) = self.0.upgrade() {
+            if let Some(error) = shared.closed.borrow().clone() {
+                flow.fail(error);
+                return;
+            }
+            shared.datagrams.lock().unwrap().insert(handle, flow);
+        }
+    }
+
+    pub(crate) fn get(&self, handle: u64) -> Option<Arc<crate::net::DatagramState>> {
+        self.0
+            .upgrade()
+            .and_then(|shared| shared.datagrams.lock().unwrap().get(&handle).cloned())
+    }
+
+    pub(crate) fn remove(&self, handle: u64) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.datagrams.lock().unwrap().remove(&handle);
+        }
     }
 }
 

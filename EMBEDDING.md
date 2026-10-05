@@ -373,6 +373,14 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   compositor. List them, capture one as PNG or AVIF, click, scroll, press keys
   (`key_combo("ctrl+c")`, `typed_keys("hello{enter}")`) or enter text,
   resize, focus and close them: `yas surface`, for programs that drive GUIs.
+- **Network** (`net`): `client.net()?.open_tcp(host, port)` opens a TCP
+  connection from the server and returns a `NetStream`, Tokio
+  `AsyncRead + AsyncWrite` with half-close and credit both ways; any number
+  share the session. `open_udp` relays whole datagrams. A refused open says
+  why with `Error::net_failure()` (`Denied` by the server's
+  `--allow-forward` policy, `NotFound`, `Refused`, `Timeout`). A server run
+  with `--net-only --allow-forward host:port` offers this and nothing else
+  ([docs/server.md](docs/server.md#net-only-servers)).
 - **Errors** (`Error`): connection failures, lost sessions, server statuses
   (`is_not_found`, `is_conflict`), timeouts, unsupported operations,
   protocol violations.
@@ -404,7 +412,8 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   ([docs/transports.md](docs/transports.md#read-only-socket)).
 
 `cargo run -p yas-client --example run -- local -- uname -a` is a complete
-example; `crates/cli/tests/client_host.rs` exercises the API end to end.
+example; `crates/cli/tests/client_host.rs` and `client_net.rs` exercise the
+API end to end.
 
 ## Rust: the whole CLI, `yas-cli`
 

@@ -164,6 +164,28 @@ _none_ of them parse, the relay reaches loopback only. An empty allowlist
 that was asked for is not the same as no allowlist: an operator who
 mistyped the flag should lose reachability, not gain the internet.
 
+**`--allow-forward-strict` drops the loopback exception.** The implicit
+loopback is right for a server on your own machine and wrong for one placed
+in somebody else's network as a connector, where loopback is that host's
+admin ports and its local databases. With `--allow-forward-strict` (or
+`YAS_ALLOW_FORWARD_STRICT=1`, or `Config::allow_forward_strict`) only the
+patterns are reachable: loopback too only when a pattern names it
+(`localhost:8080`, `127.0.0.1:5432`), an empty or entirely unparsable list
+reaches nothing, and Unix sockets and Windows pipes, which no `host:port`
+pattern can name, are refused. Without it, Unix sockets and pipes stay
+outside the policy, as before. `--net-only` ([../server.md](../server.md#net-only-servers))
+implies it.
+
+Address and CIDR rules match what a requested **name** resolves to: a
+request for `db.internal` under `10.0.0.0/8:5432` resolves, then dials only
+an address in the block. A literal request is checked before resolving.
+
+Open failures keep their reasons apart: `UNAVAILABLE` for the policy,
+`NOT_FOUND` for a name that does not resolve, `IO` for a refused or reset
+connection, `TIMEOUT` for a connect or TLS handshake past its bound. The Rust
+client's `Error::net_failure()` names them (`Denied`, `NotFound`, `Refused`,
+`Timeout`).
+
 UDP is worth a sentence on **amplification**, mostly to say why the
 usual alarm does not apply. Classic reflection needs a spoofed source:
 the attacker asks a resolver a small question with the victim's address
@@ -216,6 +238,36 @@ TLS uses the versions already pinned in-tree — `rustls` 0.23 with
 `ring`, `tokio-rustls` 0.26, `rustls-native-certs` 0.8 (see `cli` and
 `webrtc-forwarder`). The `server` crate takes its first
 TLS dependency here; nothing new enters the workspace.
+
+## Client: the Rust library
+
+`yas_client::net` is the one Rust client of the family; `yas forward` and
+`yas socks` are built on it, and embedders (a service reaching a database
+through a net-only connector) use it directly:
+
+```rust
+let client = yas_client::Client::connect(Some("uplink:…"), &Default::default()).await?;
+let net = client.net()?; // Error::Unsupported without Net and Transfer
+let stream = net.open_tcp("db.internal", 5432).await?; // AsyncRead + AsyncWrite
+```
+
+- `Net::open_tcp`/`open_tcp_with`/`open_stream` return a `NetStream`: Tokio
+  `AsyncRead + AsyncWrite` over the flow's bidirectional Transfer, with a
+  credit window each way (256 KiB to receive by default, capped by the
+  server's per-flow buffer), so a reader that stops stops the server and
+  then the peer. `shutdown` is a half-close; a zero read is the peer's.
+  Dropping it after the peer finished half-closes ours; dropping it earlier,
+  or `abort`, sends Net `CLOSE` and the peer sees a reset.
+- `StreamOptions` carries early data, server-terminated TLS (`Tls`: SNI,
+  ALPN, `insecure`), the receive window and a local open deadline (30 s;
+  the server's own connect and handshake bounds answer `TIMEOUT` first).
+  A client that runs TLS itself leaves `tls` unset: the relay stays a pipe.
+- `Net::open_udp`/`open_datagram` return a `DatagramFlow`: whole datagrams,
+  natively over a datagram sideband when the transport has one, else
+  tunnelled in order; a bounded drop-oldest receive queue.
+- Every stream and flow rides the `Client`'s one session beside its other
+  families; opens in flight are bounded by the server's `max_pending_opens`
+  and wait rather than fail.
 
 ## Client: `yas forward`
 

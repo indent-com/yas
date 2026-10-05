@@ -58,6 +58,11 @@ connections that are no longer needed.
 | `YAS_MAX_CONNECTIONS`                | `0` (unlimited)                                                   | Reject client connections past this count                                                              |
 | `YAS_MAX_PTYS`                       | `0` (unlimited)                                                   | Refuse `CREATE` past this many PTYs across all clients                                                 |
 | `YAS_PROCESS`                        | `1`                                                               | `0` disables the native Process family                                                                 |
+| `YAS_NET`                            | `1`                                                               | `0` disables the native Net family (TCP/UDP relay)                                                     |
+| `YAS_ALLOW_FORWARD`                  | unset (unrestricted)                                              | Comma-separated `host[:ports]` relay allowlist (also `--allow-forward`)                                |
+| `YAS_ALLOW_FORWARD_STRICT`           | unset                                                             | `1`: only the allowlist, no implicit loopback (also `--allow-forward-strict`)                          |
+| `YAS_ALLOW_FORWARD_INSECURE`         | unset                                                             | `1` permits relayed TLS without verification (also `--allow-forward-insecure`)                         |
+| `YAS_NET_ONLY`                       | unset                                                             | `1`: offer Core, Transfer and Net alone, start nothing else (also `--net-only`)                        |
 | `YAS_PROCESS_MAX_PER_SESSION`        | `16` (at most 16384)                                              | Live processes per session (also `--process-max-per-session`; older name `YAS_PROCESS_MAX_PER_CLIENT`) |
 | `YAS_PROCESS_MAX`                    | `64` (at most 65536)                                              | Process generations server-wide (also `--process-max`)                                                 |
 | `YAS_PROCESS_MAX_PENDING_SPAWNS`     | `8` (at most 4096)                                                | Spawns in flight per session (also `--process-max-pending-spawns`)                                     |
@@ -112,6 +117,30 @@ you want a specific ceiling.
 
 A Terminal `CREATE` refused by `YAS_MAX_PTYS` receives a correlated
 `RESOURCE_EXHAUSTED` Result. The server also logs the configured-cap refusal.
+
+### Net-only servers
+
+`yas server --net-only` (or `YAS_NET_ONLY=1`, or `Config::net_only` for an
+embedder) is a server whose whole job is the Net relay
+([design/net.md](design/net.md)): a network connector placed inside a network
+and reached through an outbound [uplink](uplink.md), so nothing listens there.
+
+- HELLO selects Core, Transfer and Net, whatever the client offers. A client
+  that requires another family fails HELLO with `UNSUPPORTED`; a Request of
+  any other family is answered `UNSUPPORTED` at once. `yas-client` reports it
+  as `Error::Unsupported` before sending anything.
+- Nothing else starts: no compositor, no shell or terminals, no processes
+  (`YAS_PROCESS=0`), no extensions or their restore, no font scan, no relay
+  catalogue, no KV warm-up. Core `SHUTDOWN` is not offered to clients: the
+  process's lifetime is its operator's.
+- The relay's target policy is strict (`--allow-forward-strict`, implied):
+  only the `--allow-forward` patterns are reachable, loopback too only when
+  listed, an empty list reaches nothing, and Unix sockets and Windows pipes
+  are refused. Denials answer `UNAVAILABLE`.
+
+```bash
+yas server --net-only --allow-forward db.internal:5432 --allow-forward '10.2.0.0/16:8123'
+```
 
 ## Native non-PTY processes
 

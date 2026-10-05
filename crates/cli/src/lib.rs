@@ -813,6 +813,8 @@ async fn async_main(args: Vec<std::ffi::OsString>) {
             microphone_codecs,
             allow_forward,
             allow_forward_insecure,
+            allow_forward_strict,
+            net_only,
             no_persistent_extensions,
             edge,
             share,
@@ -961,6 +963,8 @@ async fn async_main(args: Vec<std::ffi::OsString>) {
                         .unwrap_or(false),
                 allow_forward,
                 allow_forward_insecure,
+                allow_forward_strict: allow_forward_strict || env_flag("YAS_ALLOW_FORWARD_STRICT"),
+                net_only: net_only || env_flag("YAS_NET_ONLY"),
                 allow_persistent_extensions: !no_persistent_extensions
                     && !std::env::var("YAS_ALLOW_EXT_PERSIST").is_ok_and(|value| value == "0"),
             };

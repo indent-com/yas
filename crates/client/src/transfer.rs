@@ -38,7 +38,7 @@ fn closed_error(client: &Client) -> Error {
         .unwrap_or_else(|| Error::disconnected("YAS session closed during a Transfer"))
 }
 
-fn check_sensitivity(descriptor: &Descriptor, frame: &Frame) -> Result<()> {
+pub(crate) fn check_sensitivity(descriptor: &Descriptor, frame: &Frame) -> Result<()> {
     let required = descriptor.requires_sensitive_frame(frame.header.kind)?;
     if frame.header.sensitive != required {
         return Err(Error::protocol(format!(
@@ -626,7 +626,7 @@ impl Drop for ByteSink {
     }
 }
 
-fn detail_extensions(detail: &[u8]) -> yas_wire::Extensions {
+pub(crate) fn detail_extensions(detail: &[u8]) -> yas_wire::Extensions {
     if detail.is_empty() {
         return yas_wire::Extensions::default();
     }

@@ -483,13 +483,23 @@ pub struct Config {
     /// default, and worth leaving off when the server is embedded in a host
     /// binary whose directory holds no `yas`.
     pub inject_path: bool,
-    /// Permit relayed streams to skip TLS certificate verification
-    /// (`NET_OPEN_INSECURE`). Right for a self-signed dev server on loopback,
-    /// wrong for anything reached across a network.
     /// `--allow-forward` egress patterns (docs/design/net.md § Target
     /// policy). Empty = unrestricted, the default.
     pub allow_forward: Vec<String>,
+    /// Permit relayed streams to skip TLS certificate verification
+    /// (`NET_OPEN_INSECURE`). Right for a self-signed dev server on loopback,
+    /// wrong for anything reached across a network.
     pub allow_forward_insecure: bool,
+    /// `--allow-forward-strict`: only `allow_forward` is reachable. Loopback
+    /// is not implied, an empty list reaches nothing, and Unix sockets and
+    /// Windows pipes are refused. `net_only` implies it.
+    pub allow_forward_strict: bool,
+    /// `--net-only`: a server that offers Core, Transfer and Net alone (a
+    /// network connector). Every other family is refused at HELLO and never
+    /// started: no terminals or shell, no processes, files, compositor,
+    /// surfaces, KV, environment, extensions, channels, Git or LSP. Implies
+    /// `allow_forward_strict`.
+    pub net_only: bool,
     /// Permit durable extension create/update/control and startup restore.
     /// True by default; `--no-persistent-extensions` turns it off, which is
     /// how a bad definition gets repaired. Transient extensions remain
@@ -8533,11 +8543,26 @@ fn embedded_origin() -> ConnectionOrigin {
 /// be talking to a server that cannot answer.
 pub type HostedServices = Box<dyn FnOnce(LocalEndpoint) + Send>;
 
+fn env_flag_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "1")
+}
+
 pub async fn run(config: Config) {
     run_hosted(config, None).await;
 }
 
-pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
+pub async fn run_hosted(mut config: Config, hosted: Option<HostedServices>) {
+    if config.net_only || env_flag_set("YAS_NET_ONLY") {
+        // A network connector: nothing but Net is ever offered, so nothing
+        // else is started (docs/server.md § Net-only servers).
+        config.net_only = true;
+        config.allow_forward_strict = true;
+        config.processes = false;
+        config.skip_compositor = true;
+        config.allow_persistent_extensions = false;
+        config.export_sock = false;
+        config.inject_path = false;
+    }
     // Embedders may not call `configure_deployment`; in that case freeze the
     // environment now, before any feature mask or service is constructed.
     let _ = ensure_deployment_settings();
@@ -8610,8 +8635,11 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     );
     let extensions =
         extension::ExtensionService::from_env(config.allow_persistent_extensions, &config.name);
-    let fonts = font::Service::from_env().await;
-    let relay = relay::Service::from_env();
+    let (fonts, relay) = if config.net_only {
+        (font::Service::disabled(), relay::Service::disabled())
+    } else {
+        (font::Service::from_env().await, relay::Service::from_env())
+    };
     let state: AppState = Arc::new(AppStateInner {
         config,
         events: event_log.clone(),
@@ -8651,7 +8679,9 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
             }
         }
     }
-    extensions.restore(state.clone()).await;
+    if !state.config.net_only {
+        extensions.restore(state.clone()).await;
+    }
 
     // Start the compositor eagerly so it is ready before any client
     // connects or any terminal is created.
@@ -8741,7 +8771,7 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     // § Storage): the load+hash of the whole database happens now, in the
     // background, instead of inline in the first connection's first KV
     // message. YAS_KV=0 disables the family, so nothing to warm.
-    if !std::env::var("YAS_KV").is_ok_and(|v| v == "0") {
+    if !state.config.net_only && !std::env::var("YAS_KV").is_ok_and(|v| v == "0") {
         kv::warm();
     }
 
@@ -13206,6 +13236,8 @@ mod tests {
                     inject_path: false,
                     allow_forward: Vec::new(),
                     allow_forward_insecure: false,
+                    allow_forward_strict: false,
+                    net_only: false,
                     allow_persistent_extensions: false,
                 },
                 events: events::EventLog::new(

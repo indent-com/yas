@@ -34,7 +34,7 @@ impl Catalog {
         self.revisions.clone()
     }
 
-    #[cfg(test)]
+    /// A catalogue that never changes (tests; a net-only server's empty one).
     pub(crate) fn fixed(catalog: Arc<FontCatalog>) -> Self {
         let (tx, revisions) = tokio::sync::watch::channel(1);
         let _ = tx;
@@ -170,6 +170,11 @@ impl Service {
 
     #[cfg(test)]
     pub(crate) fn disabled_for_test() -> Self {
+        Self::disabled()
+    }
+
+    /// No catalogue, nothing scanned or watched (a net-only server).
+    pub(crate) fn disabled() -> Self {
         Self {
             catalog: Catalog::fixed(Arc::new(empty_catalog(FontExportPolicy::Deny))),
             fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES)),

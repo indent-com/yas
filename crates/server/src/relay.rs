@@ -167,7 +167,7 @@ impl Service {
         }
     }
 
-    fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
             catalogue: Arc::new(RelayRouteCatalog::new()),

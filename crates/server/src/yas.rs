@@ -1110,6 +1110,8 @@ struct Services {
     channel_enabled: bool,
     net_enabled: bool,
     net_policy: super::net::Policy,
+    /// `--net-only`: HELLO selects Core, Transfer and Net alone.
+    net_only: bool,
     events: Option<super::yas_events::Runtime>,
     fs: Option<super::yas_fs::Runtime>,
     git: Option<super::yas_git_adapter::Runtime>,
@@ -1170,7 +1172,9 @@ impl Services {
             net_policy: super::net::Policy::new(
                 state.config.allow_forward_insecure,
                 &state.config.allow_forward,
+                state.config.allow_forward_strict || state.config.net_only,
             ),
+            net_only: state.config.net_only,
             events: Some(super::yas_events::Runtime::new(state.events.clone())),
             fs: Some(super::yas_fs::Runtime::new(state.clone())),
             git: Some(super::yas_git_adapter::Runtime::new(state.clone())),
@@ -7496,9 +7500,10 @@ impl Session {
                     .await;
             }
         };
-        let (Some(state), Some(coordinator)) = (
+        let (Some(state), Some(coordinator), false) = (
             self.services.app_state.clone(),
             self.services.shutdown.clone(),
+            self.services.net_only,
         ) else {
             return self
                 .send_sensitive_result(&frame, Status::Unavailable, Vec::new())
@@ -28948,6 +28953,7 @@ fn negotiate(
             required.insert(offer.family_id);
         }
         let supported = (!read_only || read_only_family_allowed(offer.family_id))
+            && (!services.net_only || net_only_family_allowed(offer.family_id))
             && offer.versions.contains(&1)
             && match offer.family_id {
                 family::TRANSFER => true,
@@ -29098,11 +29104,14 @@ fn family_descriptors(
         sends_event(yas_wire::core::event_kind::FAMILY_UPDATE),
     ];
     if services.shutdown.is_some() {
-        core_operations.push(advertised_operation(
-            family::CORE,
-            Class::Request,
-            yas_wire::core::request_kind::SHUTDOWN,
-        ));
+        // A net-only server's lifetime is its operator's, never a client's.
+        if !services.net_only {
+            core_operations.push(advertised_operation(
+                family::CORE,
+                Class::Request,
+                yas_wire::core::request_kind::SHUTDOWN,
+            ));
+        }
         core_operations.push(advertised_operation(
             family::CORE,
             Class::Event,
@@ -30202,6 +30211,12 @@ fn family_descriptors(
     }
     descriptors.sort_by_key(|descriptor| descriptor.family_id);
     descriptors
+}
+
+/// What a `--net-only` server offers beside Core: Net, and the Transfer
+/// streams its TCP flows ride on.
+const fn net_only_family_allowed(family_id: u16) -> bool {
+    matches!(family_id, family::TRANSFER | family::NET)
 }
 
 const fn read_only_family_allowed(family_id: u16) -> bool {
@@ -33247,6 +33262,7 @@ async fn send_event_confirmed_with_sensitivity<T: Encode>(
 fn net_connect_status(error: super::net::NativeConnectError) -> Status {
     match error {
         super::net::NativeConnectError::Permission => Status::Unavailable,
+        super::net::NativeConnectError::Timeout => Status::Timeout,
         super::net::NativeConnectError::NotFound(_detail) => Status::NotFound,
         super::net::NativeConnectError::Refused(_detail)
         | super::net::NativeConnectError::Io(_detail) => Status::Io,
@@ -40989,6 +41005,7 @@ mod tests {
             channel_enabled: true,
             net_enabled: true,
             net_policy: super::super::net::Policy::default(),
+            net_only: false,
             events: None,
             fs: None,
             git: None,
@@ -56206,6 +56223,228 @@ mod tests {
             .expect("native YAS server did not stop")
             .unwrap();
         wait_for_server_diagnostics_to_clear(&diagnostics).await;
+    }
+
+    /// `--net-only` (docs/server.md § Net-only servers): a client offering
+    /// every family gets Core, Transfer and Net; a Request of any other
+    /// family is answered UNSUPPORTED, not left hanging; Core SHUTDOWN is not
+    /// a client's; TCP flows work, to listed targets only (strict: loopback
+    /// too must be listed).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn net_only_sessions_offer_net_alone_and_refuse_every_other_family() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let allowed = listener.local_addr().unwrap();
+        let unlisted = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unlisted_port = unlisted.local_addr().unwrap().port();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"hello from the database").await.unwrap();
+        });
+
+        let initial = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let mut inner = Arc::try_unwrap(initial).ok().expect("fresh test state");
+        inner.config.net_only = true;
+        inner.config.allow_forward = vec![format!("127.0.0.1:{}", allowed.port())];
+        let every: Vec<u16> = yas_wire::schema::FAMILIES
+            .iter()
+            .map(|metadata| metadata.id)
+            .filter(|family_id| *family_id != family::CORE)
+            .collect();
+        let state = Arc::new(inner);
+        let session = |state: AppState| {
+            let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+            let cancellation = ConnectionCancellation::default();
+            let registration = state
+                .connections
+                .register(cancellation.clone())
+                .expect("test session registers");
+            let task = tokio::spawn(serve_registered(
+                server,
+                Services::from_state(&state),
+                cancellation,
+                Some(registration),
+                None,
+                None,
+                ConnectionOrigin::Network,
+            ));
+            (client, task)
+        };
+        let hello_with = |required: Option<u16>| ClientHello {
+            min_minor: 1,
+            max_minor: 1,
+            receive: ReceiveLimits {
+                max_frame: SERVER_MAX_FRAME,
+                max_decoded: SERVER_MAX_DECODED,
+                max_datagram: 0,
+                max_buffered: TEST_PEER_MAX_BUFFERED,
+            },
+            client_instance: [7; 16],
+            client_name: "yas-server-test".to_owned(),
+            client_release: "1".to_owned(),
+            families: every
+                .iter()
+                .map(|family_id| FamilyOffer {
+                    family_id: *family_id,
+                    versions: vec![1],
+                    required: required == Some(*family_id),
+                })
+                .collect(),
+            codecs: Vec::new(),
+            extensions: Extensions::default(),
+        };
+        async fn hello_result(
+            client: &mut DuplexStream,
+            hello: ClientHello,
+        ) -> (FrameCodec, ResultPrefix) {
+            let frame = Frame {
+                header: FrameHeader::request(family::CORE, yas_wire::core::request_kind::HELLO, 1),
+                payload: hello.encode().unwrap(),
+            };
+            client.write_all(&yas_wire::PREFACE).await.unwrap();
+            client
+                .write_all(&FrameCodec::pre_hello().encode_stream(&frame).unwrap())
+                .await
+                .unwrap();
+            let codec = FrameCodec::new(FrameLimits::recommended(), []).unwrap();
+            let response = next_frame(client, &codec).await;
+            (codec, ResultPrefix::decode(&response.payload).unwrap())
+        }
+
+        // A client that requires another family is refused at HELLO.
+        let (mut refused, refused_task) = session(state.clone());
+        let (_, prefix) = hello_result(&mut refused, hello_with(Some(family::TERMINAL))).await;
+        assert_eq!(prefix.status, Status::Unsupported);
+        drop(refused);
+        let _ = timeout(TEST_TIMEOUT, refused_task).await.unwrap();
+
+        // One that offers every family gets Core, Transfer and Net.
+        let (mut client, server_task) = session(state);
+        let (codec, prefix) = hello_result(&mut client, hello_with(None)).await;
+        assert_eq!(prefix.status, Status::Ok);
+        let hello = ServerHello::decode(&prefix.body).unwrap();
+
+        let offered: Vec<u16> = hello
+            .families
+            .iter()
+            .map(|descriptor| descriptor.family_id)
+            .collect();
+        assert_eq!(offered, [family::CORE, family::TRANSFER, family::NET]);
+        let core = &hello.families[0];
+        assert!(core.operations.iter().all(|operation| {
+            !(operation.class == Class::Request
+                && operation.kind == yas_wire::core::request_kind::SHUTDOWN)
+        }));
+
+        let mut request_id = 101;
+        for metadata in yas_wire::schema::FAMILIES {
+            if matches!(metadata.id, family::CORE | family::TRANSFER | family::NET) {
+                continue;
+            }
+            let Some(operation) = metadata
+                .operations
+                .iter()
+                .find(|operation| operation.class == yas_wire::schema::transport::class::REQUEST)
+            else {
+                continue;
+            };
+            let mut header = FrameHeader::request(metadata.id, operation.kind, request_id);
+            header.sensitive = operation.sensitive == yas_wire::schema::transport::policy::REQUIRED;
+            client
+                .write_all(
+                    &codec
+                        .encode_stream(&Frame {
+                            header,
+                            payload: Vec::new(),
+                        })
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let answer = next_frame(&mut client, &codec).await;
+            assert_eq!(answer.header.class, Class::Result, "{}", metadata.name);
+            assert_eq!(answer.header.family, metadata.id, "{}", metadata.name);
+            assert_eq!(answer.header.request_id, Some(request_id));
+            assert_eq!(
+                ResultPrefix::decode(&answer.payload).unwrap().status,
+                Status::Unsupported,
+                "{} {}",
+                metadata.name,
+                operation.name
+            );
+            request_id += 2;
+        }
+
+        let open = |port: u16, operation: u8| yas_net::Open {
+            operation_id: [operation; 16],
+            address: yas_net::Address::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            },
+            delivery_preference: yas_net::DeliveryPreference::NotApplicable,
+            drop_policy: yas_net::DropPolicy::NotApplicable,
+            initial_receive_credit: 64 * 1024,
+            early_data: Vec::new(),
+            tls_options: None,
+            extensions: Extensions::default(),
+        };
+        write_request(
+            &mut client,
+            &codec,
+            family::NET,
+            yas_wire::schema::net::request::OPEN,
+            3,
+            &open(unlisted_port, 41),
+        )
+        .await;
+        assert_eq!(
+            next_sensitive_result(
+                &mut client,
+                &codec,
+                family::NET,
+                yas_wire::schema::net::request::OPEN,
+                3,
+            )
+            .await
+            .status,
+            Status::Unavailable,
+            "strict: unlisted loopback is refused by policy"
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::NET,
+            yas_wire::schema::net::request::OPEN,
+            5,
+            &open(allowed.port(), 42),
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::NET,
+            yas_wire::schema::net::request::OPEN,
+            5,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let endpoint = yas_net::Endpoint::decode(&opened.body).unwrap();
+        let transfer = endpoint.descriptor.unwrap();
+        let data = next_frame(&mut client, &codec).await;
+        assert_eq!(
+            data.header.kind,
+            yas_wire::schema::transfer::event::BYTE_DATA
+        );
+        let data = ByteData::decode(&data.payload).unwrap();
+        assert_eq!(data.transfer_id, transfer.transfer_id);
+        assert_eq!(data.data, b"hello from the database");
+
+        timeout(TEST_TIMEOUT, target).await.unwrap().unwrap();
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
 
     #[tokio::test]

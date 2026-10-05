@@ -43,13 +43,20 @@ pub struct Policy {
     /// `--allow-forward` and mistyped it should get loopback, not the
     /// internet.
     restricted: bool,
+    /// `--allow-forward-strict`: only `allow` is reachable. Loopback is not
+    /// implied, an empty list reaches nothing, and Unix sockets and Windows
+    /// pipes (which no host:port pattern names) are refused.
+    strict: bool,
 }
 
 impl Policy {
     /// `allow` are `host[:ports]` patterns; unparsable ones are reported and
     /// dropped, and patterns that all fail to parse leave loopback only
-    /// rather than widening back to unrestricted.
-    pub fn new(insecure_allowed: bool, allow: &[String]) -> Self {
+    /// rather than widening back to unrestricted. With `strict` (or
+    /// `YAS_ALLOW_FORWARD_STRICT=1`), only the patterns are reachable:
+    /// loopback too only when listed, nothing at all when none parse.
+    pub fn new(insecure_allowed: bool, allow: &[String], strict: bool) -> Self {
+        let strict = strict || std::env::var("YAS_ALLOW_FORWARD_STRICT").is_ok_and(|v| v == "1");
         let env = std::env::var("YAS_ALLOW_FORWARD").unwrap_or_default();
         let patterns = allow
             .iter()
@@ -64,15 +71,31 @@ impl Policy {
                 None => eprintln!("yas: ignoring unparsable --allow-forward {pattern:?}"),
             }
         }
-        if restricted && rules.is_empty() {
+        if strict && rules.is_empty() {
+            eprintln!("yas: strict --allow-forward list is empty; the relay reaches nothing");
+        } else if restricted && rules.is_empty() {
             eprintln!("yas: no --allow-forward pattern parsed; the relay reaches loopback only");
         }
         Self {
             insecure_allowed: insecure_allowed
                 || std::env::var("YAS_ALLOW_FORWARD_INSECURE").is_ok_and(|v| v == "1"),
             allow: rules,
-            restricted,
+            restricted: restricted || strict,
+            strict,
         }
+    }
+
+    /// Whether only the listed patterns are reachable
+    /// (`--allow-forward-strict`).
+    #[cfg(test)]
+    fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    /// Strict policies name hosts and ports only: a Unix socket or Windows
+    /// pipe is never on the list.
+    fn permits_local_endpoint(&self) -> bool {
+        !self.strict
     }
 
     fn insecure_allowed(&self) -> bool {
@@ -93,8 +116,8 @@ impl Policy {
             return true;
         }
         // Loopback always works, so a dev server does not need a rule
-        // (docs/design/net.md § Target policy).
-        if is_loopback_host(host) {
+        // (docs/design/net.md § Target policy) — unless the list is strict.
+        if !self.strict && is_loopback_host(host) {
             return true;
         }
         self.allow.iter().any(|r| r.matches_host(host, port))
@@ -104,7 +127,8 @@ impl Policy {
     /// already matched the requested host authorizes its addresses; address
     /// and CIDR rules are matched here.
     fn permits_addr(&self, host: &str, addr: SocketAddr) -> bool {
-        if !self.restricted || addr.ip().is_loopback() || is_loopback_host(host) {
+        if !self.restricted || (!self.strict && (addr.ip().is_loopback() || is_loopback_host(host)))
+        {
             return true;
         }
         self.allow
@@ -126,6 +150,7 @@ impl Policy {
         let resolved = resolve_target(host, port).await?;
         let mut last_error = None;
         let mut denied = false;
+        let mut timed_out = false;
         for addr in resolved {
             if !self.permits_addr(host, addr) {
                 denied = true;
@@ -166,11 +191,16 @@ impl Policy {
                     });
                 }
                 Ok(Err(error)) => last_error = Some(error.to_string()),
-                Err(_) => last_error = Some("connect timed out".to_owned()),
+                Err(_) => {
+                    timed_out = true;
+                    last_error = Some("connect timed out".to_owned());
+                }
             }
         }
         if denied {
             Err(NativeConnectError::Permission)
+        } else if timed_out {
+            Err(NativeConnectError::Timeout)
         } else {
             Err(NativeConnectError::Refused(
                 last_error.unwrap_or_else(|| "no route".to_owned()),
@@ -240,6 +270,9 @@ impl Policy {
         name: &str,
         requested_mode: yas_net::PipeMode,
     ) -> Result<NativeWindowsPipe, NativeConnectError> {
+        if !self.permits_local_endpoint() {
+            return Err(NativeConnectError::Permission);
+        }
         connect_windows_pipe(name, requested_mode).await
     }
 
@@ -248,6 +281,9 @@ impl Policy {
         &self,
         name: &yas_net::UnixName,
     ) -> Result<NativeUnixStream, NativeConnectError> {
+        if !self.permits_local_endpoint() {
+            return Err(NativeConnectError::Permission);
+        }
         let stream = connect_unix_stream(name).await?;
         Ok(NativeUnixStream {
             stream: Box::new(stream),
@@ -260,6 +296,9 @@ impl Policy {
         &self,
         name: &yas_net::UnixName,
     ) -> Result<NativeUnixDatagram, NativeConnectError> {
+        if !self.permits_local_endpoint() {
+            return Err(NativeConnectError::Permission);
+        }
         connect_unix_datagram(name).await
     }
 
@@ -268,6 +307,9 @@ impl Policy {
         &self,
         name: &yas_net::UnixName,
     ) -> Result<NativeUnixSeqpacket, NativeConnectError> {
+        if !self.permits_local_endpoint() {
+            return Err(NativeConnectError::Permission);
+        }
         connect_unix_seqpacket(name).await
     }
 }
@@ -275,6 +317,8 @@ impl Policy {
 #[derive(Debug)]
 pub(crate) enum NativeConnectError {
     Permission,
+    /// Connecting or the TLS handshake took longer than its bound.
+    Timeout,
     NotFound(String),
     Refused(String),
     Io(String),
@@ -462,7 +506,7 @@ async fn native_tls(
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tls = tokio::time::timeout(TLS_TIMEOUT, connector.connect(server_name, stream))
         .await
-        .map_err(|_| NativeConnectError::Io("TLS handshake timed out".to_owned()))?
+        .map_err(|_| NativeConnectError::Timeout)?
         .map_err(|error| NativeConnectError::Io(error.to_string()))?;
     let alpn = tls
         .get_ref()
@@ -1018,11 +1062,12 @@ impl TargetRule {
             HostRule::Suffix(suffix) => lower == *suffix || lower.ends_with(&format!(".{suffix}")),
             HostRule::Exact(name) => lower == *name,
             // An address rule matches a requested literal directly, and
-            // otherwise waits for resolution.
-            HostRule::Addr(ip) => lower.parse::<std::net::IpAddr>().is_ok_and(|h| h == *ip),
+            // otherwise waits for resolution: `permits_addr` then checks the
+            // addresses the name resolved to.
+            HostRule::Addr(ip) => lower.parse::<std::net::IpAddr>().map_or(true, |h| h == *ip),
             HostRule::Cidr(net, bits) => lower
                 .parse::<std::net::IpAddr>()
-                .is_ok_and(|h| in_cidr(h, *net, *bits)),
+                .map_or(true, |h| in_cidr(h, *net, *bits)),
         }
     }
 
@@ -1185,12 +1230,21 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn policy(patterns: &[&str]) -> Policy {
+        policy_with(patterns, false)
+    }
+
+    fn strict_policy(patterns: &[&str]) -> Policy {
+        policy_with(patterns, true)
+    }
+
+    fn policy_with(patterns: &[&str], strict: bool) -> Policy {
         unsafe {
             std::env::remove_var("YAS_ALLOW_FORWARD_INSECURE");
             std::env::remove_var("YAS_ALLOW_FORWARD");
+            std::env::remove_var("YAS_ALLOW_FORWARD_STRICT");
         }
         let owned: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
-        Policy::new(false, &owned)
+        Policy::new(false, &owned, strict)
     }
 
     // macOS has no Unix-domain SOCK_SEQPACKET implementation.
@@ -1324,7 +1378,7 @@ mod tests {
             alpn: vec![b"yas-test".to_vec()],
             extensions: Default::default(),
         };
-        let mut socket = Policy::new(true, &[])
+        let mut socket = Policy::new(true, &[], false)
             .connect_native_tcp("127.0.0.1", port, Some(&options))
             .await
             .unwrap();
@@ -1414,6 +1468,92 @@ mod tests {
             "all-unparsable patterns must not widen the policy"
         );
         assert!(p.permits_host("localhost", 9), "loopback still works");
+    }
+
+    /// `--allow-forward-strict` (docs/design/net.md § Target policy): only
+    /// the patterns, loopback included, and nothing for an empty list.
+    #[test]
+    fn strict_allowlists_permit_only_their_patterns() {
+        let p = strict_policy(&["db.internal:5432"]);
+        assert!(p.is_strict());
+        assert!(p.permits_host("db.internal", 5432));
+        assert!(!p.permits_host("db.internal", 5433), "ports still narrow");
+        assert!(
+            !p.permits_host("localhost", 5432),
+            "loopback is not implied"
+        );
+        assert!(!p.permits_host("127.0.0.1", 22));
+        assert!(!p.permits_host("::1", 22));
+        assert!(!p.permits_addr("other.internal", "127.0.0.1:5432".parse().unwrap()));
+        // A name rule still authorizes what that name resolves to.
+        assert!(p.permits_addr("db.internal", "10.0.0.7:5432".parse().unwrap()));
+        assert!(
+            !p.permits_local_endpoint(),
+            "no pattern names a Unix socket"
+        );
+
+        // Loopback is reachable when listed, by name or address.
+        let p = strict_policy(&["localhost:8080", "127.0.0.1:9000"]);
+        assert!(p.permits_host("localhost", 8080));
+        assert!(p.permits_addr("localhost", "127.0.0.1:8080".parse().unwrap()));
+        assert!(p.permits_host("127.0.0.1", 9000));
+        assert!(p.permits_addr("127.0.0.1", "127.0.0.1:9000".parse().unwrap()));
+        assert!(!p.permits_host("127.0.0.1", 8080));
+
+        // An empty strict list, or one where nothing parsed, reaches nothing.
+        for patterns in [&[][..], &["host:notaport"][..]] {
+            let p = strict_policy(patterns);
+            assert!(!p.permits_host("localhost", 80));
+            assert!(!p.permits_host("example.com", 443));
+            assert!(!p.permits_addr("localhost", "127.0.0.1:80".parse().unwrap()));
+        }
+
+        // Without strict, Unix sockets stay reachable as before.
+        assert!(policy(&["db.internal"]).permits_local_endpoint());
+    }
+
+    /// Address and CIDR rules match what a requested name resolves to.
+    #[test]
+    fn address_rules_wait_for_resolution_of_names() {
+        let p = policy(&["10.0.0.0/8:5432"]);
+        assert!(
+            p.permits_host("db.internal", 5432),
+            "checked after resolving"
+        );
+        assert!(!p.permits_host("db.internal", 5433));
+        assert!(p.permits_addr("db.internal", "10.1.2.3:5432".parse().unwrap()));
+        assert!(!p.permits_addr("db.internal", "192.0.2.1:5432".parse().unwrap()));
+        assert!(
+            !p.permits_host("192.0.2.1", 5432),
+            "a literal is checked at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_policies_refuse_loopback_targets_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let denied = strict_policy(&["db.internal:5432"])
+            .connect_native_tcp("127.0.0.1", port, None)
+            .await;
+        assert!(matches!(denied, Err(NativeConnectError::Permission)));
+        let allowed = strict_policy(&[&format!("127.0.0.1:{port}")])
+            .connect_native_tcp("127.0.0.1", port, None)
+            .await;
+        assert!(allowed.is_ok());
+        #[cfg(unix)]
+        {
+            let name = yas_net::UnixName {
+                kind: yas_net::UnixNameKind::Filesystem,
+                name: b"/nonexistent.sock".to_vec(),
+            };
+            assert!(matches!(
+                strict_policy(&["*"])
+                    .connect_native_unix_stream(&name)
+                    .await,
+                Err(NativeConnectError::Permission)
+            ));
+        }
     }
 
     #[tokio::test]
