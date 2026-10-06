@@ -1874,7 +1874,10 @@ View input and FRAME_ACK share this ten-byte feedback prefix:
 
 Feedback is cumulative. Before presenting any frame, `presented_sequence` is
 `first_sequence - 1` modulo 2^32. Queue depth and available slots are exact
-because a view has at most 255 in-flight frames. Stale feedback is ignored. The server sends no more than
+because a view has at most 255 in-flight frames. Stale feedback is ignored.
+A closed or retired view's feedback can cross its removal on the wire, so the
+server keeps a bounded record of recent views and ignores their feedback, and
+drops input carried with it, as long as it acknowledges no unsent frame. The server sends no more than
 `max_inflight_frames` logical frames beyond the highest presented sequence and
 also obeys the most recent available-slot report.
 

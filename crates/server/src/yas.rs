@@ -169,6 +169,7 @@ const TERMINAL_MAX_INFLIGHT_FRAMES: u8 = 3;
 // fifth of the floor.
 const TERMINAL_FRAME_CELL_BUCKET: u32 = 8 * 1024;
 const MAX_SURFACE_OPERATION_REPLAYS: usize = 256;
+const MAX_RETIRED_TERMINAL_VIEWS: usize = 256;
 const MAX_SURFACE_CAPTURE_RETAINED_BYTES: u64 = SERVER_MAX_BUFFERED;
 const SURFACE_CODEC_SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
 // Surface frames share the reliable byte stream with latency probes and
@@ -2347,6 +2348,16 @@ async fn serve_registered<S>(
                 .map(|state| state.surface_catalogue_updates.subscribe())
         })
         .flatten();
+    let mut terminal_exit_updates = negotiated
+        .selected
+        .contains(&family::TERMINAL)
+        .then(|| {
+            services
+                .app_state
+                .as_ref()
+                .map(|state| state.terminal_exit_updates.subscribe())
+        })
+        .flatten();
     let (channel, mut channel_rx, mut channel_terminal_rx) =
         if negotiated.selected.contains(&family::CHANNEL) {
             match services.app_state.clone() {
@@ -2560,6 +2571,19 @@ async fn serve_registered<S>(
                         Err(()) => break 'session "Surface catalogue refresh failed".to_owned(),
                     },
                     Err(_) => surface_catalogue_updates = None,
+                },
+                changed = async {
+                    match terminal_exit_updates.as_mut() {
+                        Some(updates) => updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if terminal_exit_updates.is_some() => match changed {
+                    Ok(()) => {
+                        if session.refresh_terminal_catalogue().await {
+                            session.publish_terminal_catalogue();
+                        }
+                    }
+                    Err(_) => terminal_exit_updates = None,
                 },
                 _ = catalogue_tick.tick(), if poll_terminal_catalogue || poll_client_catalogue || poll_desktop_catalogue || poll_media_catalogue => {
                     if poll_terminal_catalogue && session.refresh_terminal_catalogue().await {
@@ -3882,6 +3906,16 @@ struct TerminalRuntime {
     operations: HashMap<[u8; 16], TerminalOperationReplay>,
     next_view_id: u32,
     views: HashMap<u32, TerminalView>,
+    /// Views this connection closed or retired, oldest first. The peer may
+    /// already have sent feedback for one when the removal crosses it.
+    retired_views: VecDeque<RetiredTerminalView>,
+}
+
+#[derive(Clone, Copy)]
+struct RetiredTerminalView {
+    view_id: u32,
+    acknowledged_sequence: u32,
+    last_sent: u32,
 }
 
 struct TerminalOperationReplay {
@@ -4987,6 +5021,7 @@ impl TerminalRuntime {
             operations: HashMap::new(),
             next_view_id: 1,
             views: HashMap::new(),
+            retired_views: VecDeque::new(),
         }
     }
 
@@ -4994,11 +5029,30 @@ impl TerminalRuntime {
         for _ in 0..u32::MAX {
             let view_id = self.next_view_id.max(1);
             self.next_view_id = self.next_view_id.wrapping_add(1).max(1);
-            if !self.views.contains_key(&view_id) {
+            if !self.views.contains_key(&view_id) && self.retired_view(view_id).is_none() {
                 return Some(view_id);
             }
         }
         None
+    }
+
+    fn remove_view(&mut self, view_id: u32) -> Option<TerminalView> {
+        let view = self.views.remove(&view_id)?;
+        if self.retired_views.len() >= MAX_RETIRED_TERMINAL_VIEWS {
+            self.retired_views.pop_front();
+        }
+        self.retired_views.push_back(RetiredTerminalView {
+            view_id,
+            acknowledged_sequence: view.acknowledged_sequence,
+            last_sent: view.next_sequence.wrapping_sub(1),
+        });
+        Some(view)
+    }
+
+    fn retired_view(&mut self, view_id: u32) -> Option<&mut RetiredTerminalView> {
+        self.retired_views
+            .iter_mut()
+            .find(|retired| retired.view_id == view_id)
     }
 }
 
@@ -14162,12 +14216,16 @@ impl Session {
             }
             yas_wire::schema::terminal::event::INPUT => {
                 let value = yas_terminal::Input::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 self.write_terminal_input(pty_id, &value.data).await
             }
             yas_wire::schema::terminal::event::MOUSE => {
                 let value = yas_terminal::Mouse::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 let column = u16::try_from(value.column).map_err(|_| ())?;
                 let row = u16::try_from(value.row).map_err(|_| ())?;
                 self.write_terminal_mouse(
@@ -14182,7 +14240,9 @@ impl Session {
             }
             yas_wire::schema::terminal::event::WHEEL => {
                 let value = yas_terminal::Wheel::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 if value.dx_32_32 != 0 || value.dy_32_32 == 0 {
                     return Err(());
                 }
@@ -14191,7 +14251,9 @@ impl Session {
             }
             yas_wire::schema::terminal::event::WHEEL_AT => {
                 let value = yas_terminal::WheelAt::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 if value.dx_32_32 != 0 || value.dy_32_32 == 0 {
                     return Err(());
                 }
@@ -14209,16 +14271,30 @@ impl Session {
         }
     }
 
+    /// Applies view feedback and returns the view's PTY, or `None` for a view
+    /// this connection already retired, whose input is dropped.
     async fn update_terminal_feedback(
         &mut self,
         feedback: &yas_terminal::ViewFeedback,
-    ) -> Result<u16, ()> {
+    ) -> Result<Option<u16>, ()> {
         self.settle_completed_terminal_frame(feedback.view_id, true)
             .await?;
         let (state, pty_id, backend_view, owed_final_guard) = {
             let terminal = self.native.as_mut().ok_or(())?;
             let state = terminal.state.clone();
-            let view = terminal.views.get_mut(&feedback.view_id).ok_or(())?;
+            let Some(view) = terminal.views.get_mut(&feedback.view_id) else {
+                let retired = terminal.retired_view(feedback.view_id).ok_or(())?;
+                if terminal_feedback_advance(
+                    retired.acknowledged_sequence,
+                    retired.last_sent,
+                    feedback.presented_sequence,
+                )?
+                .is_some()
+                {
+                    retired.acknowledged_sequence = feedback.presented_sequence;
+                }
+                return Ok(None);
+            };
             let credit_opened = apply_terminal_feedback(view, feedback)?;
             let owed_final_guard = (credit_opened && view.frame_owed).then(|| {
                 view.frame_owed = false;
@@ -14237,7 +14313,7 @@ impl Session {
             view.frame_owed = true;
             view.frame_owed_final_guard = owed_final_guard;
         }
-        Ok(pty_id)
+        Ok(Some(pty_id))
     }
 
     async fn rearm_terminal_view(
@@ -15026,7 +15102,7 @@ impl Session {
                 .collect::<Vec<_>>();
             view_ids
                 .into_iter()
-                .filter_map(|view_id| terminal.views.remove(&view_id))
+                .filter_map(|view_id| terminal.remove_view(view_id))
                 .collect::<Vec<_>>()
         };
         let backend_views = removed_views
@@ -15668,8 +15744,7 @@ impl Session {
             .native
             .as_mut()
             .ok_or(())?
-            .views
-            .remove(&request.view_id)
+            .remove_view(request.view_id)
             .expect("Terminal view checked");
         // CLOSE_VIEW is Control while Terminal frames are Data. Drain this
         // view's already-queued frames so the scheduler cannot write one
@@ -27788,7 +27863,7 @@ impl Session {
                 .collect::<Vec<_>>();
             retired_view_ids
                 .into_iter()
-                .filter_map(|view_id| terminal.views.remove(&view_id))
+                .filter_map(|view_id| terminal.remove_view(view_id))
                 .collect()
         };
         let retired_receipts = retired_views
@@ -55237,6 +55312,178 @@ mod tests {
         );
         drop(client);
         timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+        delivery.abort();
+        process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_feedback_crossing_close_is_ignored_but_unsent_frames_are_rejected() {
+        let process_service = super::super::process::Server::new(false, true);
+        let state = super::super::tests::process_transport::test_state(process_service.clone());
+        let delivery_state = state.clone();
+        let delivery = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_state.delivery_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                let _ = super::super::tick(&delivery_state).await;
+            }
+        });
+        let (mut client, codec, _, task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut pending_frames = Vec::new();
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            100,
+            &yas_terminal::Create {
+                rows: 12,
+                cols: 40,
+                operation_id: [0xb0; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"/bin/sh".to_vec(),
+                        b"-c".to_vec(),
+                        b"exec cat".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let created = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CREATE,
+            100,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OPEN_VIEW,
+            101,
+            &yas_terminal::OpenView {
+                terminal_handle: created.terminal_handle,
+                rows: 12,
+                cols: 40,
+                max_fps: 60,
+                codec_versions: vec![1],
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::OPEN_VIEW,
+            101,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let opened = yas_terminal::OpenViewResult::decode(&opened.body).unwrap();
+        let first =
+            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CLOSE,
+            102,
+            &yas_terminal::Close {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0xb2; 16],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CLOSE,
+                102,
+                &mut pending_frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        // The client presented the frame before it learned of the close.
+        let feedback = yas_terminal::ViewFeedback {
+            view_id: opened.view_id,
+            presented_sequence: first.frame_sequence,
+            decoder_queue_depth: 0,
+            available_frame_slots: 1,
+        };
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &feedback,
+        )
+        .await;
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::INPUT,
+            &yas_terminal::Input {
+                feedback,
+                data: b"late keystroke".to_vec(),
+            },
+        )
+        .await;
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CLOSE,
+            103,
+            &yas_terminal::Close {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0xb3; 16],
+            },
+        )
+        .await;
+        next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CLOSE,
+            103,
+            &mut pending_frames,
+        )
+        .await;
+
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &yas_terminal::ViewFeedback {
+                presented_sequence: first.frame_sequence.wrapping_add(1),
+                ..feedback
+            },
+        )
+        .await;
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("feedback for an unsent frame ends the session")
+            .unwrap();
         delivery.abort();
         process_service.shutdown().await;
     }

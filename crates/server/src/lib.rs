@@ -7494,6 +7494,10 @@ struct AppStateInner {
     /// native YAS session. The delivery loop updates the shared cache first;
     /// receivers then rebuild their own catalogue without a polling delay.
     surface_catalogue_updates: watch::Sender<u64>,
+    /// Bumped once per PTY exit, after its output is drained and its exit
+    /// status collected. Terminal catalogue publication must not wait for the
+    /// next display frame or catalogue poll.
+    terminal_exit_updates: watch::Sender<u64>,
     /// Retained shutdown state for every accept loop, including fd-channel.
     shutdown_started: watch::Sender<bool>,
     /// Broadcast to everything this process hosts alongside the server, so a
@@ -8394,6 +8398,9 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
         // timeout for output that is never coming.
         let end_seq = pty.driver.cursor_seq().0;
         pty.journal.note_pty_exit(end_seq);
+        state
+            .terminal_exit_updates
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
@@ -8622,6 +8629,7 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
         pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         delivery_notify: Arc::new(Notify::new()),
         surface_catalogue_updates: watch::channel(0).0,
+        terminal_exit_updates: watch::channel(0).0,
         shutdown_started: watch::channel(false).0,
         hosted_shutdown: Arc::new(Notify::new()),
         connections: Arc::new(ConnectionRegistry::default()),
@@ -13218,6 +13226,7 @@ mod tests {
                 pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
                 delivery_notify: Arc::new(Notify::new()),
                 surface_catalogue_updates: watch::channel(0).0,
+                terminal_exit_updates: watch::channel(0).0,
                 shutdown_started: watch::channel(false).0,
                 hosted_shutdown: Arc::new(Notify::new()),
                 connections: Arc::new(ConnectionRegistry::default()),
@@ -13860,6 +13869,55 @@ mod tests {
     #[tokio::test]
     async fn sync_output_exit_drains_with_descendant_holding_slave() {
         assert_sync_output_drained(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_exit_update_follows_drained_output_once() {
+        let service = process::Server::new(false, true);
+        let state = process_transport::test_state(service.clone());
+        let mut exits = state.terminal_exit_updates.subscribe();
+        let terminal = pty::spawn_pty(
+            "/bin/sh",
+            "",
+            24,
+            80,
+            1,
+            "",
+            pty::ChildSpec {
+                command: Some("printf 'LAST-OUTPUT'; exit 7"),
+                ..Default::default()
+            },
+            None,
+            100,
+            state.clone(),
+            None,
+        )
+        .unwrap();
+        state.session.lock().await.ptys.insert(1, terminal);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !exits.has_changed().unwrap() {
+                tick(&state).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("PTY exit was announced");
+        exits.borrow_and_update();
+        {
+            let sess = state.session.lock().await;
+            let terminal = &sess.ptys[&1];
+            assert!(terminal.exited);
+            assert_eq!(terminal.exit_status, 7);
+            let text = terminal.driver.seq_text(0, 0, None, 10000).text;
+            assert!(text.contains("LAST-OUTPUT"), "{text}");
+        }
+        cleanup_pty_internal(1, None, &state).await;
+        assert!(
+            !exits.has_changed().unwrap(),
+            "a second cleanup announced the exit again"
+        );
+        service.shutdown().await;
     }
 
     fn test_client() -> ClientState {

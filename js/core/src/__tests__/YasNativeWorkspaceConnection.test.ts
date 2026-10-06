@@ -1161,6 +1161,39 @@ describe("YasNativeWorkspaceConnection", () => {
     expect(disposeFont).toHaveBeenCalledOnce();
   });
 
+  it("handles SET_FOCUS rejected because the view closed first", async () => {
+    // A rejected promise nobody observes terminates a Node embedder.
+    const observed: number[] = [];
+    const setFocus = vi.fn((viewId: number) => ({
+      then(_resolve: unknown, reject?: (error: Error) => void) {
+        if (reject) observed.push(viewId);
+        reject?.(new Error("not found"));
+      },
+    }));
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection as object, {
+      id: "remote",
+      views: new Map([
+        [1n, { view: { result: { viewId: 11 } } }],
+        [2n, { view: { result: { viewId: 12 } } }],
+      ]),
+      sessions: new Map([
+        ["remote:terminal:1", { ptyId: 1n, state: "active" }],
+        ["remote:terminal:2", { ptyId: 2n, state: "active" }],
+      ]),
+      terminalClient: { setFocus },
+      focusedSessionId: "remote:terminal:1",
+      refreshSnapshot: vi.fn(),
+    });
+
+    connection.focusSession("remote:terminal:2");
+    await flush();
+
+    expect(observed).toEqual([11, 12]);
+  });
+
   it("deduplicates concurrent Terminal OPEN_VIEW requests per handle", async () => {
     const result = deferred<{
       result: {
