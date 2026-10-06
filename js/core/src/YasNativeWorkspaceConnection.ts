@@ -999,11 +999,11 @@ export class YasNativeWorkspaceConnection {
     this.focusedSessionId = sessionId;
     if (previous) {
       const view = this.views.get(this.handleForSession(previous));
-      if (view) void this.terminal.setFocus(view.view.result.viewId, false);
+      if (view) this.setViewFocus(view.view.result.viewId, false);
     }
     if (sessionId) {
       const view = this.views.get(this.handleForSession(sessionId));
-      if (view) void this.terminal.setFocus(view.view.result.viewId, true);
+      if (view) this.setViewFocus(view.view.result.viewId, true);
     }
     this.refreshSnapshot();
   }
@@ -3862,7 +3862,19 @@ export class YasNativeWorkspaceConnection {
       this.configureView(handle, latestSize);
     }
     if (this.focusedSessionId === this.sessionId(handle))
-      void this.terminal.setFocus(view.result.viewId, true);
+      this.setViewFocus(view.result.viewId, true);
+  }
+
+  // Focus follows workspace state, including the fallback chosen when a
+  // session closes, so the view can already be gone when the request lands.
+  private setViewFocus(viewId: number, focused: boolean): void {
+    void (async () => {
+      try {
+        await this.terminal.setFocus(viewId, focused);
+      } catch {
+        // The view closed first; there is nothing left to focus.
+      }
+    })();
   }
 
   private terminalGrid(
