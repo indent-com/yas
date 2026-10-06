@@ -2347,6 +2347,16 @@ async fn serve_registered<S>(
                 .map(|state| state.surface_catalogue_updates.subscribe())
         })
         .flatten();
+    let mut terminal_exit_updates = negotiated
+        .selected
+        .contains(&family::TERMINAL)
+        .then(|| {
+            services
+                .app_state
+                .as_ref()
+                .map(|state| state.terminal_exit_updates.subscribe())
+        })
+        .flatten();
     let (channel, mut channel_rx, mut channel_terminal_rx) =
         if negotiated.selected.contains(&family::CHANNEL) {
             match services.app_state.clone() {
@@ -2560,6 +2570,19 @@ async fn serve_registered<S>(
                         Err(()) => break 'session "Surface catalogue refresh failed".to_owned(),
                     },
                     Err(_) => surface_catalogue_updates = None,
+                },
+                changed = async {
+                    match terminal_exit_updates.as_mut() {
+                        Some(updates) => updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if terminal_exit_updates.is_some() => match changed {
+                    Ok(()) => {
+                        if session.refresh_terminal_catalogue().await {
+                            session.publish_terminal_catalogue();
+                        }
+                    }
+                    Err(_) => terminal_exit_updates = None,
                 },
                 _ = catalogue_tick.tick(), if poll_terminal_catalogue || poll_client_catalogue || poll_desktop_catalogue || poll_media_catalogue => {
                     if poll_terminal_catalogue && session.refresh_terminal_catalogue().await {
