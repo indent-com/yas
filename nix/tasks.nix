@@ -627,7 +627,10 @@ let
       cargo xtask protocol --check
 
       echo "=== Clippy ==="
-      cargo clippy --workspace -- -D warnings
+      cargo clippy --workspace ${
+        # The compositor's Wayland probe examples only build on Linux.
+        if pkgs.stdenv.hostPlatform.isLinux then "--all-targets" else "--lib --bins --tests"
+      } -- -D warnings
 
       echo "=== Clippy: YAS fuzz harnesses ==="
       cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
