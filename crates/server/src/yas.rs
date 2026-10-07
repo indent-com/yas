@@ -14169,12 +14169,16 @@ impl Session {
             }
             yas_wire::schema::terminal::event::INPUT => {
                 let value = yas_terminal::Input::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 self.write_terminal_input(pty_id, &value.data).await
             }
             yas_wire::schema::terminal::event::MOUSE => {
                 let value = yas_terminal::Mouse::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 let column = u16::try_from(value.column).map_err(|_| ())?;
                 let row = u16::try_from(value.row).map_err(|_| ())?;
                 self.write_terminal_mouse(
@@ -14189,7 +14193,9 @@ impl Session {
             }
             yas_wire::schema::terminal::event::WHEEL => {
                 let value = yas_terminal::Wheel::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 if value.dx_32_32 != 0 || value.dy_32_32 == 0 {
                     return Err(());
                 }
@@ -14198,7 +14204,9 @@ impl Session {
             }
             yas_wire::schema::terminal::event::WHEEL_AT => {
                 let value = yas_terminal::WheelAt::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 if value.dx_32_32 != 0 || value.dy_32_32 == 0 {
                     return Err(());
                 }
@@ -14219,13 +14227,15 @@ impl Session {
     async fn update_terminal_feedback(
         &mut self,
         feedback: &yas_terminal::ViewFeedback,
-    ) -> Result<u16, ()> {
+    ) -> Result<Option<u16>, ()> {
         self.settle_completed_terminal_frame(feedback.view_id, true)
             .await?;
         let (state, pty_id, backend_view, owed_final_guard) = {
             let terminal = self.native.as_mut().ok_or(())?;
             let state = terminal.state.clone();
-            let view = terminal.views.get_mut(&feedback.view_id).ok_or(())?;
+            let Some(view) = terminal.views.get_mut(&feedback.view_id) else {
+                return Ok(None);
+            };
             let credit_opened = apply_terminal_feedback(view, feedback)?;
             let owed_final_guard = (credit_opened && view.frame_owed).then(|| {
                 view.frame_owed = false;
@@ -14244,7 +14254,7 @@ impl Session {
             view.frame_owed = true;
             view.frame_owed_final_guard = owed_final_guard;
         }
-        Ok(pty_id)
+        Ok(Some(pty_id))
     }
 
     async fn rearm_terminal_view(
@@ -53757,6 +53767,144 @@ mod tests {
         drop(observer);
         timeout(TEST_TIMEOUT, owner_task).await.unwrap().unwrap();
         timeout(TEST_TIMEOUT, observer_task).await.unwrap().unwrap();
+        delivery.abort();
+        process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_feedback_for_a_closed_view_does_not_end_the_session() {
+        let process_service = super::super::process::Server::new(false, true);
+        let state = super::super::tests::process_transport::test_state(process_service.clone());
+        let delivery_state = state.clone();
+        let delivery = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_state.delivery_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                let _ = super::super::tick(&delivery_state).await;
+            }
+        });
+        let (mut client, codec, _, task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut pending_frames = Vec::new();
+        let create = |operation: u8| yas_terminal::Create {
+            rows: 24,
+            cols: 80,
+            operation_id: [operation; 16],
+            launch: yas_terminal::Launch {
+                command: yas_terminal::Command::Argv(vec![
+                    b"/bin/sh".to_vec(),
+                    b"-c".to_vec(),
+                    b"exec cat".to_vec(),
+                ]),
+                cwd: yas_terminal::Cwd::ServerDefault,
+                environment_base: yas_terminal::EnvironmentBase::Server,
+                environment: Vec::new(),
+                extensions: Extensions::default(),
+            },
+            extensions: Extensions::default(),
+        };
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            80,
+            &create(0x80),
+        )
+        .await;
+        let created = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CREATE,
+            80,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OPEN_VIEW,
+            81,
+            &yas_terminal::OpenView {
+                terminal_handle: created.terminal_handle,
+                rows: 24,
+                cols: 80,
+                max_fps: 60,
+                codec_versions: vec![1],
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::OPEN_VIEW,
+            81,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let opened = yas_terminal::OpenViewResult::decode(&opened.body).unwrap();
+        let frame =
+            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CLOSE,
+            82,
+            &yas_terminal::Close {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0x82; 16],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CLOSE,
+                82,
+                &mut pending_frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        acknowledge_terminal_frame(&mut client, &codec, &frame).await;
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            83,
+            &create(0x83),
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CREATE,
+                83,
+                &mut pending_frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
         delivery.abort();
         process_service.shutdown().await;
     }
