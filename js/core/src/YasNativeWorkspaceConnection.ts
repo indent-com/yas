@@ -240,9 +240,6 @@ import {
 
 const textEncoder = new TextEncoder();
 
-// Fire-and-forget Terminal requests race the terminal's exit, close, and the
-// link itself. NOT_FOUND or a disconnect then has no caller to report to, and
-// leaving the rejection unhandled terminates Node embedders.
 function settleTerminalRequest(request: Promise<unknown>): void {
   request.catch((error: unknown) => {
     if (error instanceof YasDisconnectedError) return;
