@@ -1079,7 +1079,8 @@ export class YasNativeWorkspaceConnection {
     offset: number,
     amount: number,
     mode:
-      typeof YAS_TERMINAL_SCROLL_ABSOLUTE | typeof YAS_TERMINAL_SCROLL_RELATIVE,
+      | typeof YAS_TERMINAL_SCROLL_ABSOLUTE
+      | typeof YAS_TERMINAL_SCROLL_RELATIVE,
   ): void {
     const handle = this.handleForSession(sessionId);
     const state = this.views.get(handle);

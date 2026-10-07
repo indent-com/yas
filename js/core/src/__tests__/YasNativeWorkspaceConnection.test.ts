@@ -1214,7 +1214,10 @@ describe("YasNativeWorkspaceConnection", () => {
         [2n, { rows: 24, cols: 80 }],
       ]),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: null,
       store: { handleUpdate: vi.fn() },
     });
@@ -1298,7 +1301,10 @@ describe("YasNativeWorkspaceConnection", () => {
         [9n, { rows: 24, cols: 80 }],
       ]),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: "remote:terminal:9",
       store: { handleUpdate: vi.fn() },
     });
@@ -1368,7 +1374,7 @@ describe("YasNativeWorkspaceConnection", () => {
       pendingSequences: [],
       lastPresented: 0,
     };
-    const setFocus = vi.fn();
+    const setFocus = vi.fn().mockResolvedValue(undefined);
     const connection = Object.create(
       YasNativeWorkspaceConnection.prototype,
     ) as YasNativeWorkspaceConnection;
@@ -1499,7 +1505,10 @@ describe("YasNativeWorkspaceConnection", () => {
         [2n, { rows: 24, cols: 80 }],
       ]),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: "remote:terminal:2",
       store: { handleUpdate: vi.fn() },
     });
@@ -1561,7 +1570,10 @@ describe("YasNativeWorkspaceConnection", () => {
       viewSizes: new Map(),
       records: new Map([[1n, { rows: 24, cols: 80 }]]),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: null,
       store: { handleUpdate: vi.fn() },
     });
@@ -1626,7 +1638,10 @@ describe("YasNativeWorkspaceConnection", () => {
       viewSizes: new Map(),
       records: new Map([[1n, { rows: 24, cols: 80 }]]),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: null,
       store: { handleUpdate: vi.fn() },
     });
@@ -1698,7 +1713,10 @@ describe("YasNativeWorkspaceConnection", () => {
       ]),
       surfaceStore: { releaseStream: vi.fn() },
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: null,
       store: { handleUpdate: vi.fn() },
     });
@@ -1771,7 +1789,10 @@ describe("YasNativeWorkspaceConnection", () => {
       sessions: new Map(),
       termCwdListeners: new Set(),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: null,
       store: { handleUpdate: vi.fn() },
       snapshotListeners: new Set(),
@@ -1826,7 +1847,10 @@ describe("YasNativeWorkspaceConnection", () => {
       viewSizes: new Map(),
       records: new Map([[1n, { rows: 24, cols: 80 }]]),
       session: { ready: true },
-      terminalClient: { openView, setFocus: vi.fn() },
+      terminalClient: {
+        openView,
+        setFocus: vi.fn().mockResolvedValue(undefined),
+      },
       focusedSessionId: null,
       store: { handleUpdate: vi.fn() },
     });
