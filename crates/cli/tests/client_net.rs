@@ -173,6 +173,12 @@ async fn failed_opens_say_why() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
     };
+    // Ephemeral ports can be consecutive (macOS CI), making `closed` equal
+    // `listed + 1`, which is allowlisted and so Refused, not Denied.
+    let unlisted = (1..)
+        .map(|offset| listed.wrapping_add(offset))
+        .find(|port| *port != 0 && *port != closed)
+        .unwrap();
     let server = start(
         options()
             .arg("--allow-forward-strict")
@@ -191,11 +197,11 @@ async fn failed_opens_say_why() {
     };
     // Strict: loopback is reachable only where listed.
     assert_eq!(
-        failure(net.open_tcp("127.0.0.1", listed.wrapping_add(1)).await),
+        failure(net.open_tcp("127.0.0.1", unlisted).await),
         NetFailure::Denied
     );
     assert_eq!(
-        failure(net.open_tcp("localhost", listed.wrapping_add(1)).await),
+        failure(net.open_tcp("localhost", unlisted).await),
         NetFailure::Denied
     );
     assert_eq!(
