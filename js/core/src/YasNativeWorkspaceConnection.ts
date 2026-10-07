@@ -152,6 +152,7 @@ import {
   YAS_SURFACE_TOUCH_PHASE_MOVE,
   YAS_SURFACE_TOUCH_PHASE_UP,
   YAS_SURFACE_TOUCH,
+  YAS_STATUS_NOT_FOUND,
   YAS_STATUS_RESOURCE_EXHAUSTED,
   YAS_STATUS_UNAVAILABLE,
   YAS_STATUS_UNSUPPORTED,
@@ -230,9 +231,29 @@ import {
   type YasTerminalView,
 } from "./yas/terminal.js";
 import { encodeBrowserTerminalGrid } from "./yas/terminalRenderer.js";
-import { equalBytes, YasResultError, YasWriter } from "./yas/wire.js";
+import {
+  equalBytes,
+  YasDisconnectedError,
+  YasResultError,
+  YasWriter,
+} from "./yas/wire.js";
 
 const textEncoder = new TextEncoder();
+
+// Fire-and-forget Terminal requests race the terminal's exit, close, and the
+// link itself. NOT_FOUND or a disconnect then has no caller to report to, and
+// leaving the rejection unhandled terminates Node embedders.
+function settleTerminalRequest(request: Promise<unknown>): void {
+  request.catch((error: unknown) => {
+    if (error instanceof YasDisconnectedError) return;
+    if (
+      error instanceof YasResultError &&
+      error.status === YAS_STATUS_NOT_FOUND
+    )
+      return;
+    console.error("YAS terminal request failed", error);
+  });
+}
 const textDecoder = new TextDecoder();
 const clipboardTextDecoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_QUERY_BYTES = 8 * 1024 * 1024;
@@ -968,13 +989,11 @@ export class YasNativeWorkspaceConnection {
   }
 
   restartSession(sessionId: SessionId): void {
-    void this.terminal.restart(
-      this.handleForSession(sessionId),
-      operationId(),
-      {
+    settleTerminalRequest(
+      this.terminal.restart(this.handleForSession(sessionId), operationId(), {
         launchMode: YAS_TERMINAL_LAUNCH_REPLAY,
         cutoverMode: YAS_TERMINAL_CUTOVER_STOP_THEN_START,
-      },
+      }),
     );
   }
 
@@ -987,10 +1006,12 @@ export class YasNativeWorkspaceConnection {
           : signal === 1
             ? YAS_TERMINAL_SIGNAL_HANGUP
             : YAS_TERMINAL_SIGNAL_TERMINATE;
-    void this.terminal.signal(
-      this.handleForSession(sessionId),
-      operationId(),
-      kind,
+    settleTerminalRequest(
+      this.terminal.signal(
+        this.handleForSession(sessionId),
+        operationId(),
+        kind,
+      ),
     );
   }
 
@@ -999,11 +1020,17 @@ export class YasNativeWorkspaceConnection {
     this.focusedSessionId = sessionId;
     if (previous) {
       const view = this.views.get(this.handleForSession(previous));
-      if (view) void this.terminal.setFocus(view.view.result.viewId, false);
+      if (view)
+        settleTerminalRequest(
+          this.terminal.setFocus(view.view.result.viewId, false),
+        );
     }
     if (sessionId) {
       const view = this.views.get(this.handleForSession(sessionId));
-      if (view) void this.terminal.setFocus(view.view.result.viewId, true);
+      if (view)
+        settleTerminalRequest(
+          this.terminal.setFocus(view.view.result.viewId, true),
+        );
     }
     this.refreshSnapshot();
   }
@@ -1019,7 +1046,7 @@ export class YasNativeWorkspaceConnection {
 
   resizeSession(sessionId: SessionId, rows: number, cols: number): void {
     const handle = this.handleForSession(sessionId);
-    void this.terminal.resize(handle, rows, cols);
+    settleTerminalRequest(this.terminal.resize(handle, rows, cols));
     const state = this.views.get(handle);
     if (state) this.configureView(handle, { rows, cols });
   }
@@ -1055,26 +1082,30 @@ export class YasNativeWorkspaceConnection {
     offset: number,
     amount: number,
     mode:
-      | typeof YAS_TERMINAL_SCROLL_ABSOLUTE
-      | typeof YAS_TERMINAL_SCROLL_RELATIVE,
+      typeof YAS_TERMINAL_SCROLL_ABSOLUTE | typeof YAS_TERMINAL_SCROLL_RELATIVE,
   ): void {
     const handle = this.handleForSession(sessionId);
     const state = this.views.get(handle);
     if (!state) return;
     const request = (state.scrollRequest = Symbol());
-    void this.terminal
-      .scroll(state.view.result.viewId, BigInt(amount), mode)
-      .then((applied) => {
-        // The finger may already be several moves ahead of this reply.
-        // Replaying it would move the viewport backwards and inflate the
-        // next relative delta. Only reconcile a correction to the latest
-        // request, while it still belongs to the same open view.
-        if (this.views.get(handle) !== state || state.scrollRequest !== request)
-          return;
-        state.scrollRequest = undefined;
-        if (applied !== BigInt(offset))
-          this.emitScrollAnchor(sessionId, Number(applied));
-      });
+    settleTerminalRequest(
+      this.terminal
+        .scroll(state.view.result.viewId, BigInt(amount), mode)
+        .then((applied) => {
+          // The finger may already be several moves ahead of this reply.
+          // Replaying it would move the viewport backwards and inflate the
+          // next relative delta. Only reconcile a correction to the latest
+          // request, while it still belongs to the same open view.
+          if (
+            this.views.get(handle) !== state ||
+            state.scrollRequest !== request
+          )
+            return;
+          state.scrollRequest = undefined;
+          if (applied !== BigInt(offset))
+            this.emitScrollAnchor(sessionId, Number(applied));
+        }),
+    );
   }
 
   sendMouse(
@@ -3862,7 +3893,7 @@ export class YasNativeWorkspaceConnection {
       this.configureView(handle, latestSize);
     }
     if (this.focusedSessionId === this.sessionId(handle))
-      void this.terminal.setFocus(view.result.viewId, true);
+      settleTerminalRequest(this.terminal.setFocus(view.result.viewId, true));
   }
 
   private terminalGrid(
