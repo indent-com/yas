@@ -14217,9 +14217,6 @@ impl Session {
         }
     }
 
-    /// Returns `None` for feedback naming a view this session no longer has.
-    /// A view retires when its terminal closes or exits, and feedback the
-    /// client sent before it saw that is stale, not a protocol error.
     async fn update_terminal_feedback(
         &mut self,
         feedback: &yas_terminal::ViewFeedback,
@@ -53853,7 +53850,6 @@ mod tests {
             .status,
             Status::Ok,
         );
-        // The client presented this frame before it saw the CLOSE Result.
         acknowledge_terminal_frame(&mut client, &codec, &frame).await;
 
         write_request(
