@@ -1376,7 +1376,7 @@ async fn the_process_catalogue_can_be_watched() {
         .await
         .unwrap();
     let handle = process.handle();
-    let mut stdin = process.take_stdin().unwrap();
+    let stdin = process.take_stdin().unwrap();
     loop {
         match next(&mut watch).await {
             ProcessChange::Updated(info) if info.handle == handle => {
