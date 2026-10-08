@@ -105,6 +105,22 @@ impl Default for ImageDescription {
 }
 
 impl ImageDescription {
+    /// What a client is told to render for. Clients such as Chromium follow
+    /// `get_preferred` and encode their output for it without tagging the
+    /// surface (an untagged surface is sRGB), so anything else than sRGB
+    /// makes ordinary SDR content come out washed out. HDR clients still
+    /// create their own PQ/HLG/scRGB descriptions and tag their surfaces.
+    pub const PREFERRED: Self = Self {
+        intent: Intent::Perceptual,
+        lut: None,
+        primaries: Primaries::Srgb,
+        transfer: Transfer::Srgb,
+        reference_nits: 80.0,
+        peak_nits: 80.0,
+        min_nits: 0.2,
+        target_peak_nits: None,
+    };
+
     pub const HDR: Self = Self {
         intent: Intent::Perceptual,
         lut: None,

@@ -1829,6 +1829,94 @@ describe("YasSurfaceCanvas scroll", () => {
     container.remove();
   });
 
+  it("releases a press whose mouseup was lost once motion shows no button held", () => {
+    const result = attachScrolling();
+    const { canvas, pointers } = result;
+    const mouse = (type: string, buttons: number) =>
+      canvas.dispatchEvent(
+        new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          buttons,
+          clientX: 200,
+          clientY: 150,
+        }),
+      );
+
+    mouse("mousedown", 1);
+    // A drag held the button: motion keeps it.
+    mouse("mousemove", 1);
+    expect(pointers.map(({ type }) => type)).not.toContain(SURFACE_POINTER_UP);
+    // The browser swallowed the mouseup; the next motion reports nothing held.
+    mouse("mousemove", 0);
+    const types = pointers.map(({ type }) => type);
+    expect(types.filter((t) => t === SURFACE_POINTER_UP)).toHaveLength(1);
+    expect(types.indexOf(SURFACE_POINTER_UP)).toBeLessThan(
+      types.lastIndexOf(SURFACE_POINTER_MOVE),
+    );
+    // The release is not repeated, and the real mouseup that finally follows
+    // does not double it.
+    mouse("mousemove", 0);
+    expect(
+      pointers.filter(({ type }) => type === SURFACE_POINTER_UP),
+    ).toHaveLength(1);
+    result.surface.dispose();
+  });
+
+  it("releases a held button before its next press", () => {
+    const result = attachScrolling();
+    const { canvas, pointers } = result;
+    for (const type of ["mousedown", "mousedown", "mouseup"]) {
+      canvas.dispatchEvent(
+        new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          buttons: type === "mouseup" ? 0 : 1,
+          clientX: 200,
+          clientY: 150,
+        }),
+      );
+    }
+    expect(
+      pointers
+        .map(({ type }) => type)
+        .filter((t) => t === SURFACE_POINTER_DOWN || t === SURFACE_POINTER_UP),
+    ).toEqual([
+      SURFACE_POINTER_DOWN,
+      SURFACE_POINTER_UP,
+      SURFACE_POINTER_DOWN,
+      SURFACE_POINTER_UP,
+    ]);
+    result.surface.dispose();
+  });
+
+  it("releases held mouse buttons when the window loses focus", () => {
+    const result = attachScrolling();
+    const { canvas, pointers } = result;
+    canvas.dispatchEvent(
+      new MouseEvent("mousedown", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        buttons: 1,
+        clientX: 200,
+        clientY: 150,
+      }),
+    );
+    window.dispatchEvent(new Event("blur"));
+    expect(
+      pointers
+        .map(({ type }) => type)
+        .filter((t) => t === SURFACE_POINTER_DOWN || t === SURFACE_POINTER_UP),
+    ).toEqual([SURFACE_POINTER_DOWN, SURFACE_POINTER_UP]);
+    result.surface.dispose();
+    expect(
+      pointers.filter(({ type }) => type === SURFACE_POINTER_UP),
+    ).toHaveLength(1);
+  });
+
   it("does not focus or press through a zero-size canvas", () => {
     const result = attachScrolling();
     result.canvas.getBoundingClientRect = () =>

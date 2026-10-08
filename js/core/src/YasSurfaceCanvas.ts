@@ -78,6 +78,14 @@ function effectiveCodecSupport(mask: number): number {
   return mask & _allowedCodecSupport || mask;
 }
 
+/** `MouseEvent.buttons` bit of each `MouseEvent.button` value. */
+const MOUSE_BUTTON_MASK: Record<number, number> = {
+  0: 1,
+  1: 4,
+  2: 2,
+  3: 8,
+  4: 16,
+};
 /** Radius of a mirrored touch contact, in logical pixels — about a fingertip. */
 const REMOTE_CONTACT_RADIUS = 14;
 
@@ -1322,6 +1330,10 @@ export class YasSurfaceCanvas {
   /** Track which mouse buttons are currently pressed so we can send synthetic
    *  pointer-up events on dispose — preventing a dangling compositor grab. */
   private pressedButtons = new Set<number>();
+
+  /** The subset of `pressedButtons` that a physical mouse holds, so a missing
+   *  `mouseup` can be told from a touch gesture's own button. */
+  private mouseHeld = new Set<number>();
 
   /** Whether this canvas has placed the shared Wayland pointer on its surface.
    *
@@ -2983,6 +2995,9 @@ export class YasSurfaceCanvas {
       this.compositionActive = false;
       this._pendingPasteAbandon?.();
       this.releaseAllKeys();
+      // The mouseup of a press that was still held when the window lost focus
+      // goes to whatever took it.
+      this.releaseHeldMouseButtons();
       // iPadOS can suspend the page without delivering the contact's end.
       // Release direct-touch ownership before the browser loses the gesture.
       this.cancelDirectTouches();
@@ -3232,6 +3247,7 @@ export class YasSurfaceCanvas {
     // surface under the pointer.  Its ordinary target listener must not
     // emit the same input Event a second time.
     if (routedGrabMouseEvents.has(e)) return;
+    this.releaseLostMouseButtons(e, type);
     if (type === SURFACE_POINTER_MOVE) {
       this.wakeHiddenHostCursor();
     }
@@ -3339,6 +3355,11 @@ export class YasSurfaceCanvas {
       return;
     }
     sendPointer();
+    if (type === SURFACE_POINTER_DOWN && this.pressedButtons.has(e.button)) {
+      this.mouseHeld.add(e.button);
+    } else if (type === SURFACE_POINTER_UP) {
+      this.mouseHeld.delete(e.button);
+    }
     if (
       type === SURFACE_POINTER_DOWN &&
       e.button === 0 &&
@@ -3348,6 +3369,36 @@ export class YasSurfaceCanvas {
         activeSurfaceMouseGrab = { owner: this, buttons: new Set() };
       }
       activeSurfaceMouseGrab.buttons.add(e.button);
+    }
+  }
+
+  /**
+   * Release mouse buttons whose `mouseup` never reached us.
+   *
+   * The browser can swallow a release (a native drag, a context menu, focus
+   * moving to another frame or window mid-press). The app then keeps the
+   * button down, and the next press arrives on top of a held button, which
+   * toolkits ignore: the click appears not to register. Every later mouse
+   * event says which buttons are really down, so trust that.
+   */
+  private releaseLostMouseButtons(e: MouseEvent, type: number): void {
+    if (this.mouseHeld.size === 0) return;
+    for (const button of [...this.mouseHeld]) {
+      // A press of the same button again is itself the proof its release was
+      // lost; otherwise only motion (which carries `buttons`) can tell.
+      const lost =
+        type === SURFACE_POINTER_DOWN
+          ? button === e.button
+          : type === SURFACE_POINTER_MOVE &&
+            !(e.buttons & MOUSE_BUTTON_MASK[button]!);
+      if (!lost) continue;
+      this.mouseHeld.delete(button);
+      this.sendPointerAt(e.clientX, e.clientY, SURFACE_POINTER_UP, button);
+      if (activeSurfaceMouseGrab?.owner === this) {
+        activeSurfaceMouseGrab.buttons.delete(button);
+        if (activeSurfaceMouseGrab.buttons.size === 0)
+          activeSurfaceMouseGrab = null;
+      }
     }
   }
 
@@ -3448,6 +3499,8 @@ export class YasSurfaceCanvas {
     const grab = activeSurfaceMouseGrab;
     if (!grab || grab.owner !== this || routedGrabMouseEvents.has(e)) return;
     if (type === SURFACE_POINTER_UP && !grab.buttons.has(e.button)) return;
+    this.releaseLostMouseButtons(e, type);
+    if (!grab.buttons.size) return;
     const target = this.mouseGrabTarget(e);
     // A gap carries no surface-local coordinate.  Keep the grab alive and
     // wait for the next canvas; a release in the gap still has to cancel it.
@@ -3459,6 +3512,7 @@ export class YasSurfaceCanvas {
       // The release may have been sent by another canvas, but the button was
       // recorded by the origin.  Clear both views of the physical grab.
       this.pressedButtons.delete(e.button);
+      this.mouseHeld.delete(e.button);
       grab.buttons.delete(e.button);
       if (grab.buttons.size === 0) activeSurfaceMouseGrab = null;
     }
@@ -3883,6 +3937,27 @@ export class YasSurfaceCanvas {
     };
   }
 
+  private releaseHeldMouseButtons(): void {
+    const conn = this.getConn();
+    if (!conn || !this.surface) {
+      this.mouseHeld.clear();
+      return;
+    }
+    const point = this.lastPointerPoint ?? { x: 0, y: 0 };
+    for (const button of this.mouseHeld) {
+      this.pressedButtons.delete(button);
+      conn.sendSurfacePointer(
+        this._surfaceId,
+        SURFACE_POINTER_UP,
+        button,
+        point.x,
+        point.y,
+      );
+    }
+    this.mouseHeld.clear();
+    if (activeSurfaceMouseGrab?.owner === this) activeSurfaceMouseGrab = null;
+  }
+
   /** Send synthetic pointer-up for any buttons still held.  Prevents the
    *  compositor's implicit pointer grab from outliving this canvas. */
   private releaseAllButtons(): void {
@@ -3900,6 +3975,7 @@ export class YasSurfaceCanvas {
       );
     }
     this.pressedButtons.clear();
+    this.mouseHeld.clear();
     if (activeSurfaceMouseGrab?.owner === this) {
       activeSurfaceMouseGrab = null;
     }

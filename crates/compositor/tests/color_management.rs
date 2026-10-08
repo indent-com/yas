@@ -44,6 +44,17 @@ fn preferred_color_information_can_be_completed_and_requested_again() {
         queue.roundtrip(&mut app).unwrap();
         assert_eq!(app.information_done, batch * 2);
     }
+    // Chromium renders for what it is told the surface prefers and never
+    // tags that output: an untagged surface is sRGB. Preferring PQ made every
+    // ordinary page come out dim and desaturated.
+    assert!(!app.described_transfers.is_empty());
+    assert!(
+        app.described_transfers
+            .iter()
+            .all(|tf| *tf == cm::TransferFunction::Srgb),
+        "preferred description must be SDR sRGB: {:?}",
+        app.described_transfers
+    );
     preferred.destroy();
     parametric.destroy();
     feedback.destroy();

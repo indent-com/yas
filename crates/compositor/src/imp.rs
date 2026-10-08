@@ -2861,6 +2861,11 @@ struct Compositor {
     /// therefore be swallowed too.  Delivering the release alone would hand
     /// a client a button it never saw pressed.
     popup_dismiss_button: Option<u32>,
+    /// Buttons a client was last told are down, with the surface it was told on. A viewer can lose a
+    /// release (a swallowed `mouseup`, a dropped connection); the next press
+    /// of that button would then arrive on a button the client still holds,
+    /// which toolkits ignore.
+    pointer_buttons_down: FxHashMap<u32, ObjectId>,
     /// The popup holding keyboard focus, when one does.
     ///
     /// Keyboard focus is otherwise a `u16` toplevel id resolved through
@@ -5811,6 +5816,7 @@ impl Compositor {
         // dnd_cancelled when there is none.
         if self.client_pointer_drag_grabbed() {
             if !pressed {
+                self.pointer_buttons_down.remove(&button);
                 self.client_drag_release();
             }
             let _ = self.display_handle.flush_clients();
@@ -5854,6 +5860,38 @@ impl Compositor {
                 .values()
                 .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
                 .map(|s| s.wl_surface.clone());
+            // A press of a button a client still holds means its release
+            // never reached us: that client gets the release first. It is the
+            // one that saw the press, which may no longer be the focused one.
+            let holder = if pressed {
+                focused_wl
+                    .as_ref()
+                    .and_then(|wl| self.pointer_buttons_down.insert(button, wl.id()))
+            } else {
+                self.pointer_buttons_down.remove(&button);
+                None
+            };
+            if let Some(holder) = holder {
+                let holder_wl = self
+                    .surfaces
+                    .values()
+                    .find(|s| s.wl_surface.id() == holder)
+                    .map(|s| s.wl_surface.clone());
+                if let Some(wl) = holder_wl {
+                    let release_serial = self.next_serial();
+                    for ptr in &self.pointers {
+                        if same_client(ptr, &wl) {
+                            ptr.button(
+                                release_serial,
+                                time,
+                                button,
+                                wl_pointer::ButtonState::Released,
+                            );
+                            ptr.frame();
+                        }
+                    }
+                }
+            }
             for ptr in &self.pointers {
                 if let Some(ref wl) = focused_wl
                     && same_client(ptr, wl)
@@ -12891,6 +12929,7 @@ fn run_compositor(
         popup_grab_stack: Vec::new(),
         kb_focus_popup: None,
         popup_dismiss_button: None,
+        pointer_buttons_down: FxHashMap::default(),
         held_buffers: FxHashMap::default(),
         syncobj_device,
         syncobj_timelines: FxHashMap::default(),

@@ -31,6 +31,8 @@ pub struct App {
     pub color: Option<cm::WpColorManagerV1>,
     pub ready: usize,
     pub information_done: usize,
+    /// Transfer functions the information objects named.
+    pub described_transfers: Vec<cm::TransferFunction>,
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
     fn event(
@@ -120,8 +122,12 @@ impl Dispatch<info::WpImageDescriptionInfoV1, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let info::Event::Done = event {
-            s.information_done += 1;
+        match event {
+            info::Event::Done => s.information_done += 1,
+            info::Event::TfNamed {
+                tf: wayland_client::WEnum::Value(tf),
+            } => s.described_transfers.push(tf),
+            _ => {}
         }
     }
 }

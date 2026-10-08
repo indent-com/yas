@@ -1,5 +1,7 @@
-//! Parametric Wayland color management. Output descriptions name YAS's virtual
-//! HDR output; each remote viewer receives its own gamut/tone conversion.
+//! Parametric Wayland color management. Clients are told to render for SDR
+//! sRGB (Chromium encodes for whatever it is told and leaves its output
+//! untagged); HDR clients tag their own PQ/HLG surfaces, and each remote
+//! viewer receives its own gamut/tone conversion.
 use super::*;
 use crate::color::{ImageDescription, Intent, Primaries, Transfer};
 use std::sync::Mutex;
@@ -343,7 +345,12 @@ impl Dispatch<WpColorManagementOutputV1, WlOutput> for Compositor {
     ) {
         if let output::Request::GetImageDescription { image_description } = request {
             if output.is_alive() {
-                image(init, image_description, Some(ImageDescription::HDR), true);
+                image(
+                    init,
+                    image_description,
+                    Some(ImageDescription::PREFERRED),
+                    true,
+                );
             } else {
                 init.init(
                     image_description,
@@ -376,7 +383,12 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, WlSurface> for Compositor {
                     object.post_error(feedback::Error::Inert, "surface was destroyed");
                     return;
                 }
-                image(init, image_description, Some(ImageDescription::HDR), true);
+                image(
+                    init,
+                    image_description,
+                    Some(ImageDescription::PREFERRED),
+                    true,
+                );
             }
             _ => {}
         }
@@ -659,16 +671,31 @@ impl Dispatch<WpImageDescriptionV1, Description> for Compositor {
                 return;
             }
             let info = init.init(information, ());
-            info.primaries(
-                708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000,
-            );
-            info.primaries_named(manager::Primaries::Bt2020);
-            info.tf_named(manager::TransferFunction::St2084Pq);
-            info.luminances(50, 10000, 203);
-            info.target_primaries(
-                708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000,
-            );
-            info.target_luminance(50, 10000);
+            // Only the compositor's own descriptions carry information: the
+            // SDR one it prefers, and the HDR one it can still output.
+            if data.color.as_ref().is_some_and(|c| !c.is_hdr()) {
+                info.primaries(
+                    640000, 330000, 300000, 600000, 150000, 60000, 312700, 329000,
+                );
+                info.primaries_named(manager::Primaries::Srgb);
+                info.tf_named(manager::TransferFunction::Srgb);
+                info.luminances(2000, 80, 80);
+                info.target_primaries(
+                    640000, 330000, 300000, 600000, 150000, 60000, 312700, 329000,
+                );
+                info.target_luminance(2000, 80);
+            } else {
+                info.primaries(
+                    708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000,
+                );
+                info.primaries_named(manager::Primaries::Bt2020);
+                info.tf_named(manager::TransferFunction::St2084Pq);
+                info.luminances(50, 10000, 203);
+                info.target_primaries(
+                    708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000,
+                );
+                info.target_luminance(50, 10000);
+            }
             // `done` destroys the new object. The backend installs its data
             // after this callback returns, so defer destruction until the
             // request dispatch is complete.
