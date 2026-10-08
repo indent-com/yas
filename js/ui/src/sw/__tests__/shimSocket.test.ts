@@ -231,7 +231,11 @@ describe("relayed WebSocket liveness", () => {
     shim.relay!.onmessage = (event) => relayMessages.push(event.data);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(events).toContain("close");
-    expect(relayMessages.some(relayCloseRequest)).toBe(true);
+    // The close request crosses a MessagePort, whose delivery is not ordered
+    // against timers.
+    await vi.waitFor(() =>
+      expect(relayMessages.some(relayCloseRequest)).toBe(true),
+    );
   });
 
   it("bounds an unterminated handshake header", async () => {
@@ -247,7 +251,9 @@ describe("relayed WebSocket liveness", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(events).toEqual(["error", "close"]);
-    expect(relayMessages.some(relayCloseRequest)).toBe(true);
+    await vi.waitFor(() =>
+      expect(relayMessages.some(relayCloseRequest)).toBe(true),
+    );
   });
 
   it("rejects oversized and unsafe u64 frame lengths from their headers", async () => {
