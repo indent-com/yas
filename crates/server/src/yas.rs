@@ -36251,7 +36251,7 @@ async fn run_terminal_watch(
     {
         return;
     }
-    let mut revision = initial.revision;
+    let mut previous = initial;
     loop {
         tokio::select! {
             changed = updates.changed() => {
@@ -36261,50 +36261,96 @@ async fn run_terminal_watch(
             }
             _ = cancellation.cancelled() => return,
         }
-        let snapshot = updates.borrow_and_update().clone();
-        if snapshot.revision <= revision {
+        let current = updates.borrow_and_update().clone();
+        if current.revision <= previous.revision {
             continue;
         }
-        let reset = StateEvent {
-            subscription_id,
-            phase: Phase::Reset,
-            flags: 0,
-            from_revision: revision,
-            to_revision: snapshot.revision,
-            records: Vec::new(),
+        let Ok(event) = terminal_delta_event(subscription_id, &previous, &current) else {
+            return;
         };
-        if send_bounded_state_event_with_sensitivity(
-            family::TERMINAL,
-            yas_wire::schema::terminal::event::STATE,
-            &reset,
-            event_limit,
-            &mut sent_bytes,
-            &control,
-            &out,
-            &cancellation,
-            false,
-        )
-        .await
-        .is_err()
-        {
+        let result = if let Some(reset) = state_delta_reset(&event, event_limit) {
+            if send_bounded_state_event_with_sensitivity(
+                family::TERMINAL,
+                yas_wire::schema::terminal::event::STATE,
+                &reset,
+                event_limit,
+                &mut sent_bytes,
+                &control,
+                &out,
+                &cancellation,
+                false,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+            send_terminal_snapshot(
+                subscription_id,
+                &current,
+                event_limit,
+                &mut sent_bytes,
+                &control,
+                &out,
+                &cancellation,
+            )
+            .await
+        } else {
+            send_bounded_state_event_with_sensitivity(
+                family::TERMINAL,
+                yas_wire::schema::terminal::event::STATE,
+                &event,
+                event_limit,
+                &mut sent_bytes,
+                &control,
+                &out,
+                &cancellation,
+                false,
+            )
+            .await
+        };
+        if result.is_err() {
             return;
         }
-        if send_terminal_snapshot(
-            subscription_id,
-            &snapshot,
-            event_limit,
-            &mut sent_bytes,
-            &control,
-            &out,
-            &cancellation,
-        )
-        .await
-        .is_err()
-        {
-            return;
-        }
-        revision = snapshot.revision;
+        previous = current;
     }
+}
+
+fn terminal_delta_event(
+    subscription_id: u32,
+    previous: &TerminalCatalogue,
+    current: &TerminalCatalogue,
+) -> Result<StateEvent, ()> {
+    let handles = previous
+        .records
+        .keys()
+        .chain(current.records.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut records = Vec::new();
+    for terminal_handle in handles {
+        let record = match (
+            previous.records.get(&terminal_handle),
+            current.records.get(&terminal_handle),
+        ) {
+            (None, Some(record)) => record.state_record(RecordKind::Add),
+            (Some(_), None) => yas_terminal::RemovedTerminal { terminal_handle }.state_record(),
+            (Some(previous), Some(current)) if previous != current => {
+                current.state_record(RecordKind::Replace)
+            }
+            _ => continue,
+        }
+        .map_err(|_| ())?;
+        records.push(record);
+    }
+    Ok(StateEvent {
+        subscription_id,
+        phase: Phase::Delta,
+        flags: 0,
+        from_revision: previous.revision,
+        to_revision: current.revision,
+        records,
+    })
 }
 
 fn client_delta_event(
@@ -39575,6 +39621,56 @@ mod tests {
                 .unwrap()
                 .session_id,
             added.session_id,
+        );
+    }
+
+    #[test]
+    fn terminal_catalogue_revision_is_one_delta_with_only_changed_records() {
+        let terminal = |terminal_handle| yas_terminal::TerminalRecord {
+            terminal_handle,
+            lifecycle: yas_terminal::Lifecycle::Running,
+            rows: 24,
+            cols: 80,
+            generation: 1,
+            used_rows: 0,
+            extensions: Extensions::default(),
+        };
+        let (unchanged, changed, removed, added) =
+            (terminal(1), terminal(2), terminal(3), terminal(4));
+        let previous = TerminalCatalogue {
+            revision: 40,
+            records: HashMap::from([(1, unchanged.clone()), (2, changed.clone()), (3, removed)]),
+        };
+        let mut exited = changed;
+        exited.lifecycle = yas_terminal::Lifecycle::Exited;
+        let current = TerminalCatalogue {
+            revision: 42,
+            records: HashMap::from([(1, unchanged), (2, exited.clone()), (4, added.clone())]),
+        };
+
+        let delta = terminal_delta_event(7, &previous, &current).unwrap();
+
+        assert_eq!(delta.subscription_id, 7);
+        assert_eq!(delta.phase, Phase::Delta);
+        assert_eq!(delta.from_revision, 40);
+        assert_eq!(delta.to_revision, 42);
+        assert_eq!(delta.records.len(), 3);
+        assert_eq!(delta.records[0].kind, RecordKind::Replace);
+        assert_eq!(
+            yas_terminal::terminal_from_state_record(&delta.records[0]).unwrap(),
+            exited,
+        );
+        assert_eq!(delta.records[1].kind, RecordKind::Remove);
+        assert_eq!(
+            yas_terminal::removal_from_state_record(&delta.records[1])
+                .unwrap()
+                .terminal_handle,
+            3,
+        );
+        assert_eq!(delta.records[2].kind, RecordKind::Add);
+        assert_eq!(
+            yas_terminal::terminal_from_state_record(&delta.records[2]).unwrap(),
+            added,
         );
     }
 
@@ -54241,7 +54337,14 @@ mod tests {
                     }),
                     "closed Terminal survived the observer catalogue reset",
                 );
-                if saw_reset && state_event.phase == Phase::SnapshotEnd {
+                let removed = state_event.phase == Phase::Delta
+                    && state_event.records.iter().any(|record| {
+                        record.kind == RecordKind::Remove
+                            && yas_terminal::RemovedTerminal::decode(&record.body).is_ok_and(
+                                |removal| removal.terminal_handle == created.terminal_handle,
+                            )
+                    });
+                if removed || (saw_reset && state_event.phase == Phase::SnapshotEnd) {
                     break;
                 }
             }
