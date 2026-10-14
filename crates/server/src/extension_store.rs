@@ -134,7 +134,10 @@ impl ObjectRead {
     pub fn sync(&self) -> Result<(), ObjectStoreError> {
         // FlushFileBuffers needs write access: a read-only handle fails with
         // ERROR_ACCESS_DENIED on Windows, so open for write (this does not modify the file).
-        OpenOptions::new().write(true).open(&self.path)?.sync_all()?;
+        OpenOptions::new()
+            .write(true)
+            .open(&self.path)?
+            .sync_all()?;
         #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
             File::open(parent)?.sync_all()?;
