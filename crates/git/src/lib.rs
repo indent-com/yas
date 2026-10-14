@@ -28,7 +28,9 @@ mod state;
 
 pub use state::{StateHandle, StateOptions};
 #[doc(hidden)]
-pub use state::{debug_engine_refs, debug_status_recomputes, debug_worktree_watches};
+pub use state::{
+    debug_engine_refs, debug_status_recomputes, debug_wait_worktree_watches, debug_worktree_watches,
+};
 
 /// The slash-separated Git path of `abs` relative to `workdir`, if any.
 /// On Windows this converts backslashes so that ignore rules and index
