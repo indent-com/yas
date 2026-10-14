@@ -79,6 +79,18 @@ impl Repository {
             .map(|path| std::fs::canonicalize(path).unwrap())
             .collect()
     }
+
+    /// The engine republishes its watch set on the pass after the change,
+    /// which can come after the status snapshot that reflects it.
+    fn wait_for_watch(&self, dir: &str, armed: bool) {
+        let path = self.0.join(dir);
+        let want = if armed { "armed" } else { "disarmed" };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.worktree_watches().contains(&path) != armed {
+            assert!(Instant::now() < deadline, "{dir} was not {want} in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 impl Drop for Repository {
@@ -466,13 +478,13 @@ fn index_changes_reconcile_tracked_exceptions_to_ignore_pruning() {
 
     repository.git(&["add", "-f", "generated/nested/tracked"]);
     assert_eq!(state.status()["generated/nested/tracked"], (b'A', b' '));
-    assert!(watches().contains(&repository.0.join("generated/nested")));
+    repository.wait_for_watch("generated/nested", true);
     repository.write("generated/nested/tracked", b"modified after force-add\n");
     assert_eq!(state.status()["generated/nested/tracked"], (b'A', b'M'));
 
     repository.git(&["rm", "--cached", "-f", "generated/nested/tracked"]);
     assert!(state.status().is_empty());
-    assert!(!watches().contains(&repository.0.join("generated")));
+    repository.wait_for_watch("generated", false);
 }
 
 #[test]
@@ -594,17 +606,7 @@ fn reattached_status_selection_observes_changes_made_while_pruned() {
 
     // Wait for the asynchronous detach to disarm this directory. Writes
     // inside it then cannot invalidate a cached ignored-status segment.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while repository
-        .worktree_watches()
-        .contains(&repository.0.join("ignored"))
-    {
-        assert!(
-            Instant::now() < deadline,
-            "ignored directory was not pruned"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    repository.wait_for_watch("ignored", false);
     repository.write("ignored/second", b"new ignored file\n");
     let broader = StateStream::new(&handle, status_options(true, true));
     assert_eq!(broader.status().len(), 2);
