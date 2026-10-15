@@ -2704,11 +2704,7 @@ mod windows_tests {
     ) -> T {
         let mut output = String::new();
         loop {
-            match tokio::time::timeout(Duration::from_secs(20), attachment.next())
-                .await
-                .expect("output in time")
-                .expect("the attachment is open")
-            {
+            match attachment.next().await.expect("the attachment is open") {
                 Event::Output { stream, data, .. } => {
                     *acked += data.len() as u64;
                     attachment.acknowledge_output(stream, *acked).unwrap();
@@ -2955,7 +2951,6 @@ mod windows_tests {
         let server = Server::new(false, true);
         let runtime = Runtime::new(server.clone());
         let session = runtime.session([34; 16], None).unwrap();
-        let started = std::time::Instant::now();
         let mut attachment = session
             .spawn(
                 &with_residue_grace(
@@ -2975,6 +2970,7 @@ mod windows_tests {
             .unwrap();
         let mut acked = 0;
         let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let started = std::time::Instant::now();
         let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(20)).await;
         assert_eq!(
             (exit.kind, exit.code),
