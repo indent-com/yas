@@ -496,9 +496,6 @@ pub fn pipewire_available() -> bool {
     missing_pipewire_binaries().is_empty() && crate::audio_pw::available()
 }
 
-/// Returns the list of required PipeWire / D-Bus binaries that are not
-/// found on `$PATH`.  Empty list means audio can run (provided
-/// libpipewire is also loadable at runtime; see `pipewire_available`).
 /// One-line reason desktop audio could not start, for normal verbosity.
 pub fn unavailable_reason(desktop_bus: bool, missing: &[&str], load_error: &str) -> String {
     if !missing.is_empty() {
@@ -512,6 +509,9 @@ pub fn unavailable_reason(desktop_bus: bool, missing: &[&str], load_error: &str)
     }
 }
 
+/// Returns the list of required PipeWire / D-Bus binaries that are not
+/// found on `$PATH`.  Empty list means audio can run (provided
+/// libpipewire is also loadable at runtime; see `pipewire_available`).
 pub fn missing_pipewire_binaries() -> Vec<&'static str> {
     [
         "pipewire",
