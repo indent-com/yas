@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use yas_git::native::{
     self, BlameRecord, DiffRecord, DiffRequest, Endpoint, LogRequest, PatchRecord, PatchRequest,
@@ -78,6 +78,19 @@ impl Repository {
             .into_iter()
             .map(|path| std::fs::canonicalize(path).unwrap())
             .collect()
+    }
+
+    /// Waits for the engine to arm or disarm `dir`. The status snapshot can
+    /// reflect an index written after its pass reconciled the watch set, so
+    /// the set catches up on the pass that index event triggers.
+    fn wait_for_watch(&self, dir: &str, armed: bool) {
+        let path = self.0.join(dir);
+        yas_git::debug_wait_worktree_watches(&self.0.join(".git"), |watches| {
+            watches
+                .iter()
+                .any(|watch| std::fs::canonicalize(watch).is_ok_and(|watch| watch == path))
+                == armed
+        });
     }
 }
 
@@ -466,13 +479,13 @@ fn index_changes_reconcile_tracked_exceptions_to_ignore_pruning() {
 
     repository.git(&["add", "-f", "generated/nested/tracked"]);
     assert_eq!(state.status()["generated/nested/tracked"], (b'A', b' '));
-    assert!(watches().contains(&repository.0.join("generated/nested")));
+    repository.wait_for_watch("generated/nested", true);
     repository.write("generated/nested/tracked", b"modified after force-add\n");
     assert_eq!(state.status()["generated/nested/tracked"], (b'A', b'M'));
 
     repository.git(&["rm", "--cached", "-f", "generated/nested/tracked"]);
     assert!(state.status().is_empty());
-    assert!(!watches().contains(&repository.0.join("generated")));
+    repository.wait_for_watch("generated", false);
 }
 
 #[test]
@@ -594,17 +607,7 @@ fn reattached_status_selection_observes_changes_made_while_pruned() {
 
     // Wait for the asynchronous detach to disarm this directory. Writes
     // inside it then cannot invalidate a cached ignored-status segment.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while repository
-        .worktree_watches()
-        .contains(&repository.0.join("ignored"))
-    {
-        assert!(
-            Instant::now() < deadline,
-            "ignored directory was not pruned"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    repository.wait_for_watch("ignored", false);
     repository.write("ignored/second", b"new ignored file\n");
     let broader = StateStream::new(&handle, status_options(true, true));
     assert_eq!(broader.status().len(), 2);

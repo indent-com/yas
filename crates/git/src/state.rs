@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::model::{
@@ -223,11 +223,27 @@ fn status_recomputes() -> &'static Mutex<HashMap<PathBuf, u64>> {
 /// arm. Test/diagnostic hook.
 #[doc(hidden)]
 pub fn debug_worktree_watches(gitdir: &Path) -> Option<Vec<PathBuf>> {
-    worktree_watch_sets().lock().unwrap().get(gitdir).cloned()
+    worktree_watch_sets().0.lock().unwrap().get(gitdir).cloned()
 }
 
-fn worktree_watch_sets() -> &'static Mutex<HashMap<PathBuf, Vec<PathBuf>>> {
-    static SETS: OnceLock<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> = OnceLock::new();
+/// Blocks until the engine publishes a watch set for `gitdir` that
+/// satisfies `done`. Test/diagnostic hook.
+#[doc(hidden)]
+pub fn debug_wait_worktree_watches(gitdir: &Path, mut done: impl FnMut(&[PathBuf]) -> bool) {
+    let (sets, published) = worktree_watch_sets();
+    drop(
+        published
+            .wait_while(sets.lock().unwrap(), |sets| {
+                !done(sets.get(gitdir).map_or(&[], Vec::as_slice))
+            })
+            .unwrap(),
+    );
+}
+
+type WatchSets = (Mutex<HashMap<PathBuf, Vec<PathBuf>>>, Condvar);
+
+fn worktree_watch_sets() -> &'static WatchSets {
+    static SETS: OnceLock<WatchSets> = OnceLock::new();
     SETS.get_or_init(Default::default)
 }
 
@@ -1241,10 +1257,11 @@ impl Engine {
         }
         arms.watch_set_changed = false;
         let dirs = arms.worktree_dirs.iter().cloned().collect();
-        worktree_watch_sets()
-            .lock()
+        let (sets, published) = worktree_watch_sets();
+        sets.lock()
             .unwrap()
             .insert((*self.repo.gitdir).clone(), dirs);
+        published.notify_all();
     }
 
     /// Directories to arm for the ignore sources that live *outside* every
