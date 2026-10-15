@@ -2696,19 +2696,23 @@ mod windows_tests {
         id
     }
 
+    /// Windows PowerShell 5.1 can take over 20 s to print its first line when the runner starts
+    /// it cold under the parallel suite (seen on the windows-2025 20261007 image).
+    const POWERSHELL_START: Duration = Duration::from_secs(120);
+
     /// Reads output until `until` finds what it wants in it, crediting as it goes.
     async fn read_until<T>(
         attachment: &mut Attachment,
         acked: &mut u64,
+        within: Duration,
         mut until: impl FnMut(&str) -> Option<T>,
     ) -> T {
         let mut output = String::new();
         loop {
-            match tokio::time::timeout(Duration::from_secs(20), attachment.next())
-                .await
-                .expect("output in time")
-                .expect("the attachment is open")
-            {
+            let Ok(event) = tokio::time::timeout(within, attachment.next()).await else {
+                panic!("no output in {within:?}; output so far {output:?}");
+            };
+            match event.expect("the attachment is open") {
                 Event::Output { stream, data, .. } => {
                     *acked += data.len() as u64;
                     attachment.acknowledge_output(stream, *acked).unwrap();
@@ -2863,9 +2867,12 @@ mod windows_tests {
             .await
             .unwrap();
         let mut acked = 0;
-        read_until(&mut attachment, &mut acked, |output| {
-            output.contains("127.0.0.1").then_some(())
-        })
+        read_until(
+            &mut attachment,
+            &mut acked,
+            Duration::from_secs(20),
+            |output| output.contains("127.0.0.1").then_some(()),
+        )
         .await;
         let started = std::time::Instant::now();
         control(
@@ -2955,7 +2962,6 @@ mod windows_tests {
         let server = Server::new(false, true);
         let runtime = Runtime::new(server.clone());
         let session = runtime.session([34; 16], None).unwrap();
-        let started = std::time::Instant::now();
         let mut attachment = session
             .spawn(
                 &with_residue_grace(
@@ -2974,7 +2980,8 @@ mod windows_tests {
             .await
             .unwrap();
         let mut acked = 0;
-        let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let pid = read_until(&mut attachment, &mut acked, POWERSHELL_START, residue_pid).await;
+        let started = std::time::Instant::now();
         let exit = exit_of(&mut attachment, &mut acked, Duration::from_secs(20)).await;
         assert_eq!(
             (exit.kind, exit.code),
@@ -3014,7 +3021,7 @@ mod windows_tests {
             .await
             .unwrap();
         let mut acked = 0;
-        let pid = read_until(&mut attachment, &mut acked, residue_pid).await;
+        let pid = read_until(&mut attachment, &mut acked, POWERSHELL_START, residue_pid).await;
         let started = std::time::Instant::now();
         control(
             &session,
