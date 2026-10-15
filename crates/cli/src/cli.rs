@@ -1934,7 +1934,7 @@ pub enum FsCommand {
     /// --json, emits one NDJSON event per record (`upsert`, `delete`,
     /// `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
     Sync {
-        /// Path on the server (absolute, or relative to the server's cwd)
+        /// Path on the server (absolute, or relative to the client's cwd)
         path: String,
 
         /// Sync file contents too (hashes always sync)
@@ -2142,12 +2142,13 @@ pub enum FsCommand {
         #[arg(short = 'w', long)]
         word: bool,
 
-        /// Search gitignored files too; they rank after tracked ones.
-        /// Much slower on a tree with build output.
+        /// Search gitignored files and `.git` too. Results stay in path
+        /// order; ignored files are marked in --json. Much slower on a tree
+        /// with build output.
         #[arg(long)]
         no_ignore: bool,
 
-        /// Stop after this many matching files (0 = server default)
+        /// Stop after this many matching files (0 = no limit)
         #[arg(short = 'm', long, default_value_t = 0)]
         max_matches: u16,
 
@@ -2198,7 +2199,7 @@ pub enum FsCommand {
 pub enum GitCommand {
     /// Branch, ahead/behind, stash, and working-tree status
     Status {
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2228,7 +2229,7 @@ pub enum GitCommand {
         #[arg(last = true)]
         pathspec: Vec<String>,
 
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2284,7 +2285,7 @@ pub enum GitCommand {
         #[arg(last = true)]
         pathspec: Vec<String>,
 
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2318,12 +2319,15 @@ pub enum GitCommand {
     ///   yas git show HEAD:src/main.rs   # a file at a revision
     ///   yas git show v1.0:Cargo.toml
     ///   yas git show HEAD               # the commit object itself
+    ///   yas git show HEAD:src           # a directory, listed like ls-tree
     Show {
-        /// REV[:PATH]. Omit PATH for the commit object; omit REV
-        /// (`:path`) for HEAD.
+        /// REV[:PATH]. REV names a commit; reach trees and blobs by PATH.
+        /// Omit PATH for the commit object (in `git cat-file commit`
+        /// layout); a directory PATH is listed like ls-tree, and `REV:`
+        /// lists the root tree. Omit REV (`:path`) for HEAD.
         spec: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2340,7 +2344,7 @@ pub enum GitCommand {
         /// REV[:PATH]; omit PATH for the root tree
         spec: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2358,7 +2362,7 @@ pub enum GitCommand {
         #[arg(default_value = "")]
         path: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2375,7 +2379,7 @@ pub enum GitCommand {
         #[arg(required = true, num_args = 2..)]
         revs: Vec<String>,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2393,7 +2397,7 @@ pub enum GitCommand {
         /// File to blame
         path: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2428,7 +2432,7 @@ pub enum GitCommand {
         #[arg(default_value = "")]
         ref_name: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2450,7 +2454,7 @@ pub enum GitCommand {
     /// TSV: WORKDIR<TAB>GITDIR. Deduped by gitdir, so several paths
     /// resolving to one repository report once.
     Discover {
-        /// Directory to search (default: server cwd)
+        /// Directory to search (relative to the client's cwd)
         #[arg(default_value = ".")]
         path: String,
 
@@ -2484,7 +2488,7 @@ pub enum GitCommand {
         /// Refspecs to fetch (default: the remote's configured ones)
         refspecs: Vec<String>,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2599,7 +2603,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2617,7 +2621,7 @@ pub enum LspCommand {
         #[arg(long)]
         declaration: bool,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2631,7 +2635,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2648,7 +2652,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2665,7 +2669,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2684,7 +2688,7 @@ pub enum LspCommand {
         #[arg(long)]
         file: Option<String>,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2705,11 +2709,12 @@ pub enum LspCommand {
         #[arg(long)]
         watch: bool,
 
-        /// Wait for language servers to finish indexing first
+        /// Wait for language servers to finish indexing, then for the next
+        /// published diagnostics (or 5 seconds without any server update)
         #[arg(long)]
         wait: bool,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2727,7 +2732,7 @@ pub enum LspCommand {
         /// The new name
         new_name: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2738,7 +2743,7 @@ pub enum LspCommand {
 
     /// Block until the workspace's language servers are ready
     Wait {
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
