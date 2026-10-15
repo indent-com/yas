@@ -157,7 +157,15 @@ impl server::Handler for Handler {
             session.channel_failure(id)?;
             return Ok(());
         };
-        let spawned = tokio::process::Command::new("/bin/sh")
+        let mut command_line = tokio::process::Command::new("/bin/sh");
+        // A real sshd starts the command from a fresh environment: none of the YAS variables this test process
+        // runs with (a CI machine's YAS_TARGET naming its own server, YAS_PROCESS_* maxima) reach it.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("YAS_") {
+                command_line.env_remove(key);
+            }
+        }
+        let spawned = command_line
             .arg("-c")
             .arg(&command)
             .envs(self.options.env.iter().cloned())

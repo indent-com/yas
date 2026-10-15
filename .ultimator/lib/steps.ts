@@ -46,6 +46,16 @@ export function nix(): Step {
         . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
       fi
       dirname "$(command -v nix)" >> "$ULTIMATOR_PATH"
+      # Ultimator's sandboxes run as root with Nix's sandbox off, so a builder that makes its $HOME leaves
+      # /homeless-shelter on the real root, and every later build there refuses to start ("home directory
+      # /homeless-shelter exists"), in this job or the next one a pooled sandbox runs. Build sandboxed, as GitHub's
+      # runners did (it falls back when the kernel can't), and clear what an earlier build left.
+      if [ "$(uname -s)" = Linux ] && [ "$(id -u)" = 0 ]; then
+        rm -rf /homeless-shelter
+        if [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ] && [ -w /etc/nix/nix.conf ]; then
+          echo "sandbox = true" >> /etc/nix/nix.conf
+        fi
+      fi
       nix --version
       nix config show experimental-features | grep -qw flakes || echo "NIX_CONFIG=experimental-features = nix-command flakes" >> "$ULTIMATOR_ENV"
     `,
@@ -98,10 +108,11 @@ export function packages(label: PackagesLabel): Step[] {
  * YAS for Windows x86_64 on crab-win, the Windows 11 ARM64 VM on crab, as GitHub's windows-2025 runner built it: an
  * x86_64 toolchain that runs under Windows' x64 emulation, so the binaries and the tests are x86_64 ones. crab-win
  * needs (pcarrier/sys docs/github-runner-windows.md): Git for Windows (bash), rustup, Visual Studio's x64/x86 build
- * tools (component Microsoft.VisualStudio.Component.VC.Tools.x86.x64, beside the ARM64 ones), Node.js 22 or later and
- * 7-Zip. wasm-pack, pnpm and bun are installed by the job.
+ * tools (component Microsoft.VisualStudio.Component.VC.Tools.x86.x64, beside the ARM64 ones) and 7-Zip. Node.js is
+ * the machine's when it has one (22 or later), else a portable one the job fetches; wasm-pack, pnpm and bun are
+ * installed by the job.
  */
-export function windowsX64(bunVersion = "1.3.13"): Step[] {
+export function windowsX64(bunVersion = "1.3.13", nodeVersion = "24.11.0"): Step[] {
   return [
     {
       name: "x86_64 toolchain (emulated)",
@@ -119,9 +130,22 @@ export function windowsX64(bunVersion = "1.3.13"): Step[] {
     {
       name: "wasm-pack, pnpm, bun",
       shell: "bash",
-      env: { BUN_VERSION: bunVersion },
+      env: { BUN_VERSION: bunVersion, NODE_VERSION: nodeVersion },
       run: sh`
         rustc -vV | grep -Fx "host: x86_64-pc-windows-msvc"
+        # Node.js: the machine's when it has one, else a portable x64 build kept beside the runner's jobs.
+        if ! command -v node >/dev/null; then
+          node_dir="$HOME/.ultimator-ci/tools/node-v\${NODE_VERSION}-win-x64"
+          if [ ! -x "$node_dir/node.exe" ]; then
+            mkdir -p "$HOME/.ultimator-ci/tools"
+            zip="$HOME/.ultimator-ci/tools/node-$$.zip"
+            curl -fsSL --retry 3 -o "$zip" "https://nodejs.org/dist/v\${NODE_VERSION}/node-v\${NODE_VERSION}-win-x64.zip"
+            (cd "$HOME/.ultimator-ci/tools" && unzip -q -o "$zip")
+            rm -f "$zip"
+          fi
+          export PATH="$node_dir:$PATH"
+          cygpath -w "$node_dir" >> "$ULTIMATOR_PATH"
+        fi
         command -v wasm-pack >/dev/null || cargo install wasm-pack --locked
         npm install -g pnpm@10 "bun@$BUN_VERSION"
         node --version; pnpm --version; bun --version; wasm-pack --version
