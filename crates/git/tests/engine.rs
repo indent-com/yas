@@ -85,12 +85,20 @@ impl Repository {
     /// the set catches up on the pass that index event triggers.
     fn wait_for_watch(&self, dir: &str, armed: bool) {
         let path = self.0.join(dir);
-        yas_git::debug_wait_worktree_watches(&self.0.join(".git"), |watches| {
-            watches
-                .iter()
-                .any(|watch| std::fs::canonicalize(watch).is_ok_and(|watch| watch == path))
-                == armed
-        });
+        let held = yas_git::debug_wait_worktree_watches(
+            &self.0.join(".git"),
+            std::time::Duration::from_secs(5),
+            |watches| {
+                watches
+                    .iter()
+                    .any(|watch| std::fs::canonicalize(watch).is_ok_and(|watch| watch == path))
+                    == armed
+            },
+        );
+        assert!(
+            held,
+            "worktree watch on {dir} never became armed={armed} within 5 s"
+        );
     }
 }
 

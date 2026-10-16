@@ -227,17 +227,21 @@ pub fn debug_worktree_watches(gitdir: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// Blocks until the engine publishes a watch set for `gitdir` that
-/// satisfies `done`. Test/diagnostic hook.
+/// satisfies `done`, or `timeout` passes. Returns whether `done` held.
+/// Test/diagnostic hook.
 #[doc(hidden)]
-pub fn debug_wait_worktree_watches(gitdir: &Path, mut done: impl FnMut(&[PathBuf]) -> bool) {
+pub fn debug_wait_worktree_watches(
+    gitdir: &Path,
+    timeout: Duration,
+    mut done: impl FnMut(&[PathBuf]) -> bool,
+) -> bool {
     let (sets, published) = worktree_watch_sets();
-    drop(
-        published
-            .wait_while(sets.lock().unwrap(), |sets| {
-                !done(sets.get(gitdir).map_or(&[], Vec::as_slice))
-            })
-            .unwrap(),
-    );
+    let (_sets, result) = published
+        .wait_timeout_while(sets.lock().unwrap(), timeout, |sets| {
+            !done(sets.get(gitdir).map_or(&[], Vec::as_slice))
+        })
+        .unwrap();
+    !result.timed_out()
 }
 
 type WatchSets = (Mutex<HashMap<PathBuf, Vec<PathBuf>>>, Condvar);
