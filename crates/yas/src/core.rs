@@ -1578,6 +1578,30 @@ pub struct GoAway {
     pub detail: Extensions,
 }
 
+impl GoAway {
+    /// Detail carrying the UTF-8 reason a Client DISCONNECT gave; empty for
+    /// an empty reason.
+    pub fn reason_detail(reason: &str) -> Extensions {
+        if reason.is_empty() {
+            return Extensions::default();
+        }
+        Extensions(vec![Extension {
+            tag: crate::schema::core::GOAWAY_REASON_EXTENSION as u16,
+            required: false,
+            value: reason.as_bytes().to_vec(),
+        }])
+    }
+
+    /// The disconnect reason in `detail`, if the server sent one.
+    pub fn reason(&self) -> Option<String> {
+        self.detail
+            .0
+            .iter()
+            .find(|extension| extension.tag == crate::schema::core::GOAWAY_REASON_EXTENSION as u16)
+            .map(|extension| String::from_utf8_lossy(&extension.value).into_owned())
+    }
+}
+
 impl Encode for GoAway {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
         validate_result_or_event_extensions(&self.detail, "required GOAWAY detail extension")?;
@@ -1731,6 +1755,26 @@ impl Decode for FamilyUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goaway_reason_round_trips_as_optional_detail() {
+        let goaway = GoAway {
+            status: Status::Ok,
+            close_deadline_server_ns: 7,
+            detail: GoAway::reason_detail("Removed by an administrator"),
+        };
+        let decoded = GoAway::decode(&goaway.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.reason().as_deref(),
+            Some("Removed by an administrator")
+        );
+        assert!(GoAway::reason_detail("").0.is_empty());
+        let silent = GoAway {
+            detail: Extensions::default(),
+            ..goaway
+        };
+        assert_eq!(silent.reason(), None);
+    }
 
     fn limits() -> ReceiveLimits {
         ReceiveLimits {

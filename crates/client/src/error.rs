@@ -42,6 +42,8 @@ pub enum Error {
         status: Status,
         /// Rendered detail extensions.
         detail: String,
+        /// Why a Client `DISCONNECT` removed this session, when it did.
+        reason: Option<String>,
     },
     /// A request completed with a status other than `OK`.
     Status {
@@ -95,6 +97,14 @@ impl Error {
         )
     }
 
+    pub(crate) fn goaway(goaway: &yas_wire::core::GoAway) -> Self {
+        Self::GoAway {
+            status: goaway.status,
+            detail: format_result_detail(&goaway.detail),
+            reason: goaway.reason(),
+        }
+    }
+
     pub(crate) fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol(message.into())
     }
@@ -130,9 +140,15 @@ impl fmt::Display for Error {
             | Self::Unsupported(message)
             | Self::Protocol(message)
             | Self::Invalid(message) => f.write_str(message),
-            Self::GoAway { status, detail } => {
-                write!(f, "YAS server is closing with {status:?}: {detail}")
-            }
+            Self::GoAway {
+                reason: Some(reason),
+                ..
+            } => write!(f, "disconnected by the YAS server: {reason}"),
+            Self::GoAway {
+                status,
+                detail,
+                reason: None,
+            } => write!(f, "YAS server is closing with {status:?}: {detail}"),
             Self::Status {
                 operation,
                 status,
@@ -196,6 +212,27 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goaway_with_a_disconnect_reason_names_it() {
+        let kicked = yas_wire::core::GoAway {
+            status: Status::Ok,
+            close_deadline_server_ns: 0,
+            detail: yas_wire::core::GoAway::reason_detail("Removed by an administrator"),
+        };
+        assert_eq!(
+            Error::goaway(&kicked).to_string(),
+            "disconnected by the YAS server: Removed by an administrator"
+        );
+        let closing = yas_wire::core::GoAway {
+            detail: Extensions::default(),
+            ..kicked
+        };
+        assert_eq!(
+            Error::goaway(&closing).to_string(),
+            "YAS server is closing with Ok: no detail"
+        );
+    }
 
     #[test]
     fn status_errors_render_like_the_cli_always_did() {

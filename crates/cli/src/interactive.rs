@@ -26,7 +26,7 @@ struct BrowserState {
 }
 
 /// Open the local browser UI backed by one native YAS server.
-pub async fn run_browser(port: Option<u16>, _hub: &str) {
+pub async fn run_browser(port: Option<u16>) {
     let token: String = {
         use rand::RngExt as _;
         rand::rng()

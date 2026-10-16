@@ -359,6 +359,10 @@
         {
           "name": "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION",
           "value": 1
+        },
+        {
+          "name": "GOAWAY_REASON_EXTENSION",
+          "value": 1
         }
       ]
     },

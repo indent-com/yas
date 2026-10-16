@@ -211,6 +211,7 @@ export const YAS_CORE_EXTENSION_SUPPORT_WASMI = 2 as const;
 export const YAS_CORE_EXTENSION_SUPPORT_QUICKJS = 4 as const;
 export const YAS_CORE_EXTENSION_SUPPORT_COMMAND_PROVIDER = 8 as const;
 export const YAS_CORE_SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION = 1 as const;
+export const YAS_CORE_GOAWAY_REASON_EXTENSION = 1 as const;
 export const YAS_FAMILY_TRANSFER = 1 as const;
 export const YAS_TRANSFER_VERSION = 1 as const;
 export const YAS_TRANSFER_BYTE_DATA = 0 as const;
@@ -3289,6 +3290,10 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION",
+          "value": 1
+        },
+        {
+          "name": "GOAWAY_REASON_EXTENSION",
           "value": 1
         }
       ]

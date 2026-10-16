@@ -2161,7 +2161,9 @@ present in a selected family descriptor and cannot exceed their canonical hard
 maximums.
 
 DISCONNECT names a session ID, operation ID, and UTF-8 reason. Its Result is
-queued before the target receives Core GOAWAY. Targeting the caller is valid
+queued before the target receives Core GOAWAY. A nonempty reason travels in
+that GOAWAY's detail as optional Core extension `GOAWAY_REASON_EXTENSION` (1),
+whose value is the reason's UTF-8 bytes. Targeting the caller is valid
 and becomes an orderly self-disconnect after the Result is sent. Core SHUTDOWN,
 not this family, stops the whole server.
 
