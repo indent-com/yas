@@ -15965,6 +15965,12 @@ impl Session {
             .expect("checked watcher");
         watcher.control.cancel();
         watcher.task.abort();
+        if frame.header.family == family::LSP {
+            // A workspace takes one WATCH at a time and is free again only
+            // once the task has dropped its Watch, so wait for that before
+            // answering: a WATCH sent after this UNWATCH must not see Busy.
+            let _ = watcher.task.await;
+        }
         if frame.header.family == family::CLIENT
             && let Some(native) = self.native.as_mut()
         {
@@ -32548,13 +32554,15 @@ async fn run_lsp_watch(
 ) {
     let mut sent_bytes = 0u64;
     let mut revision = 1u64;
-    let mut backend = Vec::new();
-    let mut diagnostics = Vec::new();
+    let Ok((mut backend, mut diagnostics)) = watch.retained() else {
+        return;
+    };
     // The engine replays its retained diagnostics as the first Diagnostics
-    // update, so waiting for it lets the initial snapshot carry them rather
-    // than an empty set that a one-shot reader would take as clean.
+    // update, once per workspace, so waiting for it lets the initial snapshot
+    // carry them rather than an empty set that a one-shot reader would take
+    // as clean. A later WATCH already has them.
     let mut initial_acks = Vec::new();
-    if watch.wants_diagnostics() {
+    if watch.wants_diagnostics() && !watch.has_diagnostics() {
         loop {
             let event = tokio::select! {
                 event = watch.next() => event,
@@ -40363,6 +40371,120 @@ mod tests {
         }
         receiver.changed().await.unwrap();
         assert_eq!(*receiver.borrow_and_update(), 101_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lsp_rewatching_a_workspace_sends_a_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::LSP]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::LSP,
+            yas_lsp_wire::request_kind::OPEN,
+            10,
+            &yas_lsp_wire::Open {
+                source: yas_lsp_wire::WorkspaceSource::PlatformPath(
+                    root.path().to_string_lossy().as_bytes().to_vec(),
+                ),
+                open_mode: yas_wire::schema::lsp::OPEN_AUTO_DISCOVER as u8,
+                diagnostics_settle_ms: 0,
+                language: String::new(),
+                profile: String::new(),
+                initialization_options: Vec::new(),
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::LSP,
+            yas_lsp_wire::request_kind::OPEN,
+            10,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let workspace_handle = yas_lsp_wire::OpenResult::decode(&opened.body)
+            .unwrap()
+            .workspace_handle;
+
+        // The engine replays diagnostics once per workspace, and the first
+        // WATCH consumes that replay. Each later WATCH still needs a snapshot.
+        let diagnostics = yas_wire::schema::lsp::WATCH_DIAGNOSTICS as u16;
+        let backend = yas_wire::schema::lsp::WATCH_BACKEND as u16;
+        for (request_id, datasets) in [
+            (20, diagnostics),
+            (30, diagnostics),
+            (40, backend),
+            (50, diagnostics | backend),
+        ] {
+            write_request(
+                &mut client,
+                &codec,
+                family::LSP,
+                yas_lsp_wire::request_kind::WATCH,
+                request_id,
+                &yas_lsp_wire::Watch {
+                    workspace_handle,
+                    datasets,
+                    state: Watch {
+                        initial_credit: 1024 * 1024,
+                        resume: None,
+                        extensions: Extensions::default(),
+                    },
+                },
+            )
+            .await;
+            let watched = next_sensitive_result(
+                &mut client,
+                &codec,
+                family::LSP,
+                yas_lsp_wire::request_kind::WATCH,
+                request_id,
+            )
+            .await;
+            assert_eq!(watched.status, Status::Ok, "WATCH {request_id}");
+            let subscription_id = WatchResult::decode(&watched.body).unwrap().subscription_id;
+            loop {
+                let frame = next_frame(&mut client, &codec).await;
+                assert_eq!(frame.header.kind, yas_lsp_wire::event_kind::STATE);
+                let event = StateEvent::decode(&frame.payload).unwrap();
+                assert_eq!(event.subscription_id, subscription_id);
+                if event.phase == Phase::SnapshotEnd {
+                    break;
+                }
+            }
+            write_request(
+                &mut client,
+                &codec,
+                family::LSP,
+                yas_lsp_wire::request_kind::UNWATCH,
+                request_id + 1,
+                &Unwatch { subscription_id },
+            )
+            .await;
+            assert_eq!(
+                next_sensitive_result(
+                    &mut client,
+                    &codec,
+                    family::LSP,
+                    yas_lsp_wire::request_kind::UNWATCH,
+                    request_id + 1,
+                )
+                .await
+                .status,
+                Status::Ok,
+            );
+        }
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
