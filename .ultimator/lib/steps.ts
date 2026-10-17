@@ -112,7 +112,10 @@ export function packages(label: PackagesLabel): Step[] {
  * the machine's when it has one (22 or later), else a portable one the job fetches; wasm-pack, pnpm and bun are
  * installed by the job.
  */
-export function windowsX64(bunVersion = "1.3.13", nodeVersion = "24.11.0"): Step[] {
+export function windowsX64(
+  bunVersion = "1.3.13",
+  nodeVersion = "24.11.0",
+): Step[] {
   return [
     {
       name: "x86_64 toolchain (emulated)",
