@@ -2657,23 +2657,52 @@ mod windows_tests {
         request
     }
 
-    fn powershell(script: &str) -> Vec<Vec<u8>> {
-        vec![
-            system32(r"WindowsPowerShell\v1.0\powershell.exe"),
-            b"-NoProfile".to_vec(),
-            b"-NonInteractive".to_vec(),
-            b"-Command".to_vec(),
-            script.as_bytes().to_vec(),
-        ]
+    const RESIDUE_CHILD: &str = "YAS_TEST_RESIDUE_CHILD";
+
+    /// This test binary run as `residue_child` in `mode`, so the LEAVE_RESIDUE tests don't
+    /// depend on a Windows PowerShell cold start.
+    fn residue_request(mode: &str, operation: u8, grace: Duration) -> wire::Spawn {
+        let exe = std::env::current_exe().unwrap();
+        let mut request = with_residue_grace(
+            request(
+                &[
+                    exe.to_string_lossy().as_bytes(),
+                    b"--exact",
+                    b"yas_process::windows_tests::residue_child",
+                    b"--ignored",
+                    b"--nocapture",
+                ],
+                schema::process::SPAWN_LEAVE_RESIDUE,
+                operation,
+            ),
+            grace,
+        );
+        request.env = vec![wire::EnvEntry {
+            key: RESIDUE_CHILD.as_bytes().to_vec(),
+            value: mode.as_bytes().to_vec(),
+        }];
+        request
     }
 
-    /// Starts a `ping` that shares the script's console and pipes, prints its PID on a line of
-    /// its own, then runs `rest`.
-    fn residue_script(rest: &str) -> Vec<Vec<u8>> {
-        powershell(&format!(
-            "$p = Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' \
-             -NoNewWindow -PassThru; [Console]::Out.WriteLine('PID ' + $p.Id); {rest}"
-        ))
+    /// Starts a `ping` that shares this process's console and pipes and prints its PID on a line
+    /// of its own, then exits 3 (`exit`) or waits for the ping (`wait`).
+    #[test]
+    #[ignore = "the LEAVE_RESIDUE tests run it as their child"]
+    fn residue_child() {
+        let Ok(mode) = std::env::var(RESIDUE_CHILD) else {
+            return;
+        };
+        let mut ping = std::process::Command::new(String::from_utf8(system32("PING.EXE")).unwrap())
+            .args(["-n", "120", "127.0.0.1"])
+            .spawn()
+            .unwrap();
+        println!("PID {}", ping.id());
+        match mode.as_str() {
+            "exit" => std::process::exit(3),
+            _ => {
+                ping.wait().unwrap();
+            }
+        }
     }
 
     async fn control(session: &Session, handle: u64, action: wire::ControlAction, value: u16) {
@@ -2704,7 +2733,11 @@ mod windows_tests {
     ) -> T {
         let mut output = String::new();
         loop {
-            match attachment.next().await.expect("the attachment is open") {
+            let Ok(event) = tokio::time::timeout(Duration::from_secs(20), attachment.next()).await
+            else {
+                panic!("no output in time; output so far {output:?}");
+            };
+            match event.expect("the attachment is open") {
                 Event::Output { stream, data, .. } => {
                     *acked += data.len() as u64;
                     attachment.acknowledge_output(stream, *acked).unwrap();
@@ -2953,17 +2986,7 @@ mod windows_tests {
         let session = runtime.session([34; 16], None).unwrap();
         let mut attachment = session
             .spawn(
-                &with_residue_grace(
-                    request(
-                        &residue_script("exit 3")
-                            .iter()
-                            .map(Vec::as_slice)
-                            .collect::<Vec<_>>(),
-                        schema::process::SPAWN_LEAVE_RESIDUE,
-                        5,
-                    ),
-                    Duration::from_millis(500),
-                ),
+                &residue_request("exit", 5, Duration::from_millis(500)),
                 None,
             )
             .await
@@ -2994,17 +3017,7 @@ mod windows_tests {
         let session = runtime.session([35; 16], None).unwrap();
         let mut attachment = session
             .spawn(
-                &with_residue_grace(
-                    request(
-                        &residue_script("Start-Sleep -Seconds 120")
-                            .iter()
-                            .map(Vec::as_slice)
-                            .collect::<Vec<_>>(),
-                        schema::process::SPAWN_LEAVE_RESIDUE,
-                        6,
-                    ),
-                    Duration::from_millis(100),
-                ),
+                &residue_request("wait", 6, Duration::from_millis(100)),
                 None,
             )
             .await
