@@ -76,8 +76,19 @@ struct WorkspaceInner {
     revision: AtomicU64,
     root: PathBuf,
     attachment: Arc<yas_lsp::Attachment>,
-    receiver: StdMutex<Option<mpsc::Receiver<yas_lsp::native::Event>>>,
+    feed: StdMutex<Option<Feed>>,
     closed: AtomicBool,
+}
+
+/// The attachment's event stream and what it has delivered so far. The
+/// engine sends each stream's full state only once per attachment, so this
+/// moves from WATCH to WATCH on the workspace rather than starting over.
+struct Feed {
+    receiver: mpsc::Receiver<yas_lsp::native::Event>,
+    state: BTreeMap<u16, yas_lsp::native::Server>,
+    diagnostics: BTreeMap<PathBuf, yas_lsp::native::FileDiagnostics>,
+    state_update: Option<u32>,
+    diagnostics_update: Option<u32>,
 }
 
 #[derive(Default)]
@@ -183,9 +194,7 @@ struct ReplayCache {
 pub(crate) struct Watch {
     workspace: Arc<WorkspaceInner>,
     datasets: u16,
-    receiver: Option<mpsc::Receiver<yas_lsp::native::Event>>,
-    state: BTreeMap<u16, yas_lsp::native::Server>,
-    diagnostics: BTreeMap<PathBuf, yas_lsp::native::FileDiagnostics>,
+    feed: Option<Feed>,
     pending_backend: AtomicU32,
     pending_diagnostics: AtomicU32,
     owner: Weak<SessionInner>,
@@ -481,7 +490,13 @@ impl Session {
                 revision: AtomicU64::new(1),
                 root,
                 attachment,
-                receiver: StdMutex::new(Some(receiver)),
+                feed: StdMutex::new(Some(Feed {
+                    receiver,
+                    state: BTreeMap::new(),
+                    diagnostics: BTreeMap::new(),
+                    state_update: None,
+                    diagnostics_update: None,
+                })),
                 closed: AtomicBool::new(false),
             }),
         );
@@ -531,8 +546,8 @@ impl Session {
     pub(crate) fn watch(&self, request: &wire::Watch) -> Result<Watch, Error> {
         self.ensure_open()?;
         let workspace = self.workspace(request.workspace_handle)?;
-        let receiver = workspace
-            .receiver
+        let feed = workspace
+            .feed
             .lock()
             .unwrap()
             .take()
@@ -540,9 +555,7 @@ impl Session {
         Ok(Watch {
             workspace,
             datasets: request.datasets,
-            receiver: Some(receiver),
-            state: BTreeMap::new(),
-            diagnostics: BTreeMap::new(),
+            feed: Some(feed),
             pending_backend: AtomicU32::new(0),
             pending_diagnostics: AtomicU32::new(0),
             owner: Arc::downgrade(&self.inner),
@@ -611,33 +624,58 @@ impl Watch {
         self.datasets & yas_wire::schema::lsp::WATCH_DIAGNOSTICS as u16 != 0
     }
 
+    /// Whether the engine's diagnostics replay already reached this
+    /// workspace, so [`Watch::retained`] holds the published diagnostics.
+    pub(crate) fn has_diagnostics(&self) -> bool {
+        self.feed
+            .as_ref()
+            .is_some_and(|feed| feed.diagnostics_update.is_some())
+    }
+
+    /// The backend and diagnostics entities an earlier WATCH already
+    /// received, for the datasets this WATCH selects.
+    pub(crate) fn retained(
+        &self,
+    ) -> Result<(Vec<wire::StateEntity>, Vec<wire::StateEntity>), Error> {
+        let Some(feed) = &self.feed else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let backend = match feed.state_update {
+            Some(update_id) if self.datasets & yas_wire::schema::lsp::WATCH_BACKEND as u16 != 0 => {
+                backend_entities(&self.owner, &self.workspace, update_id, &feed.state)?
+            }
+            _ => Vec::new(),
+        };
+        let diagnostics = match feed.diagnostics_update {
+            Some(update_id) if self.wants_diagnostics() => {
+                diagnostics_entities(&self.owner, &self.workspace, update_id, &feed.diagnostics)?
+            }
+            _ => Vec::new(),
+        };
+        Ok((backend, diagnostics))
+    }
+
     pub(crate) async fn next(&mut self) -> Option<Result<WatchEvent, Error>> {
-        while let Some(event) = self.receiver.as_mut()?.recv().await {
+        loop {
+            let feed = self.feed.as_mut()?;
+            let Some(event) = feed.receiver.recv().await else {
+                break;
+            };
             match event {
                 yas_lsp::native::Event::State { update_id, servers } => {
-                    self.state = servers
+                    feed.state = servers
                         .into_iter()
                         .map(|server| (server.server_ref, server))
                         .collect();
+                    feed.state_update = Some(update_id);
                     if self.datasets & yas_wire::schema::lsp::WATCH_BACKEND as u16 == 0 {
                         self.workspace
                             .attachment
                             .ack_native(yas_lsp::native::Stream::State, update_id);
                         continue;
                     }
-                    let entities = self
-                        .state
-                        .iter()
-                        .map(|(server_ref, server)| {
-                            Ok(wire::StateEntity::Backend(server_record(
-                                &self.owner,
-                                &self.workspace,
-                                update_id,
-                                *server_ref,
-                                server,
-                            )?))
-                        })
-                        .collect::<Result<Vec<_>, Error>>();
+                    let entities =
+                        backend_entities(&self.owner, &self.workspace, update_id, &feed.state);
                     self.pending_backend.store(update_id, Ordering::Release);
                     return Some(entities.map(|entities| WatchEvent::Snapshot {
                         stream: WatchStream::Backend,
@@ -651,15 +689,16 @@ impl Watch {
                     files,
                 } => {
                     if full {
-                        self.diagnostics.clear();
+                        feed.diagnostics.clear();
                     }
                     for file in files {
                         if file.diagnostics.is_empty() {
-                            self.diagnostics.remove(&file.path);
+                            feed.diagnostics.remove(&file.path);
                         } else {
-                            self.diagnostics.insert(file.path.clone(), file);
+                            feed.diagnostics.insert(file.path.clone(), file);
                         }
                     }
+                    feed.diagnostics_update = Some(update_id);
                     if self.datasets & yas_wire::schema::lsp::WATCH_DIAGNOSTICS as u16 == 0 {
                         self.workspace
                             .attachment
@@ -670,7 +709,7 @@ impl Watch {
                         &self.owner,
                         &self.workspace,
                         update_id,
-                        &self.diagnostics,
+                        &feed.diagnostics,
                     );
                     self.pending_diagnostics.store(update_id, Ordering::Release);
                     return Some(entities.map(|entities| WatchEvent::Snapshot {
@@ -726,12 +765,12 @@ impl Drop for Watch {
         if self.workspace.closed.load(Ordering::Acquire) {
             return;
         }
-        let Some(receiver) = self.receiver.take() else {
+        let Some(feed) = self.feed.take() else {
             return;
         };
-        let mut slot = self.workspace.receiver.lock().unwrap();
+        let mut slot = self.workspace.feed.lock().unwrap();
         if slot.is_none() {
-            *slot = Some(receiver);
+            *slot = Some(feed);
         }
     }
 }
@@ -1508,6 +1547,26 @@ fn server_record_parts(
         last_message: last_message.to_owned(),
         extensions: Extensions::default(),
     })
+}
+
+fn backend_entities(
+    owner: &Weak<SessionInner>,
+    workspace: &WorkspaceInner,
+    update_id: u32,
+    state: &BTreeMap<u16, yas_lsp::native::Server>,
+) -> Result<Vec<wire::StateEntity>, Error> {
+    state
+        .iter()
+        .map(|(server_ref, server)| {
+            Ok(wire::StateEntity::Backend(server_record(
+                owner,
+                workspace,
+                update_id,
+                *server_ref,
+                server,
+            )?))
+        })
+        .collect()
 }
 
 fn diagnostics_entities(

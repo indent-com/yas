@@ -452,13 +452,12 @@ async fn cmd_diagnostics(
     let mut diagnostics = BTreeMap::<String, DiagnosticRecord>::new();
     let mut snapshot_done = false;
     let mut cumulative_credit = STATE_CREDIT;
-    let mut awaiting_publish = wait && !watch_forever;
-    let mut baseline: Option<BTreeMap<String, DiagnosticRecord>> = None;
+    let mut publish = PublishWait::new(wait && !watch_forever);
     loop {
         let next = workspace
             .client
             .next_matching_event(family::LSP, lsp::event_kind::STATE);
-        let frame = if awaiting_publish && snapshot_done {
+        let frame = if publish.waiting() && snapshot_done {
             match tokio::time::timeout(DIAGNOSTICS_LULL, next).await {
                 Ok(frame) => frame?,
                 // A clean workspace publishes nothing distinguishable, so a
@@ -525,17 +524,8 @@ async fn cmd_diagnostics(
         }
         if event.phase == Phase::SnapshotEnd || (snapshot_done && event.phase == Phase::Delta) {
             snapshot_done = true;
-            if awaiting_publish {
-                // Retained diagnostics may predate the edit being checked;
-                // wait for a publish that changes them.
-                match &baseline {
-                    None => {
-                        baseline = Some(diagnostics.clone());
-                        continue;
-                    }
-                    Some(baseline) if *baseline == diagnostics => continue,
-                    Some(_) => awaiting_publish = false,
-                }
+            if !publish.ready(&diagnostics) {
+                continue;
             }
             let count = print_diagnostics(&diagnostics, filter.as_deref(), json);
             if !watch_forever {
@@ -939,6 +929,39 @@ fn symbol_kind(kind: u16) -> &'static str {
     NAMES.get(kind as usize).copied().unwrap_or("unknown")
 }
 
+/// When `diagnostics --wait` reports. Retained diagnostics may predate the
+/// edit being checked, so it waits for a complete view that differs from the
+/// first one; without `--wait` the first view is the answer.
+struct PublishWait<T> {
+    waiting: bool,
+    baseline: Option<T>,
+}
+
+impl<T: Clone + PartialEq> PublishWait<T> {
+    fn new(wait: bool) -> Self {
+        Self {
+            waiting: wait,
+            baseline: None,
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiting
+    }
+
+    fn ready(&mut self, view: &T) -> bool {
+        if !self.waiting {
+            return true;
+        }
+        match &self.baseline {
+            None => self.baseline = Some(view.clone()),
+            Some(baseline) if baseline == view => {}
+            Some(_) => self.waiting = false,
+        }
+        !self.waiting
+    }
+}
+
 fn wire_error(error: impl std::fmt::Display) -> String {
     format!("invalid YAS LSP payload: {error}")
 }
@@ -946,6 +969,25 @@ fn wire_error(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_report_the_first_view_unless_waiting_for_a_publish() {
+        let mut once = PublishWait::new(false);
+        assert!(!once.waiting());
+        assert!(once.ready(&vec!["retained"]));
+
+        let mut wait = PublishWait::new(true);
+        assert!(!wait.ready(&vec!["retained"]));
+        assert!(!wait.ready(&vec!["retained"]));
+        assert!(wait.waiting());
+        assert!(wait.ready(&vec!["retained", "published"]));
+        assert!(!wait.waiting());
+        assert!(wait.ready(&vec!["retained", "published"]));
+
+        let mut clean = PublishWait::new(true);
+        assert!(!clean.ready(&Vec::<&str>::new()));
+        assert!(clean.ready(&vec!["published"]));
+    }
 
     #[test]
     fn position_specs_are_one_based_at_the_cli_boundary() {
