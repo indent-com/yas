@@ -2174,25 +2174,12 @@ fn grep_root(root: &Root, request: &wire::Grep) -> Result<QueryData, Error> {
         } else {
             0
         };
-        let mut matches = Vec::new();
-        for found in regex
+        let mut matches = regex
             .find_iter(text.as_bytes())
             .take(max_per_file)
             .skip(resume_match)
-        {
-            let (line, column) = byte_line_column(text.as_bytes(), found.start());
-            let (end_line, end_column) = byte_line_column(text.as_bytes(), found.end());
-            let display = line_display(text, line as usize);
-            matches.push(wire::QueryGrepMatchRecord {
-                file_index: 0,
-                line,
-                column,
-                end_line,
-                end_column,
-                text: display,
-            });
-        }
-        if matches.is_empty() {
+            .peekable();
+        if matches.peek().is_none() {
             continue;
         }
         if records.len().saturating_add(2) > max_results {
@@ -2216,25 +2203,41 @@ fn grep_root(root: &Root, request: &wire::Grep) -> Result<QueryData, Error> {
         let file_cost = query_record_size(&file_record)?;
         let mut included = Vec::new();
         let mut included_cost = 0usize;
-        for mut found in matches {
-            found.file_index = file_index;
-            let record = wire::QueryRecord::GrepMatch(found);
-            let cost = query_record_size(&record)?;
+        // Matches arrive in order, so one forward pass over the file places
+        // them all; records are built only while the page has room.
+        let mut lines = LineCursor::new(text);
+        while let Some(found) = matches.peek() {
             if records
                 .len()
                 .saturating_add(1)
                 .saturating_add(included.len())
                 >= max_results
-                || bytes_used
-                    .saturating_add(file_cost)
-                    .saturating_add(included_cost)
-                    .saturating_add(cost)
-                    > wire::MAX_QUERY_BYTES
+            {
+                break;
+            }
+            let (line, column) = lines.advance(found.start());
+            let display = lines.current_line();
+            let (end_line, end_column) = lines.advance(found.end());
+            let record = wire::QueryRecord::GrepMatch(wire::QueryGrepMatchRecord {
+                file_index,
+                line,
+                column,
+                end_line,
+                end_column,
+                text: display,
+            });
+            let cost = query_record_size(&record)?;
+            if bytes_used
+                .saturating_add(file_cost)
+                .saturating_add(included_cost)
+                .saturating_add(cost)
+                > wire::MAX_QUERY_BYTES
             {
                 break;
             }
             included_cost += cost;
             included.push(record);
+            matches.next();
         }
         if included.is_empty() {
             if records.is_empty() {
@@ -2249,21 +2252,10 @@ fn grep_root(root: &Root, request: &wire::Grep) -> Result<QueryData, Error> {
         bytes_used = bytes_used
             .saturating_add(file_cost)
             .saturating_add(included_cost);
+        let consumed = included.len();
         records.push(file_record);
         records.extend(included);
-
-        let consumed = records
-            .iter()
-            .rev()
-            .take_while(|record| matches!(record, wire::QueryRecord::GrepMatch(_)))
-            .count();
-        if resume_match.saturating_add(consumed) < max_per_file
-            && regex
-                .find_iter(text.as_bytes())
-                .take(max_per_file)
-                .nth(resume_match.saturating_add(consumed))
-                .is_some()
-        {
+        if matches.peek().is_some() {
             next = Some((path_index, resume_match.saturating_add(consumed)));
             break;
         }
@@ -2302,24 +2294,51 @@ fn encode_grep_cursor(path: usize, found: usize) -> Vec<u8> {
     cursor
 }
 
-fn byte_line_column(bytes: &[u8], offset: usize) -> (u32, u32) {
-    let offset = offset.min(bytes.len());
-    let line = bytes[..offset]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
-    let line_start = bytes[..offset]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    (
-        u32::try_from(line).unwrap_or(u32::MAX),
-        u32::try_from(offset.saturating_sub(line_start)).unwrap_or(u32::MAX),
-    )
+/// Line and column of increasing byte offsets in one text.
+struct LineCursor<'a> {
+    text: &'a str,
+    offset: usize,
+    line: usize,
+    line_start: usize,
 }
 
-fn line_display(text: &str, line: usize) -> String {
-    let value = text.lines().nth(line).unwrap_or("");
+impl<'a> LineCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            offset: 0,
+            line: 0,
+            line_start: 0,
+        }
+    }
+
+    /// Moves to `offset`, which must not be before the previous one.
+    fn advance(&mut self, offset: usize) -> (u32, u32) {
+        let offset = offset.min(self.text.len()).max(self.offset);
+        let bytes = &self.text.as_bytes()[self.offset..offset];
+        for newline in memchr::memchr_iter(b'\n', bytes) {
+            self.line += 1;
+            self.line_start = self.offset + newline + 1;
+        }
+        self.offset = offset;
+        (
+            u32::try_from(self.line).unwrap_or(u32::MAX),
+            u32::try_from(offset - self.line_start).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// The current line as `str::lines` yields it.
+    fn current_line(&self) -> String {
+        let rest = &self.text[self.line_start..];
+        let line = match memchr::memchr(b'\n', rest.as_bytes()) {
+            Some(end) => rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]),
+            None => rest,
+        };
+        line_display(line)
+    }
+}
+
+fn line_display(value: &str) -> String {
     let mut end = value.len().min(schema::fs::MAX_GREP_LINE_BYTES as usize);
     while !value.is_char_boundary(end) {
         end = end.saturating_sub(1);
@@ -4135,6 +4154,63 @@ mod tests {
             cursor = page.next_cursor;
         }
         assert_eq!(lines, [0, 1, 2]);
+    }
+
+    #[test]
+    fn grep_match_positions_follow_lines_across_pages() {
+        let directory = TestDir::new();
+        fs::write(
+            directory.0.join("lines.txt"),
+            b"one needle\r\ntwo needle needle\nneedle\nthree\nlast needle\r",
+        )
+        .unwrap();
+        let root = test_root(&directory);
+        let grep = |flags: u16, query: &[u8], max_results: u16| {
+            let mut cursor = Vec::new();
+            let mut found = Vec::new();
+            loop {
+                let page = grep_root(
+                    &root,
+                    &wire::Grep {
+                        root_handle: 1,
+                        flags,
+                        max_results,
+                        max_per_file: 0,
+                        query: query.to_vec(),
+                        cursor,
+                        initial_receive_credit: 0,
+                        extensions: Extensions::default(),
+                    },
+                )
+                .unwrap();
+                found.extend(page.records.into_iter().filter_map(|record| match record {
+                    wire::QueryRecord::GrepMatch(m) => {
+                        Some((m.line, m.column, m.end_line, m.end_column, m.text))
+                    }
+                    _ => None,
+                }));
+                if page.next_cursor.is_empty() {
+                    return found;
+                }
+                cursor = page.next_cursor;
+            }
+        };
+        let expected = [
+            (0, 4, 0, 10, "one needle"),
+            (1, 4, 1, 10, "two needle needle"),
+            (1, 11, 1, 17, "two needle needle"),
+            (2, 0, 2, 6, "needle"),
+            (4, 5, 4, 11, "last needle\r"),
+        ]
+        .map(|(line, column, end_line, end_column, text)| {
+            (line, column, end_line, end_column, text.to_owned())
+        });
+        assert_eq!(grep(0, b"needle", 0), expected);
+        assert_eq!(grep(0, b"needle", 2), expected);
+        assert_eq!(
+            grep(schema::fs::GREP_REGEX as u16, b"needle\nthree", 0),
+            [(2, 0, 3, 5, "needle".to_owned())]
+        );
     }
 
     #[test]
