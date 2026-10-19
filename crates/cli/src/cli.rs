@@ -2323,9 +2323,10 @@ pub enum GitCommand {
     ///   yas git show HEAD:src           # a directory, listed like ls-tree
     Show {
         /// REV[:PATH]. REV names a commit; reach trees and blobs by PATH.
-        /// Omit PATH for the commit object (in `git cat-file commit`
-        /// layout); a directory PATH is listed like ls-tree, and `REV:`
-        /// lists the root tree. Omit REV (`:path`) for HEAD.
+        /// Omit PATH for the commit (in `git cat-file commit` layout,
+        /// without headers like gpgsig or mergetag); a directory PATH is
+        /// listed like ls-tree, and `REV:` lists the root tree. Omit REV
+        /// (`:path`) for HEAD.
         spec: String,
 
         /// Repository path on the server (relative to the client's cwd)
