@@ -133,7 +133,10 @@ const cases: readonly [string, (payload: Uint8Array) => Uint8Array][] = [
     "fs.stage_write.payload",
     (payload) => encodeFsStageWrite(decodeFsStageWrite(payload)),
   ],
-  ["fs.publish.payload", (payload) => encodeFsPublish(decodeFsPublish(payload))],
+  [
+    "fs.publish.payload",
+    (payload) => encodeFsPublish(decodeFsPublish(payload)),
+  ],
   [
     "fs.publish_result.payload",
     (payload) => encodeFsPublishResult(decodeFsPublishResult(payload)),
@@ -296,14 +299,7 @@ describe("YAS FS v1", () => {
       );
     }
     for (const field of ["source", "destination"] as const) {
-      for (const component of [
-        [],
-        [0],
-        [0x2e],
-        [0x2e, 0x2e],
-        [0x2f],
-        [0x5c],
-      ]) {
+      for (const component of [[], [0], [0x2e], [0x2e, 0x2e], [0x2f], [0x5c]]) {
         const malformedPath = new YasWriter()
           .u16(1)
           .bytesU16(new Uint8Array(component))
@@ -345,7 +341,9 @@ describe("YAS FS v1", () => {
       for (const offset of [0, 1, 2, 3]) {
         const malformed = payload.slice();
         malformed[offset] = offset === 0 ? 2 : 1;
-        expect(() => decodeFsPublishResult(malformed)).toThrow(YasProtocolError);
+        expect(() => decodeFsPublishResult(malformed)).toThrow(
+          YasProtocolError,
+        );
       }
       expect(() =>
         decodeFsPublishResult(new Uint8Array([...payload, 0])),
@@ -360,7 +358,9 @@ describe("YAS FS v1", () => {
       value: new Uint8Array([0xff]),
     };
     const value = { ...publish(), extensions: [extension] };
-    expect(decodeFsPublish(encodeFsPublish(value)).extensions).toEqual([extension]);
+    expect(decodeFsPublish(encodeFsPublish(value)).extensions).toEqual([
+      extension,
+    ]);
     expect(
       decodeFsPublishResult(
         encodeFsPublishResult({ durable: false, extensions: [extension] }),
@@ -469,7 +469,9 @@ function batch(
 function publish(): YasFsPublish {
   return {
     rootHandle: 9n,
-    source: { components: [new Uint8Array([0xff, 0x61]), new Uint8Array([0x73])] },
+    source: {
+      components: [new Uint8Array([0xff, 0x61]), new Uint8Array([0x73])],
+    },
     destination: {
       components: [new Uint8Array([0xff, 0x61]), new Uint8Array([0x64])],
     },

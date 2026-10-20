@@ -1565,7 +1565,10 @@ export function decodeFsPublishResult(bytes: Uint8Array): YasFsPublishResult {
   const cursor = new YasCursor(bytes);
   const durable = cursor.u8("FS PUBLISH durability");
   if (durable > 1) throw new YasProtocolError("invalid FS PUBLISH durability");
-  requireZero(cursor.take(3, "FS PUBLISH Result reserved"), "FS PUBLISH Result");
+  requireZero(
+    cursor.take(3, "FS PUBLISH Result reserved"),
+    "FS PUBLISH Result",
+  );
   const value = {
     durable: Boolean(durable),
     extensions: decodeExtensions(
