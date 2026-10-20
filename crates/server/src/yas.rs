@@ -30018,6 +30018,11 @@ fn family_descriptors(
                     Class::Request,
                     yas_wire::schema::fs::request::APPLY,
                 ),
+                advertised_operation(
+                    family::FS,
+                    Class::Request,
+                    yas_wire::schema::fs::request::PUBLISH,
+                ),
                 advertised_operation(family::FS, Class::Event, yas_wire::schema::fs::event::STATE),
                 advertised_operation(
                     family::FS,
@@ -51278,6 +51283,106 @@ mod tests {
             Status::NotFound,
         );
 
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fs_publish_is_advertised_and_publishes_over_negotiated_transport() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"negotiated publication\0\xff";
+        std::fs::write(root.path().join("source"), bytes).unwrap();
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, hello, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::FS]).await;
+        let descriptor = hello
+            .families
+            .iter()
+            .find(|descriptor| descriptor.family_id == family::FS)
+            .unwrap();
+        assert!(
+            yas_fs_wire::Limits::from_extensions(&descriptor.limits)
+                .unwrap()
+                .supports(yas_wire::schema::fs::CAPABILITY_PUBLISH)
+        );
+        // Typed clients require both the capability and this HELLO operation before
+        // sending anything. Calling Session::publish directly misses this contract.
+        assert!(
+            descriptor
+                .operation(Class::Request, yas_wire::schema::fs::request::PUBLISH)
+                .is_some_and(|operation| operation.server_accepts)
+        );
+        write_request(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::OPEN,
+            10,
+            &yas_fs_wire::Open {
+                flags: 0,
+                source: yas_fs_wire::RootSource::PlatformPath(
+                    root.path().as_os_str().as_bytes().to_vec(),
+                ),
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::OPEN,
+            10,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let opened = yas_fs_wire::OpenResult::decode(&opened.body).unwrap();
+        write_request(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::PUBLISH,
+            11,
+            &yas_fs_wire::Publish {
+                root_handle: opened.root_handle,
+                source: yas_fs_wire::Path {
+                    components: vec![b"source".to_vec()],
+                },
+                destination: yas_fs_wire::Path {
+                    components: vec![b"destination".to_vec()],
+                },
+                precondition: yas_fs_wire::Precondition::Absent,
+                operation_id: [41; 16],
+                byte_len: bytes.len() as u64,
+                content_hash: *blake3::hash(bytes).as_bytes(),
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let published = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::FS,
+            yas_wire::schema::fs::request::PUBLISH,
+            11,
+        )
+        .await;
+        assert_eq!(published.status, Status::Ok);
+        assert!(
+            yas_fs_wire::PublishResult::decode(&published.body)
+                .unwrap()
+                .durable
+        );
+        assert_eq!(std::fs::read(root.path().join("source")).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(root.path().join("destination")).unwrap(),
+            bytes
+        );
         drop(client);
         timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
