@@ -615,7 +615,7 @@ async fn cmd_show(
     match path {
         None => {
             let commit = commit_object(&mut repository, &object)
-                .await
+                .await?
                 .ok_or_else(|| format!("'{revision}' did not resolve to a commit"))?;
             std::io::stdout()
                 .write_all(&commit)
@@ -732,9 +732,14 @@ fn print_tree_entries(records: Vec<QueryRecord>, json: bool) {
     }
 }
 
-/// The commit object in `git cat-file commit` layout, rebuilt from the LOG
-/// record because BLOB serves only blobs.
-async fn commit_object(repository: &mut Repository, object: &ObjectId) -> Option<Vec<u8>> {
+/// The commit in `git cat-file commit` layout, rebuilt from the LOG record
+/// because BLOB serves only blobs. CommitRecord has no extra headers
+/// (`gpgsig`, `mergetag`, `encoding`), so for commits that carry them the
+/// output isn't the object's bytes and won't hash to its OID.
+async fn commit_object(
+    repository: &mut Repository,
+    object: &ObjectId,
+) -> Result<Option<Vec<u8>>, String> {
     let records = repository
         .query(
             QueryBody::Log {
@@ -747,12 +752,11 @@ async fn commit_object(repository: &mut Repository, object: &ObjectId) -> Option
             1,
             1,
         )
-        .await
-        .ok()?;
-    records.into_iter().find_map(|record| match record {
+        .await?;
+    Ok(records.into_iter().find_map(|record| match record {
         QueryRecord::Commit(commit) => Some(render_commit(&commit)),
         _ => None,
-    })
+    }))
 }
 
 fn render_commit(commit: &git::CommitRecord) -> Vec<u8> {
