@@ -2488,6 +2488,25 @@ fn vectors(artifact: &Artifact) -> VectorArtifact {
     push_u32(&mut fs_commit, 0);
     push_vector(&mut vectors, "fs.commit.payload", &fs_commit);
 
+    let mut fs_publish = Vec::new();
+    push_u64(&mut fs_publish, 1);
+    push_bytes_u32(&mut fs_publish, &fs_path_a);
+    push_bytes_u32(&mut fs_publish, &fs_path_b);
+    push_bytes_u32(&mut fs_publish, &fs_precondition);
+    fs_publish.extend_from_slice(&[6; 16]);
+    push_u64(&mut fs_publish, 3);
+    fs_publish.extend_from_slice(&[3; 32]);
+    push_u32(&mut fs_publish, 0);
+    push_vector(&mut vectors, "fs.publish.payload", &fs_publish);
+
+    let mut fs_publish_result = vec![1, 0, 0, 0];
+    push_u32(&mut fs_publish_result, 0);
+    push_vector(
+        &mut vectors,
+        "fs.publish_result.payload",
+        &fs_publish_result,
+    );
+
     let mut fs_apply_item_body = Vec::new();
     push_bytes_u32(&mut fs_apply_item_body, &fs_path_a);
     push_bytes_u32(&mut fs_apply_item_body, &fs_precondition);

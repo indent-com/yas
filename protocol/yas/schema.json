@@ -5130,6 +5130,15 @@
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "root_handle:u64,operation_id:[u8;16],flags:u16,item_count:u16,repeated item_len:u32,item_kind:u16,item_flags:u16,item_body,Extensions; ResultPrefix + root_revision:u64,result_count:u16,reserved:u16=0,repeated ApplyItemResult,Extensions"
+        },
+        {
+          "name": "PUBLISH",
+          "kind": 12,
+          "direction": "client_to_server",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "root_handle:u64,source:bytes_u32 containing WirePath,destination:bytes_u32 containing WirePath,precondition:bytes_u32 containing destination Precondition,operation_id:[u8;16],byte_len:u64,content_hash:[u8;32] BLAKE3,Extensions; ResultPrefix + durable:u8 (0 or 1),reserved:[u8;3]=0,Extensions; offered with CAPABILITY_PUBLISH; source and destination must be distinct nonroot paths in the same directory, reached through a pinned root and nofollow directory-relative walk (symlink parents refused); only Any and atomic no-replace Absent preconditions are supported, Hash/Revision return UNSUPPORTED before mutation; source retained; server copies a pinned nofollow regular source in 64 KiB chunks into an adjacent temporary file, checks length and hash, syncs and closes that file, atomically replaces destination subject to its precondition, then syncs the parent; durable=0 means replacement happened but post-publication durability confirmation failed; pre-publication failures use non-OK status; connection or result loss means unknown outcome, never replay into a new session"
         }
       ],
       "events": [
@@ -5844,8 +5853,16 @@
           "value": 32
         },
         {
+          "name": "MAX_PUBLISH_BYTES",
+          "value": 1073741824
+        },
+        {
+          "name": "CAPABILITY_PUBLISH",
+          "value": 64
+        },
+        {
           "name": "CAPABILITY_FLAGS",
-          "value": 63
+          "value": 127
         }
       ]
     },

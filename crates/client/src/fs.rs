@@ -40,7 +40,7 @@ use yas_wire::{
     state::Watch as StateWatch,
 };
 
-pub use yas_wire::fs::{OsError, Precondition};
+pub use yas_wire::fs::{OsError, Precondition, PublishResult};
 
 use crate::client::{Client, DEFAULT_REQUEST_TIMEOUT, Hook, Route};
 use crate::error::{Error, Result};
@@ -886,6 +886,45 @@ impl FsRoot {
         .await
     }
 
+    /// Publish a native copy of `source` by atomic replacement of `destination`, after
+    /// verifying its exact length and BLAKE3 hash. Both paths must name distinct files
+    /// in the same directory below this root, reached without symlink parents. The source
+    /// is retained for caller cleanup. Only `Any` and atomic no-replace `Absent` are supported;
+    /// hash/revision CAS against external writers is explicitly unsupported.
+    /// Requires `CAPABILITY_PUBLISH`; there is no fallback or automatic replay.
+    ///
+    /// `Ok` means replacement happened, including when `durable` is false (durability
+    /// confirmation failed after replacement). A timeout, disconnect or lost result
+    /// leaves the outcome unknown: never replay the operation into a new session.
+    pub async fn publish(
+        &self,
+        source: &str,
+        destination: &str,
+        byte_len: u64,
+        content_hash: [u8; 32],
+        precondition: Precondition,
+    ) -> Result<PublishResult> {
+        validate_publish(self.client.fs_capabilities(), byte_len)?;
+        if !matches!(precondition, Precondition::Any | Precondition::Absent) {
+            return Err(Error::Unsupported(
+                "FS PUBLISH accepts only Any or Absent preconditions".into(),
+            ));
+        }
+        let request = wire::Publish {
+            root_handle: self.handle,
+            source: wire_path(source)?,
+            destination: wire_path(destination)?,
+            precondition,
+            operation_id: nonzero_id(),
+            byte_len,
+            content_hash,
+            extensions: Extensions::default(),
+        };
+        self.client
+            .request(family::FS, request_kind::PUBLISH, &request)
+            .await
+    }
+
     /// Stage `content` (`STAGE_WRITE`, upload) and `COMMIT` it.
     async fn stage_and_commit(
         &self,
@@ -1167,6 +1206,19 @@ pub fn conflict_detail(error: &Error) -> Option<ConflictDetail> {
     }
 }
 
+fn validate_publish(capabilities: u32, byte_len: u64) -> Result<()> {
+    if capabilities & schema::CAPABILITY_PUBLISH as u32 == 0 {
+        return Err(Error::Unsupported("FS PUBLISH is not advertised".into()));
+    }
+    if byte_len > schema::MAX_PUBLISH_BYTES {
+        return Err(Error::invalid(format!(
+            "file is {byte_len} bytes; the YAS publish limit is {}",
+            schema::MAX_PUBLISH_BYTES
+        )));
+    }
+    Ok(())
+}
+
 fn item_path(item: &ApplyItem) -> Path {
     match item {
         ApplyItem::WriteInline { path, .. }
@@ -1224,6 +1276,24 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publish_requires_its_capability_and_hard_size_bound() {
+        for capabilities in [0, schema::CAPABILITY_PUBLISH as u32 - 1, 1 << 31] {
+            assert!(matches!(
+                validate_publish(capabilities, 0),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        let capability = schema::CAPABILITY_PUBLISH as u32;
+        assert!(validate_publish(capability, 0).is_ok());
+        assert!(validate_publish(capability, schema::MAX_PUBLISH_BYTES).is_ok());
+        assert!(matches!(
+            validate_publish(capability, schema::MAX_PUBLISH_BYTES + 1),
+            Err(Error::Invalid(_))
+        ));
+        assert!(validate_publish(capability | (1 << 31), 1).is_ok());
+    }
 
     #[test]
     fn paths_are_relative_components() {

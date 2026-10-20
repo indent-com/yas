@@ -978,6 +978,7 @@ export const YAS_FS_GREP = 8 as const;
 export const YAS_FS_STAGE_WRITE = 9 as const;
 export const YAS_FS_COMMIT = 10 as const;
 export const YAS_FS_APPLY = 11 as const;
+export const YAS_FS_PUBLISH = 12 as const;
 export const YAS_FS_STATE = 0 as const;
 export const YAS_FS_STATE_ACK = 1 as const;
 export const YAS_FS_SOURCE_PLATFORM_PATH = 0 as const;
@@ -1125,7 +1126,9 @@ export const YAS_FS_CAPABILITY_READ_REALPATH = 4 as const;
 export const YAS_FS_CAPABILITY_READ_STAT_ONLY = 8 as const;
 export const YAS_FS_CAPABILITY_STAGE_IN_PLACE = 16 as const;
 export const YAS_FS_CAPABILITY_APPLY_IN_PLACE = 32 as const;
-export const YAS_FS_CAPABILITY_FLAGS = 63 as const;
+export const YAS_FS_MAX_PUBLISH_BYTES = 1073741824 as const;
+export const YAS_FS_CAPABILITY_PUBLISH = 64 as const;
+export const YAS_FS_CAPABILITY_FLAGS = 127 as const;
 export const YAS_FAMILY_GIT = 49 as const;
 export const YAS_GIT_VERSION = 1 as const;
 export const YAS_GIT_OPEN = 0 as const;
@@ -2556,6 +2559,8 @@ export const YAS_OPERATION_POLICIES: Readonly<Record<string, YasOperationPolicy>
   "48/2/10": [1, 0, 0],
   "48/1/11": [1, 0, 0],
   "48/2/11": [1, 0, 0],
+  "48/1/12": [1, 0, 0],
+  "48/2/12": [1, 0, 0],
   "48/0/0": [1, 0, 0],
   "48/0/1": [0, 0, 0],
   "49/1/0": [1, 0, 0],
@@ -2842,6 +2847,7 @@ export const YAS_OPERATION_DIRECTION_MASKS: Readonly<Record<string, number>> = {
   "48/1/9": 1,
   "48/1/10": 1,
   "48/1/11": 1,
+  "48/1/12": 1,
   "48/0/0": 2,
   "48/0/1": 1,
   "49/1/0": 1,
@@ -8062,6 +8068,15 @@ export const YAS_SCHEMA = {
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "root_handle:u64,operation_id:[u8;16],flags:u16,item_count:u16,repeated item_len:u32,item_kind:u16,item_flags:u16,item_body,Extensions; ResultPrefix + root_revision:u64,result_count:u16,reserved:u16=0,repeated ApplyItemResult,Extensions"
+        },
+        {
+          "name": "PUBLISH",
+          "kind": 12,
+          "direction": "client_to_server",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "root_handle:u64,source:bytes_u32 containing WirePath,destination:bytes_u32 containing WirePath,precondition:bytes_u32 containing destination Precondition,operation_id:[u8;16],byte_len:u64,content_hash:[u8;32] BLAKE3,Extensions; ResultPrefix + durable:u8 (0 or 1),reserved:[u8;3]=0,Extensions; offered with CAPABILITY_PUBLISH; source and destination must be distinct nonroot paths in the same directory, reached through a pinned root and nofollow directory-relative walk (symlink parents refused); only Any and atomic no-replace Absent preconditions are supported, Hash/Revision return UNSUPPORTED before mutation; source retained; server copies a pinned nofollow regular source in 64 KiB chunks into an adjacent temporary file, checks length and hash, syncs and closes that file, atomically replaces destination subject to its precondition, then syncs the parent; durable=0 means replacement happened but post-publication durability confirmation failed; pre-publication failures use non-OK status; connection or result loss means unknown outcome, never replay into a new session"
         }
       ],
       "events": [
@@ -8776,8 +8791,16 @@ export const YAS_SCHEMA = {
           "value": 32
         },
         {
+          "name": "MAX_PUBLISH_BYTES",
+          "value": 1073741824
+        },
+        {
+          "name": "CAPABILITY_PUBLISH",
+          "value": 64
+        },
+        {
           "name": "CAPABILITY_FLAGS",
-          "value": 63
+          "value": 127
         }
       ]
     },
@@ -15299,6 +15322,10 @@ export const YAS_GOLDEN_VECTORS = {
       "hex": "30000b000901000000"
     },
     {
+      "name": "yas.fs.request.publish.header",
+      "hex": "30000c000901000000"
+    },
+    {
       "name": "yas.fs.event.state.header",
       "hex": "3000000008"
     },
@@ -16029,6 +16056,14 @@ export const YAS_GOLDEN_VECTORS = {
     {
       "name": "fs.commit.payload",
       "hex": "0200000000000000040404040404040404040404040404040100000000000000"
+    },
+    {
+      "name": "fs.publish.payload",
+      "hex": "01000000000000000500000001000100610500000001000100620400000001000000060606060606060606060606060606060300000000000000030303030303030303030303030303030303030303030303030303030303030300000000"
+    },
+    {
+      "name": "fs.publish_result.payload",
+      "hex": "0100000000000000"
     },
     {
       "name": "fs.apply.payload",

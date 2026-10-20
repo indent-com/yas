@@ -59,6 +59,8 @@ struct SessionInner {
     next_stage: AtomicU64,
     staging_root: StdMutex<Option<PathBuf>>,
     replay: StdMutex<ReplayCache>,
+    /// Serialize PUBLISH replay lookup, publication and recording, not legacy FS operations.
+    publication: tokio::sync::Mutex<()>,
     closed: AtomicBool,
 }
 
@@ -67,6 +69,10 @@ struct Root {
     path: PathBuf,
     canonical_path: Vec<u8>,
     single_file: bool,
+    /// Native publication retains the authorized directory identity even if its path moves.
+    /// Failure to open this optional handle does not change legacy root admission.
+    #[cfg(unix)]
+    publication_dir: Option<File>,
     revision: AtomicU64,
     entries: StdMutex<BTreeMap<wire::Path, EntryVersion>>,
     operation_echoes: StdMutex<BTreeMap<wire::Path, [u8; 16]>>,
@@ -127,6 +133,7 @@ struct Stage {
 enum ReplayValue {
     Commit(wire::CommitResult),
     Apply(wire::ApplyResult),
+    Publish(wire::PublishResult),
 }
 
 #[derive(Default)]
@@ -171,6 +178,9 @@ pub(crate) enum Error {
     NotFound,
     Permission,
     Conflict(wire::ConflictDetail),
+    /// A conflict for which observing the current destination would itself be unsafe/unbounded.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "native PUBLISH is Unix-only"))]
+    PreconditionFailed,
     ResourceExhausted,
     TooLarge,
     Unsupported,
@@ -225,7 +235,9 @@ impl std::fmt::Display for Error {
             Self::Unavailable => formatter.write_str("FS family is unavailable"),
             Self::NotFound => formatter.write_str("filesystem entry not found"),
             Self::Permission => formatter.write_str("filesystem operation is not permitted"),
-            Self::Conflict(_) => formatter.write_str("filesystem precondition failed"),
+            Self::Conflict(_) | Self::PreconditionFailed => {
+                formatter.write_str("filesystem precondition failed")
+            }
             Self::ResourceExhausted => formatter.write_str("filesystem resource limit reached"),
             Self::TooLarge => formatter.write_str("filesystem value is too large"),
             Self::Unsupported => formatter.write_str("filesystem operation is unsupported"),
@@ -243,6 +255,11 @@ impl Runtime {
         let enabled = !std::env::var("YAS_FS").is_ok_and(|value| value == "0");
         let writes_enabled = !std::env::var("YAS_FS_WRITE").is_ok_and(|value| value == "0");
         let mut limits = wire::Limits::HARD;
+        // PUBLISH promises a synced parent directory, not the no-op directory sync on Windows.
+        #[cfg(not(unix))]
+        {
+            limits.capabilities &= !(schema::fs::CAPABILITY_PUBLISH as u32);
+        }
         limits.max_catalog_entries = u32::try_from(sync::SyncOptions::default().max_entries)
             .unwrap_or(u32::MAX)
             .clamp(1, wire::Limits::HARD.max_catalog_entries);
@@ -291,6 +308,7 @@ impl Runtime {
                 next_stage: AtomicU64::new(1),
                 staging_root: StdMutex::new(None),
                 replay: StdMutex::new(ReplayCache::default()),
+                publication: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
             }),
         })
@@ -299,15 +317,36 @@ impl Runtime {
     fn root(&self, path: PathBuf) -> Result<Arc<Root>, Error> {
         let mut roots = self.inner.roots.lock().unwrap();
         roots.retain(|_, root| root.strong_count() != 0);
+        let metadata = fs::symlink_metadata(&path).map_err(os_io("lstat"))?;
+        #[cfg(unix)]
+        let publication_dir = publication_directory(&path);
         if let Some(root) = roots.get(&path).and_then(Weak::upgrade) {
-            return Ok(root);
+            #[cfg(unix)]
+            let same = match (&root.publication_dir, &publication_dir) {
+                (Some(previous), Some(current)) => {
+                    use std::os::unix::fs::MetadataExt;
+                    previous
+                        .metadata()
+                        .ok()
+                        .zip(current.metadata().ok())
+                        .is_some_and(|(a, b)| (a.dev(), a.ino()) == (b.dev(), b.ino()))
+                }
+                // An unpinned root cannot prove identity for a fresh admission.
+                _ => false,
+            };
+            #[cfg(not(unix))]
+            let same = true;
+            if same {
+                return Ok(root);
+            }
         }
         let handle = next_nonzero(&self.inner.next_root).ok_or(Error::ResourceExhausted)?;
-        let metadata = fs::symlink_metadata(&path).map_err(os_io("lstat"))?;
         let root = Arc::new(Root {
             handle,
             canonical_path: os_path_bytes(&path),
             single_file: !metadata.is_dir(),
+            #[cfg(unix)]
+            publication_dir,
             path: path.clone(),
             revision: AtomicU64::new(1),
             entries: StdMutex::new(BTreeMap::new()),
@@ -668,13 +707,15 @@ impl Session {
         if let Some(value) = self.replay(&request.operation_id, fingerprint)? {
             return match value {
                 ReplayValue::Commit(value) => Ok(value),
-                ReplayValue::Apply(_) => Err(Error::Conflict(wire::ConflictDetail {
-                    path: wire::Path::default(),
-                    current_present: false,
-                    current_entry_revision: 0,
-                    modified_unix_ns: 0,
-                    current_hash: None,
-                })),
+                ReplayValue::Apply(_) | ReplayValue::Publish(_) => {
+                    Err(Error::Conflict(wire::ConflictDetail {
+                        path: wire::Path::default(),
+                        current_present: false,
+                        current_entry_revision: 0,
+                        modified_unix_ns: 0,
+                        current_hash: None,
+                    }))
+                }
             };
         }
         let stage = {
@@ -714,7 +755,9 @@ impl Session {
         if let Some(value) = self.replay(&request.operation_id, fingerprint)? {
             return match value {
                 ReplayValue::Apply(value) => Ok(value),
-                ReplayValue::Commit(_) => Err(Error::Invalid("FS operation ID reused")),
+                ReplayValue::Commit(_) | ReplayValue::Publish(_) => {
+                    Err(Error::Invalid("FS operation ID reused"))
+                }
             };
         }
         let root = opened.root;
@@ -727,6 +770,52 @@ impl Session {
             request.operation_id,
             fingerprint,
             ReplayValue::Apply(result.clone()),
+        );
+        Ok(result)
+    }
+
+    /// A bounded, verified copy of a caller-owned adjacent file. The result distinguishes
+    /// publication from durability: failure to sync the directory cannot undo the rename.
+    pub(crate) async fn publish(
+        &self,
+        request: &wire::Publish,
+    ) -> Result<wire::PublishResult, Error> {
+        let _publication = self.inner.publication.lock().await;
+        self.ensure_open()?;
+        if !self
+            .inner
+            .runtime
+            .inner
+            .limits
+            .supports(schema::fs::CAPABILITY_PUBLISH)
+        {
+            return Err(Error::Unsupported);
+        }
+        let opened = self.opened(request.root_handle)?;
+        if opened.read_only {
+            return Err(Error::Permission);
+        }
+        let fingerprint = request_fingerprint(request)?;
+        if let Some(value) = self.replay(&request.operation_id, fingerprint)? {
+            return match value {
+                ReplayValue::Publish(value) => Ok(value),
+                _ => Err(Error::Invalid("FS operation ID reused")),
+            };
+        }
+        let root = opened.root;
+        let request = request.clone();
+        let operation_id = request.operation_id;
+        let result = tokio::task::spawn_blocking(move || {
+            publish_file(&root, &request, |parent| {
+                parent.sync_all().map_err(os_io("fsync"))
+            })
+        })
+        .await
+        .map_err(|_| Error::Internal)??;
+        self.remember_replay(
+            operation_id,
+            fingerprint,
+            ReplayValue::Publish(result.clone()),
         );
         Ok(result)
     }
@@ -1726,7 +1815,7 @@ fn status_for(error: &Error) -> u16 {
     match error.kind() {
         Error::NotFound => schema::core::status::NOT_FOUND,
         Error::Permission => schema::core::status::IO,
-        Error::Conflict(_) => schema::core::status::CONFLICT,
+        Error::Conflict(_) | Error::PreconditionFailed => schema::core::status::CONFLICT,
         Error::ResourceExhausted | Error::TooLarge => schema::core::status::RESOURCE_EXHAUSTED,
         Error::Unsupported => schema::core::status::UNSUPPORTED,
         Error::Invalid(_) => schema::core::status::INVALID,
@@ -2937,6 +3026,33 @@ fn atomic_write(
     atomic_replace(&target, mode, false, |file| file.write_all(content))
 }
 
+#[cfg(unix)]
+fn publication_directory(path: &OsPath) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()
+}
+
+#[cfg(unix)]
+#[path = "yas_fs_publish.rs"]
+mod publication;
+#[cfg(unix)]
+use publication::publish_file;
+#[cfg(all(test, unix))]
+use publication::publish_file_with_open_hook;
+
+#[cfg(not(unix))]
+fn publish_file(
+    _root: &Root,
+    _request: &wire::Publish,
+    _sync_parent: impl FnOnce(&File) -> Result<(), Error>,
+) -> Result<wire::PublishResult, Error> {
+    Err(Error::Unsupported)
+}
+
 fn atomic_replace(
     target: &OsPath,
     mode: u32,
@@ -3088,6 +3204,14 @@ fn set_private_directory(_path: &OsPath) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+#[path = "yas_fs_publish_tests.rs"]
+mod publish_tests;
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "yas_fs_publish_session_tests.rs"]
+mod publish_session_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3128,6 +3252,8 @@ mod tests {
             handle: 1,
             canonical_path: os_path_bytes(&path),
             single_file: false,
+            #[cfg(unix)]
+            publication_dir: publication_directory(&path),
             path,
             revision: AtomicU64::new(1),
             entries: StdMutex::new(BTreeMap::new()),

@@ -2251,6 +2251,7 @@ pub const GREP: u16 = 0x0008;
 pub const STAGE_WRITE: u16 = 0x0009;
 pub const COMMIT: u16 = 0x000a;
 pub const APPLY: u16 = 0x000b;
+pub const PUBLISH: u16 = 0x000c;
 }
 pub mod event {
 pub const STATE: u16 = 0x0000;
@@ -2401,7 +2402,9 @@ pub const CAPABILITY_READ_REALPATH: u64 = 4;
 pub const CAPABILITY_READ_STAT_ONLY: u64 = 8;
 pub const CAPABILITY_STAGE_IN_PLACE: u64 = 16;
 pub const CAPABILITY_APPLY_IN_PLACE: u64 = 32;
-pub const CAPABILITY_FLAGS: u64 = 63;
+pub const MAX_PUBLISH_BYTES: u64 = 1073741824;
+pub const CAPABILITY_PUBLISH: u64 = 64;
+pub const CAPABILITY_FLAGS: u64 = 127;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "OPEN", class: 1, kind: 0, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "flags:u16,reserved:u16=0,source:bytes_u32 containing RootSource,Extensions; ResultPrefix + root_handle:u64,root_revision:u64,path_model:u8,case_behavior:u8,reserved:u16=0,canonical_path:bytes_u32,Extensions" },
 super::OperationMetadata { name: "CLOSE", class: 1, kind: 1, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,Extensions; ResultPrefix; idempotent and invalidates root-scoped watches/stages" },
@@ -2415,6 +2418,7 @@ super::OperationMetadata { name: "GREP", class: 1, kind: 8, direction: 0, sensit
 super::OperationMetadata { name: "STAGE_WRITE", class: 1, kind: 9, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,path:bytes_u32 containing WirePath,precondition:bytes_u32 containing Precondition,flags:u16,reserved:u16=0,mode:u32,byte_len:u64,content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + staging_handle:u64,descriptor:bytes_u32 containing sensitive receiver-to-sender BYTE TransferDescriptor with required upload-stage extension naming that handle,Extensions; before COMMIT succeeds, RESET of the returned descriptor discards the stage; a CONFLICT ResultPrefix detail Extensions contains optional tag RESULT_CONFLICT_DETAIL_EXTENSION with exact ConflictDetail value" },
 super::OperationMetadata { name: "COMMIT", class: 1, kind: 10, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "staging_handle:u64,operation_id:[u8;16],flags:u16,reserved:u16=0,Extensions; ResultPrefix + root_revision:u64,entry_revision:u64,modified_unix_ns:i64,content_hash:[u8;32]; a CONFLICT ResultPrefix detail Extensions contains optional tag RESULT_CONFLICT_DETAIL_EXTENSION with exact ConflictDetail value" },
 super::OperationMetadata { name: "APPLY", class: 1, kind: 11, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,operation_id:[u8;16],flags:u16,item_count:u16,repeated item_len:u32,item_kind:u16,item_flags:u16,item_body,Extensions; ResultPrefix + root_revision:u64,result_count:u16,reserved:u16=0,repeated ApplyItemResult,Extensions" },
+super::OperationMetadata { name: "PUBLISH", class: 1, kind: 12, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "root_handle:u64,source:bytes_u32 containing WirePath,destination:bytes_u32 containing WirePath,precondition:bytes_u32 containing destination Precondition,operation_id:[u8;16],byte_len:u64,content_hash:[u8;32] BLAKE3,Extensions; ResultPrefix + durable:u8 (0 or 1),reserved:[u8;3]=0,Extensions; offered with CAPABILITY_PUBLISH; source and destination must be distinct nonroot paths in the same directory, reached through a pinned root and nofollow directory-relative walk (symlink parents refused); only Any and atomic no-replace Absent preconditions are supported, Hash/Revision return UNSUPPORTED before mutation; source retained; server copies a pinned nofollow regular source in 64 KiB chunks into an adjacent temporary file, checks length and hash, syncs and closes that file, atomically replaces destination subject to its precondition, then syncs the parent; durable=0 means replacement happened but post-publication durability confirmation failed; pre-publication failures use non-OK status; connection or result loss means unknown outcome, never replay into a new session" },
 super::OperationMetadata { name: "STATE", class: 0, kind: 0, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "StateEvent<EntryRecord|EntryPatch|RemoveRecord|MoveRecord>; known family record kinds includes RECORD_MOVE" },
 super::OperationMetadata { name: "STATE_ACK", class: 0, kind: 1, direction: 0, sensitive: 0, compression: 0, datagram: 0, layout: "StateAck" },
 ];
@@ -2609,7 +2613,9 @@ super::ConstantMetadata { name: "CAPABILITY_READ_REALPATH", value: 4 },
 super::ConstantMetadata { name: "CAPABILITY_READ_STAT_ONLY", value: 8 },
 super::ConstantMetadata { name: "CAPABILITY_STAGE_IN_PLACE", value: 16 },
 super::ConstantMetadata { name: "CAPABILITY_APPLY_IN_PLACE", value: 32 },
-super::ConstantMetadata { name: "CAPABILITY_FLAGS", value: 63 },
+super::ConstantMetadata { name: "MAX_PUBLISH_BYTES", value: 1073741824 },
+super::ConstantMetadata { name: "CAPABILITY_PUBLISH", value: 64 },
+super::ConstantMetadata { name: "CAPABILITY_FLAGS", value: 127 },
 ];
 }
 pub mod git {
@@ -5016,6 +5022,7 @@ GoldenVector { name: "yas.fs.request.grep.header", hex: "300008000901000000" },
 GoldenVector { name: "yas.fs.request.stage_write.header", hex: "300009000901000000" },
 GoldenVector { name: "yas.fs.request.commit.header", hex: "30000a000901000000" },
 GoldenVector { name: "yas.fs.request.apply.header", hex: "30000b000901000000" },
+GoldenVector { name: "yas.fs.request.publish.header", hex: "30000c000901000000" },
 GoldenVector { name: "yas.fs.event.state.header", hex: "3000000008" },
 GoldenVector { name: "yas.fs.event.state_ack.header", hex: "3000010000" },
 GoldenVector { name: "yas.git.request.open.header", hex: "310000000901000000" },
@@ -5199,6 +5206,8 @@ GoldenVector { name: "fs.index.payload", hex: "010000000000000001000a00000000040
 GoldenVector { name: "fs.grep.payload", hex: "01000000000000000200140005000000090000007961732e2a776972650000000400000000000000000000" },
 GoldenVector { name: "fs.stage_write.payload", hex: "0100000000000000050000000100010061040000000100000001000000a401000003000000000000000303030303030303030303030303030303030303030303030303030303030303000400000000000000000000" },
 GoldenVector { name: "fs.commit.payload", hex: "0200000000000000040404040404040404040404040404040100000000000000" },
+GoldenVector { name: "fs.publish.payload", hex: "01000000000000000500000001000100610500000001000100620400000001000000060606060606060606060606060606060300000000000000030303030303030303030303030303030303030303030303030303030303030300000000" },
+GoldenVector { name: "fs.publish_result.payload", hex: "0100000000000000" },
 GoldenVector { name: "fs.apply.payload", hex: "0100000000000000050505050505050505050505050505050100010020000000000000000500000001000100610400000001000000a40100000300000079617300000000" },
 GoldenVector { name: "fs.apply.in_place.payload", hex: "0100000000000000050505050505050505050505050505050000010020000000000002000500000001000100610400000001000000a40100000300000079617300000000" },
 GoldenVector { name: "fs.entry.inline.payload", hex: "050000000100010061010000000000000000000000a4010000010000000000000003000000000000000606060606060606060606060606060606060606060606060606060606060606010000000300000079617300000000" },

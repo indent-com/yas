@@ -55,6 +55,7 @@ export {
   YAS_FS_GREP,
   YAS_FS_INDEX,
   YAS_FS_OPEN,
+  YAS_FS_PUBLISH,
   YAS_FS_READ,
   YAS_FS_SEARCH,
   YAS_FS_STAGE_WRITE,
@@ -210,6 +211,23 @@ export type YasFsPrecondition =
   | { kind: "absent" }
   | { kind: "revision"; revision: bigint }
   | { kind: "hash"; contentHash: Uint8Array };
+
+export interface YasFsPublish {
+  rootHandle: bigint;
+  source: YasFsPath;
+  destination: YasFsPath;
+  precondition: YasFsPrecondition;
+  operationId: Uint8Array;
+  byteLength: bigint;
+  contentHash: Uint8Array;
+  extensions?: readonly YasExtension[];
+}
+
+export interface YasFsPublishResult {
+  /** False still means publication occurred; parent-directory durability was not confirmed. */
+  durable: boolean;
+  extensions: readonly YasExtension[];
+}
 
 export interface YasFsStageWrite {
   rootHandle: bigint;
@@ -1478,6 +1496,85 @@ export function decodeFsConflictDetail(bytes: Uint8Array): YasFsConflictDetail {
   };
   cursor.end("FS conflict detail");
   encodeFsConflictDetail(value);
+  return value;
+}
+
+export function encodeFsPublish(value: YasFsPublish): Uint8Array {
+  requireHandle(value.rootHandle, "FS root handle");
+  validatePath(value.source);
+  validatePath(value.destination);
+  if (
+    value.source.components.length === 0 ||
+    value.destination.components.length === 0 ||
+    samePath(value.source, value.destination) ||
+    !samePath(
+      { components: value.source.components.slice(0, -1) },
+      { components: value.destination.components.slice(0, -1) },
+    )
+  )
+    throw new YasProtocolError(
+      "FS PUBLISH requires distinct nonroot sibling paths",
+    );
+  requireOperationId(value.operationId);
+  requireHash(value.contentHash);
+  if (
+    value.byteLength < 0n ||
+    value.byteLength > BigInt(g.YAS_FS_MAX_PUBLISH_BYTES)
+  )
+    throw new YasProtocolError("FS published bytes exceed their limit");
+  return new YasWriter()
+    .u64(value.rootHandle)
+    .bytesU32(encodeFsPath(value.source))
+    .bytesU32(encodeFsPath(value.destination))
+    .bytesU32(encodeFsPrecondition(value.precondition))
+    .bytes(value.operationId)
+    .u64(value.byteLength)
+    .bytes(value.contentHash)
+    .bytes(encodeExtensions(value.extensions))
+    .finish();
+}
+
+export function decodeFsPublish(bytes: Uint8Array): YasFsPublish {
+  const cursor = new YasCursor(bytes);
+  const value = {
+    rootHandle: cursor.u64("FS root handle"),
+    source: decodeFsPath(cursor.bytesU32("FS PUBLISH source")),
+    destination: decodeFsPath(cursor.bytesU32("FS PUBLISH destination")),
+    precondition: decodeFsPrecondition(cursor.bytesU32("FS precondition")),
+    operationId: new Uint8Array(cursor.take(16, "FS operation ID")),
+    byteLength: cursor.u64("FS published byte length"),
+    contentHash: new Uint8Array(cursor.take(32, "FS content hash")),
+    extensions: decodeExtensions(cursor, new Set(), "FS PUBLISH extensions"),
+  };
+  cursor.end("FS PUBLISH");
+  encodeFsPublish(value);
+  return value;
+}
+
+export function encodeFsPublishResult(value: YasFsPublishResult): Uint8Array {
+  if (typeof value.durable !== "boolean")
+    throw new YasProtocolError("invalid FS PUBLISH durability");
+  return new YasWriter()
+    .u8(value.durable ? 1 : 0)
+    .bytes(new Uint8Array(3))
+    .bytes(encodeExtensions(value.extensions))
+    .finish();
+}
+
+export function decodeFsPublishResult(bytes: Uint8Array): YasFsPublishResult {
+  const cursor = new YasCursor(bytes);
+  const durable = cursor.u8("FS PUBLISH durability");
+  if (durable > 1) throw new YasProtocolError("invalid FS PUBLISH durability");
+  requireZero(cursor.take(3, "FS PUBLISH Result reserved"), "FS PUBLISH Result");
+  const value = {
+    durable: Boolean(durable),
+    extensions: decodeExtensions(
+      cursor,
+      new Set(),
+      "FS PUBLISH Result extensions",
+    ),
+  };
+  cursor.end("FS PUBLISH Result");
   return value;
 }
 

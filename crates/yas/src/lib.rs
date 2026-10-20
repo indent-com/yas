@@ -538,6 +538,26 @@ mod generated_artifact_tests {
             ("fs.commit.payload", true, |bytes| {
                 fs::Commit::decode(bytes).map(|_| ())
             }),
+            ("fs.publish.payload", true, |bytes| {
+                let value = fs::Publish::decode(bytes)?;
+                assert_eq!(value.root_handle, 1);
+                assert_eq!(value.source.components, vec![b"a".to_vec()]);
+                assert_eq!(value.destination.components, vec![b"b".to_vec()]);
+                assert_eq!(value.precondition, fs::Precondition::Absent);
+                assert_eq!(value.operation_id, [6; 16]);
+                assert_eq!(value.byte_len, 3);
+                assert_eq!(value.content_hash, [3; 32]);
+                assert_eq!(value.extensions, Extensions::default());
+                assert_eq!(value.encode()?, bytes);
+                Ok(())
+            }),
+            ("fs.publish_result.payload", true, |bytes| {
+                let value = fs::PublishResult::decode(bytes)?;
+                assert!(value.durable);
+                assert_eq!(value.extensions, Extensions::default());
+                assert_eq!(value.encode()?, bytes);
+                Ok(())
+            }),
             ("fs.apply.payload", true, |bytes| {
                 fs::Apply::decode(bytes).map(|_| ())
             }),

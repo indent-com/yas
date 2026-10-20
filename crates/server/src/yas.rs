@@ -3240,6 +3240,7 @@ enum FsOperationOutcome {
         outcome: Result<yas_fs_wire::CommitResult, super::yas_fs::Error>,
     },
     Apply(Result<yas_fs_wire::ApplyResult, super::yas_fs::Error>),
+    Publish(Result<yas_fs_wire::PublishResult, super::yas_fs::Error>),
 }
 
 enum FsQueryRequest {
@@ -3261,6 +3262,7 @@ fn is_fs_semantic_operation(kind: u16) -> bool {
             | yas_wire::schema::fs::request::GREP
             | yas_wire::schema::fs::request::COMMIT
             | yas_wire::schema::fs::request::APPLY
+            | yas_wire::schema::fs::request::PUBLISH
     )
 }
 
@@ -18985,6 +18987,46 @@ impl Session {
                 );
                 Ok(())
             }
+            yas_wire::schema::fs::request::PUBLISH => {
+                let request = match yas_fs_wire::Publish::decode(&frame.payload) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return self
+                            .send_sensitive_result(&frame, Status::Invalid, Vec::new())
+                            .await;
+                    }
+                };
+                let service = self.fs.as_ref().ok_or(())?.session.clone();
+                let internal = self.internal.clone();
+                let request_id = frame.header.request_id.ok_or(())?;
+                let (semantic_id, semantic_slot) =
+                    semantic_admission.expect("FS PUBLISH is a semantic operation");
+                let task = tokio::spawn(async move {
+                    let outcome = FsOperationOutcome::Publish(service.publish(&request).await);
+                    let _ = internal
+                        .send(Internal::FsOperationComplete {
+                            request_id,
+                            semantic_id,
+                            outcome,
+                        })
+                        .await;
+                    drop(inbound_credit);
+                    drop(semantic_slot);
+                });
+                self.pending_requests.insert(
+                    request_id,
+                    PendingRequest {
+                        family: family::FS,
+                        kind: frame.header.kind,
+                        operation: PendingOperation::Fs {
+                            semantic_id,
+                            task,
+                            committed_mutation: true,
+                        },
+                    },
+                );
+                Ok(())
+            }
             yas_wire::schema::fs::request::APPLY => {
                 let request = match yas_fs_wire::Apply::decode(&frame.payload) {
                     Ok(request) => request,
@@ -25450,6 +25492,21 @@ impl Session {
                     Err(error) => self.send_fs_error_parts(kind, request_id, error).await,
                 }
             }
+            FsOperationOutcome::Publish(outcome) => match outcome {
+                Ok(result) => {
+                    let body = result.encode().map_err(|_| ())?;
+                    self.send_result_parts_with_sensitivity(
+                        family::FS,
+                        kind,
+                        request_id,
+                        Status::Ok,
+                        body,
+                        true,
+                    )
+                    .await
+                }
+                Err(error) => self.send_fs_error_parts(kind, request_id, error).await,
+            },
             FsOperationOutcome::Apply(outcome) => match outcome {
                 Ok(result) => {
                     let body = result.encode().map_err(|_| ())?;
@@ -31691,7 +31748,9 @@ fn fs_error_status(error: &super::yas_fs::Error) -> Status {
         super::yas_fs::Error::Unavailable | super::yas_fs::Error::Closed => Status::Unavailable,
         super::yas_fs::Error::NotFound => Status::NotFound,
         super::yas_fs::Error::Permission | super::yas_fs::Error::Io(_) => Status::Io,
-        super::yas_fs::Error::Conflict(_) => Status::Conflict,
+        super::yas_fs::Error::Conflict(_) | super::yas_fs::Error::PreconditionFailed => {
+            Status::Conflict
+        }
         super::yas_fs::Error::ResourceExhausted | super::yas_fs::Error::TooLarge => {
             Status::ResourceExhausted
         }
@@ -50620,6 +50679,7 @@ mod tests {
             yas_wire::schema::fs::request::GREP,
             yas_wire::schema::fs::request::COMMIT,
             yas_wire::schema::fs::request::APPLY,
+            yas_wire::schema::fs::request::PUBLISH,
         ]);
         let metadata = yas_wire::schema::family_metadata(family::FS, 1).expect("FS metadata");
         let mut seen_semantic = BTreeSet::new();

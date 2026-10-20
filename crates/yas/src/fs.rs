@@ -20,6 +20,7 @@ pub const MAX_INLINE_BYTES: usize = crate::schema::fs::MAX_INLINE_BYTES as usize
 pub const MAX_QUERY_RECORDS: usize = crate::schema::fs::MAX_QUERY_RECORDS as usize;
 pub const MAX_QUERY_BYTES: usize = crate::schema::fs::MAX_QUERY_BYTES as usize;
 pub const MAX_BATCH_ITEMS: usize = crate::schema::fs::MAX_BATCH_ITEMS as usize;
+pub const MAX_PUBLISH_BYTES: u64 = crate::schema::fs::MAX_PUBLISH_BYTES;
 
 pub mod request_kind {
     pub use crate::schema::fs::request::*;
@@ -2520,6 +2521,110 @@ impl Decode for CommitResult {
     }
 }
 
+/// Publish a retained adjacent source by verified native copy and atomic replacement.
+/// An operation with a lost result has an unknown outcome; never replay it in a new session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Publish {
+    pub root_handle: u64,
+    pub source: Path,
+    pub destination: Path,
+    pub precondition: Precondition,
+    pub operation_id: [u8; 16],
+    pub byte_len: u64,
+    pub content_hash: [u8; 32],
+    pub extensions: Extensions,
+}
+
+impl Encode for Publish {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        handle(self.root_handle, "zero FS root handle")?;
+        operation_id(&self.operation_id)?;
+        if self.source.components.is_empty()
+            || self.destination.components.is_empty()
+            || self.source == self.destination
+            || self.source.components[..self.source.components.len() - 1]
+                != self.destination.components[..self.destination.components.len() - 1]
+        {
+            return Err(Error::Invalid(
+                "FS PUBLISH requires distinct adjacent paths",
+            ));
+        }
+        if self.byte_len > crate::schema::fs::MAX_PUBLISH_BYTES {
+            return Err(limit(
+                "FS publish bytes",
+                self.byte_len,
+                crate::schema::fs::MAX_PUBLISH_BYTES,
+            ));
+        }
+        reject_unknown_required(&self.extensions, &[])?;
+        put_u64(out, self.root_handle);
+        put_bytes_u32(out, &self.source.encode()?)?;
+        put_bytes_u32(out, &self.destination.encode()?)?;
+        put_bytes_u32(out, &self.precondition.encode()?)?;
+        out.extend_from_slice(&self.operation_id);
+        put_u64(out, self.byte_len);
+        out.extend_from_slice(&self.content_hash);
+        self.extensions.encode_tail(out)
+    }
+}
+
+impl Decode for Publish {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let value = Self {
+            root_handle: decoder.u64()?,
+            source: Path::decode(decoder.len_bytes_u32()?)?,
+            destination: Path::decode(decoder.len_bytes_u32()?)?,
+            precondition: Precondition::decode(decoder.len_bytes_u32()?)?,
+            operation_id: decoder.array_16()?,
+            byte_len: decoder.u64()?,
+            content_hash: decoder.array_32()?,
+            extensions: decoder.extensions()?,
+        };
+        decoder.finish()?;
+        let mut ignored = Vec::new();
+        value.encode_to(&mut ignored)?;
+        Ok(value)
+    }
+}
+
+/// Successful publication: replacement happened even when `durable` is false.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishResult {
+    /// Whether post-publication durability was confirmed. False never means rollback.
+    pub durable: bool,
+    pub extensions: Extensions,
+}
+
+impl Encode for PublishResult {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        reject_unknown_required(&self.extensions, &[])?;
+        out.push(u8::from(self.durable));
+        out.extend_from_slice(&[0; 3]);
+        self.extensions.encode_tail(out)
+    }
+}
+
+impl Decode for PublishResult {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let durable = decoder.u8()?;
+        if durable > 1 || decoder.take(3)? != [0; 3] {
+            return Err(Error::Invalid(
+                "FS PUBLISH result durable or reserved field",
+            ));
+        }
+        let value = Self {
+            durable: durable != 0,
+            extensions: decoder.extensions()?,
+        };
+        decoder.finish()?;
+        let mut ignored = Vec::new();
+        value.encode_to(&mut ignored)?;
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyItem {
     WriteInline {
@@ -3033,6 +3138,95 @@ mod tests {
     fn path(name: &[u8]) -> Path {
         Path {
             components: vec![name.to_vec()],
+        }
+    }
+
+    #[test]
+    fn publish_round_trip_and_malformed_values() {
+        let publish = Publish {
+            root_handle: 1,
+            source: path(b"temporary"),
+            destination: path(b"final"),
+            precondition: Precondition::Hash([3; 32]),
+            operation_id: [4; 16],
+            byte_len: crate::schema::fs::MAX_PUBLISH_BYTES,
+            content_hash: [5; 32],
+            extensions: Extensions::default(),
+        };
+        let bytes = publish.encode().unwrap();
+        truncations::<Publish>(&bytes);
+        assert_eq!(Publish::decode(&bytes).unwrap(), publish);
+        let mut extended = publish.clone();
+        extended.extensions = Extensions(vec![Extension {
+            tag: 99,
+            required: false,
+            value: vec![7, 8],
+        }]);
+        assert_eq!(
+            Publish::decode(&extended.encode().unwrap()).unwrap(),
+            extended
+        );
+        extended.extensions.0[0].required = true;
+        assert!(extended.encode().is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(Publish::decode(&trailing).is_err());
+        let mut invalid = publish.clone();
+        invalid.byte_len += 1;
+        assert!(invalid.encode().is_err());
+        let mut malformed = bytes.clone();
+        // Fixed trailing fields: operation ID, length, hash, empty Extensions count.
+        let length_offset = malformed.len() - 4 - 32 - 8;
+        malformed[length_offset..length_offset + 8]
+            .copy_from_slice(&(crate::schema::fs::MAX_PUBLISH_BYTES + 1).to_le_bytes());
+        assert!(Publish::decode(&malformed).is_err());
+        for source in [
+            publish.destination.clone(),
+            Path { components: vec![] },
+            Path {
+                components: vec![b"other".to_vec(), b"temporary".to_vec()],
+            },
+        ] {
+            invalid = publish.clone();
+            invalid.source = source;
+            assert!(invalid.encode().is_err());
+        }
+        invalid = publish.clone();
+        invalid.destination = Path { components: vec![] };
+        assert!(invalid.encode().is_err());
+        invalid = publish.clone();
+        invalid.operation_id = [0; 16];
+        assert!(invalid.encode().is_err());
+        invalid = publish;
+        invalid.root_handle = 0;
+        assert!(invalid.encode().is_err());
+        let mut malformed = bytes.clone();
+        malformed[..8].fill(0);
+        assert!(Publish::decode(&malformed).is_err());
+        let operation_offset = length_offset - 16;
+        let mut malformed = bytes;
+        malformed[operation_offset..operation_offset + 16].fill(0);
+        assert!(Publish::decode(&malformed).is_err());
+    }
+
+    #[test]
+    fn publish_result_distinguishes_replacement_from_durability() {
+        for durable in [false, true] {
+            let result = PublishResult {
+                durable,
+                extensions: Extensions::default(),
+            };
+            let bytes = result.encode().unwrap();
+            truncations::<PublishResult>(&bytes);
+            assert_eq!(PublishResult::decode(&bytes).unwrap(), result);
+            for index in 0..4 {
+                let mut malformed = bytes.clone();
+                malformed[index] = 2;
+                assert!(PublishResult::decode(&malformed).is_err());
+            }
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert!(PublishResult::decode(&trailing).is_err());
         }
     }
 
