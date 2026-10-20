@@ -240,6 +240,8 @@ import {
   decodeFsIndex,
   decodeFsMove,
   decodeFsOpen,
+  decodeFsPublish,
+  decodeFsPublishResult,
   decodeFsQueryGrepFileRecord,
   decodeFsQueryGrepMatchRecord,
   decodeFsQueryPage,
@@ -401,6 +403,8 @@ import {
   encodeFsIndex,
   encodeFsMove,
   encodeFsOpen,
+  encodeFsPublish,
+  encodeFsPublishResult,
   encodeFsQueryGrepFileRecord,
   encodeFsQueryGrepMatchRecord,
   encodeFsQueryPage,
@@ -1747,6 +1751,15 @@ describe("YAS v1", () => {
       fromHex(vector("fs.commit_result.payload")),
     );
     matches("fs.commit_result.payload", encodeFsCommitResult(fsCommitResult));
+    const fsPublish = decodeFsPublish(fromHex(vector("fs.publish.payload")));
+    matches("fs.publish.payload", encodeFsPublish(fsPublish));
+    const fsPublishResult = decodeFsPublishResult(
+      fromHex(vector("fs.publish_result.payload")),
+    );
+    matches(
+      "fs.publish_result.payload",
+      encodeFsPublishResult(fsPublishResult),
+    );
     const fsConflict = decodeFsConflictDetail(
       fromHex(vector("fs.conflict_detail.payload")),
     );
