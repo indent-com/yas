@@ -590,7 +590,7 @@ pub(crate) fn walk_log(
         }
     }
 
-    let mut walk = repo.rev_walk(tips);
+    let mut walk = repo.rev_walk(tips.clone());
     if flags & GIT_LOG_FIRST_PARENT != 0 {
         walk = walk.first_parent_only();
     }
@@ -617,16 +617,21 @@ pub(crate) fn walk_log(
     // Collect one page of MATCHING commits — the path filter runs during
     // collection, so a filtered page fills up to `limit` instead of
     // shipping mostly-empty pages, still capped by `walk_max` visited.
-    // The frontier is the walk's pending boundary: parents seen that were
-    // never visited (skipped commits stay skipped — they matched nothing).
+    // The frontier is the walk's pending boundary: tips and parents seen
+    // that were never visited (skipped commits stay skipped — they matched
+    // nothing).
     let mut visited = 0usize;
     let mut more = false;
     let mut current_path = path_filter.clone();
     let mut records: Vec<OwnedGitCommitRecord> = Vec::new();
     let mut page: Vec<Matched> = Vec::new();
     let mut visited_set: std::collections::HashSet<gix::ObjectId> = Default::default();
-    let mut parent_seen: Vec<gix::ObjectId> = Vec::new();
     let mut parent_set: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let mut parent_seen: Vec<gix::ObjectId> = tips
+        .iter()
+        .copied()
+        .filter(|tip| parent_set.insert(*tip))
+        .collect();
     // Per-page entry_at memo: a commit's tree lookup runs once, not once
     // as itself and once as its child's parent. Cleared when FOLLOW
     // adopts a new name (the memo is keyed for one path), and capped so a
@@ -778,8 +783,8 @@ pub(crate) fn walk_log(
 
     // Frontier: matched-but-unemitted commits (byte-budget cut) resume
     // from themselves; everything else resumes from the walk's pending
-    // boundary — parents seen that were never visited. Extra tips that
-    // are ancestors of a resumed commit are harmless: the continuation
+    // boundary — tips and parents seen that were never visited. Extra tips
+    // that are ancestors of a resumed commit are harmless: the continuation
     // walk deduplicates.
     let walked_upto = truncated_at.unwrap_or(page.len());
     let mut frontier: Vec<GitOid> = Vec::new();
