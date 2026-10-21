@@ -284,6 +284,67 @@ fn semantic_diff_patch_and_index_have_no_packet_round_trip() {
 }
 
 #[test]
+fn structured_patch_pages_keep_a_file_cut_before_its_first_row() {
+    let repository = Repository::new();
+    for name in ["a.txt", "b.txt"] {
+        repository.write(name, b"old\n");
+    }
+    repository.commit("base");
+    let (handle, head) = open(&repository);
+    for name in ["a.txt", "b.txt"] {
+        repository.write(name, b"new\n");
+    }
+    let page = |max_bytes, after: Vec<Vec<u8>>, after_position| {
+        let patch = handle
+            .native_patch(
+                &PatchRequest {
+                    flags: 0,
+                    context_lines: 3,
+                    rename_threshold: 0,
+                    old: Endpoint::Commit(head),
+                    new: Endpoint::Worktree,
+                    path: Vec::new(),
+                    max_bytes,
+                    after,
+                    after_position,
+                },
+                &Cancel::default(),
+            )
+            .unwrap();
+        let PatchResult::Structured(records) = patch else {
+            panic!("expected a structured patch")
+        };
+        records
+    };
+    let rows = |records: &[PatchRecord]| {
+        records
+            .iter()
+            .filter(|record| matches!(record, PatchRecord::Row { .. }))
+            .count()
+    };
+    assert_eq!(rows(&page(64 * 1024, Vec::new(), 0)), 2);
+
+    // Every budget from "nothing fits" to "everything fits" pages through
+    // both files' rows.
+    for max_bytes in 1..256 {
+        let (mut after, mut after_position, mut seen) = (Vec::new(), 0, 0);
+        for _ in 0..8 {
+            let records = page(max_bytes, after.clone(), after_position);
+            seen += rows(&records);
+            let Some(PatchRecord::Cursor {
+                after: next,
+                position,
+            }) = records.last()
+            else {
+                break;
+            };
+            (after, after_position) = (next.clone(), *position);
+        }
+        assert_eq!(seen, 2, "max_bytes {max_bytes}");
+    }
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");

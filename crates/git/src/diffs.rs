@@ -1800,7 +1800,8 @@ impl RepoHandle {
         // refuses: it stops at the budget and says where. The stop is a
         // threshold rather than a ceiling — the record that crosses it is
         // already written, and one row is bounded by the engine field
-        // clip — so a payload can exceed `max_len` by that one record.
+        // clip — so a payload can exceed `max_len` by that record, plus the
+        // first row of the file it opens.
         if text_mode && text.len() > budget {
             return fail(GIT_STATUS_TOO_LARGE);
         }
@@ -1882,7 +1883,9 @@ impl RowWindow<'_> {
             self.pos += 1;
             return;
         }
-        if patch_records_size(self.records) >= self.budget {
+        // A file's first record goes out whatever the budget: a cut at
+        // position 0 would resume after this file and lose its rows.
+        if self.pos > self.skip && patch_records_size(self.records) >= self.budget {
             self.stopped = true;
             return;
         }
