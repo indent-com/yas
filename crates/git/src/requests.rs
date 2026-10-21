@@ -381,9 +381,12 @@ const BASE_STALE: u8 = 4;
 const BASE_RESULT: u8 = 8;
 
 /// The `(commit time, parents)` of a commit, memoized — the paint walk
-/// touches a commit once for its time and once for its parents.
+/// touches a commit once for its time and once for its parents. A shallow
+/// boundary commit has no parents here, as in git: the ones it names are
+/// not in the repository.
 fn commit_info(
     repo: &gix::Repository,
+    shallow: Option<&gix::shallow::Commits>,
     cache: &mut std::collections::HashMap<gix::ObjectId, (i64, Vec<gix::ObjectId>)>,
     id: gix::ObjectId,
 ) -> Result<(i64, Vec<gix::ObjectId>), u8> {
@@ -392,7 +395,11 @@ fn commit_info(
     }
     let commit = repo.find_commit(id).map_err(|_| GIT_STATUS_OTHER)?;
     let time = commit.time().map(|t| t.seconds).unwrap_or(0);
-    let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+    let parents: Vec<gix::ObjectId> = if shallow.is_some_and(|s| s.binary_search(&id).is_ok()) {
+        Vec::new()
+    } else {
+        commit.parent_ids().map(|p| p.detach()).collect()
+    };
     cache.insert(id, (time, parents.clone()));
     Ok((time, parents))
 }
@@ -425,9 +432,11 @@ fn paint_bases(
     let mut counted: std::collections::HashMap<gix::ObjectId, usize> = Default::default();
     let mut live = 0usize;
     let mut results: Vec<gix::ObjectId> = Vec::new();
+    let shallow = repo.shallow_commits().map_err(|_| GIT_STATUS_OTHER)?;
+    let shallow = shallow.as_ref();
 
     for (id, flag) in [(a, BASE_P1), (b, BASE_P2)] {
-        let (time, _) = commit_info(repo, &mut info, id)?;
+        let (time, _) = commit_info(repo, shallow, &mut info, id)?;
         flags.insert(id, flag);
         heap.push((time, id));
         *counted.entry(id).or_default() += 1;
@@ -459,7 +468,7 @@ fn paint_bases(
             }
             pass |= BASE_STALE;
         }
-        let (_, parents) = commit_info(repo, &mut info, id)?;
+        let (_, parents) = commit_info(repo, shallow, &mut info, id)?;
         for parent in parents {
             let entry = flags.entry(parent).or_insert(0);
             if *entry & pass == pass {
@@ -471,7 +480,7 @@ fn paint_bases(
             if now_stale && !was_stale {
                 live -= counted.remove(&parent).unwrap_or(0);
             }
-            let (time, _) = commit_info(repo, &mut info, parent)?;
+            let (time, _) = commit_info(repo, shallow, &mut info, parent)?;
             heap.push((time, parent));
             if !now_stale {
                 *counted.entry(parent).or_default() += 1;
