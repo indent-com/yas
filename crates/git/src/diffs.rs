@@ -1171,6 +1171,15 @@ fn record_old_path(change: &Change) -> Vec<u8> {
     if old.is_empty() { new } else { old }
 }
 
+/// The new path a `PATCH_FILE` record reports: none when there is no new
+/// side, as for a deletion.
+fn record_new_path(change: &Change) -> Vec<u8> {
+    if change.new.is_none() {
+        return Vec::new();
+    }
+    change_new_path(change)
+}
+
 /// Split a rename's NUL-joined path back into (old, new).
 fn rename_paths(change: &Change) -> (Vec<u8>, Vec<u8>) {
     if change.st == b'R'
@@ -1751,7 +1760,7 @@ impl RepoHandle {
                         similarity: change.similarity,
                         flags: file_flags,
                         old_path: &crate::escape_bstr(&record_old_path(change)),
-                        new_path: &crate::escape_bstr(&change_new_path(change)),
+                        new_path: &crate::escape_bstr(&record_new_path(change)),
                     },
                 );
                 if !binary {

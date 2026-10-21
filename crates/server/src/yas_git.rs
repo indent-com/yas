@@ -2181,6 +2181,49 @@ mod tests {
     }
 
     #[test]
+    fn structured_patch_of_a_deletion_encodes() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "-q"]);
+        std::fs::write(directory.path().join("gone.txt"), b"gone\n").unwrap();
+        git(directory.path(), &["add", "gone.txt"]);
+        std::fs::remove_file(directory.path().join("gone.txt")).unwrap();
+        let (repository, _) = yas_git::native::open_path(directory.path()).unwrap();
+        let page = run_query(
+            Some(&repository),
+            yas_wire::schema::git::OBJECT_SHA1 as u8,
+            &query(wire::QueryBody::Patch {
+                left: wire::QueryEndpoint::Index,
+                right: wire::QueryEndpoint::Worktree,
+                path: None,
+                context_lines: 3,
+                rename_threshold: 0,
+                max_bytes: 1024 * 1024,
+                flags: 0,
+            }),
+            None,
+            &yas_git::Cancel::default(),
+        )
+        .unwrap();
+        let [QueryItem::Record(file), QueryItem::Record(row)] = page.records.as_slice() else {
+            panic!("unexpected deletion patch page: {:?}", page.records);
+        };
+        assert_eq!(
+            file,
+            &wire::QueryRecord::PatchFile(wire::PatchFileRecord {
+                status: yas_wire::schema::git::DIFF_DELETED as u8,
+                similarity_percent: 0,
+                flags: 0,
+                old_path: Some(fs_wire::Path {
+                    components: vec![b"gone.txt".to_vec()],
+                }),
+                new_path: None,
+            })
+        );
+        file.encode_typed().unwrap();
+        row.encode_typed().unwrap();
+    }
+
+    #[test]
     fn typed_queries_cover_repository_reads_without_exposing_legacy_packets() {
         let directory = tempfile::tempdir().unwrap();
         git(directory.path(), &["init", "-q"]);
