@@ -284,6 +284,37 @@ fn semantic_diff_patch_and_index_have_no_packet_round_trip() {
 }
 
 #[test]
+fn merge_base_stops_at_a_shallow_boundary() {
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    source.git(&["branch", "base"]);
+    source.git(&["checkout", "-q", "-b", "pr"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "three"]);
+
+    // `two` is the shallow boundary: its parent `one` was never fetched.
+    let consumer = Repository::new();
+    let remote = source.remote_path();
+    consumer.git(&[
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        &remote,
+        "base:refs/heads/base",
+    ]);
+    consumer.git(&["fetch", "-q", &remote, "pr:refs/heads/pr"]);
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let base = resolve(&handle, "base");
+    assert_eq!(
+        handle
+            .native_merge_base(&[base, resolve(&handle, "pr")], &Cancel::default())
+            .unwrap(),
+        vec![base]
+    );
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");
