@@ -1082,7 +1082,7 @@ fn run_query(
                 )
                 .map_err(native_error)?;
             let records = match response {
-                yas_git::native::PatchResult::Text(data) => {
+                yas_git::native::PatchResult::Text(data, cursor) => {
                     let object = match endpoint_content_object(right)
                         .or_else(|| endpoint_content_object(left))
                     {
@@ -1098,7 +1098,12 @@ fn run_query(
                             offset: 0,
                             bytes: data,
                         })],
-                        wire::QueryCursor::Start,
+                        cursor.map_or(wire::QueryCursor::Start, |(after, position)| {
+                            wire::QueryCursor::Patch {
+                                path: fs_wire::Path { components: after },
+                                position,
+                            }
+                        }),
                     ));
                 }
                 yas_git::native::PatchResult::Structured(records) => records,
@@ -2180,6 +2185,55 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn cut_text_patch_page_carries_a_patch_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "-q"]);
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(directory.path().join(name), b"old\n").unwrap();
+        }
+        git(directory.path(), &["add", "."]);
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(directory.path().join(name), b"new\n").unwrap();
+        }
+        let (repository, _) = yas_git::native::open_path(directory.path()).unwrap();
+        let page = |max_bytes| {
+            let page = run_query(
+                Some(&repository),
+                yas_wire::schema::git::OBJECT_SHA1 as u8,
+                &query(wire::QueryBody::Patch {
+                    left: wire::QueryEndpoint::Index,
+                    right: wire::QueryEndpoint::Worktree,
+                    path: None,
+                    context_lines: 3,
+                    rename_threshold: 0,
+                    max_bytes,
+                    flags: yas_wire::schema::git::PATCH_TEXT as u16,
+                }),
+                None,
+                &yas_git::Cancel::default(),
+            )
+            .unwrap();
+            let [QueryItem::Content(OwnedContent { bytes, .. })] = page.records.as_slice() else {
+                panic!("unexpected text patch page: {:?}", page.records);
+            };
+            (bytes.clone(), page.next_cursor)
+        };
+        let (whole, cursor) = page(1024 * 1024);
+        assert_eq!(cursor, wire::QueryCursor::Start);
+        let (first, cursor) = page(whole.len() as u32 / 2 + 1);
+        assert_eq!(first, whole[..whole.len() / 2]);
+        assert_eq!(
+            cursor,
+            wire::QueryCursor::Patch {
+                path: fs_wire::Path {
+                    components: vec![b"a.txt".to_vec()],
+                },
+                position: 0,
+            }
+        );
     }
 
     #[test]

@@ -1524,7 +1524,7 @@ impl RepoHandle {
     /// `GIT_PATCH`: aligned row records (default) or unified text.
     pub(crate) fn patch(&self, req: &GitPatchRequest<'_>, cancel: &Cancel) -> PatchResponse {
         let repo = self.local();
-        let fail = |status: u8| patch_text_response(req.nonce, status, 0, &[]);
+        let fail = |status: u8| patch_text_response(req.nonce, status, 0, &[], None);
         // The same rejections `GIT_DIFF` makes, since the low bits are the
         // same flags and `rename` is the same field: an out-of-range
         // threshold is INVALID rather than a silent fall back to the
@@ -1778,18 +1778,11 @@ impl RepoHandle {
             }
             last_whole = Some(sort_key(change));
         }
-        // Text mode's payload is a patch, not a record stream, so it has
-        // nowhere to put a CURSOR record: there, `TRUNCATED` means "resume
-        // from the last `+++` path you were given", which the client has in
-        // front of it. Structured mode says it exactly.
-        if !text_mode && let Some((key, pos)) = cursor {
-            push_git_patch_record(
-                &mut records,
-                &GitPatchRecord::Cursor {
-                    after: &crate::escape_bstr(&key),
-                    pos,
-                },
-            );
+        // Text mode's payload is a patch, not a record stream, so its
+        // cursor travels beside the text rather than as a CURSOR record.
+        let cursor = cursor.map(|(key, pos)| (crate::escape_bstr(&key), pos));
+        if !text_mode && let Some((after, pos)) = &cursor {
+            push_git_patch_record(&mut records, &GitPatchRecord::Cursor { after, pos: *pos });
         }
         // Unified text is the one shape that cannot be windowed mid-file: a
         // patch cut between a hunk header and its rows is not a patch. Reaching
@@ -1805,7 +1798,7 @@ impl RepoHandle {
             return fail(GIT_STATUS_TOO_LARGE);
         }
         if text_mode {
-            patch_text_response(req.nonce, GIT_STATUS_OK, resp_flags, &text)
+            patch_text_response(req.nonce, GIT_STATUS_OK, resp_flags, &text, cursor)
         } else {
             patch_records_response(req.nonce, GIT_STATUS_OK, resp_flags, &records)
         }

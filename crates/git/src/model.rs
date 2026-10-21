@@ -654,7 +654,9 @@ pub struct PatchResponse {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PatchPayload {
-    Text(Vec<u8>),
+    /// Unified text, and where a cut one resumes: the `(after, pos)` of
+    /// the CURSOR record a structured response would end with.
+    Text(Vec<u8>, Option<(String, u64)>),
     Structured(Vec<OwnedGitPatchRecord>),
 }
 
@@ -1020,11 +1022,17 @@ pub fn diff_response(
         value: records.to_vec(),
     }
 }
-pub fn patch_text_response(_nonce: u16, status: u8, flags: u8, data: &[u8]) -> PatchResponse {
+pub fn patch_text_response(
+    _nonce: u16,
+    status: u8,
+    flags: u8,
+    data: &[u8],
+    cursor: Option<(String, u64)>,
+) -> PatchResponse {
     PatchResponse {
         status,
         flags,
-        payload: PatchPayload::Text(data.to_vec()),
+        payload: PatchPayload::Text(data.to_vec(), cursor),
     }
 }
 pub fn patch_records_response(

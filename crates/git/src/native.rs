@@ -636,7 +636,8 @@ pub struct PatchRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PatchResult {
-    Text(Vec<u8>),
+    /// Unified text, and the `(after, position)` it resumes from when cut.
+    Text(Vec<u8>, Option<(RepoPath, u64)>),
     Structured(Vec<PatchRecord>),
 }
 
@@ -769,7 +770,16 @@ impl RepoHandle {
         );
         result_status(response.status)?;
         let encoded = match response.payload {
-            engine::PatchPayload::Text(bytes) => return Ok(PatchResult::Text(bytes)),
+            engine::PatchPayload::Text(bytes, cursor) => {
+                let cursor = cursor
+                    .map(|(after, pos)| {
+                        decode_path(&after)
+                            .map(|after| (after, pos))
+                            .ok_or_else(|| Failure::malformed("PATCH cursor"))
+                    })
+                    .transpose()?;
+                return Ok(PatchResult::Text(bytes, cursor));
+            }
             engine::PatchPayload::Structured(records) => records,
         };
         let mut records = Vec::new();
