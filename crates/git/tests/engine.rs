@@ -284,6 +284,60 @@ fn semantic_diff_patch_and_index_have_no_packet_round_trip() {
 }
 
 #[test]
+fn text_patch_cut_at_max_bytes_resumes_from_its_cursor() {
+    // The wire's PATCH_TEXT, which native requests carry unchanged.
+    const PATCH_TEXT: u16 = 1 << 6;
+    let repository = Repository::new();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        repository.write(name, b"old\n");
+    }
+    repository.commit("base");
+    let (handle, head) = open(&repository);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        repository.write(name, b"new\n");
+    }
+    let page = |max_bytes, after: Vec<Vec<u8>>| {
+        let patch = handle
+            .native_patch(
+                &PatchRequest {
+                    flags: PATCH_TEXT,
+                    context_lines: 3,
+                    rename_threshold: 0,
+                    old: Endpoint::Commit(head),
+                    new: Endpoint::Worktree,
+                    path: Vec::new(),
+                    max_bytes,
+                    after,
+                    after_position: 0,
+                },
+                &Cancel::default(),
+            )
+            .unwrap();
+        let PatchResult::Text(text, cursor) = patch else {
+            panic!("expected a text patch")
+        };
+        (text, cursor)
+    };
+    let (whole, cursor) = page(64 * 1024, Vec::new());
+    assert_eq!(cursor, None);
+    let file_len = whole.len() / 3;
+
+    let mut resumed = Vec::new();
+    let mut after = Vec::new();
+    loop {
+        let (text, cursor) = page(file_len as u32 + 1, after);
+        assert!(!text.is_empty());
+        resumed.extend_from_slice(&text);
+        let Some((next, position)) = cursor else {
+            break;
+        };
+        assert_eq!(position, 0);
+        after = next;
+    }
+    assert_eq!(resumed, whole);
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");

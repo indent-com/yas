@@ -208,7 +208,9 @@ records are engine-agnostic by design, so a syntax-aware engine can
 replace the alignment later, purely server-side. A `PATCH_TEXT` answer's
 content object is the right endpoint's object, else the left's; between two
 mutable endpoints (INDEX, WORKTREE, EMPTY) it is the null object ID, as
-`git diff` prints for the worktree side.
+`git diff` prints for the worktree side. Text cannot stop mid-file, so a
+`PATCH_TEXT` answer cut by `max_bytes` ends at its last whole file, and its
+`PATCH` cursor resumes after that file.
 
 Nothing runs under the session mutex; Results and Events interleave with
 Terminal, Surface, Media, and FS traffic through the per-session writer.
