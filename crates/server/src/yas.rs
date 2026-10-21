@@ -40996,6 +40996,141 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_fetch_failure_is_a_result_and_the_session_survives() {
+        if !yas_git::native::fetch_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q", "origin"]);
+        git(&[
+            "-C",
+            "origin",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        git(&["clone", "-q", "origin", "clone"]);
+
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::GIT]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::OPEN,
+            10,
+            &yas_git_wire::Open {
+                source: yas_git_wire::RepositorySource::PlatformPath(
+                    root.path()
+                        .join("clone")
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::OPEN,
+            10,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let repository_handle = yas_git_wire::OpenResult::decode(&opened.body)
+            .unwrap()
+            .repository_handle;
+        // The remote refuses the want, so git exits non-zero having printed
+        // no ref line.
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::FETCH,
+            11,
+            &yas_git_wire::Fetch {
+                repository_handle,
+                operation_id: [1; 16],
+                flags: 0,
+                timeout_ms: 10_000,
+                remote: b"origin".to_vec(),
+                refspecs: vec![b"1111111111111111111111111111111111111111".to_vec()],
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let fetched = loop {
+            let frame = timeout(TEST_TIMEOUT, next_frame(&mut client, &codec))
+                .await
+                .unwrap();
+            if frame.header.class == Class::Event {
+                assert_eq!(frame.header.kind, yas_git_wire::event_kind::PROGRESS);
+                continue;
+            }
+            assert_eq!(
+                frame.header,
+                FrameHeader {
+                    sensitive: true,
+                    ..FrameHeader::result(family::GIT, yas_git_wire::request_kind::FETCH, 11)
+                }
+            );
+            break ResultPrefix::decode(&frame.payload).unwrap();
+        };
+        assert_eq!(fetched.status, Status::Ok);
+        let refs = yas_git_wire::FetchResult::decode(&fetched.body)
+            .unwrap()
+            .refs;
+        assert!(refs.iter().any(|reference| {
+            reference.status != Status::Ok.code()
+                && reference.name == b"origin"
+                && reference.detail.contains("not our ref")
+        }));
+
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::CLOSE,
+            12,
+            &yas_git_wire::Close {
+                repository_handle,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let closed = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::CLOSE,
+            12,
+        )
+        .await;
+        assert_eq!(closed.status, Status::Ok);
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn extension_installation_support_matches_server_policy() {
         for persistent in [false, true] {

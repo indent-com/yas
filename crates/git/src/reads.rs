@@ -668,7 +668,9 @@ impl RepoHandle {
             // A remote can refuse one refspec of several and still exit
             // zero, so success is never inferred from the code alone —
             // but a non-zero code with nothing parsed still has to say
-            // something, and git's last stderr line is what it has.
+            // something, and git's last stderr line is what it has. It is
+            // the remote's outcome rather than one ref's, so it carries the
+            // remote's name: the wire has no record without one.
             let detail = output
                 .stderr
                 .lines()
@@ -681,7 +683,7 @@ impl RepoHandle {
                     status: GIT_STATUS_OTHER,
                     old: GIT_OID_NONE,
                     new: GIT_OID_NONE,
-                    name: "",
+                    name: remote,
                     detail,
                 },
             );
