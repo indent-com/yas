@@ -509,6 +509,53 @@ fn parent_steps_stop_at_a_shallow_boundary() {
 }
 
 #[test]
+fn octopus_merge_base_keeps_every_pairwise_base() {
+    let repository = Repository::new();
+    let git_at = |seconds: u64, args: &[&str]| {
+        let date = format!("{seconds} +0000");
+        let status = Command::new("git")
+            .args(args)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(&repository.0)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    // `a` and `b` both merge root `x` with the newer, unrelated root `y`, so
+    // they have two merge bases. Only `x` is shared with `c`.
+    git_at(1_700_001_000, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    repository.git(&["branch", "x"]);
+    git_at(1_700_002_000, &["checkout", "-q", "--orphan", "y"]);
+    git_at(1_700_002_000, &["commit", "-q", "--allow-empty", "-m", "y"]);
+    for (seconds, branch) in [(1_700_003_000, "a"), (1_700_004_000, "b")] {
+        repository.git(&["checkout", "-q", "-b", branch, "x"]);
+        git_at(
+            seconds,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "--allow-unrelated-histories",
+                "-m",
+                branch,
+                "y",
+            ],
+        );
+    }
+    repository.git(&["checkout", "-q", "-b", "c", "x"]);
+    git_at(1_700_005_000, &["commit", "-q", "--allow-empty", "-m", "c"]);
+    let (handle, _) = open(&repository);
+    let [x, a, b, c] = ["x", "a", "b", "c"].map(|spec| resolve(&handle, spec));
+    assert_eq!(
+        handle
+            .native_merge_base(&[a, b, c], &Cancel::default())
+            .unwrap(),
+        vec![x]
+    );
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");

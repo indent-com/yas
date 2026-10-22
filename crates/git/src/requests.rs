@@ -235,24 +235,47 @@ impl RepoHandle {
                 Err(_) => return fail(GIT_STATUS_NOT_FOUND),
             }
         }
-        // Octopus: fold pairwise. Disjoint histories yield an empty list.
-        let mut base = ids[0];
-        for id in &ids[1..] {
-            match bounded_merge_base(
-                &repo,
-                &self.merge_memo,
-                base,
-                *id,
-                self.budgets.walk_max,
-                cancel,
-            ) {
-                Ok(Some(found)) => base = found,
-                Ok(None) => return base_response(nonce, GIT_STATUS_OK, &[]),
-                Err(status) => return fail(status),
+        match octopus_merge_bases(&repo, &self.merge_memo, &ids, self.budgets.walk_max, cancel) {
+            Ok(bases) => match bases.first() {
+                Some(best) => base_response(nonce, GIT_STATUS_OK, &[oid_bytes(best.as_ref())]),
+                None => base_response(nonce, GIT_STATUS_OK, &[]),
+            },
+            Err(status) => fail(status),
+        }
+    }
+}
+
+/// The maximal common ancestors of every commit in `ids`, newest first —
+/// git's `merge-base --octopus`. Folding one best base at a time is not
+/// enough: when a pair has several, the one kept may share nothing with the
+/// next commit while another does. Disjoint histories yield an empty list.
+fn octopus_merge_bases(
+    repo: &gix::Repository,
+    memo: &MergeMemo,
+    ids: &[gix::ObjectId],
+    budget: usize,
+    cancel: &Cancel,
+) -> Result<Vec<gix::ObjectId>, u8> {
+    let mut bases = vec![ids[0]];
+    for id in &ids[1..] {
+        let mut next = Vec::new();
+        for base in &bases {
+            for found in bounded_merge_bases(repo, memo, *base, *id, budget, cancel)? {
+                if !next.contains(&found) {
+                    next.push(found);
+                }
             }
         }
-        base_response(nonce, GIT_STATUS_OK, &[oid_bytes(base.as_ref())])
+        bases = reduce_bases(repo, next, budget, cancel)?;
     }
+    let time = |id: &gix::ObjectId| {
+        repo.find_commit(*id)
+            .ok()
+            .and_then(|commit| commit.time().ok())
+            .map_or(0, |time| time.seconds)
+    };
+    bases.sort_by_key(|id| std::cmp::Reverse(time(id)));
+    Ok(bases)
 }
 
 /// Resolve a revision spec to `(tips, hides)` commit oids, ready for a log
