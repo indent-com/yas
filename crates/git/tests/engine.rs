@@ -379,6 +379,35 @@ fn merge_base_follows_a_deepened_shallow_boundary() {
 }
 
 #[test]
+fn first_parent_log_keeps_every_parent_of_a_merge() {
+    // The wire's LOG_FIRST_PARENT, which native requests carry unchanged.
+    const LOG_FIRST_PARENT: u8 = 1 << 0;
+    let repository = Repository::new();
+    repository.git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    repository.git(&["checkout", "-q", "-b", "side"]);
+    repository.git(&["commit", "-q", "--allow-empty", "-m", "side"]);
+    repository.git(&["checkout", "-q", "-"]);
+    repository.git(&["merge", "-q", "--no-ff", "--no-edit", "side"]);
+    let (handle, head) = open(&repository);
+    let log = handle
+        .native_log(
+            &LogRequest {
+                flags: LOG_FIRST_PARENT,
+                limit: 1,
+                path: Vec::new(),
+                tips: vec![head],
+                hides: Vec::new(),
+            },
+            &Cancel::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        log.records.as_slice(),
+        [native::LogRecord::Commit { parents, .. }] if parents.len() == 2
+    ));
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");

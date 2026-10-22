@@ -783,7 +783,8 @@ pub(crate) fn walk_log(
         let Ok(commit) = repo.find_commit(matched.id) else {
             return Err(GIT_STATUS_OTHER);
         };
-        if !append_commit(repo, &commit, &matched.parents, flags, &mut records) {
+        let shallow_root = is_shallow(shallow, &matched.id);
+        if !append_commit(repo, &commit, shallow_root, flags, &mut records) {
             return Err(GIT_STATUS_OTHER);
         }
         if flags & GIT_LOG_PATH_OIDS != 0
@@ -915,7 +916,7 @@ fn find_blob_path(
 fn append_commit(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
-    parents: &[gix::ObjectId],
+    shallow_root: bool,
     req_flags: u8,
     records: &mut Vec<OwnedGitCommitRecord>,
 ) -> bool {
@@ -954,7 +955,14 @@ fn append_commit(
             flags: if lossy { GIT_COMMIT_LOSSY_ENCODING } else { 0 },
             oid: oid_bytes(commit.id().as_ref()),
             tree: oid_bytes(commit_ref.tree().as_ref()),
-            parents: parents.iter().map(|p| oid_bytes(p.as_ref())).collect(),
+            parents: if shallow_root {
+                Vec::new()
+            } else {
+                commit_ref
+                    .parents()
+                    .map(|p| oid_bytes(p.as_ref()))
+                    .collect()
+            },
             author_time,
             author_tz,
             committer_time,
