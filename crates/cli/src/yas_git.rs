@@ -239,48 +239,71 @@ async fn query_all(
     let mut cursor = QueryCursor::Start;
     let mut records = Vec::new();
     loop {
-        let page: QueryPage = client
-            .request_typed(
-                family::GIT,
-                git::request_kind::QUERY,
-                &Query {
-                    repository_handle,
-                    max_records: page_records,
-                    cursor: cursor.clone(),
-                    initial_receive_credit: QUERY_CREDIT,
-                    body: body.clone(),
-                    extensions: Extensions::default(),
-                },
-                true,
-            )
-            .await?;
-        let typed = match page.delivery {
-            PageDelivery::Inline(records) => records,
-            PageDelivery::Transfer(descriptor) => client
-                .receive_message_transfer(
-                    &descriptor,
-                    git::MAX_QUERY_BYTES as u64,
-                    git::MAX_QUERY_RECORDS,
-                )
-                .await?
-                .into_iter()
-                .map(|message| git::TypedRecord::decode_message(&message).map_err(wire_error))
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        for record in typed {
-            if let Some(record) = QueryRecord::decode_typed(&record).map_err(wire_error)? {
-                records.push(record);
-                if records.len() > maximum_records.min(MAX_COLLECTED_RECORDS) {
-                    return Err("Git query exceeded the CLI record limit; narrow it".into());
-                }
+        let (page, next) = query_page(
+            client,
+            repository_handle,
+            body.clone(),
+            cursor,
+            page_records,
+        )
+        .await?;
+        for record in page {
+            records.push(record);
+            if records.len() > maximum_records.min(MAX_COLLECTED_RECORDS) {
+                return Err("Git query exceeded the CLI record limit; narrow it".into());
             }
         }
-        cursor = page.next_cursor;
+        cursor = next;
         if matches!(cursor, QueryCursor::Start) || records.len() >= maximum_records {
             records.truncate(maximum_records);
             return Ok(records);
         }
     }
+}
+
+/// One QUERY page: its records and the cursor that continues it.
+async fn query_page(
+    client: &mut NativeClient,
+    repository_handle: u64,
+    body: QueryBody,
+    cursor: QueryCursor,
+    page_records: u16,
+) -> Result<(Vec<QueryRecord>, QueryCursor), String> {
+    let page: QueryPage = client
+        .request_typed(
+            family::GIT,
+            git::request_kind::QUERY,
+            &Query {
+                repository_handle,
+                max_records: page_records,
+                cursor,
+                initial_receive_credit: QUERY_CREDIT,
+                body,
+                extensions: Extensions::default(),
+            },
+            true,
+        )
+        .await?;
+    let typed = match page.delivery {
+        PageDelivery::Inline(records) => records,
+        PageDelivery::Transfer(descriptor) => client
+            .receive_message_transfer(
+                &descriptor,
+                git::MAX_QUERY_BYTES as u64,
+                git::MAX_QUERY_RECORDS,
+            )
+            .await?
+            .into_iter()
+            .map(|message| git::TypedRecord::decode_message(&message).map_err(wire_error))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let mut records = Vec::new();
+    for record in typed {
+        if let Some(record) = QueryRecord::decode_typed(&record).map_err(wire_error)? {
+            records.push(record);
+        }
+    }
+    Ok((records, page.next_cursor))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,7 +496,7 @@ async fn cmd_diff(
         };
     }
     let path = path.as_deref().map(fs_path).transpose()?;
-    let records = if patch {
+    if patch {
         let mut flags =
             yas_wire::schema::git::PATCH_RENAMES as u16 | yas_wire::schema::git::PATCH_TEXT as u16;
         if matches!(right, QueryEndpoint::Worktree) {
@@ -482,27 +505,53 @@ async fn cmd_diff(
         if binary {
             flags |= yas_wire::schema::git::PATCH_BINARY as u16;
         }
-        repository
-            .query(
-                QueryBody::Patch {
-                    left,
-                    right,
-                    path,
-                    context_lines: 3,
-                    rename_threshold: 0,
-                    max_bytes: git::MAX_QUERY_BYTES as u32,
-                    flags,
-                },
+        let body = QueryBody::Patch {
+            left,
+            right,
+            path,
+            context_lines: 3,
+            rename_threshold: 0,
+            max_bytes: git::MAX_QUERY_BYTES as u32,
+            flags,
+        };
+        let mut cursor = QueryCursor::Start;
+        loop {
+            let (records, next) = query_page(
+                &mut repository.client,
+                repository.handle,
+                body.clone(),
+                cursor,
                 git::MAX_QUERY_RECORDS as u16,
-                MAX_COLLECTED_RECORDS,
             )
-            .await?
+            .await?;
+            // Each page's content is read before the next page is asked for:
+            // unread, its transfer would wait in the client's bounded queue.
+            for record in records {
+                if let QueryRecord::PatchContent(content) = record {
+                    let bytes = content_bytes(&mut repository.client, content).await?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"type": "patch", "text": String::from_utf8_lossy(&bytes)})
+                        );
+                    } else {
+                        std::io::stdout()
+                            .write_all(&bytes)
+                            .map_err(|error| format!("writing stdout: {error}"))?;
+                    }
+                }
+            }
+            if matches!(next, QueryCursor::Start) {
+                break;
+            }
+            cursor = next;
+        }
     } else {
         let mut flags = yas_wire::schema::git::DIFF_RENAMES as u16;
         if matches!(right, QueryEndpoint::Worktree) {
             flags |= yas_wire::schema::git::DIFF_UNTRACKED as u16;
         }
-        repository
+        let records = repository
             .query(
                 QueryBody::Diff {
                     left,
@@ -514,38 +563,11 @@ async fn cmd_diff(
                 git::MAX_QUERY_RECORDS as u16,
                 MAX_COLLECTED_RECORDS,
             )
-            .await?
-    };
-    for record in records {
-        match record {
-            QueryRecord::Diff(diff) => print_diff(&diff, json),
-            QueryRecord::PatchContent(content) => {
-                let bytes = content_bytes(&mut repository.client, content).await?;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"type": "patch", "text": String::from_utf8_lossy(&bytes)})
-                    );
-                } else {
-                    std::io::stdout()
-                        .write_all(&bytes)
-                        .map_err(|error| format!("writing stdout: {error}"))?;
-                }
+            .await?;
+        for record in records {
+            if let QueryRecord::Diff(diff) = record {
+                print_diff(&diff, json);
             }
-            QueryRecord::PatchFile(file) => {
-                let old = file.old_path.as_ref().map(display_path).unwrap_or_default();
-                let new = file.new_path.as_ref().map(display_path).unwrap_or_default();
-                println!("diff --git a/{old} b/{new}");
-            }
-            QueryRecord::PatchRow(row) => {
-                if row.old_line != 0 {
-                    println!("-{}", String::from_utf8_lossy(&row.old_text));
-                }
-                if row.new_line != 0 {
-                    println!("+{}", String::from_utf8_lossy(&row.new_text));
-                }
-            }
-            _ => {}
         }
     }
     repository.close().await?;
