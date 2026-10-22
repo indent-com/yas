@@ -551,12 +551,17 @@ pub(crate) fn bounded_merge_bases(
     cancel: &Cancel,
 ) -> Result<Vec<gix::ObjectId>, u8> {
     let key = if a <= b { (a, b) } else { (b, a) };
-    if let Some(bases) = memo.get(&key) {
+    // Deepening moves a shallow boundary under the same oids, so an answer
+    // it cut short is not one to keep.
+    let memoize = !repo.is_shallow();
+    if memoize && let Some(bases) = memo.get(&key) {
         return Ok(bases);
     }
     let candidates = paint_bases(repo, a, b, budget, cancel)?;
     let bases = reduce_bases(repo, candidates, budget, cancel)?;
-    memo.put(key, bases.clone());
+    if memoize {
+        memo.put(key, bases.clone());
+    }
     Ok(bases)
 }
 

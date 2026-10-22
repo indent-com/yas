@@ -382,6 +382,46 @@ fn merge_base_stops_at_a_shallow_boundary() {
 }
 
 #[test]
+fn merge_base_follows_a_deepened_shallow_boundary() {
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    source.git(&["checkout", "-q", "-b", "left"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "left"]);
+    source.git(&["checkout", "-q", "-b", "right", "HEAD~1"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "right"]);
+
+    // Both tips are shallow roots, so they share nothing until deepened.
+    let consumer = Repository::new();
+    let remote = source.remote_path();
+    for branch in ["left", "right"] {
+        consumer.git(&[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            &remote,
+            &format!("{branch}:refs/heads/{branch}"),
+        ]);
+    }
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let cancel = Cancel::default();
+    let tips = [resolve(&handle, "left"), resolve(&handle, "right")];
+    assert!(handle.native_merge_base(&tips, &cancel).unwrap().is_empty());
+
+    consumer.git(&[
+        "fetch",
+        "-q",
+        "--unshallow",
+        &remote,
+        "left:refs/heads/left",
+    ]);
+    assert_eq!(
+        handle.native_merge_base(&tips, &cancel).unwrap(),
+        vec![resolve(&handle, "left~1")]
+    );
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");
