@@ -509,6 +509,47 @@ fn parent_steps_stop_at_a_shallow_boundary() {
 }
 
 #[test]
+fn text_patch_describes_a_gitlink_by_its_commit() {
+    // The wire's PATCH_TEXT, which native requests carry unchanged.
+    const PATCH_TEXT: u16 = 1 << 6;
+    let repository = Repository::new();
+    let gitlink = |oid: &str| {
+        repository.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{oid},sub"),
+        ]);
+        repository.git(&["commit", "-q", "-m", oid]);
+    };
+    gitlink("1111111111111111111111111111111111111111");
+    let (handle, old) = open(&repository);
+    gitlink("2222222222222222222222222222222222222222");
+    let new = resolve(&handle, "HEAD");
+    let patch = handle
+        .native_patch(
+            &PatchRequest {
+                flags: PATCH_TEXT,
+                context_lines: 3,
+                rename_threshold: 0,
+                old: Endpoint::Commit(old),
+                new: Endpoint::Commit(new),
+                path: Vec::new(),
+                max_bytes: 64 * 1024,
+                after: Vec::new(),
+                after_position: 0,
+            },
+            &Cancel::default(),
+        )
+        .unwrap();
+    let PatchResult::Text(text) = patch else {
+        panic!("expected a text patch")
+    };
+    let full_index = repository.git(&["diff", "--full-index", "HEAD~1", "HEAD"]);
+    assert_eq!(String::from_utf8(text).unwrap().trim_end(), full_index);
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");

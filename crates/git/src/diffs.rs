@@ -525,6 +525,20 @@ fn side_bytes(
     std::fs::read(abs).ok()
 }
 
+/// A side's content as a patch shows it. A gitlink records a commit of
+/// another repository, which git diffs as one `Subproject commit` line.
+fn patch_side_bytes(
+    repo: &gix::Repository,
+    workdir: Option<&std::path::Path>,
+    path: &[u8],
+    side: &Side,
+) -> Option<Vec<u8>> {
+    if side.mode & 0o170000 == 0o160000 && !side.oid.is_null() {
+        return Some(format!("Subproject commit {}\n", side.oid).into_bytes());
+    }
+    side_bytes(repo, workdir, path, side)
+}
+
 /// Binary sniff (NUL in the first 8 KiB) without materializing whole
 /// sides: worktree files read at most 8 KiB from disk; object sides
 /// borrow the decoded blob and memoize the verdict by oid, so a rename
@@ -1684,12 +1698,16 @@ impl RepoHandle {
                 let old_bytes = change
                     .old
                     .as_ref()
-                    .and_then(|side| side_bytes(&repo, workdir.as_deref(), &old_read_path, side))
+                    .and_then(|side| {
+                        patch_side_bytes(&repo, workdir.as_deref(), &old_read_path, side)
+                    })
                     .unwrap_or_default();
                 let mut new_bytes = change
                     .new
                     .as_ref()
-                    .and_then(|side| side_bytes(&repo, workdir.as_deref(), &new_read_path, side))
+                    .and_then(|side| {
+                        patch_side_bytes(&repo, workdir.as_deref(), &new_read_path, side)
+                    })
                     .unwrap_or_default();
                 // The worktree side is normalized per the path's
                 // text/eol attributes, so a CRLF checkout of an
