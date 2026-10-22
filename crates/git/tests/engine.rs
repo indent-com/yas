@@ -284,7 +284,7 @@ fn semantic_diff_patch_and_index_have_no_packet_round_trip() {
 }
 
 #[test]
-fn merge_base_stops_at_a_shallow_boundary() {
+fn shallow_boundary_commits_have_no_parents() {
     let source = Repository::new();
     source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
     source.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
@@ -305,13 +305,37 @@ fn merge_base_stops_at_a_shallow_boundary() {
     ]);
     consumer.git(&["fetch", "-q", &remote, "pr:refs/heads/pr"]);
     let (handle, _) = native::open_path(&consumer.0).unwrap();
-    let base = resolve(&handle, "base");
+    let cancel = Cancel::default();
+    let (base, pr) = (resolve(&handle, "base"), resolve(&handle, "pr"));
     assert_eq!(
-        handle
-            .native_merge_base(&[base, resolve(&handle, "pr")], &Cancel::default())
-            .unwrap(),
+        handle.native_merge_base(&[base, pr], &cancel).unwrap(),
         vec![base]
     );
+    assert!(
+        handle
+            .native_resolve("base^@", &cancel)
+            .unwrap()
+            .tips
+            .is_empty()
+    );
+
+    let log = handle
+        .native_log(
+            &LogRequest {
+                flags: 0,
+                limit: 1,
+                path: Vec::new(),
+                tips: vec![base],
+                hides: Vec::new(),
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert!(!log.more);
+    assert!(matches!(
+        log.records.as_slice(),
+        [native::LogRecord::Commit { object, parents, .. }] if *object == base && parents.is_empty()
+    ));
 }
 
 #[test]
