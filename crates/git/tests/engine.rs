@@ -284,6 +284,73 @@ fn semantic_diff_patch_and_index_have_no_packet_round_trip() {
 }
 
 #[test]
+fn log_pages_resume_from_tips_they_never_reached() {
+    let repository = Repository::new();
+    let commit_at = |seconds: u64, message: &str| {
+        let date = format!("{seconds} +0000");
+        let status = Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", message])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(&repository.0)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    // A merge whose side branch is older than everything on the first-parent
+    // line: a one-commit page walks the newer line and leaves the side's tip
+    // pending.
+    commit_at(1_700_001_000, "base");
+    repository.git(&["checkout", "-q", "-b", "side"]);
+    commit_at(1_700_002_000, "side");
+    repository.git(&["checkout", "-q", "-"]);
+    commit_at(1_700_003_000, "main 1");
+    commit_at(1_700_004_000, "main 2");
+    repository.git(&["merge", "-q", "--no-ff", "--no-edit", "side"]);
+    let (handle, head) = open(&repository);
+
+    let walk = |tips: Vec<native::Oid>, limit| {
+        handle
+            .native_log(
+                &LogRequest {
+                    flags: 0,
+                    limit,
+                    path: Vec::new(),
+                    tips,
+                    hides: Vec::new(),
+                },
+                &Cancel::default(),
+            )
+            .unwrap()
+    };
+    let commits = |page: &native::LogPage| {
+        page.records
+            .iter()
+            .filter_map(|record| match record {
+                native::LogRecord::Commit { object, .. } => Some(*object),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut whole = commits(&walk(vec![head], 16));
+    assert_eq!(whole.len(), 5);
+
+    let mut paged = Vec::new();
+    let mut tips = vec![head];
+    loop {
+        let page = walk(tips, 1);
+        paged.extend(commits(&page));
+        if !page.more {
+            break;
+        }
+        tips = page.frontier;
+    }
+    whole.sort();
+    paged.sort();
+    assert_eq!(paged, whole);
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");
