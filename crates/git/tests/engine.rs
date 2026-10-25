@@ -351,7 +351,7 @@ fn log_pages_resume_from_tips_they_never_reached() {
 }
 
 #[test]
-fn merge_base_stops_at_a_shallow_boundary() {
+fn shallow_boundary_commits_have_no_parents() {
     let source = Repository::new();
     source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
     source.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
@@ -372,13 +372,37 @@ fn merge_base_stops_at_a_shallow_boundary() {
     ]);
     consumer.git(&["fetch", "-q", &remote, "pr:refs/heads/pr"]);
     let (handle, _) = native::open_path(&consumer.0).unwrap();
-    let base = resolve(&handle, "base");
+    let cancel = Cancel::default();
+    let (base, pr) = (resolve(&handle, "base"), resolve(&handle, "pr"));
     assert_eq!(
-        handle
-            .native_merge_base(&[base, resolve(&handle, "pr")], &Cancel::default())
-            .unwrap(),
+        handle.native_merge_base(&[base, pr], &cancel).unwrap(),
         vec![base]
     );
+    assert!(
+        handle
+            .native_resolve("base^@", &cancel)
+            .unwrap()
+            .tips
+            .is_empty()
+    );
+
+    let log = handle
+        .native_log(
+            &LogRequest {
+                flags: 0,
+                limit: 1,
+                path: Vec::new(),
+                tips: vec![base],
+                hides: Vec::new(),
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert!(!log.more);
+    assert!(matches!(
+        log.records.as_slice(),
+        [native::LogRecord::Commit { object, parents, .. }] if *object == base && parents.is_empty()
+    ));
 }
 
 #[test]
@@ -419,6 +443,35 @@ fn merge_base_follows_a_deepened_shallow_boundary() {
         handle.native_merge_base(&tips, &cancel).unwrap(),
         vec![resolve(&handle, "left~1")]
     );
+}
+
+#[test]
+fn first_parent_log_keeps_every_parent_of_a_merge() {
+    // The wire's LOG_FIRST_PARENT, which native requests carry unchanged.
+    const LOG_FIRST_PARENT: u8 = 1 << 0;
+    let repository = Repository::new();
+    repository.git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    repository.git(&["checkout", "-q", "-b", "side"]);
+    repository.git(&["commit", "-q", "--allow-empty", "-m", "side"]);
+    repository.git(&["checkout", "-q", "-"]);
+    repository.git(&["merge", "-q", "--no-ff", "--no-edit", "side"]);
+    let (handle, head) = open(&repository);
+    let log = handle
+        .native_log(
+            &LogRequest {
+                flags: LOG_FIRST_PARENT,
+                limit: 1,
+                path: Vec::new(),
+                tips: vec![head],
+                hides: Vec::new(),
+            },
+            &Cancel::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        log.records.as_slice(),
+        [native::LogRecord::Commit { parents, .. }] if parents.len() == 2
+    ));
 }
 
 #[test]
