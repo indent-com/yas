@@ -351,6 +351,164 @@ fn log_pages_resume_from_tips_they_never_reached() {
 }
 
 #[test]
+fn shallow_boundary_commits_have_no_parents() {
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    source.git(&["branch", "base"]);
+    source.git(&["checkout", "-q", "-b", "pr"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "three"]);
+
+    // `two` is the shallow boundary: its parent `one` was never fetched.
+    let consumer = Repository::new();
+    let remote = source.remote_path();
+    consumer.git(&[
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        &remote,
+        "base:refs/heads/base",
+    ]);
+    consumer.git(&["fetch", "-q", &remote, "pr:refs/heads/pr"]);
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let cancel = Cancel::default();
+    let (base, pr) = (resolve(&handle, "base"), resolve(&handle, "pr"));
+    assert_eq!(
+        handle.native_merge_base(&[base, pr], &cancel).unwrap(),
+        vec![base]
+    );
+    assert!(
+        handle
+            .native_resolve("base^@", &cancel)
+            .unwrap()
+            .tips
+            .is_empty()
+    );
+
+    let log = handle
+        .native_log(
+            &LogRequest {
+                flags: 0,
+                limit: 1,
+                path: Vec::new(),
+                tips: vec![base],
+                hides: Vec::new(),
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert!(!log.more);
+    assert!(matches!(
+        log.records.as_slice(),
+        [native::LogRecord::Commit { object, parents, .. }] if *object == base && parents.is_empty()
+    ));
+}
+
+#[test]
+fn merge_base_follows_a_deepened_shallow_boundary() {
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    source.git(&["checkout", "-q", "-b", "left"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "left"]);
+    source.git(&["checkout", "-q", "-b", "right", "HEAD~1"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "right"]);
+
+    // Both tips are shallow roots, so they share nothing until deepened.
+    let consumer = Repository::new();
+    let remote = source.remote_path();
+    for branch in ["left", "right"] {
+        consumer.git(&[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            &remote,
+            &format!("{branch}:refs/heads/{branch}"),
+        ]);
+    }
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let cancel = Cancel::default();
+    let tips = [resolve(&handle, "left"), resolve(&handle, "right")];
+    assert!(handle.native_merge_base(&tips, &cancel).unwrap().is_empty());
+
+    consumer.git(&[
+        "fetch",
+        "-q",
+        "--unshallow",
+        &remote,
+        "left:refs/heads/left",
+    ]);
+    assert_eq!(
+        handle.native_merge_base(&tips, &cancel).unwrap(),
+        vec![resolve(&handle, "left~1")]
+    );
+}
+
+#[test]
+fn first_parent_log_keeps_every_parent_of_a_merge() {
+    // The wire's LOG_FIRST_PARENT, which native requests carry unchanged.
+    const LOG_FIRST_PARENT: u8 = 1 << 0;
+    let repository = Repository::new();
+    repository.git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    repository.git(&["checkout", "-q", "-b", "side"]);
+    repository.git(&["commit", "-q", "--allow-empty", "-m", "side"]);
+    repository.git(&["checkout", "-q", "-"]);
+    repository.git(&["merge", "-q", "--no-ff", "--no-edit", "side"]);
+    let (handle, head) = open(&repository);
+    let log = handle
+        .native_log(
+            &LogRequest {
+                flags: LOG_FIRST_PARENT,
+                limit: 1,
+                path: Vec::new(),
+                tips: vec![head],
+                hides: Vec::new(),
+            },
+            &Cancel::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        log.records.as_slice(),
+        [native::LogRecord::Commit { parents, .. }] if parents.len() == 2
+    ));
+}
+
+#[test]
+fn parent_steps_stop_at_a_shallow_boundary() {
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    source.git(&["branch", "old"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    source.git(&["branch", "base"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "three"]);
+
+    // `two` stays a shallow boundary even though fetching `old` brought its
+    // parent `one` into the object store.
+    let consumer = Repository::new();
+    let remote = source.remote_path();
+    consumer.git(&[
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        &remote,
+        "base:refs/heads/base",
+    ]);
+    consumer.git(&["fetch", "-q", &remote, "old:refs/heads/old"]);
+    consumer.git(&["fetch", "-q", &remote, "HEAD:refs/heads/head"]);
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let cancel = Cancel::default();
+    for spec in ["base^", "base~1", "head~2", "old..base^"] {
+        let error = handle.native_resolve(spec, &cancel).unwrap_err();
+        assert_eq!(error.status, Status::NotFound, "{spec}");
+    }
+    let base = resolve(&handle, "base");
+    assert_eq!(resolve(&handle, "head^"), base);
+    assert_eq!(resolve(&handle, "head~1^0"), base);
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");
