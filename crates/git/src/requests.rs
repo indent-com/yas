@@ -290,8 +290,13 @@ fn resolve_one(
     cancel: &Cancel,
 ) -> Result<(Vec<gix::ObjectId>, Vec<gix::ObjectId>), u8> {
     use gix::revision::plumbing::Spec;
+    let shallow = repo.shallow_commits().map_err(|_| GIT_STATUS_OTHER)?;
+    let spec = match &shallow {
+        Some(shallow) => std::borrow::Cow::Owned(shallow_navigation(repo, shallow, spec)?),
+        None => std::borrow::Cow::Borrowed(spec),
+    };
     let parsed = repo
-        .rev_parse(spec)
+        .rev_parse(spec.as_ref())
         .map_err(|_| GIT_STATUS_NOT_FOUND)?
         .detach();
     // Peel an object to a commit; non-committish specs are WRONG_TYPE.
@@ -303,7 +308,6 @@ fn resolve_one(
             .map_err(|_| GIT_STATUS_WRONG_TYPE)
     };
     // Commit oids of an object's parents (for the `^@` / `^!` forms).
-    let shallow = repo.shallow_commits().map_err(|_| GIT_STATUS_OTHER)?;
     let parents = |id: gix::ObjectId| -> Result<Vec<gix::ObjectId>, u8> {
         let c = commit(id)?;
         if is_shallow(shallow.as_ref(), &c) {
@@ -383,6 +387,106 @@ const BASE_P1: u8 = 1;
 const BASE_P2: u8 = 2;
 const BASE_STALE: u8 = 4;
 const BASE_RESULT: u8 = 8;
+
+/// `spec` with each range endpoint of the form `<rev>` followed only by `^n` /
+/// `~n` steps replaced by the commit those steps reach. gix walks the parents
+/// a commit object names, so in a shallow repository it steps past a
+/// boundary that git stops at; here a step off a boundary commit is
+/// NOT_FOUND, as `git rev-parse` reports it. Other forms pass through.
+fn shallow_navigation(
+    repo: &gix::Repository,
+    shallow: &gix::shallow::Commits,
+    spec: &str,
+) -> Result<String, u8> {
+    let (negated, rest) = match spec.strip_prefix('^') {
+        Some(rest) => ("^", rest),
+        None => ("", spec),
+    };
+    let (left, separator, right) = match rest.find("..") {
+        Some(at) => {
+            let separator = if rest[at..].starts_with("...") {
+                "..."
+            } else {
+                ".."
+            };
+            (&rest[..at], separator, &rest[at + separator.len()..])
+        }
+        None => (rest, "", ""),
+    };
+    let mut out = String::from(negated);
+    for (index, endpoint) in [left, right].into_iter().enumerate() {
+        if index == 1 {
+            if separator.is_empty() {
+                break;
+            }
+            out.push_str(separator);
+        }
+        out.push_str(&navigate_endpoint(repo, shallow, endpoint)?);
+    }
+    Ok(out)
+}
+
+fn navigate_endpoint(
+    repo: &gix::Repository,
+    shallow: &gix::shallow::Commits,
+    endpoint: &str,
+) -> Result<String, u8> {
+    let steps_start = endpoint
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit() || *c == '^' || *c == '~')
+        .last()
+        .map_or(endpoint.len(), |(at, _)| at);
+    // The run must open with a step: in `abc123` the digits are the name.
+    let steps_start = endpoint[steps_start..]
+        .find(['^', '~'])
+        .map_or(endpoint.len(), |at| steps_start + at);
+    let (base, steps) = endpoint.split_at(steps_start);
+    if steps.is_empty() || base.is_empty() {
+        return Ok(endpoint.to_owned());
+    }
+    let mut id = repo
+        .rev_parse_single(base)
+        .map_err(|_| GIT_STATUS_NOT_FOUND)?
+        .object()
+        .map_err(|_| GIT_STATUS_NOT_FOUND)?
+        .peel_to_kind(gix::object::Kind::Commit)
+        .map_err(|_| GIT_STATUS_WRONG_TYPE)?
+        .id;
+    let mut rest = steps;
+    while let Some(kind) = rest.chars().next() {
+        let digits = rest[1..].len()
+            - rest[1..]
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .len();
+        let count = match &rest[1..1 + digits] {
+            "" => 1,
+            n => n.parse::<usize>().map_err(|_| GIT_STATUS_INVALID)?,
+        };
+        rest = &rest[1 + digits..];
+        let parent = |id: gix::ObjectId, nth: usize| -> Result<gix::ObjectId, u8> {
+            if is_shallow(Some(shallow), &id) {
+                return Err(GIT_STATUS_NOT_FOUND);
+            }
+            let commit = repo.find_commit(id).map_err(|_| GIT_STATUS_NOT_FOUND)?;
+            commit
+                .parent_ids()
+                .nth(nth)
+                .map(|parent| parent.detach())
+                .ok_or(GIT_STATUS_NOT_FOUND)
+        };
+        match (kind, count) {
+            ('^', 0) => {}
+            ('^', n) => id = parent(id, n - 1)?,
+            (_, n) => {
+                for _ in 0..n {
+                    id = parent(id, 0)?;
+                }
+            }
+        }
+    }
+    Ok(id.to_hex().to_string())
+}
 
 /// Whether `id` is a shallow boundary commit. Git treats one as a root,
 /// whatever parents its object names: they are not part of the history this

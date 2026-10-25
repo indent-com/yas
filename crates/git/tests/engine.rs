@@ -475,6 +475,40 @@ fn first_parent_log_keeps_every_parent_of_a_merge() {
 }
 
 #[test]
+fn parent_steps_stop_at_a_shallow_boundary() {
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    source.git(&["branch", "old"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    source.git(&["branch", "base"]);
+    source.git(&["commit", "-q", "--allow-empty", "-m", "three"]);
+
+    // `two` stays a shallow boundary even though fetching `old` brought its
+    // parent `one` into the object store.
+    let consumer = Repository::new();
+    let remote = source.remote_path();
+    consumer.git(&[
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        &remote,
+        "base:refs/heads/base",
+    ]);
+    consumer.git(&["fetch", "-q", &remote, "old:refs/heads/old"]);
+    consumer.git(&["fetch", "-q", &remote, "HEAD:refs/heads/head"]);
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let cancel = Cancel::default();
+    for spec in ["base^", "base~1", "head~2", "old..base^"] {
+        let error = handle.native_resolve(spec, &cancel).unwrap_err();
+        assert_eq!(error.status, Status::NotFound, "{spec}");
+    }
+    let base = resolve(&handle, "base");
+    assert_eq!(resolve(&handle, "head^"), base);
+    assert_eq!(resolve(&handle, "head~1^0"), base);
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");
