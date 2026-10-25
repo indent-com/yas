@@ -16325,8 +16325,8 @@ impl Session {
         let entries = self.services.environment_snapshot();
         if let Ok(result) = yas_wire::env::GetResult::inline(entries.clone(), Extensions::default())
         {
-            let body = result.encode().map_err(|_| ())?;
-            return self.send_sensitive_result(&frame, Status::Ok, body).await;
+            let (status, body) = result_body(&result);
+            return self.send_sensitive_result(&frame, status, body).await;
         }
         if !self.negotiated.selected.contains(&family::TRANSFER) {
             return self
@@ -19295,8 +19295,8 @@ impl Session {
                 let fs = self.fs.as_ref().map(|runtime| runtime.session.clone());
                 match session.open(&request, fs.as_ref()).await {
                     Ok(result) => {
-                        let body = result.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&result);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(&frame, error.status, Vec::new())
@@ -19480,8 +19480,8 @@ impl Session {
                 let result = self.lsp.as_ref().ok_or(())?.session.list_servers(&request);
                 match result {
                     Ok(list) => {
-                        let body = list.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&list);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(&frame, error.status, Vec::new())
@@ -19637,17 +19637,27 @@ impl Session {
                     .await;
             }
         };
-        let records = data
+        let encoded = data
             .records
             .iter()
             .map(yas_lsp_wire::QueryRecord::encode_typed)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ())?;
-        let messages = records
-            .iter()
-            .map(yas_lsp_wire::TypedRecord::encode_message)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ())?;
+            .and_then(|records| {
+                let messages = records
+                    .iter()
+                    .map(yas_lsp_wire::TypedRecord::encode_message)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((records, messages))
+            });
+        let (records, messages) = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                eprintln!("native YAS LSP QUERY page failed to encode: {error}");
+                return self
+                    .send_sensitive_result(&frame, Status::Internal, Vec::new())
+                    .await;
+            }
+        };
         let inline_bytes = messages.iter().map(Vec::len).sum::<usize>();
         let inline_limit = usize::try_from(self.negotiated.peer_receive.max_decoded)
             .unwrap_or(usize::MAX)
@@ -19898,8 +19908,8 @@ impl Session {
                 };
                 match session.deploy(&request).await {
                     Ok(identity) => {
-                        let body = identity.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&identity);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(
@@ -19931,8 +19941,8 @@ impl Session {
                 };
                 match session.control(&request).await {
                     Ok(identity) => {
-                        let body = identity.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&identity);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(
@@ -19965,8 +19975,8 @@ impl Session {
                 };
                 match session.discover_commands(&request).await {
                     Ok(page) => {
-                        let body = page.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&page);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(
@@ -20008,8 +20018,8 @@ impl Session {
                     .await
                 {
                     Ok(result) => {
-                        let body = result.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&result);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(
@@ -20437,8 +20447,8 @@ impl Session {
                 let fs = self.fs.as_ref().map(|runtime| runtime.session.clone());
                 match session.open(&request, fs.as_ref()).await {
                     Ok(result) => {
-                        let body = result.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&result);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         self.send_sensitive_result(&frame, error.status, Vec::new())
@@ -20557,8 +20567,8 @@ impl Session {
                             true,
                         )
                         .await?;
-                        let body = result.encode().map_err(|_| ())?;
-                        self.send_sensitive_result(&frame, Status::Ok, body).await
+                        let (status, body) = result_body(&result);
+                        self.send_sensitive_result(&frame, status, body).await
                     }
                     Err(error) => {
                         send_event_with_sensitivity(
@@ -20923,13 +20933,31 @@ impl Session {
                     }
                 }
             };
-            records.push(record.encode_typed().map_err(|_| ())?);
+            records.push(record);
         }
-        let messages = records
+        let encoded = records
             .iter()
-            .map(yas_git_wire::TypedRecord::encode_message)
+            .map(yas_git_wire::QueryRecord::encode_typed)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ())?;
+            .and_then(|records| {
+                let messages = records
+                    .iter()
+                    .map(yas_git_wire::TypedRecord::encode_message)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((records, messages))
+            });
+        let (records, messages) = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                eprintln!("native YAS Git QUERY page failed to encode: {error}");
+                for (transfer_id, _, _) in content_transfers {
+                    self.abort_transfer(transfer_id);
+                }
+                return self
+                    .send_sensitive_result(&frame, Status::Internal, Vec::new())
+                    .await;
+            }
+        };
         let inline_bytes = messages.iter().map(Vec::len).sum::<usize>();
         let inline_limit = usize::try_from(self.negotiated.peer_receive.max_decoded)
             .unwrap_or(usize::MAX)
@@ -21051,8 +21079,8 @@ impl Session {
                         .send_sensitive_result(&frame, Status::Unavailable, Vec::new())
                         .await;
                 };
-                let body = events.service.config().encode().map_err(|_| ())?;
-                self.send_sensitive_result(&frame, Status::Ok, body).await
+                let (status, body) = result_body(&events.service.config());
+                self.send_sensitive_result(&frame, status, body).await
             }
             yas_wire::schema::events::request::SET_CONFIG => self.set_events_config(frame).await,
             yas_wire::schema::events::request::DUMP => self.dump_events(frame).await,
@@ -21081,8 +21109,8 @@ impl Session {
                         .send_sensitive_result(&frame, Status::Unavailable, Vec::new())
                         .await;
                 };
-                let body = events.service.recordings().encode().map_err(|_| ())?;
-                self.send_sensitive_result(&frame, Status::Ok, body).await
+                let (status, body) = result_body(&events.service.recordings());
+                self.send_sensitive_result(&frame, status, body).await
             }
             _ => {
                 self.send_sensitive_result(&frame, Status::Unsupported, Vec::new())
@@ -25125,12 +25153,12 @@ impl Session {
         match outcome {
             FsOperationOutcome::Open(outcome) => match outcome {
                 Ok(result) => {
-                    let body = result.encode().map_err(|_| ())?;
+                    let (status, body) = result_body(&result);
                     self.send_result_parts_with_sensitivity(
                         family::FS,
                         kind,
                         request_id,
-                        Status::Ok,
+                        status,
                         body,
                         true,
                     )
@@ -25478,12 +25506,12 @@ impl Session {
                 }
                 match outcome {
                     Ok(result) => {
-                        let body = result.encode().map_err(|_| ())?;
+                        let (status, body) = result_body(&result);
                         self.send_result_parts_with_sensitivity(
                             family::FS,
                             kind,
                             request_id,
-                            Status::Ok,
+                            status,
                             body,
                             true,
                         )
@@ -25494,12 +25522,12 @@ impl Session {
             }
             FsOperationOutcome::Publish(outcome) => match outcome {
                 Ok(result) => {
-                    let body = result.encode().map_err(|_| ())?;
+                    let (status, body) = result_body(&result);
                     self.send_result_parts_with_sensitivity(
                         family::FS,
                         kind,
                         request_id,
-                        Status::Ok,
+                        status,
                         body,
                         true,
                     )
@@ -25509,12 +25537,12 @@ impl Session {
             },
             FsOperationOutcome::Apply(outcome) => match outcome {
                 Ok(result) => {
-                    let body = result.encode().map_err(|_| ())?;
+                    let (status, body) = result_body(&result);
                     self.send_result_parts_with_sensitivity(
                         family::FS,
                         kind,
                         request_id,
-                        Status::Ok,
+                        status,
                         body,
                         true,
                     )
@@ -25715,7 +25743,7 @@ impl Session {
                     return Err(());
                 }
                 let (status, body) = match outcome {
-                    Ok(result) => (Status::Ok, result.encode().map_err(|_| ())?),
+                    Ok(result) => result_body(&result),
                     Err(error) => (process_error_status(&error), Vec::new()),
                 };
                 self.record_process_replay(
@@ -25783,12 +25811,12 @@ impl Session {
                 }
                 match outcome {
                     Ok(exit) => {
-                        let body = exit.into_record(monotonic_ns()).encode().map_err(|_| ())?;
+                        let (status, body) = result_body(&exit.into_record(monotonic_ns()));
                         self.send_result_parts_with_sensitivity(
                             family::PROCESS,
                             kind,
                             request_id,
-                            Status::Ok,
+                            status,
                             body,
                             true,
                         )
@@ -32983,6 +33011,19 @@ async fn run_fs_watch(
         // copy.
         if watch.ack(update.update_id).is_err() {
             return;
+        }
+    }
+}
+
+/// A Result's status and body for `value`: OK with its encoding, or INTERNAL
+/// with no body when the server built something its own codec rejects. That
+/// is a bug in one answer, so the request fails and the session carries on.
+fn result_body(value: &impl Encode) -> (Status, Vec<u8>) {
+    match value.encode() {
+        Ok(body) => (Status::Ok, body),
+        Err(error) => {
+            eprintln!("native YAS Result body failed to encode: {error}");
+            (Status::Internal, Vec::new())
         }
     }
 }
@@ -40993,6 +41034,23 @@ mod tests {
 
         drop(client);
         timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_result_body_the_codec_rejects_is_internal() {
+        let unnamed = yas_git_wire::FetchResult {
+            repository_revision: 1,
+            refs: vec![yas_git_wire::FetchRefResult {
+                flags: 0,
+                status: Status::Internal.code(),
+                old: None,
+                new: None,
+                name: Vec::new(),
+                detail: String::new(),
+            }],
+            extensions: Extensions::default(),
+        };
+        assert_eq!(result_body(&unnamed), (Status::Internal, Vec::new()));
     }
 
     #[cfg(unix)]
