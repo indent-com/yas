@@ -9,13 +9,13 @@ use crate::model::{
     GIT_FETCH_REF_TAG_UPDATE, GIT_FOUND_BARE, GIT_FOUND_LINKED, GIT_OID_NONE,
     GIT_REFLOG_OLDEST_FIRST, GIT_REFLOG_TRUNCATED, GIT_STATUS_CANCELLED, GIT_STATUS_INVALID,
     GIT_STATUS_NOT_FOUND, GIT_STATUS_OK, GIT_STATUS_OTHER, GIT_STATUS_PERMISSION,
-    GIT_STATUS_WRONG_TYPE, GIT_WORKTREE_BARE, GIT_WORKTREE_CURRENT, GIT_WORKTREE_DETACHED,
-    GIT_WORKTREE_LOCKED, GIT_WORKTREE_MAIN, GIT_WORKTREE_PRUNABLE, GIT_WORKTREES_TRUNCATED,
-    GitBlameRecord, GitBlameRequest, GitDiscoverRecord, GitFetchRecord, GitFetchRequest,
-    GitReflogRecord, GitReflogRequest, GitWorktreeRecord, GitWorktreesRequest, OwnedGitBlameRecord,
-    OwnedGitDiscoverRecord, OwnedGitFetchRecord, OwnedGitReflogRecord, OwnedGitWorktreeRecord,
-    Response, blame_response, discover_response, fetch_response, push_git_blame_record,
-    push_git_discover_record, push_git_fetch_record, push_git_reflog_record,
+    GIT_STATUS_TIMEOUT, GIT_STATUS_WRONG_TYPE, GIT_WORKTREE_BARE, GIT_WORKTREE_CURRENT,
+    GIT_WORKTREE_DETACHED, GIT_WORKTREE_LOCKED, GIT_WORKTREE_MAIN, GIT_WORKTREE_PRUNABLE,
+    GIT_WORKTREES_TRUNCATED, GitBlameRecord, GitBlameRequest, GitDiscoverRecord, GitFetchRecord,
+    GitFetchRequest, GitReflogRecord, GitReflogRequest, GitWorktreeRecord, GitWorktreesRequest,
+    OwnedGitBlameRecord, OwnedGitDiscoverRecord, OwnedGitFetchRecord, OwnedGitReflogRecord,
+    OwnedGitWorktreeRecord, Response, blame_response, discover_response, fetch_response,
+    push_git_blame_record, push_git_discover_record, push_git_fetch_record, push_git_reflog_record,
     push_git_worktree_record, reflog_response, worktrees_response,
 };
 
@@ -711,7 +711,12 @@ fn run_git(
 ) -> Result<GitOutput, u8> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    // Its own process group, so a kill reaches what git runs: ssh, a
+    // credential helper, a local upload-pack.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
         .current_dir(dir)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -756,14 +761,12 @@ fn run_git(
             Err(_) => return Err(GIT_STATUS_OTHER),
         }
         if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_git(&mut child);
             return Err(GIT_STATUS_CANCELLED);
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(GIT_STATUS_OTHER);
+            kill_git(&mut child);
+            return Err(GIT_STATUS_TIMEOUT);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
@@ -772,6 +775,19 @@ fn run_git(
         stdout: out_thread.join().unwrap_or_default(),
         stderr: err_thread.join().unwrap_or_default(),
     })
+}
+
+/// Kill git and the process group it leads, then reap it.
+fn kill_git(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: plain syscall on the process group this child leads.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// One `git fetch --porcelain` line: `<flag> <old> <new> <ref>`, where

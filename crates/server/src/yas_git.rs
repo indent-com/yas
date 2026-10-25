@@ -790,6 +790,7 @@ fn native_error(error: yas_git::native::Failure) -> Error {
             yas_git::native::Status::ResourceExhausted => Status::ResourceExhausted,
             yas_git::native::Status::Cancelled => Status::Cancelled,
             yas_git::native::Status::Conflict => Status::Conflict,
+            yas_git::native::Status::Timeout => Status::Timeout,
             yas_git::native::Status::Other => Status::Internal,
         },
         error.detail,
@@ -805,6 +806,7 @@ fn native_status(status: yas_git::native::Status) -> Status {
         yas_git::native::Status::ResourceExhausted => Status::ResourceExhausted,
         yas_git::native::Status::Cancelled => Status::Cancelled,
         yas_git::native::Status::Conflict => Status::Conflict,
+        yas_git::native::Status::Timeout => Status::Timeout,
         yas_git::native::Status::Other => Status::Internal,
     }
 }

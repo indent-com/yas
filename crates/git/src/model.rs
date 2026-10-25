@@ -20,6 +20,7 @@ pub const GIT_STATUS_CANCELLED: u8 = 8;
 pub const GIT_STATUS_OTHER: u8 = 9;
 pub const GIT_STATUS_CONFLICT: u8 = 11;
 pub const GIT_STATUS_NO_MERGE_BASE: u8 = 12;
+pub const GIT_STATUS_TIMEOUT: u8 = 13;
 
 pub const GIT_OID_FORMAT_SHA1: u8 = 0;
 pub const GIT_OID_FORMAT_SHA256: u8 = 1;
