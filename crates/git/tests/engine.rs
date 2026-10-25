@@ -514,6 +514,48 @@ fn semantic_fetch_reports_local_remote_ref_updates() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn fetch_timeout_reports_timeout_and_kills_what_git_started() {
+    if !native::fetch_available() {
+        return;
+    }
+    let source = Repository::new();
+    source.git(&["commit", "-q", "--allow-empty", "-m", "remote"]);
+    let consumer = Repository::new();
+    consumer.git(&["remote", "add", "origin", &source.remote_path()]);
+    // The remote side stalls past the deadline, leaving its pid behind.
+    let pid_file = consumer.0.join("upload-pack.pid");
+    consumer.git(&[
+        "config",
+        "remote.origin.uploadpack",
+        &format!(
+            "echo $$ > '{}'; sleep 30; git-upload-pack",
+            pid_file.display()
+        ),
+    ]);
+    let (handle, _) = native::open_path(&consumer.0).unwrap();
+    let error = handle
+        .native_fetch("origin", &[], 0, 500, &Cancel::default())
+        .unwrap_err();
+    assert_eq!(error.status, Status::Timeout);
+
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!alive(), "upload-pack {} outlived the fetch", pid.trim());
+}
+
 #[test]
 fn status_keeps_tracked_files_and_ancestors_observable_despite_ignore_rules() {
     for untracked in [false, true] {

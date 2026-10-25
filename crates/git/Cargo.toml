@@ -27,3 +27,6 @@ notify = "8"
 # `GIT binary patch` bodies are zlib streams, as git writes them. Already in
 # the tree via gix's own object store, so this adds an edge, not a crate.
 flate2 = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

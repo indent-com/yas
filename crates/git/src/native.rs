@@ -27,6 +27,7 @@ pub enum Status {
     Invalid,
     Cancelled,
     Conflict,
+    Timeout,
     Other,
 }
 
@@ -41,6 +42,7 @@ impl Status {
             engine::GIT_STATUS_INVALID => Self::Invalid,
             engine::GIT_STATUS_CANCELLED => Self::Cancelled,
             engine::GIT_STATUS_CONFLICT | engine::GIT_STATUS_NO_MERGE_BASE => Self::Conflict,
+            engine::GIT_STATUS_TIMEOUT => Self::Timeout,
             _ => Self::Other,
         }
     }

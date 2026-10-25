@@ -8293,6 +8293,7 @@ dependencies = [
  "flate2",
  "gix",
  "imara-diff",
+ "libc",
  "notify",
  "yas-fssync",
 ]
