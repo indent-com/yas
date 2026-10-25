@@ -2204,6 +2204,15 @@ fn append_text_patch(
     if content_unchanged && old_mode != new_mode && change.old.is_some() && change.new.is_some() {
         return;
     }
+    // Likewise a rename or copy of the very same object: git prints no
+    // `index` line, no `---`/`+++`, and no "differ" for content that doesn't.
+    let same_object = match (&change.old, &change.new) {
+        (Some(old), Some(new)) => !old.oid.is_null() && old.oid == new.oid,
+        _ => false,
+    };
+    if (change.st == b'R' || change.st == b'C') && same_object {
+        return;
+    }
     // Full-length oids rather than a core.abbrev abbreviation: a unique
     // short oid costs an object-database probe per side per file, and
     // `git apply` accepts either (documented deviation).
@@ -2227,6 +2236,16 @@ fn append_text_patch(
         .as_bytes(),
     );
 
+    let a_label = if change.old.is_some() {
+        format!("a/{a_name}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let b_label = if change.new.is_some() {
+        format!("b/{b_name}")
+    } else {
+        "/dev/null".to_string()
+    };
     if binary {
         // `BINARY` is git's `--binary`: with it the content goes out as a
         // `GIT binary patch` block, so the patch is one `git apply --binary`
@@ -2238,21 +2257,11 @@ fn append_text_patch(
             append_binary_patch(out, old_bytes, new_bytes);
         } else {
             out.extend_from_slice(
-                format!("Binary files a/{a_name} and b/{b_name} differ\n").as_bytes(),
+                format!("Binary files {a_label} and {b_label} differ\n").as_bytes(),
             );
         }
         return;
     }
-    let a_label = if change.old.is_some() {
-        format!("a/{a_name}")
-    } else {
-        "/dev/null".to_string()
-    };
-    let b_label = if change.new.is_some() {
-        format!("b/{b_name}")
-    } else {
-        "/dev/null".to_string()
-    };
     out.extend_from_slice(format!("--- {a_label}\n+++ {b_label}\n").as_bytes());
     let old_lines = split_lines(old_bytes);
     let new_lines = split_lines(new_bytes);

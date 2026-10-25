@@ -509,6 +509,45 @@ fn parent_steps_stop_at_a_shallow_boundary() {
 }
 
 #[test]
+fn text_patch_headers_match_git_for_pure_renames_and_binary_adds() {
+    // The wire's PATCH_RENAMES and PATCH_TEXT, which native requests carry
+    // unchanged.
+    const PATCH_RENAMES: u16 = 1 << 0;
+    const PATCH_TEXT: u16 = 1 << 6;
+    let repository = Repository::new();
+    repository.write("text.txt", b"one\ntwo\n");
+    repository.write("old.bin", b"\0old");
+    repository.commit("base");
+    let (handle, old) = open(&repository);
+    repository.git(&["mv", "text.txt", "moved.txt"]);
+    repository.git(&["rm", "-q", "old.bin"]);
+    repository.write("new.bin", b"\0new");
+    repository.commit("move");
+    let new = resolve(&handle, "HEAD");
+    let patch = handle
+        .native_patch(
+            &PatchRequest {
+                flags: PATCH_TEXT | PATCH_RENAMES,
+                context_lines: 3,
+                rename_threshold: 50,
+                old: Endpoint::Commit(old),
+                new: Endpoint::Commit(new),
+                path: Vec::new(),
+                max_bytes: 64 * 1024,
+                after: Vec::new(),
+                after_position: 0,
+            },
+            &Cancel::default(),
+        )
+        .unwrap();
+    let PatchResult::Text(text) = patch else {
+        panic!("expected a text patch")
+    };
+    let git = repository.git(&["diff", "--full-index", "-M50%", "HEAD~1", "HEAD"]);
+    assert_eq!(String::from_utf8(text).unwrap().trim_end(), git);
+}
+
+#[test]
 fn semantic_state_stream_is_typed_and_acked() {
     let repository = Repository::new();
     repository.write("tracked", b"one\n");
