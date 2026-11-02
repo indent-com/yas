@@ -43,6 +43,7 @@ import {
   YAS_SURFACE_TOUCH_PHASE_UP,
   YAS_SURFACE_UNWATCH,
   YAS_SURFACE_WATCH,
+  YAS_STATUS_NOT_FOUND,
   YAS_STATUS_RESOURCE_EXHAUSTED,
   YAS_TERMINAL_COPY_RANGE,
   YAS_TERMINAL_STATE,
@@ -60,6 +61,7 @@ import { encodeSurfaceCodecPayload } from "../yas/packed";
 import { YasReceiveBudget } from "../yas/session";
 import {
   YasCursor,
+  YasDisconnectedError,
   YasProtocolError,
   YasResultError,
   YasWriter,
@@ -3103,7 +3105,7 @@ describe("YasNativeWorkspaceConnection", () => {
   });
 
   it("releases the Surface size and DPI claim with its last resizable view", () => {
-    const resize = vi.fn();
+    const resize = vi.fn(async () => 1n);
     const connection = Object.create(
       YasNativeWorkspaceConnection.prototype,
     ) as YasNativeWorkspaceConnection;
@@ -3120,6 +3122,35 @@ describe("YasNativeWorkspaceConnection", () => {
     connection.withdrawSurfaceViewSize(1n, "pane");
 
     expect(resize).toHaveBeenCalledWith(1n, expect.any(Uint8Array), 0n, 0n);
+  });
+
+  it.each([
+    new YasDisconnectedError(),
+    new YasResultError(YAS_STATUS_NOT_FOUND, new Uint8Array()),
+  ])("settles a Surface size release that fails with %s", async (error) => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const connection = Object.create(
+        YasNativeWorkspaceConnection.prototype,
+      ) as YasNativeWorkspaceConnection;
+      Object.assign(connection as object, {
+        // vi.fn() observes returned promises, which would handle the rejection.
+        surface: { resize: () => Promise.reject(error) },
+        surfaceRecords: new Map([[1n, {}]]),
+        surfaceMounts: new Map(),
+        surfaceViewSizes: new Map(),
+        session: { ready: true },
+      });
+
+      connection.offerSurfaceViewSize(1n, "pane", 1600, 1200, 240);
+      connection.withdrawSurfaceViewSize(1n, "pane");
+      await new Promise((resolve) => setTimeout(resolve));
+
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
   });
 
   it("preserves rounded HiDPI Surface dimensions for pointer space", () => {

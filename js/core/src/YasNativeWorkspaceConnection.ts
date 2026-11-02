@@ -240,7 +240,7 @@ import {
 
 const textEncoder = new TextEncoder();
 
-function settleTerminalRequest(request: Promise<unknown>): void {
+function settleRequest(request: Promise<unknown>): void {
   request.catch((error: unknown) => {
     if (error instanceof YasDisconnectedError) return;
     if (
@@ -248,7 +248,7 @@ function settleTerminalRequest(request: Promise<unknown>): void {
       error.status === YAS_STATUS_NOT_FOUND
     )
       return;
-    console.error("YAS terminal request failed", error);
+    console.error("YAS request failed", error);
   });
 }
 const textDecoder = new TextDecoder();
@@ -618,7 +618,8 @@ export class YasNativeWorkspaceConnection {
       this.acknowledgeSurface(surfaceId, ackToken, queueDepth),
     );
     this.surfaceStore.setKeyframeSender((surfaceId) => {
-      void this.surfaceViews.get(surfaceId)?.view.reset();
+      const view = this.surfaceViews.get(surfaceId)?.view;
+      if (view) settleRequest(view.reset());
     });
     this.store = new TerminalStore(
       {
@@ -986,7 +987,7 @@ export class YasNativeWorkspaceConnection {
   }
 
   restartSession(sessionId: SessionId): void {
-    settleTerminalRequest(
+    settleRequest(
       this.terminal.restart(this.handleForSession(sessionId), operationId(), {
         launchMode: YAS_TERMINAL_LAUNCH_REPLAY,
         cutoverMode: YAS_TERMINAL_CUTOVER_STOP_THEN_START,
@@ -1003,7 +1004,7 @@ export class YasNativeWorkspaceConnection {
           : signal === 1
             ? YAS_TERMINAL_SIGNAL_HANGUP
             : YAS_TERMINAL_SIGNAL_TERMINATE;
-    settleTerminalRequest(
+    settleRequest(
       this.terminal.signal(
         this.handleForSession(sessionId),
         operationId(),
@@ -1018,16 +1019,12 @@ export class YasNativeWorkspaceConnection {
     if (previous) {
       const view = this.views.get(this.handleForSession(previous));
       if (view)
-        settleTerminalRequest(
-          this.terminal.setFocus(view.view.result.viewId, false),
-        );
+        settleRequest(this.terminal.setFocus(view.view.result.viewId, false));
     }
     if (sessionId) {
       const view = this.views.get(this.handleForSession(sessionId));
       if (view)
-        settleTerminalRequest(
-          this.terminal.setFocus(view.view.result.viewId, true),
-        );
+        settleRequest(this.terminal.setFocus(view.view.result.viewId, true));
     }
     this.refreshSnapshot();
   }
@@ -1043,7 +1040,7 @@ export class YasNativeWorkspaceConnection {
 
   resizeSession(sessionId: SessionId, rows: number, cols: number): void {
     const handle = this.handleForSession(sessionId);
-    settleTerminalRequest(this.terminal.resize(handle, rows, cols));
+    settleRequest(this.terminal.resize(handle, rows, cols));
     const state = this.views.get(handle);
     if (state) this.configureView(handle, { rows, cols });
   }
@@ -1086,7 +1083,7 @@ export class YasNativeWorkspaceConnection {
     const state = this.views.get(handle);
     if (!state) return;
     const request = (state.scrollRequest = Symbol());
-    settleTerminalRequest(
+    settleRequest(
       this.terminal
         .scroll(state.view.result.viewId, BigInt(amount), mode)
         .then((applied) => {
@@ -1537,7 +1534,7 @@ export class YasNativeWorkspaceConnection {
       // shown on a 2x display pins the Wayland output at 2x forever even when
       // every remaining viewer is 1x.
       if (this.surface)
-        void this.surface.resize(surfaceId, operationId(), 0n, 0n);
+        settleRequest(this.surface.resize(surfaceId, operationId(), 0n, 0n));
     } else {
       const effective = effectiveSurfaceSize(
         sizes.values(),
@@ -1598,7 +1595,8 @@ export class YasNativeWorkspaceConnection {
   }
 
   sendSurfaceClose(surfaceId: SurfaceId): void {
-    void this.surface?.close(surfaceId, operationId());
+    if (this.surface)
+      settleRequest(this.surface.close(surfaceId, operationId()));
   }
 
   sendSurfaceInput(
@@ -3891,7 +3889,7 @@ export class YasNativeWorkspaceConnection {
       this.configureView(handle, latestSize);
     }
     if (this.focusedSessionId === this.sessionId(handle))
-      settleTerminalRequest(this.terminal.setFocus(view.result.viewId, true));
+      settleRequest(this.terminal.setFocus(view.result.viewId, true));
   }
 
   private terminalGrid(
