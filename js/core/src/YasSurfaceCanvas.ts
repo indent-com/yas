@@ -2309,7 +2309,15 @@ export class YasSurfaceCanvas {
     }
     // Fill the chosen rectangle on both axes. Input and overlays use that
     // same box, including when codec rounding slightly changed its aspect.
-    const objectFit = presentation?.logicalWidth ? "fill" : "contain";
+    let objectFit = presentation?.logicalWidth ? "fill" : "contain";
+    // Until a frame is drawn the backing buffer is attach()'s placeholder.
+    // Fill the display box instead, so a press anywhere in the pane reaches
+    // the canvas and maps against the pane rather than the placeholder.
+    if (ds && !this._lastFrameSize) {
+      w = ds.width;
+      h = ds.height;
+      objectFit = "fill";
+    }
     const left = 0;
     const top = 0;
     const last = this._lastLayout;

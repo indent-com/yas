@@ -80,6 +80,16 @@ function setSurfaceInfo(
   };
 }
 
+/** What presentFromStore leaves behind once a decoded frame is on the canvas. */
+function drawFrame(surface: YasSurfaceCanvas, width: number, height: number) {
+  const canvas = surface.canvasElement!;
+  canvas.width = width;
+  canvas.height = height;
+  (
+    surface as unknown as { _lastFrameSize: { width: number; height: number } }
+  )._lastFrameSize = { width, height };
+}
+
 function attachResizableCanvas(
   dims: { width: number; height: number; lw?: number; lh?: number },
   options?: { offerAccepted?: boolean },
@@ -445,9 +455,10 @@ describe("YasSurfaceCanvas layout", () => {
 
   it("keeps a smaller frame 1:1 at the top-left", () => {
     const { surface, canvas } = attachCanvas();
-    // Backing buffer is the attach() default 640×480 "frame"; the view is
-    // 1280×960 device pixels at 2x. The frame remains 640×480 device
-    // pixels, so it occupies 320×240 CSS pixels and leaves the rest empty.
+    // A 640×480 frame in a view of 1280×960 device pixels at 2x. The frame
+    // remains 640×480 device pixels, so it occupies 320×240 CSS pixels and
+    // leaves the rest empty.
+    drawFrame(surface, 640, 480);
     surface.setDisplaySize(1280, 960, 240);
     expect(canvas.style.position).toBe("absolute");
     expect(canvas.style.width).toBe("320px");
@@ -654,8 +665,7 @@ describe("YasSurfaceCanvas layout", () => {
     // leaves a pixel of background showing along two edges. Stretching that
     // last pixel would violate 1:1 presentation.
     const { surface, canvas } = attachCanvas();
-    canvas.width = 1236;
-    canvas.height = 842;
+    drawFrame(surface, 1236, 842);
     surface.setDisplaySize(1237, 843, 120);
     expect(canvas.style.width).toBe("1236px");
     expect(canvas.style.height).toBe("842px");
@@ -667,8 +677,7 @@ describe("YasSurfaceCanvas layout", () => {
   it("tracks each decoded frame at 1:1 when the stream size changes", () => {
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 1236, height: 842, lw: 1237, lh: 843 });
-    canvas.width = 1236;
-    canvas.height = 842;
+    drawFrame(surface, 1236, 842);
     surface.setDisplaySize(1237, 843, 120);
     expect(canvas.style.width).toBe("1236px");
     expect(canvas.style.height).toBe("842px");
@@ -685,8 +694,7 @@ describe("YasSurfaceCanvas layout", () => {
   it("anchors an oversized mismatched frame at the top-left without shrinking", () => {
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 2000, height: 480, lw: 640, lh: 480 });
-    canvas.width = 2000;
-    canvas.height = 480;
+    drawFrame(surface, 2000, 480);
     surface.setDisplaySize(1280, 960, 240);
     // The 2000×480 frame overflows the 640×480 CSS pane at 2x.
     // Its aspect remains 2000/480, independent of the latest catalogue.
@@ -985,8 +993,7 @@ describe("YasSurfaceCanvas layout", () => {
   it("keeps the stale frame 1:1 while an existing pane is maximized", () => {
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 400, height: 300, lw: 400, lh: 300 });
-    canvas.width = 400;
-    canvas.height = 300;
+    drawFrame(surface, 400, 300);
     surface.setDisplaySize(400, 300, 120);
     expect(canvas.style.width).toBe("400px");
     expect(canvas.style.height).toBe("300px");
@@ -1006,8 +1013,7 @@ describe("YasSurfaceCanvas layout", () => {
     const { surface, canvas, acknowledgements, update } = attachResizableCanvas(
       { width: 400, height: 300 },
     );
-    canvas.width = 400;
-    canvas.height = 300;
+    drawFrame(surface, 400, 300);
 
     surface.setDisplaySize(400, 300, 120);
     surface.requestResize(400, 300, 120);
@@ -1037,8 +1043,7 @@ describe("YasSurfaceCanvas layout", () => {
     const { surface, canvas, acknowledgements, update } = attachResizableCanvas(
       { width: 1200, height: 900 },
     );
-    canvas.width = 1200;
-    canvas.height = 900;
+    drawFrame(surface, 1200, 900);
     surface.setDisplaySize(1200, 900, 120);
     surface.requestResize(1200, 900, 120);
 
@@ -1073,8 +1078,7 @@ describe("YasSurfaceCanvas layout", () => {
     const { surface, canvas, acknowledgements, update } = attachResizableCanvas(
       { width: 1280, height: 960, lw: 512, lh: 384 },
     );
-    canvas.width = 1280;
-    canvas.height = 960;
+    drawFrame(surface, 1280, 960);
     surface.setDisplaySize(1280, 960, 300, 240);
     surface.requestResize(1280, 960, 300);
 
@@ -1133,8 +1137,7 @@ describe("YasSurfaceCanvas layout", () => {
     // than inventing pixels by stretching the frame.
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 1236, height: 842, lw: 1236, lh: 842 });
-    canvas.width = 1236;
-    canvas.height = 842;
+    drawFrame(surface, 1236, 842);
     surface.setDisplaySize(1237, 843, 120);
     expect(canvas.style.width).toBe("1236px");
     expect(canvas.style.height).toBe("842px");
@@ -1147,8 +1150,7 @@ describe("YasSurfaceCanvas layout", () => {
     // would draw nothing.
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 1200, height: 900, lw: 0, lh: 0 });
-    canvas.width = 1200;
-    canvas.height = 900;
+    drawFrame(surface, 1200, 900);
     surface.setDisplaySize(1600, 1200, 120);
     expect(canvas.style.width).toBe("1200px");
     expect(canvas.style.height).toBe("900px");
@@ -1292,7 +1294,8 @@ describe("codec support demotion", () => {
 /** Captures the scroll messages a canvas emits. */
 function attachScrolling(
   opts: {
-    frame?: [number, number];
+    /** `null` leaves attach()'s placeholder undrawn. */
+    frame?: [number, number] | null;
     css?: [number, number];
     surface?: [number, number];
     display?: [number, number];
@@ -1426,8 +1429,7 @@ function attachScrolling(
   surface.attach(container);
   const canvas = surface.canvasElement;
   if (!canvas) throw new Error("Expected surface canvas");
-  canvas.width = fw;
-  canvas.height = fh;
+  if (opts.frame !== null) drawFrame(surface, fw, fh);
   // A display size is what separates a live view from a thumbnail, and
   // only live views take input.
   surface.setDisplaySize(dw, dh, 120);
@@ -1915,6 +1917,42 @@ describe("YasSurfaceCanvas scroll", () => {
     expect(
       pointers.filter(({ type }) => type === SURFACE_POINTER_UP),
     ).toHaveLength(1);
+  });
+
+  it("maps a press before the first frame against the display box", () => {
+    const { surface, canvas, pointers } = attachScrolling({
+      frame: null,
+      surface: [1200, 700],
+      display: [1200, 700],
+      css: [1200, 700],
+    });
+    // The canvas covers the whole pane, not attach()'s 640×480 placeholder,
+    // so a press anywhere in it reaches the canvas.
+    expect(canvas.style.width).toBe("1200px");
+    expect(canvas.style.height).toBe("700px");
+
+    for (const type of ["mousedown", "mouseup"]) {
+      canvas.dispatchEvent(
+        new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          clientX: 600,
+          clientY: 350,
+        }),
+      );
+    }
+
+    expect(
+      pointers.filter(
+        ({ type }) =>
+          type === SURFACE_POINTER_DOWN || type === SURFACE_POINTER_UP,
+      ),
+    ).toEqual([
+      { type: SURFACE_POINTER_DOWN, button: 0, x: 0.5, y: 0.5 },
+      { type: SURFACE_POINTER_UP, button: 0, x: 0.5, y: 0.5 },
+    ]);
+    surface.dispose();
   });
 
   it("does not focus or press through a zero-size canvas", () => {
@@ -7253,7 +7291,7 @@ describe("YasSurfaceCanvas passive layout", () => {
     const { surface, canvas } = attachCanvas();
     surface.setDisplaySize(800, 600, 120);
     expect(canvas.style.position).toBe("absolute");
-    expect(canvas.style.width).toBe("640px");
+    expect(canvas.style.width).toBe("800px");
     expect(canvas.style.objectPosition).toBe("left top");
 
     // Going back to a passive preview has to restore the fill, or a card that
