@@ -1413,7 +1413,9 @@ fn encode_cell(
     if flags.contains(CellFlags::WIDE_CHAR) {
         f1 |= 1 << 1;
     }
-    if flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+    // The padding left in the last column when a wide char wraps early holds
+    // no text either; without the spacer bit it reads back as a space.
+    if flags.intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER) {
         f1 |= 1 << 2;
     }
     if linked {
@@ -1884,6 +1886,23 @@ mod integration_tests {
         assert_eq!(
             first_line, "abcdefghi jkl",
             "wrapped line must preserve the boundary space, got {first_line:?}"
+        );
+    }
+
+    /// Regression: a wide char wrapping early leaves a LEADING_WIDE_CHAR_SPACER
+    /// in the last column; frame text (what the server's COPY_RANGE reads) must
+    /// not turn it into a space ("뚝섬" -> "뚝 섬").
+    #[test]
+    fn wide_char_wrap_does_not_insert_space() {
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        driver.process("abcdefghi뚝섬".as_bytes());
+
+        let frame = driver.snapshot(true, true);
+        let text = frame.get_all_text();
+        let first_line = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            first_line, "abcdefghi뚝섬",
+            "wide-char wrap padding must not be copied, got {first_line:?}"
         );
     }
 
